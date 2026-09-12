@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="82%">
+      <stop offset="0" stop-color="#39204d"/>
+      <stop offset="0.48" stop-color="#1b102e"/>
+      <stop offset="1" stop-color="#0b0818"/>
+    </radialGradient>
+    <linearGradient id="portal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff557f"/>
+      <stop offset="0.48" stop-color="#ff9a5b"/>
+      <stop offset="1" stop-color="#c456ff"/>
+    </linearGradient>
+    <linearGradient id="orbitMint" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#baffd6"/>
+      <stop offset="1" stop-color="#54e8c2"/>
+    </linearGradient>
+    <linearGradient id="orbitViolet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b56cff"/>
+      <stop offset="1" stop-color="#6672ff"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="20" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- The continuous orbit is the “Anywhere” signal. -->
+  <path d="M270 512 C270 330 420 330 512 512 C604 694 754 694 754 512
+           C754 330 604 330 512 512 C420 694 270 694 270 512"
+        fill="none" stroke="#080612" stroke-width="112" stroke-linecap="round" filter="url(#glow)"/>
+  <path d="M270 512 C270 330 420 330 512 512" fill="none" stroke="url(#orbitMint)" stroke-width="72" stroke-linecap="round"/>
+  <path d="M512 512 C604 694 754 694 754 512" fill="none" stroke="#ff6a76" stroke-width="72" stroke-linecap="round"/>
+  <path d="M754 512 C754 330 604 330 512 512" fill="none" stroke="url(#orbitViolet)" stroke-width="72" stroke-linecap="round"/>
+  <path d="M512 512 C420 694 270 694 270 512" fill="none" stroke="#ff9b60" stroke-width="72" stroke-linecap="round"/>
+
+  <!-- A D-shaped portal gives the mark its DSH identity. -->
+  <path d="M366 342v340 M406 350 C638 350 638 674 406 674"
+        fill="none" stroke="#080612" stroke-width="126" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M366 342v340 M406 350 C638 350 638 674 406 674"
+        fill="none" stroke="url(#portal)" stroke-width="92" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Three nodes: origin, destination, and the active connection. -->
+  <circle cx="270" cy="512" r="51" fill="#151026" stroke="#ff9b60" stroke-width="15"/>
+  <circle cx="754" cy="512" r="51" fill="#11162a" stroke="#7affd0" stroke-width="15"/>
+  <circle cx="512" cy="512" r="34" fill="#17102a" stroke="#e4a7ff" stroke-width="13"/>
+  <circle cx="270" cy="512" r="13" fill="#ffe0cf"/>
+  <circle cx="754" cy="512" r="13" fill="#dcfff1"/>
+  <circle cx="512" cy="512" r="10" fill="#ffffff"/>
+</svg>

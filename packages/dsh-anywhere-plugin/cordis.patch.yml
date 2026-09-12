@@ -1,0 +1,11 @@
+- insert:
+    - id: dsh-anywhere-plugin
+      name: './lib/index.js'
+      inject:
+        - webServer
+        - sessionController
+        - workspaceRegistry
+      config:
+        routePrefix: /dsh-anywhere/v1
+        approvalTimeoutMs: 120000
+        eventBufferSize: 2000

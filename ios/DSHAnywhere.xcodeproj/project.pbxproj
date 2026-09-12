@@ -1,0 +1,399 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B00000000000000000000001 /* Core/Protocol/DSHProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */; };
+		B00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */; };
+		B00000000000000000000003 /* Core/Networking/DSHAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */; };
+		B00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */; };
+		B00000000000000000000005 /* Core/Store/DSHEventStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000005 /* Core/Store/DSHEventStore.swift */; };
+		B00000000000000000000006 /* App/DSHAppTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000006 /* App/DSHAppTransport.swift */; };
+		B00000000000000000000007 /* App/DSHAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000007 /* App/DSHAppModel.swift */; };
+		B00000000000000000000008 /* App/DSHAnywhereApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000008 /* App/DSHAnywhereApp.swift */; };
+		B00000000000000000000009 /* Features/Pairing/PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000009 /* Features/Pairing/PairingView.swift */; };
+		B0000000000000000000000A /* Features/Sessions/SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000A /* Features/Sessions/SessionListView.swift */; };
+		B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000B /* Features/Conversation/ConversationView.swift */; };
+		B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */; };
+		B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */; };
+		B0000000000000000000000E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000E /* Assets.xcassets */; };
+		B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000101 /* Core/DSHProtocolTests.swift */; };
+		B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000102 /* Core/DSHEventStoreTests.swift */; };
+		B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C00000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = P00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = T00000000000000000000001;
+			remoteInfo = DSHAnywhere;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHProtocol.swift; sourceTree = "<group>"; };
+		F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Security/DSHKeychainTokenStore.swift; sourceTree = "<group>"; };
+		F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Networking/DSHAPIClient.swift; sourceTree = "<group>"; };
+		F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Networking/DSHWebSocketConnection.swift; sourceTree = "<group>"; };
+		F00000000000000000000005 /* Core/Store/DSHEventStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Store/DSHEventStore.swift; sourceTree = "<group>"; };
+		F00000000000000000000006 /* App/DSHAppTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/DSHAppTransport.swift; sourceTree = "<group>"; };
+		F00000000000000000000007 /* App/DSHAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/DSHAppModel.swift; sourceTree = "<group>"; };
+		F00000000000000000000008 /* App/DSHAnywhereApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/DSHAnywhereApp.swift; sourceTree = "<group>"; };
+		F00000000000000000000009 /* Features/Pairing/PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Pairing/PairingView.swift; sourceTree = "<group>"; };
+		F0000000000000000000000A /* Features/Sessions/SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Sessions/SessionListView.swift; sourceTree = "<group>"; };
+		F0000000000000000000000B /* Features/Conversation/ConversationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ConversationView.swift; sourceTree = "<group>"; };
+		F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ToolActivityCard.swift; sourceTree = "<group>"; };
+		F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ApprovalCard.swift; sourceTree = "<group>"; };
+		F0000000000000000000000E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F00000000000000000000101 /* Core/DSHProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProtocolTests.swift; sourceTree = "<group>"; };
+		F00000000000000000000102 /* Core/DSHEventStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHEventStoreTests.swift; sourceTree = "<group>"; };
+		F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHWebSocketConnectionTests.swift; sourceTree = "<group>"; };
+		F00000000000000000000201 /* DSHAnywhere.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DSHAnywhere.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F00000000000000000000202 /* DSHAnywhereTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DSHAnywhereTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		H00000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		H00000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G00000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				G00000000000000000000002 /* DSHAnywhere */,
+				G00000000000000000000003 /* DSHAnywhereTests */,
+				G00000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		G00000000000000000000002 /* DSHAnywhere */ = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */,
+				F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */,
+				F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */,
+				F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */,
+				F00000000000000000000005 /* Core/Store/DSHEventStore.swift */,
+				F00000000000000000000006 /* App/DSHAppTransport.swift */,
+				F00000000000000000000007 /* App/DSHAppModel.swift */,
+				F00000000000000000000008 /* App/DSHAnywhereApp.swift */,
+				F00000000000000000000009 /* Features/Pairing/PairingView.swift */,
+				F0000000000000000000000A /* Features/Sessions/SessionListView.swift */,
+				F0000000000000000000000B /* Features/Conversation/ConversationView.swift */,
+				F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */,
+				F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */,
+				F0000000000000000000000E /* Assets.xcassets */,
+			);
+			path = DSHAnywhere;
+			sourceTree = "<group>";
+		};
+		G00000000000000000000003 /* DSHAnywhereTests */ = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000101 /* Core/DSHProtocolTests.swift */,
+				F00000000000000000000102 /* Core/DSHEventStoreTests.swift */,
+				F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */,
+			);
+			path = DSHAnywhereTests;
+			sourceTree = "<group>";
+		};
+		G00000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000201 /* DSHAnywhere.app */,
+				F00000000000000000000202 /* DSHAnywhereTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T00000000000000000000001 /* DSHAnywhere */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = L00000000000000000000002 /* Build configuration list for PBXNativeTarget "DSHAnywhere" */;
+			buildPhases = (
+				S00000000000000000000001 /* Sources */,
+				H00000000000000000000001 /* Frameworks */,
+				R00000000000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DSHAnywhere;
+			productName = DSHAnywhere;
+			productReference = F00000000000000000000201 /* DSHAnywhere.app */;
+			productType = "com.apple.product-type.application";
+		};
+		T00000000000000000000002 /* DSHAnywhereTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = L00000000000000000000003 /* Build configuration list for PBXNativeTarget "DSHAnywhereTests" */;
+			buildPhases = (
+				S00000000000000000000002 /* Sources */,
+				H00000000000000000000002 /* Frameworks */,
+				R00000000000000000000002 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D00000000000000000000001 /* PBXTargetDependency */,
+			);
+			name = DSHAnywhereTests;
+			productName = DSHAnywhereTests;
+			productReference = F00000000000000000000202 /* DSHAnywhereTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					T00000000000000000000001 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					T00000000000000000000002 = {
+						CreatedOnToolsVersion = 27.0;
+						TestTargetID = T00000000000000000000001;
+					};
+				};
+			};
+			buildConfigurationList = L00000000000000000000001 /* Build configuration list for PBXProject "DSHAnywhere" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = G00000000000000000000001;
+			productRefGroup = G00000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				T00000000000000000000001 /* DSHAnywhere */,
+				T00000000000000000000002 /* DSHAnywhereTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		R00000000000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000000E /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		R00000000000000000000002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S00000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B00000000000000000000001 /* Core/Protocol/DSHProtocol.swift in Sources */,
+				B00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift in Sources */,
+				B00000000000000000000003 /* Core/Networking/DSHAPIClient.swift in Sources */,
+				B00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift in Sources */,
+				B00000000000000000000005 /* Core/Store/DSHEventStore.swift in Sources */,
+				B00000000000000000000006 /* App/DSHAppTransport.swift in Sources */,
+				B00000000000000000000007 /* App/DSHAppModel.swift in Sources */,
+				B00000000000000000000008 /* App/DSHAnywhereApp.swift in Sources */,
+				B00000000000000000000009 /* Features/Pairing/PairingView.swift in Sources */,
+				B0000000000000000000000A /* Features/Sessions/SessionListView.swift in Sources */,
+				B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */,
+				B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */,
+				B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		S00000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */,
+				B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */,
+				B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D00000000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = T00000000000000000000001 /* DSHAnywhere */;
+			targetProxy = C00000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		X00000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				ENABLE_TESTABILITY = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		X00000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		X00000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 9;
+				DEVELOPMENT_TEAM = DR2TNGTRAJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				MARKETING_VERSION = 0.0.1;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				PRODUCT_BUNDLE_IDENTIFIER = me.aluvien.DSHAnywhere;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		X00000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 9;
+				DEVELOPMENT_TEAM = DR2TNGTRAJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				MARKETING_VERSION = 0.0.1;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				PRODUCT_BUNDLE_IDENTIFIER = me.aluvien.DSHAnywhere;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		X00000000000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.DSHAnywhereTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DSHAnywhere.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DSHAnywhere";
+			};
+			name = Debug;
+		};
+		X00000000000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.DSHAnywhereTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DSHAnywhere.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DSHAnywhere";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		L00000000000000000000001 /* Build configuration list for PBXProject "DSHAnywhere" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				X00000000000000000000001 /* Debug */,
+				X00000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		L00000000000000000000002 /* Build configuration list for PBXNativeTarget "DSHAnywhere" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				X00000000000000000000003 /* Debug */,
+				X00000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		L00000000000000000000003 /* Build configuration list for PBXNativeTarget "DSHAnywhereTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				X00000000000000000000005 /* Debug */,
+				X00000000000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = P00000000000000000000001 /* Project object */;
+}

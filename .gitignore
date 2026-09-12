@@ -1,0 +1,18 @@
+node_modules/
+.pnpm-store/
+lib/
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+coverage/
+.env
+*.log
+
+# 构建产物：xcarchive、安装包 zip 等，由源码重新生成，不进版本库
+artifacts/
+
+# TypeScript 编译输出，由 pnpm build 重新生成
+dist/

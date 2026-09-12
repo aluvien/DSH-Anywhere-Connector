@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="78%">
+      <stop offset="0" stop-color="#1b2d69"/>
+      <stop offset="0.58" stop-color="#101a46"/>
+      <stop offset="1" stop-color="#080b20"/>
+    </radialGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2d4ca9"/>
+      <stop offset="0.55" stop-color="#17286d"/>
+      <stop offset="1" stop-color="#101a4b"/>
+    </linearGradient>
+    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#66efff"/>
+      <stop offset="0.48" stop-color="#3d9dff"/>
+      <stop offset="1" stop-color="#8b65ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="18" result="blur"/>
+      <feOffset dy="14" result="offset"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.42"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <path d="M512 168 756 260v214c0 169-103 296-244 382-141-86-244-213-244-382V260z"
+        fill="url(#shield)" stroke="#3e5bd0" stroke-width="10" opacity="0.98" filter="url(#shadow)"/>
+
+  <path d="M338 522c0-123 78-188 174-188s174 65 174 188"
+        fill="none" stroke="url(#bridge)" stroke-width="58" stroke-linecap="round"/>
+  <path d="M338 522h348" fill="none" stroke="url(#bridge)" stroke-width="58" stroke-linecap="round"/>
+
+  <circle cx="338" cy="522" r="45" fill="#081437" stroke="#69efff" stroke-width="14"/>
+  <circle cx="686" cy="522" r="45" fill="#111039" stroke="#a37cff" stroke-width="14"/>
+  <circle cx="338" cy="522" r="13" fill="#d7fbff"/>
+  <circle cx="686" cy="522" r="13" fill="#eee5ff"/>
+
+  <path d="M512 350v344" stroke="#b3ccff" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
+  <circle cx="512" cy="522" r="27" fill="#e8fbff" stroke="#4fb7ff" stroke-width="10"/>
+</svg>

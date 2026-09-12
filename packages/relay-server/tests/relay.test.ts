@@ -1,0 +1,210 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { WebSocket } from "ws";
+import { afterEach, describe, expect, it } from "vitest";
+import { PROTOCOL_VERSION, type RelayMessage } from "@dsh-anywhere/protocol";
+import { createRelayServer, type RunningRelayServer } from "../src/server.js";
+
+interface Registration {
+  readonly machineId: string;
+  readonly machineToken: string;
+  readonly pairingSecret: string;
+}
+
+interface Pairing {
+  readonly deviceId: string;
+  readonly deviceToken: string;
+  readonly machineName: string;
+}
+
+const servers: RunningRelayServer[] = [];
+const directories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => server.close()));
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+async function relay(pairRateLimit?: number): Promise<RunningRelayServer> {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-relay-"));
+  directories.push(directory);
+  const server = await createRelayServer({
+    bootstrapToken: "bootstrap-token",
+    registryPath: join(directory, "registry.json"),
+    host: "127.0.0.1",
+    port: 0,
+    ...(pairRateLimit === undefined ? {} : { pairRateLimit }),
+  });
+  servers.push(server);
+  return server;
+}
+
+async function post<T>(base: string, path: string, body: unknown, token?: string): Promise<{ status: number; body: T }> {
+  const response = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(token === undefined ? {} : { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() as T };
+}
+
+async function register(base: string, machineName: string): Promise<Registration> {
+  const result = await post<Registration>(base, "/v1/machines/register", { machineName }, "bootstrap-token");
+  expect(result.status).toBe(201);
+  return result.body;
+}
+
+async function pair(base: string, machine: Registration, deviceName = "iPhone"): Promise<Pairing> {
+  const result = await post<Pairing>(base, "/v1/pair", {
+    machineId: machine.machineId,
+    pairingSecret: machine.pairingSecret,
+    deviceName,
+  });
+  expect(result.status).toBe(201);
+  return result.body;
+}
+
+const wsUrl = (base: string): string => base.replace(/^http/, "ws") + "/v1/connect";
+
+async function connect(base: string, token: string): Promise<WebSocket> {
+  const socket = new WebSocket(wsUrl(base), { headers: { authorization: `Bearer ${token}` } });
+  await once(socket, "open");
+  return socket;
+}
+
+function messages(socket: WebSocket): RelayMessage[] {
+  const received: RelayMessage[] = [];
+  socket.on("message", (raw) => received.push(JSON.parse(raw.toString()) as RelayMessage));
+  return received;
+}
+
+async function waitForMessage(received: RelayMessage[], type: RelayMessage["type"], timeoutMs = 1_000): Promise<RelayMessage> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const match = received.find((message) => message.type === type);
+    if (match !== undefined) return match;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${type}; received: ${JSON.stringify(received)}`);
+}
+
+function once(socket: WebSocket, event: "open"): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.once(event, () => resolve());
+    socket.once("error", reject);
+  });
+}
+
+function payload(machineId: string, sender: "machine" | "device", deviceId: string, targetDeviceId?: string): Record<string, unknown> {
+  return {
+    type: "relay.payload",
+    machineId,
+    messageId: crypto.randomUUID(),
+    sender,
+    ...(targetDeviceId === undefined ? {} : { targetDeviceId }),
+    body: {
+      version: PROTOCOL_VERSION,
+      requestId: crypto.randomUUID(),
+      machineId,
+      deviceId,
+      timestamp: Date.now(),
+      type: "session.list",
+      payload: {},
+    },
+  };
+}
+
+describe("Relay server", () => {
+  it("registers machines and writes only credential hashes to its persistent registry", async () => {
+    const server = await relay();
+    const rejected = await post<{ error: string }>(server.url, "/v1/machines/register", { machineName: "Mac" }, "wrong-token");
+    expect(rejected.status).toBe(401);
+
+    const machine = await register(server.url, "MacBook");
+    const registryText = await readFile(join(directories[0]!, "registry.json"), "utf8");
+    expect(registryText).toContain(machine.machineId);
+    expect(registryText).not.toContain(machine.machineToken);
+    expect(registryText).not.toContain(machine.pairingSecret);
+  });
+
+  it("routes payloads only within the authenticated machine", async () => {
+    const server = await relay();
+    const machineA = await register(server.url, "Mac A");
+    const machineB = await register(server.url, "Mac B");
+    const deviceA = await pair(server.url, machineA);
+    const deviceB = await pair(server.url, machineB);
+    const machineSocketA = await connect(server.url, machineA.machineToken);
+    const machineSocketB = await connect(server.url, machineB.machineToken);
+    const deviceSocketA = await connect(server.url, deviceA.deviceToken);
+    const deviceSocketB = await connect(server.url, deviceB.deviceToken);
+    const machineMessagesA = messages(machineSocketA);
+    const machineMessagesB = messages(machineSocketB);
+    messages(deviceSocketA);
+    messages(deviceSocketB);
+
+    deviceSocketA.send(JSON.stringify(payload(machineA.machineId, "device", deviceA.deviceId)));
+    const delivered = await waitForMessage(machineMessagesA, "relay.payload");
+    expect(delivered.type === "relay.payload" && delivered.machineId).toBe(machineA.machineId);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(machineMessagesB.some((message) => message.type === "relay.payload")).toBe(false);
+
+    for (const socket of [machineSocketA, machineSocketB, deviceSocketA, deviceSocketB]) socket.close();
+  });
+
+  it("can target a replay payload to one of several devices", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const deviceA = await pair(server.url, machine, "iPhone A");
+    const deviceB = await pair(server.url, machine, "iPhone B");
+    const machineSocket = await connect(server.url, machine.machineToken);
+    const deviceSocketA = await connect(server.url, deviceA.deviceToken);
+    const deviceSocketB = await connect(server.url, deviceB.deviceToken);
+    const messagesA = messages(deviceSocketA);
+    const messagesB = messages(deviceSocketB);
+
+    machineSocket.send(JSON.stringify(payload(machine.machineId, "machine", deviceA.deviceId, deviceB.deviceId)));
+    await waitForMessage(messagesB, "relay.payload");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(messagesA.some((message) => message.type === "relay.payload")).toBe(false);
+
+    for (const socket of [machineSocket, deviceSocketA, deviceSocketB]) socket.close();
+  });
+
+  it("rejects unauthorized websocket clients and reports unavailable targets", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const device = await pair(server.url, machine);
+    expect(device.machineName).toBe("Mac");
+    const rejected = new WebSocket(wsUrl(server.url), { headers: { authorization: "Bearer bad-token" } });
+    await expect(new Promise<void>((resolve, reject) => {
+      rejected.once("unexpected-response", () => resolve());
+      rejected.once("open", () => reject(new Error("unexpected connection")));
+      rejected.once("error", () => resolve());
+    })).resolves.toBeUndefined();
+
+    const deviceSocket = await connect(server.url, device.deviceToken);
+    const received = messages(deviceSocket);
+    deviceSocket.send(JSON.stringify(payload(machine.machineId, "device", device.deviceId)));
+    const error = await waitForMessage(received, "relay.error");
+    expect(error.type === "relay.error" && error.code).toBe("target_unavailable");
+    deviceSocket.close();
+  });
+
+  it("limits pairing attempts per address and machine", async () => {
+    const server = await relay(1);
+    const machine = await register(server.url, "Mac");
+    const first = await post<Pairing>(server.url, "/v1/pair", {
+      machineId: machine.machineId,
+      pairingSecret: "incorrect",
+      deviceName: "iPhone",
+    });
+    expect(first.status).toBe(401);
+    const second = await post<{ error: string }>(server.url, "/v1/pair", {
+      machineId: machine.machineId,
+      pairingSecret: machine.pairingSecret,
+      deviceName: "iPhone",
+    });
+    expect(second.status).toBe(429);
+  });
+});
