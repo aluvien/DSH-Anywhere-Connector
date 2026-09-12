@@ -25,7 +25,7 @@ import {
 import { PairingAuthority } from './auth.js'
 import { HttpError, json, readJson } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
-import { PendingQuestions } from './pending-questions.js'
+import { PendingQuestions, firstAnswered } from './pending-questions.js'
 import { ReplayBuffer } from './replay.js'
 
 export const name = 'dsh-anywhere-native-bridge'
@@ -616,12 +616,28 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       },
     })
     try {
-      const answers = await pending.result
+      // Offer the question to the Harness UI as well, so an attached phone
+      // never takes the question away from an open browser. Whichever human
+      // answers first wins; the loser's surface is dismissed below.
+      const winner = await firstAnswered(
+        pending.result.then(
+          (answers) => ({ answers }),
+          () => undefined,
+        ),
+        next(),
+      )
       publish({ type: 'question.resolved', sessionId, payload: { id: pending.id, sessionId } })
-      return { answers }
+      if (winner === undefined) {
+        // Both surfaces went quiet: no UI answerer is mounted and the phone
+        // never answered. The tool awaits this promise, so it must settle as a
+        // tool error rather than hang.
+        throw new Error('no user-questions answerer accepted the request')
+      }
+      // Releases the phone-side entry when the browser answered first, so a
+      // late tap on the dismissed card cannot resolve a dead promise.
+      questions.discard(pending.id)
+      return winner
     } catch (error) {
-      // The tool awaits this promise, so an unanswered question must settle as
-      // a tool error rather than silently delegating to a UI that is not there.
       publish({ type: 'question.resolved', sessionId, payload: { id: pending.id, sessionId } })
       throw error instanceof Error ? error : new Error(String(error))
     }

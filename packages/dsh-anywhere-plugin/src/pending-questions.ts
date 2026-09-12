@@ -65,6 +65,15 @@ export class PendingQuestions {
     for (const id of [...this.pending.keys()]) this.reject(id, error)
   }
 
+  /**
+   * Releases a question without settling it, for when another surface answered
+   * first. The phone's card is dismissed by `question.resolved`, and a late tap
+   * on it then fails the `answer()` lookup instead of resolving a dead promise.
+   */
+  discard(id: string): void {
+    this.take(id)
+  }
+
   private take(id: string): PendingQuestion | undefined {
     const item = this.pending.get(id)
     if (item === undefined) return undefined
@@ -75,4 +84,53 @@ export class PendingQuestions {
     }
     return item
   }
+}
+
+/**
+ * Resolves with the first surface that actually produces an answer.
+ *
+ * Both the phone and the browser UI are offered the same question, and a
+ * surface that has nobody listening must not end the wait on its own:
+ *
+ * - the phone resolves `undefined` when the question expires or is aborted;
+ * - the browser rejects when no UI answerer is registered at all (nobody has
+ *   the Harness page open), and also rejects when the request is aborted.
+ *
+ * Only when both surfaces have gone quiet is the question genuinely
+ * unanswerable, which is the one case this resolves `undefined` for. In
+ * particular, a browser that rejects immediately must not cut short a phone
+ * that is still able to answer.
+ */
+export async function firstAnswered<T>(
+  phone: Promise<T | undefined>,
+  browser: Promise<T>,
+): Promise<T | undefined> {
+  return await new Promise<T | undefined>((resolve) => {
+    let phoneOpen = true
+    let browserOpen = true
+    const resolveIfBothClosed = (): void => {
+      if (!phoneOpen && !browserOpen) resolve(undefined)
+    }
+    phone.then(
+      (answer) => {
+        phoneOpen = false
+        if (answer === undefined) resolveIfBothClosed()
+        else resolve(answer)
+      },
+      () => {
+        phoneOpen = false
+        resolveIfBothClosed()
+      },
+    )
+    browser.then(
+      (answer) => {
+        browserOpen = false
+        resolve(answer)
+      },
+      () => {
+        browserOpen = false
+        resolveIfBothClosed()
+      },
+    )
+  })
 }

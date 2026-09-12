@@ -14,6 +14,8 @@ struct ConversationView: View {
     @State private var showPermissionPicker = false
     @State private var sentAttachmentIDs = Set<String>()
     @State private var didRefresh = false
+    /// Tracks the composer field so the keyboard can be dismissed explicitly.
+    @FocusState private var isDraftFocused: Bool
 
     private var session: DSHSessionSummary? { model.sessions.first { $0.id == sessionID } }
     private var isRunning: Bool { model.turnState(for: sessionID).lowercased() == "running" }
@@ -69,6 +71,9 @@ struct ConversationView: View {
                 .padding()
             }
             .defaultScrollAnchor(.bottom)
+            // Dragging the transcript puts the keyboard away, which is the
+            // gesture people reach for after reading the latest reply.
+            .scrollDismissesKeyboard(.interactively)
             .safeAreaInset(edge: .bottom) { composer }
             .navigationTitle(session?.title ?? "Conversation")
             .navigationBarTitleDisplayMode(.inline)
@@ -91,6 +96,12 @@ struct ConversationView: View {
                     } label: {
                         Image(systemName: didRefresh ? "checkmark.circle.fill" : "ellipsis.circle")
                     }
+                }
+                // Swiping the transcript dismisses the keyboard, but a short
+                // conversation has nothing to scroll, so keep an explicit exit.
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { isDraftFocused = false }
                 }
             }
             .task(id: sessionID) {
@@ -172,6 +183,7 @@ struct ConversationView: View {
                 TextField("Send a message, / command, @ file or conversation", text: $model.draft, axis: .vertical)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
+                    .focused($isDraftFocused)
                     .onSubmit { send() }
                 HStack(spacing: 10) {
                     Button { showCommandMenu = true } label: {
@@ -207,7 +219,10 @@ struct ConversationView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.bar)
+            // No fill of its own: the composer already sits on the
+            // `.ultraThinMaterial` band below, and stacking a second material
+            // here is what made the card read as a redundant background behind
+            // the text field. The stroke alone defines the card.
             .clipShape(RoundedRectangle(cornerRadius: 18))
             .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.secondary.opacity(0.2)))
             .padding(.horizontal, 8)
