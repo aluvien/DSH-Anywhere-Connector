@@ -222,6 +222,40 @@ public struct DSHCommand: Codable, Sendable, Equatable {
     }
 }
 
+/// Scanned `dshanywhere://pair` payload. Mirrors `parsePairingLink` in
+/// packages/protocol so the QR format keeps a single definition across the
+/// TypeScript connector and this client.
+public struct DSHPairingLink: Equatable, Sendable {
+    public let relay: String
+    public let machineId: String
+    public let pairingSecret: String
+
+    /// Returns nil for anything that is not a complete pairing code, so the
+    /// scanner can keep looking instead of filling in half a credential.
+    public init?(urlString: String) {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              components.scheme?.lowercased() == "dshanywhere",
+              let queryItems = components.queryItems else { return nil }
+
+        func value(_ name: String) -> String? {
+            queryItems.first { $0.name == name }?.value?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let relay = value("relay"), !relay.isEmpty,
+              let machineId = value("machineId"), !machineId.isEmpty,
+              let pairingSecret = value("secret"), !pairingSecret.isEmpty,
+              let relayURL = URL(string: relay),
+              let scheme = relayURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else { return nil }
+
+        self.relay = relay
+        self.machineId = machineId
+        self.pairingSecret = pairingSecret
+    }
+}
+
 /// Relay messages deliberately wrap the existing Harness protocol. Keeping the
 /// wrapper separate means a Relay acknowledgement can never be mistaken for a
 /// Harness event by the store.

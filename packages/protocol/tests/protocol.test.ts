@@ -6,6 +6,9 @@ import {
   PairingResponseSchema,
   RelayMessageSchema,
   parseCommand,
+  pairingLink,
+  parsePairingLink,
+  relayHTTPSURL,
   validateSequence,
 } from "../src/index";
 
@@ -102,5 +105,36 @@ describe("DSH Anywhere wire protocol", () => {
     });
     expect(relay.type).toBe("relay.payload");
     expect(() => RelayMessageSchema.parse({ ...relay, unexpected: true })).toThrow();
+  });
+
+  it("round-trips a pairing link and normalises the stored wss address", () => {
+    const link = pairingLink({
+      relay: "wss://relay.example.com",
+      machineId: "machine_macmini",
+      pairingSecret: "s3cret-value-that-is-long-enough",
+    });
+
+    // The client derives both HTTPS and WSS from one base address, so the
+    // encoded relay must not keep the connector's wss:// scheme.
+    expect(link.startsWith("dshanywhere://pair?")).toBe(true);
+    expect(link).not.toContain("wss%3A");
+
+    expect(parsePairingLink(link)).toEqual({
+      relay: "https://relay.example.com",
+      machineId: "machine_macmini",
+      pairingSecret: "s3cret-value-that-is-long-enough",
+    });
+  });
+
+  it("rejects pairing codes that did not come from the connector", () => {
+    expect(parsePairingLink("https://example.com/?machineId=mac-1")).toBeUndefined();
+    expect(parsePairingLink("dshanywhere://pair?machineId=mac-1")).toBeUndefined();
+    expect(parsePairingLink("dshanywhere://pair?relay=https%3A%2F%2Fr.example&machineId=mac-1&secret=")).toBeUndefined();
+    expect(parsePairingLink("not a url")).toBeUndefined();
+  });
+
+  it("rejects a relay scheme the iOS client could not dial", () => {
+    expect(() => relayHTTPSURL("ftp://relay.example.com")).toThrow();
+    expect(relayHTTPSURL("https://relay.example.com/")).toBe("https://relay.example.com");
   });
 });

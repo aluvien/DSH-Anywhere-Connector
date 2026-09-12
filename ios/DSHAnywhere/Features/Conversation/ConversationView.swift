@@ -293,42 +293,77 @@ private struct PermissionMenu: View {
     }
 }
 
+/// Compact one-line usage strip. The previous 2×2 card grid plus a labelled
+/// context bar consumed roughly five text lines directly above the composer;
+/// this keeps the same numbers in a single row plus a hairline context bar.
 private struct UsageFooter: View {
     let usage: DSHSessionUsage?
 
-    private let columns = [
-        GridItem(.flexible(), alignment: .leading),
-        GridItem(.flexible(), alignment: .leading)
-    ]
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 7) {
-                UsageMetric(icon: "gauge.with.dots.needle.67percent", title: "Activity",
-                            value: "\(usage?.rounds ?? 0) rounds · \(usage?.steps ?? 0) steps")
-                UsageMetric(icon: "speedometer", title: "Generation",
-                            value: usage?.tokensPerSecond.map { "\(Int($0)) tok/s" } ?? "—")
-                UsageMetric(icon: "chart.bar.xaxis", title: "Tokens",
-                            value: "\(compactNumber(usage?.totalTokens)) tok")
-                UsageMetric(icon: "externaldrive.badge.checkmark", title: "Cache hit",
-                            value: usage?.cacheHitPercent.map { "\(Int($0))%" } ?? "—")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                metric("gauge.with.dots.needle.67percent", activityText)
+                separator
+                metric("speedometer", speedText)
+                separator
+                metric("chart.bar.xaxis", tokenText)
+                separator
+                metric("externaldrive.badge.checkmark", cacheText)
+                Spacer(minLength: 0)
             }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
 
-            if let used = usage?.contextUsed, let window = usage?.contextWindow, window > 0 {
-                VStack(spacing: 4) {
-                    HStack {
-                        Label("Context", systemImage: "square.stack.3d.up")
-                        Spacer()
-                        Text("\(compactNumber(used)) / \(compactNumber(window))")
-                        Text("\(Int(min(1, used / window) * 100))%")
-                    }
-                    .font(.caption2)
-                    ProgressView(value: min(1, used / window))
-                        .tint(used / window > 0.9 ? .orange : .accentColor)
+            if let ratio = contextRatio {
+                HStack(spacing: 6) {
+                    ProgressView(value: ratio)
+                        .progressViewStyle(.linear)
+                        .tint(ratio > 0.9 ? .orange : .accentColor)
+                        .frame(height: 2)
+                    Text("\(Int(ratio * 100))%")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
                 }
             }
         }
-        .foregroundStyle(.secondary)
+    }
+
+    private var separator: some View {
+        Text("·").foregroundStyle(.quaternary)
+    }
+
+    private func metric(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 9, weight: .medium))
+            Text(text)
+        }
+    }
+
+    private var contextRatio: Double? {
+        guard let used = usage?.contextUsed, let window = usage?.contextWindow, window > 0 else { return nil }
+        return min(1, max(0, used / window))
+    }
+
+    private var activityText: String {
+        guard usage?.rounds != nil || usage?.steps != nil else { return "—" }
+        return "\(usage?.rounds ?? 0)r/\(usage?.steps ?? 0)s"
+    }
+
+    private var speedText: String {
+        guard let speed = usage?.tokensPerSecond else { return "—" }
+        return "\(Int(speed)) tok/s"
+    }
+
+    private var tokenText: String {
+        guard usage?.totalTokens != nil else { return "—" }
+        return "\(compactNumber(usage?.totalTokens)) tok"
+    }
+
+    private var cacheText: String {
+        guard let hit = usage?.cacheHitPercent else { return "—" }
+        return "\(Int(hit))%"
     }
 
     private func compactNumber(_ value: Double?) -> String {
@@ -336,35 +371,6 @@ private struct UsageFooter: View {
         if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
         if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
         return String(Int(value))
-    }
-}
-
-private struct UsageMetric: View {
-    let icon: String
-    let title: String
-    let value: String
-
-    var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: icon)
-                .frame(width: 16)
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                Text(value)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.secondary.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 9))
     }
 }
 

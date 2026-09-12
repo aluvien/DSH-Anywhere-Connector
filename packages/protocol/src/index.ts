@@ -480,3 +480,59 @@ export const assertSequence = (previousSequence: number | undefined, sequence: u
   }
   return sequence;
 };
+
+/**
+ * QR pairing payload, shared by the Mac connector (producer) and the native
+ * client (consumer) so the two cannot drift apart.
+ *
+ * The iPhone derives both its HTTPS pairing call and its WSS session socket
+ * from a single base address, so the encoded relay always uses the https://
+ * form even though the connector stores wss://.
+ */
+export const PAIRING_LINK_SCHEME = "dshanywhere";
+
+export interface PairingLinkPayload {
+  readonly relay: string;
+  readonly machineId: string;
+  readonly pairingSecret: string;
+}
+
+/** Rewrites a stored wss:// (or ws://) relay address into its HTTPS form. */
+export const relayHTTPSURL = (value: string): string => {
+  const url = new URL(value);
+  if (url.protocol === "wss:") url.protocol = "https:";
+  else if (url.protocol === "ws:") url.protocol = "http:";
+  else if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("relay must be an absolute HTTPS URL");
+  }
+  return url.toString().replace(/\/+$/, "");
+};
+
+export const pairingLink = (payload: PairingLinkPayload): string => {
+  const url = new URL(`${PAIRING_LINK_SCHEME}://pair`);
+  url.searchParams.set("relay", relayHTTPSURL(payload.relay));
+  url.searchParams.set("machineId", payload.machineId);
+  url.searchParams.set("secret", payload.pairingSecret);
+  return url.toString();
+};
+
+/** Returns undefined rather than throwing so a scanner can reject foreign codes. */
+export const parsePairingLink = (value: string): PairingLinkPayload | undefined => {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== `${PAIRING_LINK_SCHEME}:`) return undefined;
+  const relay = url.searchParams.get("relay");
+  const machineId = url.searchParams.get("machineId");
+  const pairingSecret = url.searchParams.get("secret");
+  if (relay === null || machineId === null || pairingSecret === null) return undefined;
+  if (machineId.trim() === "" || pairingSecret.trim() === "") return undefined;
+  try {
+    return { relay: relayHTTPSURL(relay), machineId: machineId.trim(), pairingSecret: pairingSecret.trim() };
+  } catch {
+    return undefined;
+  }
+};

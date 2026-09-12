@@ -1,5 +1,6 @@
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -15,6 +16,8 @@ import {
   ModelCatalogPayloadSchema,
   PromptSendPayloadSchema,
   PROTOCOL_VERSION,
+  pairingLink,
+  relayHTTPSURL,
   type EventEnvelope,
 } from '@dsh-anywhere/protocol'
 import { PairingAuthority } from './auth.js'
@@ -37,6 +40,12 @@ export interface Config {
   readonly pairingRateLimitWindowMs?: number
   readonly approvalTimeoutMs?: number
   readonly eventBufferSize?: number
+  /**
+   * Where the connector keeps connector.json. The local pairing page reads it
+   * to build a scannable QR, so it must be the operator's own file rather than
+   * a copy served over the network.
+   */
+  readonly connectorConfigPath?: string
 }
 
 export const CONNECTOR_DEVICE_ID = 'dsh-anywhere-connector'
@@ -212,6 +221,172 @@ function metadataPath(): string {
   return join(process.env.DSH_ANYWHERE_DATA_DIR ?? join(homedir(), 'Library', 'Application Support', 'DSH Anywhere'), 'session-metadata.json')
 }
 
+/** Mirrors the connector's own defaultConfigPath so both resolve one file. */
+function defaultConnectorConfigPath(): string {
+  const override = process.env.DSH_ANYWHERE_CONFIG
+  if (override !== undefined && override.length > 0) return override
+  if (process.platform === 'darwin') {
+    return join(homedir(), 'Library', 'Application Support', 'DSH Anywhere', 'connector.json')
+  }
+  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'dsh-anywhere', 'connector.json')
+}
+
+/**
+ * The pairing page carries a live pairing secret, so it must never be
+ * reachable from the public internet. A loopback peer address alone is not
+ * enough: a reverse proxy running on this same Mac also appears to come from
+ * 127.0.0.1. Checking the Host header closes that hole, because a proxied
+ * request carries the public hostname instead of localhost.
+ */
+function isLoopbackRequest(req: IncomingMessage): boolean {
+  const address = req.socket?.remoteAddress ?? ''
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  const host = (header(req, 'host') ?? '').toLowerCase()
+  const hostname = host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : (host.split(':')[0] ?? '')
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1'
+}
+
+interface PairingMaterial {
+  readonly link: string
+  readonly relay: string
+  readonly machineId: string
+}
+
+async function readPairingMaterial(configPath: string): Promise<PairingMaterial | undefined> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(configPath, 'utf8'))
+  } catch {
+    return undefined
+  }
+  const record = recordOf(parsed)
+  const relay = typeof record.relayURL === 'string' ? record.relayURL : undefined
+  const machineId = typeof record.machineId === 'string' ? record.machineId : undefined
+  const pairingSecret = typeof record.pairingSecret === 'string' ? record.pairingSecret : undefined
+  if (relay === undefined || machineId === undefined || pairingSecret === undefined) return undefined
+  try {
+    return {
+      link: pairingLink({ relay, machineId, pairingSecret }),
+      relay: relayHTTPSURL(relay),
+      machineId,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * qrcode-generator declares its export with `export =`, which this workspace's
+ * verbatimModuleSyntax ESM configuration cannot default-import. Loading it via
+ * createRequire keeps one dependency without loosening tsconfig for every
+ * package. Resolution is lazy so a missing install degrades to a message on
+ * this page instead of preventing the bridge from starting.
+ */
+interface QRCodeFactory {
+  (typeNumber: number, errorCorrectionLevel: 'L' | 'M' | 'Q' | 'H'): {
+    addData(data: string): void
+    make(): void
+    createSvgTag(options?: { cellSize?: number; margin?: number; scalable?: boolean }): string
+  }
+}
+
+let qrCodeFactory: QRCodeFactory | undefined
+
+function qrCodeFactoryOf(): QRCodeFactory {
+  qrCodeFactory ??= createRequire(import.meta.url)('qrcode-generator') as QRCodeFactory
+  return qrCodeFactory
+}
+
+async function pairingPageHTML(configPath: string): Promise<string> {
+  const material = await readPairingMaterial(configPath)
+  if (material === undefined) {
+    return pairingPageShell(`
+      <h1>No pairing details yet</h1>
+      <p class="sub">This Mac has no stored pairing secret.</p>
+      <p class="hint">Re-run the connector setup, or add <code>pairingSecret</code> to
+      <code>connector.json</code>, then reload this page.</p>
+    `)
+  }
+  let qr: string
+  try {
+    const code = qrCodeFactoryOf()(0, 'M')
+    code.addData(material.link)
+    code.make()
+    qr = `<div class="qr">${code.createSvgTag({ cellSize: 4, margin: 1, scalable: true })}</div>`
+  } catch (error) {
+    return pairingPageShell(`
+      <h1>QR code unavailable</h1>
+      <p class="sub">${escapeHTML(error instanceof Error ? error.message : String(error))}</p>
+      <p class="hint">Install the plugin dependencies with <code>pnpm install</code>, then reload.</p>
+    `)
+  }
+  return pairingPageShell(`
+    <h1>Pair this Mac</h1>
+    <p class="sub">Open DSH Anywhere on your iPhone, tap Scan, and point it here.</p>
+    ${qr}
+    <dl>
+      <dt>Relay</dt><dd>${escapeHTML(material.relay)}</dd>
+      <dt>Machine</dt><dd>${escapeHTML(material.machineId)}</dd>
+    </dl>
+    <button id="copy" type="button">Copy pairing link</button>
+    <p class="hint">Served on loopback only &mdash; the secret never leaves this Mac.</p>
+  `, material.link)
+}
+
+function pairingPageShell(body: string, link?: string): string {
+  const script = link === undefined ? '' : `
+  <script>
+    const link = ${JSON.stringify(link).replaceAll('<', '\\u003c')};
+    const button = document.getElementById('copy');
+    button.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(link); button.textContent = 'Copied'; }
+      catch { button.textContent = 'Copy failed'; }
+      setTimeout(() => { button.textContent = 'Copy pairing link'; }, 1500);
+    });
+  </script>`
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>DSH Anywhere &mdash; pair this Mac</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #0b0d10; color: #e8eaed;
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { padding: 32px; max-width: 420px; text-align: center; }
+  h1 { margin: 0 0 6px; font-size: 19px; }
+  p.sub { margin: 0 0 20px; color: #9aa0a6; font-size: 13px; }
+  p.hint { margin: 16px 0 0; color: #6b7280; font-size: 11px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #c9cdd2; }
+  .qr { display: inline-block; padding: 14px; border-radius: 14px; background: #fff; line-height: 0; }
+  .qr svg { display: block; width: 236px; height: 236px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 22px 0 0;
+       font-size: 12px; text-align: left; }
+  dt { color: #6b7280; }
+  dd { margin: 0; color: #c9cdd2; word-break: break-all;
+       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  button { margin-top: 20px; padding: 9px 16px; border: 1px solid #2f3338; border-radius: 9px;
+           background: #17191d; color: #e8eaed; font-size: 13px; cursor: pointer; }
+</style>
+</head>
+<body>
+<main>${body}</main>${script}
+</body>
+</html>`
+}
+
+function escapeHTML(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
 export function apply(baseCtx: Context, config: Config = {}): void {
   const ctx = baseCtx as NativeContext
   const prefix = config.routePrefix ?? '/dsh-anywhere/v1'
@@ -266,7 +441,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     path: prefix,
     handler: async (req, res) => {
       try {
-        await handleHttp(ctx, req, res, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish)
+        await handleHttp(
+          ctx, req, res, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
+          config.connectorConfigPath ?? defaultConnectorConfigPath(),
+        )
       } catch (error) {
         const status = error instanceof HttpError ? error.status : 500
         json(res, status, { error: error instanceof Error ? error.message : String(error) })
@@ -408,6 +586,7 @@ async function handleHttp(
   machineId: string,
   metadata: SessionMetadataStore,
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
+  connectorConfigPath: string,
 ): Promise<void> {
   await metadata.ready
   const url = new URL(req.url ?? '/', 'http://localhost')
@@ -415,6 +594,21 @@ async function handleHttp(
 
   if (req.method === 'GET' && path === '/health') {
     json(res, 200, { ok: true, version: PROTOCOL_VERSION, machineId })
+    return
+  }
+  // The pairing page renders a live pairing secret, so it is deliberately
+  // unauthenticated (a browser cannot send a bearer token) but restricted to
+  // loopback. See isLoopbackRequest for why the Host header is checked too.
+  if (req.method === 'GET' && path === '/pairing') {
+    if (!isLoopbackRequest(req)) throw new HttpError(404, 'not found')
+    const html = await pairingPageHTML(connectorConfigPath)
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+    })
+    res.end(html)
     return
   }
   if (req.method === 'POST' && path === '/pair') {

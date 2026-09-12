@@ -8,6 +8,12 @@ export interface ConnectorConfig {
   readonly machineToken: string;
   readonly bridgeBaseURL: string;
   readonly bridgeToken: string;
+  /**
+   * Persisted only so the local bridge can render a scannable pairing QR
+   * without asking the operator to re-copy the secret. The file is already
+   * 0600 and holds machineToken/bridgeToken, so this adds no new exposure.
+   */
+  readonly pairingSecret?: string;
 }
 
 export type ConnectorEnvironment = Readonly<Record<string, string | undefined>>;
@@ -26,6 +32,7 @@ const ENV_FIELDS: Readonly<Record<keyof ConnectorConfig, string>> = {
   machineToken: "DSH_ANYWHERE_MACHINE_TOKEN",
   bridgeBaseURL: "DSH_ANYWHERE_BRIDGE_BASE_URL",
   bridgeToken: "DSH_ANYWHERE_BRIDGE_TOKEN",
+  pairingSecret: "DSH_ANYWHERE_PAIRING_SECRET",
 };
 
 export function defaultConfigPath(
@@ -56,12 +63,17 @@ export function parseConfig(value: unknown, environment: ConnectorEnvironment = 
 
   const relayURL = validateUrl("relayURL", merged.relayURL!, ["wss:", "ws:"], true);
   const bridgeBaseURL = validateUrl("bridgeBaseURL", merged.bridgeBaseURL!, ["http:", "https:"], false);
+  const pairingSecretCandidate = environment[ENV_FIELDS.pairingSecret] ?? raw.pairingSecret;
+  const pairingSecret = typeof pairingSecretCandidate === "string" && pairingSecretCandidate.trim() !== ""
+    ? pairingSecretCandidate.trim()
+    : undefined;
   return {
     relayURL,
     machineId: merged.machineId!,
     machineToken: merged.machineToken!,
     bridgeBaseURL: bridgeBaseURL.replace(/\/+$/, ""),
     bridgeToken: merged.bridgeToken!,
+    ...(pairingSecret === undefined ? {} : { pairingSecret }),
   };
 }
 

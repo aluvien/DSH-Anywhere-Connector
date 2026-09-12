@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { pairingLink } from "@dsh-anywhere/protocol";
 import { ConfigError, parseConfig, type ConnectorConfig } from "./config.js";
 
 export interface SetupOptions {
@@ -14,6 +15,7 @@ export interface SetupOptions {
 export interface SetupResult {
   readonly machineId: string;
   readonly pairingSecret: string;
+  readonly pairingLink: string;
   readonly configPath: string;
   readonly bridgeEnvPath: string;
   readonly config: ConnectorConfig;
@@ -53,12 +55,18 @@ export async function setupConnector(options: SetupOptions, dependencies: SetupD
     machineToken: registration.machineToken,
     bridgeBaseURL: options.bridgeBaseURL ?? DEFAULT_BRIDGE_BASE_URL,
     bridgeToken,
+    pairingSecret: registration.pairingSecret,
   }, {});
   const bridgeEnvPath = join(dirname(options.configPath), "bridge.env");
   await writeSetupFiles(options.configPath, bridgeEnvPath, config);
   return {
     machineId: registration.machineId,
     pairingSecret: registration.pairingSecret,
+    pairingLink: pairingLink({
+      relay: options.relay,
+      machineId: registration.machineId,
+      pairingSecret: registration.pairingSecret,
+    }),
     configPath: options.configPath,
     bridgeEnvPath,
     config,

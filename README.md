@@ -53,8 +53,11 @@ node packages/connector/lib/cli.js setup \
 ```
 
 命令会在 macOS 默认目录写入权限为 0600 的 `connector.json` 和 `bridge.env`，并
-打印本机的 `machineId`、`pairingSecret`。pairing secret 只应通过安全渠道交给
-该 Mac 的 iPhone 用户；不要提交到 Git 或粘贴到公共聊天。
+打印本机的 `machineId`、`pairingSecret`，以及一条 `pairingLink`。pairing secret
+只应通过安全渠道交给该 Mac 的 iPhone 用户；不要提交到 Git 或粘贴到公共聊天。
+
+setup 现在也把 `pairingSecret` 写进 `connector.json`（同样是 0600），这样本地
+bridge 可以把它渲染成二维码，不必再手工转抄一次。
 
 当前私测启动需要两个进程：
 
@@ -65,6 +68,16 @@ node packages/connector/lib/cli.js setup \
 # 终端 2：启动 Connector（只建立出站连接）
 ./scripts/run-connector.sh
 ```
+
+bridge 启动后，在 **Mac 本机**打开下面这个地址即可看到配对二维码，用 iPhone
+扫描就不用再手输 machineId 和 pairing secret：
+
+```text
+http://127.0.0.1:3080/dsh-anywhere/v1/pairing
+```
+
+该页面只在回环地址提供服务，并且会校验 Host 头，因此即使这台 Mac 的 3080 端口
+被反向代理暴露到公网，这个页面也不会随之对外可访问。
 
 macOS 用户服务也可以由安装脚本生成（会加载两个用户级 launchd agent，并自动重启
 进程）：
@@ -91,14 +104,21 @@ DSH_ANYWHERE_CONFIG=/path/to/connector.json ./scripts/run-connector.sh
 ## 3. 在原生 iOS App 配对
 
 用 Xcode 打开 [`ios/DSHAnywhere.xcodeproj`](ios/DSHAnywhere.xcodeproj)，在
-Signing & Capabilities 选择自己的 Team 和 Bundle ID，运行到 iPhone。配对页填写：
+Signing & Capabilities 选择自己的 Team 和 Bundle ID，运行到 iPhone。配对页点
+**Scan pairing code** 扫上面那个网页的二维码即可，也可以手工填写：
 
 - Relay HTTPS 地址，例如 `https://your-relay.example`
 - Connector 输出的 `machineId`
 - Connector 输出的 `pairingSecret`
 
+扫码只接受 `dshanywhere://pair` 链接（由 `packages/protocol` 的 `pairingLink`
+生成）。扫到别的二维码会提示并继续扫描，不会填入半截凭证；相机权限只用于这一步。
+
 App 通过 `POST /v1/pair` 换取设备令牌，并把令牌放进 iOS Keychain。之后 iOS
 通过 `/v1/connect` 的 Relay WebSocket 收发会话、Prompt、工具状态和审批操作。
+
+首页默认只显示未存档会话，网页端存档过的会话不会出现在列表里；需要查看时用
+右上角菜单里的 **Show archived** 打开。
 
 ## 代码结构
 

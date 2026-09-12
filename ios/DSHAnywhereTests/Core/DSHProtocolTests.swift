@@ -56,4 +56,28 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertNil(body["sessionId"])
         XCTAssertEqual(body["type"] as? String, "connection.resume")
     }
+
+    func testPairingLinkParsesTheConnectorPayload() throws {
+        let link = try XCTUnwrap(DSHPairingLink(
+            urlString: "dshanywhere://pair?relay=https%3A%2F%2Frelay.example.com&machineId=machine_macmini&secret=s3cret-value-long-enough"
+        ))
+        XCTAssertEqual(link.relay, "https://relay.example.com")
+        XCTAssertEqual(link.machineId, "machine_macmini")
+        XCTAssertEqual(link.pairingSecret, "s3cret-value-long-enough")
+    }
+
+    func testPairingLinkRejectsForeignOrIncompleteCodes() {
+        // A generic URL QR, a missing field, a blank secret and a non-URL must
+        // all be refused, so the scanner stays armed for the real code.
+        XCTAssertNil(DSHPairingLink(urlString: "https://example.com/?machineId=mac-1"))
+        XCTAssertNil(DSHPairingLink(urlString: "dshanywhere://pair?machineId=mac-1"))
+        XCTAssertNil(DSHPairingLink(urlString: "dshanywhere://pair?relay=https%3A%2F%2Fr.example&machineId=mac-1&secret="))
+        XCTAssertNil(DSHPairingLink(urlString: "not a url"))
+    }
+
+    func testPairingLinkRejectsARelayTheClientCannotDial() {
+        XCTAssertNil(DSHPairingLink(
+            urlString: "dshanywhere://pair?relay=ftp%3A%2F%2Frelay.example.com&machineId=mac-1&secret=abcdefghijklmnop"
+        ))
+    }
 }

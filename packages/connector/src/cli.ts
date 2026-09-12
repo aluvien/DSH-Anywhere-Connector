@@ -28,6 +28,10 @@ export async function runCli(
       stdout(JSON.stringify({
         machineId: result.machineId,
         pairingSecret: result.pairingSecret,
+        pairingLink: result.pairingLink,
+        // Open this on the Mac to scan the QR with the iPhone instead of
+        // retyping machineId + pairing secret. Loopback-only by design.
+        pairingPage: `${result.config.bridgeBaseURL}/pairing`,
         configPath: result.configPath,
         nextStep: `Before starting the local DSH bridge, run: . ${shellQuote(result.bridgeEnvPath)}`,
       }));
