@@ -542,6 +542,57 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+/// One row of the transcript: a single user message, or the consecutive
+/// assistant messages that belong to one turn.
+///
+/// Grouping exists so the reply is what you read: every assistant message of a
+/// turn renders as an answer, and all of that turn's chain-of-thought collapses
+/// into one disclosure placed after the answers rather than one per message.
+public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
+    public let id: String
+    public var messages: [DSHChatMessage]
+
+    public init(id: String, messages: [DSHChatMessage]) {
+        self.id = id; self.messages = messages
+    }
+
+    public var isUserTurn: Bool { messages.first?.role == .user }
+
+    /// Answers in order. An empty markdown only happens when reasoning arrived
+    /// before the streamed text, so it must not produce an empty bubble.
+    public var visibleMessages: [DSHChatMessage] {
+        messages.filter { !$0.markdown.isEmpty }
+    }
+
+    /// Every reasoning fragment this turn produced, in arrival order.
+    public var reasoning: String {
+        messages
+            .compactMap(\.reasoning)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+}
+
+public extension Array where Element == DSHChatMessage {
+    /// Collapses consecutive assistant messages into a single block so a turn's
+    /// reasoning can be folded once instead of once per message.
+    func groupedIntoTranscriptBlocks() -> [DSHTranscriptBlock] {
+        var blocks: [DSHTranscriptBlock] = []
+        for message in self {
+            let canAppend = !blocks.isEmpty
+                && message.role == .assistant
+                && blocks[blocks.count - 1].messages.first?.role == .assistant
+            if canAppend {
+                blocks[blocks.count - 1].messages.append(message)
+            } else {
+                blocks.append(DSHTranscriptBlock(id: message.id, messages: [message]))
+            }
+        }
+        return blocks
+    }
+}
+
 public struct DSHPermissionUpdate: Codable, Sendable, Equatable {
     public let sessionId: String
     public let mode: String

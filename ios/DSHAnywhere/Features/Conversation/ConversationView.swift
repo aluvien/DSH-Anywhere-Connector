@@ -26,13 +26,22 @@ struct ConversationView: View {
         model.pendingApprovals.contains { $0.sessionId == sessionID }
             || model.pendingQuestions.contains { $0.sessionId == sessionID }
     }
+    /// Assistant messages are grouped per turn so each turn folds its reasoning
+    /// exactly once, below the answers it produced.
+    private var transcriptBlocks: [DSHTranscriptBlock] {
+        model.messages(for: sessionID).groupedIntoTranscriptBlocks()
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(model.messages(for: sessionID)) { message in
-                        MessageBubble(message: message).id(message.id)
+                    ForEach(transcriptBlocks) { block in
+                        if block.isUserTurn {
+                            MessageBubble(message: block.messages[0]).id(block.id)
+                        } else {
+                            AssistantTurnView(block: block).id(block.id)
+                        }
                     }
                     ForEach(model.tools(for: sessionID)) { tool in
                         ToolActivityCard(tool: tool)
@@ -509,17 +518,12 @@ private struct MessageBubble: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 36) }
-            VStack(alignment: .leading, spacing: 6) {
-                if let reasoning = message.reasoning, !reasoning.isEmpty {
-                    ReasoningDisclosure(text: reasoning)
-                }
-                messageText
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
-                    .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-            }
+            messageText
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
+                .foregroundStyle(message.role == .user ? .white : .primary)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
             if message.role != .user { Spacer(minLength: 36) }
         }
     }
@@ -530,11 +534,37 @@ private struct MessageBubble: View {
     }
 }
 
-/// Chain-of-thought is folded away by default. It is occasionally useful, but
-/// it is not the answer, and showing it inline drowns the reply it precedes.
-private struct ReasoningDisclosure: View {
+/// One assistant turn: every answer it produced, then a single folded section
+/// holding the whole turn's chain-of-thought. The transcript itself shows only
+/// final results; the reasoning lives in that one collapsed space.
+private struct AssistantTurnView: View {
+    let block: DSHTranscriptBlock
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(block.visibleMessages) { message in
+                MessageBubble(message: message)
+            }
+            if !block.reasoning.isEmpty {
+                ThinkingDisclosure(text: block.reasoning,
+                                   answerCount: block.visibleMessages.count)
+            }
+        }
+    }
+}
+
+/// Collapsed by default: one subdued row per turn. Expanding is capped in
+/// height and scrolls, so a long chain-of-thought can never push the answers
+/// off screen — the failure mode this replaced.
+private struct ThinkingDisclosure: View {
     let text: String
+    let answerCount: Int
+
     @State private var isExpanded = false
+
+    private var title: String {
+        isExpanded ? "Hide thinking" : "Thinking"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -543,7 +573,7 @@ private struct ReasoningDisclosure: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "brain")
-                    Text(isExpanded ? "Hide thinking" : "Thinking")
+                    Text(title)
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     Spacer(minLength: 0)
@@ -554,17 +584,23 @@ private struct ReasoningDisclosure: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(isExpanded ? "Hide reasoning" : "Show reasoning")
+            .accessibilityHint(answerCount > 1
+                ? "Reasoning behind \(answerCount) answers in this turn"
+                : "Reasoning behind this answer")
 
             if isExpanded {
-                Text(text)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.secondary.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                ScrollView {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+                .padding(10)
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .frame(maxWidth: 320, alignment: .leading)

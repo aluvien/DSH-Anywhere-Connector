@@ -80,4 +80,37 @@ final class DSHProtocolTests: XCTestCase {
             urlString: "dshanywhere://pair?relay=ftp%3A%2F%2Frelay.example.com&machineId=mac-1&secret=abcdefghijklmnop"
         ))
     }
+
+    func testConsecutiveAssistantMessagesBecomeOneTurnBlock() {
+        let messages = [
+            DSHChatMessage(id: "u1", role: .user, markdown: "do it"),
+            DSHChatMessage(id: "a1", role: .assistant, markdown: "step one", reasoning: "think one"),
+            DSHChatMessage(id: "a2", role: .assistant, markdown: "step two", reasoning: "think two"),
+            DSHChatMessage(id: "u2", role: .user, markdown: "again"),
+            DSHChatMessage(id: "a3", role: .assistant, markdown: "done"),
+        ]
+
+        let blocks = messages.groupedIntoTranscriptBlocks()
+
+        // One turn = one block, so the phone folds that turn's reasoning once
+        // instead of once per assistant message.
+        XCTAssertEqual(blocks.map(\.id), ["u1", "a1", "u2", "a3"])
+        XCTAssertEqual(blocks[0].isUserTurn, true)
+        XCTAssertEqual(blocks[0].messages.count, 1)
+        XCTAssertEqual(blocks[1].messages.count, 2)
+        XCTAssertEqual(blocks[1].reasoning, "think one\n\nthink two")
+        XCTAssertEqual(blocks[3].reasoning, "")
+    }
+
+    func testTurnBlockHidesAnswersThatHaveNotStreamedYet() {
+        // Reasoning can land before the streamed text, producing a message with
+        // an empty body; it must contribute reasoning without an empty bubble.
+        let block = [
+            DSHChatMessage(id: "a1", role: .assistant, markdown: "", reasoning: "thinking"),
+            DSHChatMessage(id: "a2", role: .assistant, markdown: "the answer"),
+        ].groupedIntoTranscriptBlocks()[0]
+
+        XCTAssertEqual(block.visibleMessages.map(\.id), ["a2"])
+        XCTAssertEqual(block.reasoning, "thinking")
+    }
 }
