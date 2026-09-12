@@ -243,6 +243,49 @@ export const AttachmentUploadedPayloadSchema = StrictObject({
 });
 export type AttachmentUploadedPayload = z.infer<typeof AttachmentUploadedPayloadSchema>;
 
+/**
+ * Model reasoning is deliberately kept out of the answer markdown: the phone
+ * transcript stays readable, and a client that wants the chain-of-thought can
+ * collapse it behind a disclosure instead of mixing it into the reply.
+ */
+export const AssistantReasoningPayloadSchema = StrictObject({
+  messageId: IdentifierSchema,
+  text: z.string().min(1).max(200_000),
+});
+export type AssistantReasoningPayload = z.infer<typeof AssistantReasoningPayloadSchema>;
+
+/** One selectable answer offered for a user question. */
+export const AskUserQuestionOptionSchema = StrictObject({
+  label: z.string().min(1).max(512),
+  description: z.string().max(2_000).optional(),
+});
+export type AskUserQuestionOption = z.infer<typeof AskUserQuestionOptionSchema>;
+
+export const AskUserQuestionItemSchema = StrictObject({
+  id: IdentifierSchema,
+  question: z.string().min(1).max(4_000),
+  header: z.string().max(512).optional(),
+  /** Supporting detail (a plan under review, for example), kept out of labels. */
+  detail: z.string().max(200_000).optional(),
+  options: z.array(AskUserQuestionOptionSchema).max(32).optional(),
+  multiSelect: z.boolean().optional(),
+});
+export type AskUserQuestionItem = z.infer<typeof AskUserQuestionItemSchema>;
+
+export const QuestionAskedPayloadSchema = StrictObject({
+  id: IdentifierSchema,
+  sessionId: IdentifierSchema,
+  questions: z.array(AskUserQuestionItemSchema).min(1).max(16),
+  expiresAt: TimestampSchema.optional(),
+});
+export type QuestionAskedPayload = z.infer<typeof QuestionAskedPayloadSchema>;
+
+export const QuestionResolvedPayloadSchema = StrictObject({
+  id: IdentifierSchema,
+  sessionId: IdentifierSchema,
+});
+export type QuestionResolvedPayload = z.infer<typeof QuestionResolvedPayloadSchema>;
+
 export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("connection.ready", ConnectionReadyPayloadSchema),
   EventEnvelope("session.snapshot", SessionSnapshotPayloadSchema),
@@ -261,6 +304,9 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("session.metadata.updated", SessionMetadataUpdatedPayloadSchema),
   EventEnvelope("command.result", CommandResultPayloadSchema),
   EventEnvelope("attachment.uploaded", AttachmentUploadedPayloadSchema),
+  EventEnvelope("assistant.reasoning", AssistantReasoningPayloadSchema),
+  EventEnvelope("question.asked", QuestionAskedPayloadSchema),
+  EventEnvelope("question.resolved", QuestionResolvedPayloadSchema),
   EventEnvelope("protocol.error", ProtocolErrorPayloadSchema),
 ]);
 export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;
@@ -334,6 +380,18 @@ export const AttachmentUploadPayloadSchema = StrictObject({
   name: z.string().min(1).max(512),
   data: z.string().min(1),
 });
+/** One answered question. `selected` carries option labels verbatim. */
+export const QuestionAnswerItemSchema = StrictObject({
+  id: IdentifierSchema,
+  selected: z.array(z.string().min(1).max(512)).max(32),
+  custom: z.string().max(4_000).optional(),
+});
+export type QuestionAnswerItem = z.infer<typeof QuestionAnswerItemSchema>;
+
+export const QuestionAnswerPayloadSchema = StrictObject({
+  questionId: IdentifierSchema,
+  answers: z.array(QuestionAnswerItemSchema).min(1).max(16),
+});
 
 export type SessionListPayload = z.infer<typeof SessionListPayloadSchema>;
 export type SessionCreatePayload = z.infer<typeof SessionCreatePayloadSchema>;
@@ -347,6 +405,7 @@ export type SessionModelPayload = z.infer<typeof SessionModelPayloadSchema>;
 export type CommandExecutePayload = z.infer<typeof CommandExecutePayloadSchema>;
 export type PermissionSetPayload = z.infer<typeof PermissionSetPayloadSchema>;
 export type AttachmentUploadPayload = z.infer<typeof AttachmentUploadPayloadSchema>;
+export type QuestionAnswerPayload = z.infer<typeof QuestionAnswerPayloadSchema>;
 
 export const CommandEnvelopeSchema = z.discriminatedUnion("type", [
   CommandEnvelope("connection.resume", ConnectionResumePayloadSchema),
@@ -362,6 +421,7 @@ export const CommandEnvelopeSchema = z.discriminatedUnion("type", [
   CommandEnvelope("command.execute", CommandExecutePayloadSchema),
   CommandEnvelope("permission.set", PermissionSetPayloadSchema),
   CommandEnvelope("attachment.upload", AttachmentUploadPayloadSchema),
+  CommandEnvelope("question.answer", QuestionAnswerPayloadSchema),
   CommandEnvelope("device.revoke", DeviceRevokePayloadSchema),
 ]);
 export type CommandEnvelope = z.infer<typeof CommandEnvelopeSchema>;

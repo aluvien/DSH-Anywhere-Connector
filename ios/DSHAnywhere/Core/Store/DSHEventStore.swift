@@ -5,6 +5,7 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var messagesBySession: [String: [DSHChatMessage]] = [:]
     public var toolsBySession: [String: [DSHToolActivity]] = [:]
     public var pendingApprovals: [DSHApprovalRequest] = []
+    public var pendingQuestions: [DSHQuestionRequest] = []
     public var turnStateBySession: [String: String] = [:]
     public var modelCatalog: DSHModelCatalog?
     public var usageBySession: [String: DSHSessionUsage] = [:]
@@ -44,8 +45,27 @@ public struct DSHEventReducer: Sendable {
             state.sessions = sessions
         case .sessionCreated(let session):
             upsert(session, into: &state.sessions)
-        case .userMessageAccepted(let message), .assistantMessageCompleted(let message):
+        case .userMessageAccepted(let message):
             appendOrReplace(message, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
+        case .assistantMessageCompleted(let message):
+            // A completion replaces the streaming partial, so carry the
+            // reasoning that arrived as its own event back onto the message.
+            var completed = message
+            if let sessionId = event.envelope.sessionId,
+               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }) {
+                completed.reasoning = existing.reasoning
+            }
+            appendOrReplace(completed, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
+        case .assistantReasoning(let reasoning):
+            let sessionId = event.envelope.sessionId ?? ""
+            var messages = state.messagesBySession[sessionId, default: []]
+            if let index = messages.firstIndex(where: { $0.id == reasoning.messageId }) {
+                messages[index].reasoning = reasoning.text
+            } else {
+                messages.append(DSHChatMessage(id: reasoning.messageId, role: .assistant,
+                                               markdown: "", reasoning: reasoning.text))
+            }
+            state.messagesBySession[sessionId] = messages
         case .assistantMessageDelta(let delta):
             let sessionId = event.envelope.sessionId ?? ""
             var messages = state.messagesBySession[sessionId, default: []]
@@ -65,6 +85,12 @@ public struct DSHEventReducer: Sendable {
             }
         case .approvalResolved(let resolution):
             state.pendingApprovals.removeAll { $0.id == resolution.id }
+        case .questionAsked(let request):
+            if !state.pendingQuestions.contains(where: { $0.id == request.id }) {
+                state.pendingQuestions.append(request)
+            }
+        case .questionResolved(let resolution):
+            state.pendingQuestions.removeAll { $0.id == resolution.id }
         case .turnStateChanged(let turn):
             state.turnStateBySession[turn.sessionId] = turn.state
         case .modelCatalog(let catalog):

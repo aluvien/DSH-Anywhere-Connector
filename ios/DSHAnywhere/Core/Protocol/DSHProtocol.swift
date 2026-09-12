@@ -220,6 +220,43 @@ public struct DSHCommand: Codable, Sendable, Equatable {
                    sessionId: sessionId, type: "approval.decide",
                    payload: .object(["approvalId": .string(approvalId), "allow": .bool(allow)]))
     }
+
+    /// One answered question. `selected` carries option labels verbatim, which
+    /// is what the Harness echoes back into the model's tool result.
+    public static func answerQuestion(deviceId: String, machineId: String, sessionId: String,
+                                      questionId: String, answers: [DSHQuestionAnswer],
+                                      requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   sessionId: sessionId, type: "question.answer",
+                   payload: .object([
+                       "questionId": .string(questionId),
+                       "answers": .array(answers.map { $0.jsonValue }),
+                   ]))
+    }
+}
+
+/// One question's answer as sent back to the bridge.
+public struct DSHQuestionAnswer: Sendable, Equatable {
+    public let id: String
+    public let selected: [String]
+    public let custom: String?
+
+    public init(id: String, selected: [String], custom: String? = nil) {
+        self.id = id; self.selected = selected; self.custom = custom
+    }
+
+    var jsonValue: DSHJSONValue {
+        .object(jsonObject)
+    }
+
+    private var jsonObject: [String: DSHJSONValue] {
+        var object: [String: DSHJSONValue] = [
+            "id": .string(id),
+            "selected": .array(selected.map { .string($0) }),
+        ]
+        if let custom { object["custom"] = .string(custom) }
+        return object
+    }
 }
 
 /// Scanned `dshanywhere://pair` payload. Mirrors `parsePairingLink` in
@@ -491,13 +528,17 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public var model: String?
     public var reasoningEffort: String?
     public var contextWindow: Double?
+    /// Chain-of-thought for this message, kept out of `markdown` so the reply
+    /// reads cleanly; the transcript folds it behind a disclosure.
+    public var reasoning: String?
 
     public init(id: String, role: DSHMessageRole, markdown: String,
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
-                reasoningEffort: String? = nil, contextWindow: Double? = nil) {
+                reasoningEffort: String? = nil, contextWindow: Double? = nil,
+                reasoning: String? = nil) {
         self.id = id; self.role = role; self.markdown = markdown; self.usage = usage
         self.provider = provider; self.model = model; self.reasoningEffort = reasoningEffort
-        self.contextWindow = contextWindow
+        self.contextWindow = contextWindow; self.reasoning = reasoning
     }
 }
 
@@ -602,6 +643,60 @@ public struct DSHApprovalResolution: Codable, Sendable, Equatable {
     public init(id: String, allowed: Bool) { self.id = id; self.allowed = allowed }
 }
 
+/// One selectable answer for a question raised by `ask_user_question`.
+public struct DSHQuestionOption: Codable, Sendable, Equatable, Identifiable {
+    public let label: String
+    public let description: String?
+
+    public var id: String { label }
+
+    public init(label: String, description: String? = nil) {
+        self.label = label; self.description = description
+    }
+}
+
+public struct DSHQuestion: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let question: String
+    public let header: String?
+    /// Supporting detail, such as a plan submitted for review.
+    public let detail: String?
+    public let options: [DSHQuestionOption]?
+    public let multiSelect: Bool?
+
+    public init(id: String, question: String, header: String? = nil, detail: String? = nil,
+                options: [DSHQuestionOption]? = nil, multiSelect: Bool? = nil) {
+        self.id = id; self.question = question; self.header = header; self.detail = detail
+        self.options = options; self.multiSelect = multiSelect
+    }
+}
+
+public struct DSHQuestionRequest: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let sessionId: String
+    public let questions: [DSHQuestion]
+    public let expiresAt: Int64?
+
+    public init(id: String, sessionId: String, questions: [DSHQuestion], expiresAt: Int64? = nil) {
+        self.id = id; self.sessionId = sessionId
+        self.questions = questions; self.expiresAt = expiresAt
+    }
+}
+
+public struct DSHQuestionResolution: Codable, Sendable, Equatable {
+    public let id: String
+    public let sessionId: String
+
+    public init(id: String, sessionId: String) { self.id = id; self.sessionId = sessionId }
+}
+
+public struct DSHReasoning: Codable, Sendable, Equatable {
+    public let messageId: String
+    public let text: String
+
+    public init(messageId: String, text: String) { self.messageId = messageId; self.text = text }
+}
+
 public struct DSHTurnState: Codable, Sendable, Equatable {
     public let sessionId: String
     public let state: String
@@ -627,6 +722,9 @@ public enum DSHEventKind: Sendable, Equatable {
     case sessionMetadataUpdated(DSHSessionMetadataUpdate)
     case commandResult(DSHCommandResult)
     case attachmentUploaded(DSHUploadedAttachment)
+    case assistantReasoning(DSHReasoning)
+    case questionAsked(DSHQuestionRequest)
+    case questionResolved(DSHQuestionResolution)
     case unknown
 }
 
@@ -667,6 +765,9 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "session.metadata.updated": return decode(DSHSessionMetadataUpdate.self, payload).map(DSHEventKind.sessionMetadataUpdated) ?? .unknown
         case "command.result": return decode(DSHCommandResult.self, payload).map(DSHEventKind.commandResult) ?? .unknown
         case "attachment.uploaded": return decode(DSHUploadedAttachment.self, payload).map(DSHEventKind.attachmentUploaded) ?? .unknown
+        case "assistant.reasoning": return decode(DSHReasoning.self, payload).map(DSHEventKind.assistantReasoning) ?? .unknown
+        case "question.asked": return decode(DSHQuestionRequest.self, payload).map(DSHEventKind.questionAsked) ?? .unknown
+        case "question.resolved": return decode(DSHQuestionResolution.self, payload).map(DSHEventKind.questionResolved) ?? .unknown
         default: return .unknown
         }
     }

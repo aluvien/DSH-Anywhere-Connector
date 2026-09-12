@@ -137,4 +137,58 @@ describe("DSH Anywhere wire protocol", () => {
     expect(() => relayHTTPSURL("ftp://relay.example.com")).toThrow();
     expect(relayHTTPSURL("https://relay.example.com/")).toBe("https://relay.example.com");
   });
+
+  it("carries a question and its tappable options to the device", () => {
+    const parsed = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "question.asked",
+      payload: {
+        id: "question_1",
+        sessionId: "session-1",
+        questions: [
+          {
+            id: "mode",
+            question: "Which mode?",
+            header: "Choose Mode",
+            options: [{ label: "Fast" }, { label: "Careful", description: "Verify each step" }],
+            multiSelect: false,
+          },
+        ],
+      },
+    });
+
+    expect(parsed.type).toBe("question.asked");
+    if (parsed.type === "question.asked") {
+      expect(parsed.payload.questions[0]?.options?.map((option) => option.label)).toEqual(["Fast", "Careful"]);
+    }
+  });
+
+  it("accepts a question answer command and rejects an empty one", () => {
+    const commandFields = {
+      version: PROTOCOL_VERSION,
+      machineId: "mac-1",
+      deviceId: "iphone-1",
+      timestamp: 1_735_000_000_000,
+    };
+    const command = parseCommand({
+      ...commandFields,
+      requestId: "req-1",
+      type: "question.answer",
+      payload: {
+        questionId: "question_1",
+        answers: [{ id: "mode", selected: ["Fast"] }, { id: "extra", selected: [], custom: "Add tests" }],
+      },
+    });
+    expect(command.type).toBe("question.answer");
+
+    // The tool awaits one answer per question, so an empty selection list must
+    // not be accepted in place of a real answer.
+    expect(() => parseCommand({
+      ...envelopeFields,
+      requestId: "req-2",
+      type: "question.answer",
+      payload: { questionId: "question_1", answers: [] },
+    })).toThrow();
+  });
 });

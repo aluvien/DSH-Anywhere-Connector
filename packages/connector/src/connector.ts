@@ -555,6 +555,12 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         path: `/approvals/${encodeURIComponent(command.payload.approvalId)}/decision`,
         body: { decision: command.payload.allow ? "allowed-once" : "rejected" },
       };
+    case "question.answer":
+      return {
+        method: "POST",
+        path: `/questions/${encodeURIComponent(command.payload.questionId)}/answer`,
+        body: { answers: command.payload.answers },
+      };
     case "session.archive":
       return {
         method: "POST",

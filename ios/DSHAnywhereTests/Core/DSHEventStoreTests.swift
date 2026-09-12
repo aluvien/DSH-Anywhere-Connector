@@ -66,4 +66,69 @@ final class DSHEventStoreTests: XCTestCase {
         reducer.reduce(requested, into: &state); reducer.reduce(resolved, into: &state)
         XCTAssertTrue(state.pendingApprovals.isEmpty)
     }
+
+    func testQuestionAskedSurvivesUntilTheBridgeResolvesIt() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        let asked = DSHEvent(envelope: DSHEnvelope(
+            messageId: "q", deviceId: "d", machineId: "m", sessionId: "s", sequence: 1,
+            type: "question.asked",
+            payload: .object([
+                "id": .string("question_1"),
+                "sessionId": .string("s"),
+                "questions": .array([
+                    .object([
+                        "id": .string("mode"),
+                        "question": .string("Which mode?"),
+                        "options": .array([
+                            .object(["label": .string("Fast")]),
+                            .object(["label": .string("Careful")]),
+                        ]),
+                    ]),
+                ]),
+            ])
+        ))
+        reducer.reduce(asked, into: &state)
+
+        // The tappable options must survive decoding, since they are the whole
+        // point of answering from the phone.
+        XCTAssertEqual(state.pendingQuestions.count, 1)
+        XCTAssertEqual(state.pendingQuestions.first?.questions.first?.options?.map(\.label),
+                       ["Fast", "Careful"])
+
+        // A replayed duplicate must not stack a second card.
+        reducer.reduce(asked, into: &state)
+        XCTAssertEqual(state.pendingQuestions.count, 1)
+
+        let resolved = DSHEvent(envelope: DSHEnvelope(
+            messageId: "q2", deviceId: "d", machineId: "m", sessionId: "s", sequence: 2,
+            type: "question.resolved",
+            payload: .object(["id": .string("question_1"), "sessionId": .string("s")])
+        ))
+        reducer.reduce(resolved, into: &state)
+        XCTAssertTrue(state.pendingQuestions.isEmpty)
+    }
+
+    func testReasoningIsKeptOutOfTheAnswerAndSurvivesCompletion() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        let reasoning = DSHEvent(envelope: DSHEnvelope(
+            messageId: "r", deviceId: "d", machineId: "m", sessionId: "s", sequence: 1,
+            type: "assistant.reasoning",
+            payload: .object(["messageId": .string("a"), "text": .string("Let me think.")])
+        ))
+        let completed = DSHEvent(envelope: DSHEnvelope(
+            messageId: "c", deviceId: "d", machineId: "m", sessionId: "s", sequence: 2,
+            type: "assistant.message.completed",
+            payload: .object(["id": .string("a"), "role": .string("assistant"), "markdown": .string("The answer.")])
+        ))
+        reducer.reduce(reasoning, into: &state)
+        reducer.reduce(completed, into: &state)
+
+        let message = state.messagesBySession["s"]?.first
+        XCTAssertEqual(message?.markdown, "The answer.")
+        // Completion replaces the streaming partial, so it must carry the
+        // reasoning forward rather than dropping it.
+        XCTAssertEqual(message?.reasoning, "Let me think.")
+    }
 }

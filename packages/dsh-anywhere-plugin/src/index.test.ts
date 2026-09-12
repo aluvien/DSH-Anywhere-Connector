@@ -42,6 +42,39 @@ describe('DeepSeek Harness event normalization', () => {
     })
   })
 
+  it('keeps reasoning out of the answer and emits it as its own event', () => {
+    const events = normalizeSessionEvents('s1', {
+      type: 'assistant/message',
+      data: {
+        message: {
+          id: 'a1',
+          content: [
+            { type: 'reasoning', text: 'The user wants the short version.' },
+            { type: 'text', text: 'Here it is.' },
+          ],
+        },
+      },
+    }, new Map())
+
+    const completed = events.find((event) => event.type === 'assistant.message.completed')
+    const reasoning = events.find((event) => event.type === 'assistant.reasoning')
+
+    // The reply the phone renders must not contain chain-of-thought.
+    expect((completed?.payload as { markdown: string }).markdown).toBe('Here it is.')
+    expect(reasoning?.payload).toEqual({
+      messageId: 'a1',
+      text: 'The user wants the short version.',
+    })
+  })
+
+  it('omits the reasoning event entirely when there is none', () => {
+    const events = normalizeSessionEvents('s1', {
+      type: 'assistant/message',
+      data: { message: { id: 'a1', content: [{ type: 'text', text: 'Just the answer.' }] } },
+    }, new Map())
+    expect(events.some((event) => event.type === 'assistant.reasoning')).toBe(false)
+  })
+
   it('produces payloads accepted by the strict protocol schema', () => {
     const normalized = normalizeSessionEvent('s1', {
       type: 'turn/start', data: { turn: 1 },

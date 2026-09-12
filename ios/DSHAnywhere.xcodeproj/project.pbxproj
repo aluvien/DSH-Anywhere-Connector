@@ -20,6 +20,7 @@
 		B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000B /* Features/Conversation/ConversationView.swift */; };
 		B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */; };
 		B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */; };
+		B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */; };
 		B0000000000000000000000E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000E /* Assets.xcassets */; };
 		B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000101 /* Core/DSHProtocolTests.swift */; };
 		B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000102 /* Core/DSHEventStoreTests.swift */; };
@@ -50,6 +51,7 @@
 		F0000000000000000000000B /* Features/Conversation/ConversationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ConversationView.swift; sourceTree = "<group>"; };
 		F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ToolActivityCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ApprovalCard.swift; sourceTree = "<group>"; };
+		F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/QuestionCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F00000000000000000000101 /* Core/DSHProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProtocolTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000102 /* Core/DSHEventStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHEventStoreTests.swift; sourceTree = "<group>"; };
@@ -101,6 +103,7 @@
 				F0000000000000000000000B /* Features/Conversation/ConversationView.swift */,
 				F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */,
 				F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */,
+				F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */,
 				F0000000000000000000000E /* Assets.xcassets */,
 			);
 			path = DSHAnywhere;
@@ -237,6 +240,7 @@
 				B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */,
 				B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */,
 				B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */,
+				B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -289,7 +293,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
@@ -314,7 +318,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";

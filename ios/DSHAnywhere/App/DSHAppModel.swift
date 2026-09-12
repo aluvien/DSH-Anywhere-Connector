@@ -30,6 +30,7 @@ final class DSHAppModel: ObservableObject {
     var sessions: [DSHSessionSummary] { state.sessions }
     var modelCatalog: DSHModelCatalog? { state.modelCatalog }
     var pendingApprovals: [DSHApprovalRequest] { state.pendingApprovals }
+    var pendingQuestions: [DSHQuestionRequest] { state.pendingQuestions }
     var connectionState: DSHConnectionState { state.connectionState }
 
     func messages(for sessionID: String) -> [DSHChatMessage] {
@@ -207,6 +208,13 @@ final class DSHAppModel: ObservableObject {
     func decide(_ approval: DSHApprovalRequest, allow: Bool) {
         send(DSHCommand.decideApproval(deviceId: deviceID, machineId: machineID,
                                        sessionId: approval.sessionId, approvalId: approval.id, allow: allow))
+    }
+
+    func answer(_ request: DSHQuestionRequest, answers: [DSHQuestionAnswer]) {
+        guard !answers.isEmpty else { return }
+        send(DSHCommand.answerQuestion(deviceId: deviceID, machineId: machineID,
+                                       sessionId: request.sessionId, questionId: request.id,
+                                       answers: answers))
     }
 
     private func send(_ command: DSHCommand) {

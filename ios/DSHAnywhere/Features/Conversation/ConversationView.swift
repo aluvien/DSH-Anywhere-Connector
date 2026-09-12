@@ -20,6 +20,12 @@ struct ConversationView: View {
     private var pendingAttachments: [DSHUploadedAttachment] {
         model.attachments(for: sessionID).filter { !sentAttachmentIDs.contains($0.receiptId) }
     }
+    /// A pending question or approval is a real request for input, so the
+    /// "start a conversation" placeholder must not sit above it.
+    private var hasBlockingInteraction: Bool {
+        model.pendingApprovals.contains { $0.sessionId == sessionID }
+            || model.pendingQuestions.contains { $0.sessionId == sessionID }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -39,7 +45,12 @@ struct ConversationView: View {
                             model.decide(approval, allow: allow)
                         }
                     }
-                    if model.messages(for: sessionID).isEmpty {
+                    ForEach(model.pendingQuestions.filter { $0.sessionId == sessionID }) { question in
+                        QuestionCard(request: question) { answers in
+                            model.answer(question, answers: answers)
+                        }
+                    }
+                    if model.messages(for: sessionID).isEmpty, !hasBlockingInteraction {
                         ContentUnavailableView("Start a conversation", systemImage: "sparkles",
                                                description: Text("Send a prompt to your local DeepSeek Harness."))
                             .frame(maxWidth: .infinity)
@@ -498,12 +509,17 @@ private struct MessageBubble: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 36) }
-            messageText
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
-                .foregroundStyle(message.role == .user ? .white : .primary)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
+            VStack(alignment: .leading, spacing: 6) {
+                if let reasoning = message.reasoning, !reasoning.isEmpty {
+                    ReasoningDisclosure(text: reasoning)
+                }
+                messageText
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(message.role == .user ? .white : .primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
             if message.role != .user { Spacer(minLength: 36) }
         }
     }
@@ -511,6 +527,47 @@ private struct MessageBubble: View {
     @ViewBuilder private var messageText: some View {
         if let markdown = try? AttributedString(markdown: message.markdown) { Text(markdown) }
         else { Text(message.markdown) }
+    }
+}
+
+/// Chain-of-thought is folded away by default. It is occasionally useful, but
+/// it is not the answer, and showing it inline drowns the reply it precedes.
+private struct ReasoningDisclosure: View {
+    let text: String
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain")
+                    Text(isExpanded ? "Hide thinking" : "Thinking")
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    Spacer(minLength: 0)
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Hide reasoning" : "Show reasoning")
+
+            if isExpanded {
+                Text(text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .frame(maxWidth: 320, alignment: .leading)
     }
 }
 

@@ -16,13 +16,16 @@ import {
   ModelCatalogPayloadSchema,
   PromptSendPayloadSchema,
   PROTOCOL_VERSION,
+  QuestionAnswerPayloadSchema,
   pairingLink,
   relayHTTPSURL,
   type EventEnvelope,
+  type QuestionAnswerItem,
 } from '@dsh-anywhere/protocol'
 import { PairingAuthority } from './auth.js'
 import { HttpError, json, readJson } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
+import { PendingQuestions } from './pending-questions.js'
 import { ReplayBuffer } from './replay.js'
 
 export const name = 'dsh-anywhere-native-bridge'
@@ -39,6 +42,8 @@ export interface Config {
   readonly pairingRateLimitMaxAttempts?: number
   readonly pairingRateLimitWindowMs?: number
   readonly approvalTimeoutMs?: number
+  /** A question blocks a tool call, so it defaults to a much longer deadline. */
+  readonly questionTimeoutMs?: number
   readonly eventBufferSize?: number
   /**
    * Where the connector keeps connector.json. The local pairing page reads it
@@ -414,6 +419,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   )
   const replay = new ReplayBuffer<EventEnvelope>(config.eventBufferSize ?? 2_000)
   const approvals = new PendingApprovals()
+  const questions = new PendingQuestions()
   const metadata = new SessionMetadataStore(metadataPath())
   const clients = new Set<WebSocket>()
   const wss = new WebSocketServer({ noServer: true })
@@ -444,6 +450,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         await handleHttp(
           ctx, req, res, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
           config.connectorConfigPath ?? defaultConnectorConfigPath(),
+          questions,
         )
       } catch (error) {
         const status = error instanceof HttpError ? error.status : 500
@@ -476,7 +483,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             serverTime: Date.now(),
           capabilities: [
             'sessions', 'workspaces', 'archive', 'prompt', 'attachments',
-            'cancel', 'approval', 'permissions', 'models', 'commands', 'usage', 'replay',
+            'cancel', 'approval', 'permissions', 'models', 'commands', 'usage', 'replay', 'questions',
           ],
             ...(after > 0 ? { resumedFrom: after } : {}),
           },
@@ -565,10 +572,66 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     }
   }) as never, { global: true, prepend: true })
 
+  // Registered on the same Agent-scoped waterfall as the web UI's answerer.
+  // Claiming the request only when a device is attached keeps the Harness TUI
+  // and browser clients working when no phone is connected.
+  ctx.on('user-questions/request' as never, (async function (
+    request: {
+      questions: readonly {
+        id: string
+        question: string
+        header?: string
+        detail?: string
+        options?: readonly { label: string; description?: string }[]
+        multiSelect?: boolean
+      }[]
+      agent?: { id: string }
+      signal?: AbortSignal
+    },
+    next: () => Promise<{ answers: readonly QuestionAnswerItem[] }>,
+  ): Promise<{ answers: readonly QuestionAnswerItem[] }> {
+    if (clients.size === 0) return next()
+    const sessionId = request.agent?.id ?? 'unknown'
+    const pending = questions.create(config.questionTimeoutMs ?? 600_000, request.signal)
+    publish({
+      type: 'question.asked',
+      sessionId,
+      payload: {
+        id: pending.id,
+        sessionId,
+        questions: request.questions.map((question) => ({
+          id: question.id,
+          question: question.question,
+          ...(question.header === undefined ? {} : { header: question.header }),
+          ...(question.detail === undefined ? {} : { detail: question.detail }),
+          ...(question.options === undefined ? {} : {
+            options: question.options.map((option) => ({
+              label: option.label,
+              ...(option.description === undefined ? {} : { description: option.description }),
+            })),
+          }),
+          ...(question.multiSelect === undefined ? {} : { multiSelect: question.multiSelect }),
+        })),
+        expiresAt: Date.now() + (config.questionTimeoutMs ?? 600_000),
+      },
+    })
+    try {
+      const answers = await pending.result
+      publish({ type: 'question.resolved', sessionId, payload: { id: pending.id, sessionId } })
+      return { answers }
+    } catch (error) {
+      // The tool awaits this promise, so an unanswered question must settle as
+      // a tool error rather than silently delegating to a UI that is not there.
+      publish({ type: 'question.resolved', sessionId, payload: { id: pending.id, sessionId } })
+      throw error instanceof Error ? error : new Error(String(error))
+    }
+  }) as never, { global: true, prepend: true })
+
   ctx.effect(() => () => {
     route()
     upgrade()
     approvals.rejectAll()
+    questions.rejectAll(new Error('the connector shut down before the question was answered'))
     for (const client of clients) client.close(1001, 'plugin disposed')
     wss.close()
   }, 'dsh-anywhere: routes and sockets')
@@ -587,6 +650,7 @@ async function handleHttp(
   metadata: SessionMetadataStore,
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
   connectorConfigPath: string,
+  questions: PendingQuestions,
 ): Promise<void> {
   await metadata.ready
   const url = new URL(req.url ?? '/', 'http://localhost')
@@ -756,6 +820,22 @@ async function handleHttp(
     const decision = approvalDecisionOf(body.decision)
     if (!approvals.decide(decodeURIComponent(approvalMatch[1]!), decision)) {
       throw new HttpError(409, 'approval is no longer pending')
+    }
+    json(res, 202, { accepted: true })
+    return
+  }
+
+  const answerMatch = /^\/questions\/([^/]+)\/answer$/.exec(path)
+  if (req.method === 'POST' && answerMatch !== null) {
+    // The path id is authoritative: a stale client cannot answer a different
+    // question than the one it was handed.
+    const parsed = QuestionAnswerPayloadSchema.safeParse({
+      ...objectOf(await readJson(req)),
+      questionId: decodeURIComponent(answerMatch[1]!),
+    })
+    if (!parsed.success) throw new HttpError(400, 'every question needs an id and its selections')
+    if (!questions.answer(parsed.data.questionId, parsed.data.answers)) {
+      throw new HttpError(409, 'question is no longer pending')
     }
     json(res, 202, { accepted: true })
     return
@@ -1057,6 +1137,16 @@ export function normalizeSessionEvents(
         payload: { messageId, text: streamedText },
       })
     }
+    const reasoning = reasoningText(message.content)
+    if (reasoning.length > 0) {
+      // Sent as its own event so the answer stays clean and the phone can fold
+      // the reasoning away instead of showing it as part of the reply.
+      normalized.unshift({
+        type: 'assistant.reasoning',
+        sessionId,
+        payload: { messageId, text: reasoning },
+      })
+    }
     if (usage !== undefined) {
       normalized.push({
         type: 'usage.updated',
@@ -1277,11 +1367,24 @@ function outputRate(streamValue: unknown, outputTokens: number | undefined): num
   return outputTokens / ((last - first) / 1_000)
 }
 
+/**
+ * Only `text` blocks become the answer. Reasoning is pulled out separately by
+ * reasoningText so chain-of-thought never lands in the reply the phone renders
+ * as the assistant's message.
+ */
 function contentText(value: unknown): string {
+  return blockText(value, 'text')
+}
+
+function reasoningText(value: unknown): string {
+  return blockText(value, 'reasoning')
+}
+
+function blockText(value: unknown, kind: 'text' | 'reasoning'): string {
   if (!Array.isArray(value)) return ''
   return value.flatMap((entry) => {
     const block = recordOf(entry)
-    if ((block.type === 'text' || block.type === 'reasoning') && typeof block.text === 'string') return [block.text]
+    if (block.type === kind && typeof block.text === 'string') return [block.text]
     return []
   }).join('')
 }
