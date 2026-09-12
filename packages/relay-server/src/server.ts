@@ -12,7 +12,16 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { Registry, type RelayPrincipal } from "./registry.js";
 
 const MAX_HTTP_BODY_BYTES = 16 * 1024;
-const RELAY_SCHEMA_REVISION = 2;
+/**
+ * Bumped whenever the routed `WireMessage` union changes shape. The Relay
+ * validates every forwarded body against that union, so a Relay older than the
+ * Connector silently rejects the new event and command types. Deployment must
+ * rebuild the Relay whenever this number moves.
+ *
+ * 3: added `assistant.reasoning`, `question.asked`, `question.resolved` events
+ *    and the `question.answer` command.
+ */
+const RELAY_SCHEMA_REVISION = 3;
 
 export interface RelayServerOptions {
   readonly bootstrapToken: string;

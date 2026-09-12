@@ -38,6 +38,32 @@ curl https://your-relay.example/health
 应返回 `{"ok":true,...}`。当前的 `dsh.biaozhu.me` 如果仍反代到个人 Mac 的
 3080，不能直接用于多人 Relay；必须改为反代服务器本机的 Relay 8787。
 
+### 协议变更后必须重新部署 Relay
+
+Relay 会把每条转发消息的 body 拿去和严格的 `WireMessage` 联合类型做校验，遇到
+不认识的事件或命令类型会直接回 `invalid_message` 并丢弃，**不会**透传。而 Relay
+镜像是在构建时把 `packages/protocol` 一起打进去的，所以：
+
+- 上游协议一旦新增事件或命令（例如 `question.asked`、`question.answer`、
+  `assistant.reasoning`），**必须重新构建并重启服务器上的 Relay**，否则新功能
+  会在 Relay 这一跳被悄悄丢掉，表现是手机端「什么都没有」，而 Mac 和 App 两侧
+  看起来都正常。
+- 判断是否需要重部署看 `/health` 的 `schemaRevision`，它与
+  `packages/relay-server/src/server.ts` 里的 `RELAY_SCHEMA_REVISION` 必须一致。
+  改动 wire schema 时把该常量加一。
+
+服务器上的操作（路径按实际部署位置）：
+
+```sh
+cd /opt/dsh-anywhere
+git pull        # 或上传新的源码包
+cd deploy/relay
+docker compose --env-file .env -f compose.yaml up -d --build
+curl https://your-relay.example/health   # 确认 schemaRevision 已变为新值
+```
+
+Mac 侧的 bridge 与 Connector 也要重启才会加载新的插件与转发规则。
+
 ## 2. 在 Mac 注册 Connector
 
 在本项目根目录构建，然后只由管理员执行一次 setup。bootstrap token 不要交给

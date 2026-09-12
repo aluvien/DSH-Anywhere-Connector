@@ -115,6 +115,19 @@ function payload(machineId: string, sender: "machine" | "device", deviceId: stri
   };
 }
 
+/** A relay.payload carrying an arbitrary body, for schema-carriage tests. */
+function relayed(machineId: string, sender: "machine" | "device", deviceId: string,
+                 body: unknown, targetDeviceId?: string): Record<string, unknown> {
+  return {
+    type: "relay.payload",
+    machineId,
+    messageId: crypto.randomUUID(),
+    sender,
+    ...(targetDeviceId === undefined ? {} : { targetDeviceId }),
+    body,
+  };
+}
+
 describe("Relay server", () => {
   it("registers machines and writes only credential hashes to its persistent registry", async () => {
     const server = await relay();
@@ -150,6 +163,71 @@ describe("Relay server", () => {
     expect(machineMessagesB.some((message) => message.type === "relay.payload")).toBe(false);
 
     for (const socket of [machineSocketA, machineSocketB, deviceSocketA, deviceSocketB]) socket.close();
+  });
+
+  // The Relay validates every routed body against the strict WireMessage union
+  // before forwarding it: an unknown event or command type is answered with
+  // `invalid_message` instead of being routed. A Relay image built before these
+  // types existed therefore drops them. This test only proves the current
+  // source can carry them — catching a stale deployment is what
+  // RELAY_SCHEMA_REVISION on /health is for.
+  it("carries the bodies the phone answers questions with", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const device = await pair(server.url, machine);
+    const machineSocket = await connect(server.url, machine.machineToken);
+    const deviceSocket = await connect(server.url, device.deviceToken);
+    const machineMessages = messages(machineSocket);
+    const deviceMessages = messages(deviceSocket);
+
+    machineSocket.send(JSON.stringify(relayed(machine.machineId, "machine", device.deviceId, {
+      version: PROTOCOL_VERSION,
+      messageId: crypto.randomUUID(),
+      machineId: machine.machineId,
+      deviceId: device.deviceId,
+      sessionId: "session-1",
+      sequence: 1,
+      timestamp: Date.now(),
+      type: "question.asked",
+      payload: {
+        id: "question_1",
+        sessionId: "session-1",
+        questions: [{ id: "mode", question: "Which mode?", options: [{ label: "Fast" }] }],
+      },
+    }, device.deviceId)));
+    const asked = await waitForMessage(deviceMessages, "relay.payload");
+    expect(asked.type === "relay.payload" ? asked.body.type : undefined).toBe("question.asked");
+
+    // Drain before the next hop so the assertions read this send, not the
+    // buffered one before it.
+    deviceMessages.length = 0;
+    machineSocket.send(JSON.stringify(relayed(machine.machineId, "machine", device.deviceId, {
+      version: PROTOCOL_VERSION,
+      messageId: crypto.randomUUID(),
+      machineId: machine.machineId,
+      deviceId: device.deviceId,
+      sessionId: "session-1",
+      sequence: 2,
+      timestamp: Date.now(),
+      type: "assistant.reasoning",
+      payload: { messageId: "a1", text: "Thinking about it." },
+    }, device.deviceId)));
+    const reasoning = await waitForMessage(deviceMessages, "relay.payload");
+    expect(reasoning.type === "relay.payload" ? reasoning.body.type : undefined).toBe("assistant.reasoning");
+
+    deviceSocket.send(JSON.stringify(relayed(machine.machineId, "device", device.deviceId, {
+      version: PROTOCOL_VERSION,
+      requestId: crypto.randomUUID(),
+      machineId: machine.machineId,
+      deviceId: device.deviceId,
+      timestamp: Date.now(),
+      type: "question.answer",
+      payload: { questionId: "question_1", answers: [{ id: "mode", selected: ["Fast"] }] },
+    })));
+    const answered = await waitForMessage(machineMessages, "relay.payload");
+    expect(answered.type === "relay.payload" ? answered.body.type : undefined).toBe("question.answer");
+
+    for (const socket of [machineSocket, deviceSocket]) socket.close();
   });
 
   it("can target a replay payload to one of several devices", async () => {

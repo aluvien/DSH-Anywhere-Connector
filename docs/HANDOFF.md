@@ -142,6 +142,10 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
    将请求和 WebSocket Upgrade 反代到 `127.0.0.1:8787`，然后执行 `nginx -t && systemctl reload nginx`。
 4. `curl https://dsh.biaozhu.me/health` 应返回包含 `"ok":true,"version":1` 的 JSON。
    8787 不应直接暴露公网；旧的 frpc → Mac:3080 反代应停用。
+5. 之后每次上游协议新增事件或命令，都要重新执行 `docker compose ... up -d --build`
+   并重启 Mac 侧 bridge/Connector。Relay 会校验转发消息的 body，镜像里的 protocol
+   快照过期时会直接丢弃新类型。用 `/health` 的 `schemaRevision` 与
+   `packages/relay-server/src/server.ts` 的 `RELAY_SCHEMA_REVISION` 比对确认。
 
 ### Mac
 
