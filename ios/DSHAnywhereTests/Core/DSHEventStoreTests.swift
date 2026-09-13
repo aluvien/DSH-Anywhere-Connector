@@ -182,4 +182,19 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(sessions.groupedForList(.byWorkspace, showArchived: true)[0].sessions.map(\.id), ["live", "gone"])
         XCTAssertTrue(sessions.filter { $0.archived == true }.groupedForList(.byWorkspace, showArchived: false).isEmpty)
     }
+
+    func testWorkspaceOptionsAreDedupedAndSorted() {
+        let sessions = [
+            DSHSessionSummary(id: "a", title: "A", updatedAt: 3, workspaceId: "ws-b", workspaceName: "beta"),
+            DSHSessionSummary(id: "b", title: "B", updatedAt: 2, workspaceId: "ws-a", workspaceName: "Alpha"),
+            DSHSessionSummary(id: "c", title: "C", updatedAt: 1, workspaceId: "ws-b", workspaceName: "beta"),
+            // Unfiled sessions contribute nothing to the picker.
+            DSHSessionSummary(id: "d", title: "D", updatedAt: 0, cwd: "/tmp"),
+        ]
+
+        let options = sessions.workspaceOptions()
+
+        XCTAssertEqual(options.map(\.id), ["ws-a", "ws-b"])
+        XCTAssertEqual(options.map(\.name), ["Alpha", "beta"])
+    }
 }

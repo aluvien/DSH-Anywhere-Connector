@@ -242,17 +242,10 @@ struct ConversationView: View {
 
                     if isRunning {
                         Button(action: { model.cancelTurn(for: sessionID) }) {
-                            // Drawn rather than a symbol: `stop.circle.fill`
-                            // renders as a thin ring around a bare square on the
-                            // bar, which read as a tiny floating glyph instead of
-                            // a button the same weight as send.
-                            ZStack {
-                                Circle().fill(.red)
-                                RoundedRectangle(cornerRadius: 2)
-                                    .fill(.white)
-                                    .frame(width: 11, height: 11)
-                            }
-                            .frame(width: 28, height: 28)
+                            // The stock symbol, matching the send button's weight.
+                            Image(systemName: "stop.circle.fill")
+                                .font(.title)
+                                .foregroundStyle(.red)
                         }
                         .accessibilityLabel("Stop turn")
                     } else {

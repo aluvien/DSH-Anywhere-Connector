@@ -97,7 +97,19 @@ struct SessionListView: View {
                     // read as a second colour.
                     HStack(spacing: 0) {
                         Menu {
-                            Button { model.createSession() } label: {
+                            // A submenu, because the workspace decides whether
+                            // the session shows up in the list afterwards.
+                            Menu {
+                                ForEach(model.workspaces) { workspace in
+                                    Button { model.createSession(in: workspace) } label: {
+                                        Label(workspace.name, systemImage: "folder")
+                                    }
+                                }
+                                if !model.workspaces.isEmpty { Divider() }
+                                Button { model.createSession() } label: {
+                                    Label("No workspace", systemImage: "tray")
+                                }
+                            } label: {
                                 Label("New session", systemImage: "plus")
                             }
                             Divider()

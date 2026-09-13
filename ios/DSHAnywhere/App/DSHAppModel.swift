@@ -231,16 +231,26 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
-    func createSession() {
+    /// Workspaces available when starting a session.
+    var workspaces: [DSHWorkspaceOption] { sessions.workspaceOptions() }
+
+    /// Starts a session, optionally inside a workspace.
+    ///
+    /// Choosing a workspace matters because a session created without one does
+    /// not appear in the list at all: the list only shows registered
+    /// workspaces, so an unfiled session was reachable once and then lost.
+    func createSession(in workspace: DSHWorkspaceOption? = nil) {
         let known = Set(sessions.map(\.id))
         // Remember which request asked for this session. The connector echoes it
         // back as the created event's messageId, which is what lets the reply be
         // matched to this tap instead of guessed at.
         let requestId = UUID().uuidString
         awaitingCreatedSession = requestId
+        var payload: [String: DSHJSONValue] = ["title": .string("New session")]
+        if let workspace { payload["workspaceId"] = .string(workspace.id) }
         let command = DSHCommand(requestId: requestId, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
-                                  payload: .object(["title": .string("New session")]))
+                                  payload: .object(payload))
         send(command)
         // Fallback for when `session.created` never arrives (dropped event, older
         // connector): re-request the list and open a session we did not know

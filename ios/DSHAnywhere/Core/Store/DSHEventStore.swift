@@ -181,6 +181,31 @@ public struct DSHSessionGroup: Identifiable, Sendable, Equatable {
     }
 }
 
+/// A workspace the user can start a session in.
+public struct DSHWorkspaceOption: Identifiable, Sendable, Equatable {
+    public let id: String
+    public let name: String
+
+    public init(id: String, name: String) { self.id = id; self.name = name }
+}
+
+public extension Array where Element == DSHSessionSummary {
+    /// Workspaces offered when starting a session, derived from the sessions on
+    /// hand rather than a dedicated endpoint: the wire protocol has no
+    /// workspace-list message, and adding one would change the routed command
+    /// union — and so force another Relay redeploy — to produce a list that
+    /// would almost always match this one.
+    func workspaceOptions() -> [DSHWorkspaceOption] {
+        var seen = Set<String>()
+        return compactMap { session in
+            guard let id = session.workspaceId, let name = session.workspaceName else { return nil }
+            guard seen.insert(id).inserted else { return nil }
+            return DSHWorkspaceOption(id: id, name: name)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+}
+
 public extension Array where Element == DSHSessionSummary {
     static let unfiledGroupTitle = "Other"
     static let flatGroupID = "__flat__"
