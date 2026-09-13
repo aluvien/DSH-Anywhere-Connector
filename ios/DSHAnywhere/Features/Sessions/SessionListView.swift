@@ -4,23 +4,44 @@ struct SessionListView: View {
     @EnvironmentObject private var model: DSHAppModel
     @State private var navigationPath: [String] = []
     @State private var didRefresh = false
+    @State private var collapsedGroups: Set<String> = []
+
+    /// Sessions outside every registered workspace land in one group rather than
+    /// one group per directory. Splitting them per cwd made the phone list
+    /// disagree with the Harness sidebar, which only lists registered
+    /// workspaces — 29 of 36 sessions were phantom workspaces in practice.
+    private static let unfiledGroup = "Other"
 
     private var groupedSessions: [(String, [DSHSessionSummary])] {
         let visibleSessions = model.sessions.filter {
             model.showArchivedSessions || $0.archived != true
         }
         let groups = Dictionary(grouping: visibleSessions) { session in
-            session.workspaceName ?? session.cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Other"
+            session.workspaceName ?? Self.unfiledGroup
         }
-        return groups.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-            .map { ($0, (groups[$0] ?? []).sorted { $0.updatedAt > $1.updatedAt }) }
+        // Registered workspaces first, the unfiled bucket last.
+        return groups.keys.sorted { left, right in
+            if left == Self.unfiledGroup { return false }
+            if right == Self.unfiledGroup { return true }
+            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
+        }
+        .map { ($0, (groups[$0] ?? []).sorted { $0.updatedAt > $1.updatedAt }) }
+    }
+
+    private func isExpanded(_ group: String) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedGroups.contains(group) },
+            set: { expanded in
+                if expanded { collapsedGroups.remove(group) } else { collapsedGroups.insert(group) }
+            }
+        )
     }
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
                 ForEach(groupedSessions, id: \.0) { group, sessions in
-                    Section(group) {
+                    Section(isExpanded: isExpanded(group)) {
                         ForEach(sessions) { session in
                             NavigationLink(value: session.id) {
                                 SessionRow(session: session)
@@ -42,6 +63,14 @@ struct SessionListView: View {
                                           systemImage: session.archived == true ? "tray.and.arrow.up" : "archivebox")
                                 }
                             }
+                        }
+                    } header: {
+                        HStack {
+                            Text(group)
+                            Spacer()
+                            Text("\(sessions.count)")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
                         }
                     }
                 }
@@ -87,6 +116,17 @@ struct SessionListView: View {
                     navigationPath.append(sessionID)
                 }
                 model.selectedSessionID = nil
+            }
+            // Command failures used to be invisible: the app stored the message
+            // on the model and never rendered it, so "New session" simply
+            // appeared to do nothing at all.
+            .alert("Something went wrong", isPresented: Binding(
+                get: { model.errorMessage != nil },
+                set: { presented in if !presented { model.errorMessage = nil } }
+            ), presenting: model.errorMessage) { _ in
+                Button("OK", role: .cancel) { model.errorMessage = nil }
+            } message: { message in
+                Text(message)
             }
             // The model requests the initial list after connection.ready.
             // Doing it from onAppear races the Relay WebSocket handshake.

@@ -206,6 +206,20 @@ describe('session list rows', () => {
     }).title).toBe('DSH-ANYWHERE')
   })
 
+  it('does not invent a workspace from the working directory', () => {
+    // Registering one phantom workspace per directory is what made the phone
+    // list disagree with the Harness sidebar, which only lists real workspaces.
+    const summary = normalizeSessionSummary({
+      sessionId: 'session-4',
+      cwd: '/Users/me/DSH-ANYWHERE',
+      updatedAt: 1,
+    })
+    expect(summary.workspaceId).toBeUndefined()
+    expect(summary.workspaceName).toBeUndefined()
+    // The path is still reported so a row can show where the session lives.
+    expect(summary.cwd).toBe('/Users/me/DSH-ANYWHERE')
+  })
+
   it('ignores a blank projection and keeps the flat field as a fallback', () => {
     expect(normalizeSessionSummary({
       sessionId: 'session-3',

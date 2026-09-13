@@ -1088,11 +1088,11 @@ function selectionFor(item: Record<string, unknown>): { provider?: string; model
 function workspaceFor(ctx: NativeContext | undefined, sessionId: string, cwd: string | undefined): { workspaceId?: string; workspaceName?: string } | undefined {
   const workspace = workspaceRegistryOf(ctx)?.list().find((entry) => entry.sessionIds.includes(sessionId))
   if (workspace !== undefined) return { workspaceId: workspace.id, workspaceName: workspace.title }
-  if (cwd === undefined) return undefined
-  // Protocol identifiers are capped at 256 chars while a filesystem path is
-  // not. Retain the distinctive tail rather than rejecting a full snapshot.
-  const workspaceId = `cwd:${cwd}`
-  return { workspaceId: workspaceId.length > 256 ? `cwd:${cwd.slice(-252)}` : workspaceId, workspaceName: basename(cwd) }
+  // A session outside every registered workspace gets no workspace identity.
+  // Synthesising `cwd:<path>` used to make the phone present one phantom
+  // workspace per directory (29 of 36 sessions in practice), so its list never
+  // matched the Harness sidebar, which only lists registered workspaces.
+  return undefined
 }
 
 /**

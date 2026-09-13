@@ -16,6 +16,10 @@ struct ConversationView: View {
     @State private var didRefresh = false
     /// Tracks the composer field so the keyboard can be dismissed explicitly.
     @FocusState private var isDraftFocused: Bool
+    /// False once the reader scrolls away from the newest output, so auto-follow
+    /// never fights a manual scroll.
+    @State private var isFollowingLatest = true
+    private static let bottomAnchor = "conversation-bottom"
 
     private var session: DSHSessionSummary? { model.sessions.first { $0.id == sessionID } }
     private var isRunning: Bool { model.turnState(for: sessionID).lowercased() == "running" }
@@ -45,8 +49,13 @@ struct ConversationView: View {
                             AssistantTurnView(block: block).id(block.id)
                         }
                     }
-                    ForEach(model.tools(for: sessionID)) { tool in
-                        ToolActivityCard(tool: tool)
+                    // Tool cards are progress, not history: they stay visible
+                    // while a turn runs so the work is watchable, then collapse
+                    // away when it ends so only the answers remain.
+                    if isRunning {
+                        ForEach(model.tools(for: sessionID)) { tool in
+                            ToolActivityCard(tool: tool)
+                        }
                     }
                     ForEach(model.commandResults(for: sessionID)) { result in
                         CommandResultCard(result: result)
@@ -67,6 +76,14 @@ struct ConversationView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.top, 80)
                     }
+                    // Tracks whether the viewport is at the newest output. It
+                    // vanishes as soon as the reader scrolls back, which is what
+                    // stops auto-follow from fighting a manual scroll.
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.bottomAnchor)
+                        .onAppear { isFollowingLatest = true }
+                        .onDisappear { isFollowingLatest = false }
                 }
                 .padding()
             }
@@ -104,10 +121,16 @@ struct ConversationView: View {
             .task(id: sessionID) {
                 model.sendModelCatalog()
             }
+            // Auto-follow only while the reader is already at the newest output.
+            // Scrolling back disarms it, so incoming work never yanks the view.
             .onChange(of: model.messages(for: sessionID).count) { _, _ in
-                if let id = model.messages(for: sessionID).last?.id {
-                    withAnimation { proxy.scrollTo(id, anchor: .bottom) }
-                }
+                scrollToLatest(proxy)
+            }
+            .onChange(of: model.tools(for: sessionID).count) { _, _ in
+                scrollToLatest(proxy)
+            }
+            .onChange(of: isRunning) { _, _ in
+                scrollToLatest(proxy)
             }
             .onChange(of: selectedPhoto) { _, item in
                 guard let item else { return }
@@ -237,6 +260,12 @@ struct ConversationView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    /// Keeps the newest output on screen, unless the reader has scrolled away.
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        guard isFollowingLatest else { return }
+        withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
     }
 
     private func send() {

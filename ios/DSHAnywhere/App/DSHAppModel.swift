@@ -133,10 +133,26 @@ final class DSHAppModel: ObservableObject {
     }
 
     func createSession() {
+        let known = Set(sessions.map(\.id))
         let command = DSHCommand(version: 1, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
                                   payload: .object(["title": .string("New session")]))
         send(command)
+        // `session.created` is what normally opens the new session. This is the
+        // fallback for when that event is dropped: re-request the list, and if a
+        // session we did not know about appeared, open it. Either path makes the
+        // tap do something visible instead of silently having no effect.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .seconds(1))
+            guard self.selectedSessionID == nil else { return }
+            self.refreshSessions()
+            try? await Task.sleep(for: .seconds(1))
+            guard self.selectedSessionID == nil else { return }
+            if let created = self.sessions.first(where: { !known.contains($0.id) }) {
+                self.selectedSessionID = created.id
+            }
+        }
     }
 
     func refreshSessions(includeArchived: Bool? = nil) {
