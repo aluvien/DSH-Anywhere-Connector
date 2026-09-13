@@ -1001,7 +1001,7 @@ function parseAfter(rawUrl: string | undefined): number {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
-function normalizeSessionSummary(
+export function normalizeSessionSummary(
   value: unknown,
   ctx?: NativeContext,
   metadata?: SessionMetadataStore,
@@ -1026,9 +1026,7 @@ function normalizeSessionSummary(
     ? item.sessionId
     : typeof item.id === 'string' ? item.id : 'unknown'
   const cwd = typeof item.cwd === 'string' ? item.cwd : undefined
-  const explicitTitle = typeof item.title === 'string' && item.title.trim().length > 0
-    ? item.title.trim()
-    : undefined
+  const explicitTitle = sessionTitleOf(item)
   const workspace = workspaceFor(ctx, id, cwd)
   const selection = selectionFor(item)
   const permissionMode = metadata?.permission(id)
@@ -1056,6 +1054,23 @@ function normalizeLiveSession(value: unknown, ctx?: NativeContext, metadata?: Se
     cwd: header.cwd,
     updatedAt: Date.now(),
   }, ctx, metadata)
+}
+
+/**
+ * A session's display title lives in the `title` projection, not on the list
+ * entry: `SessionSummary` carries only sessionId/updatedAt/cwd/projections, and
+ * the Harness documents that projection as "the shape the client list rows
+ * consume". Reading `item.title` yielded undefined for every session, so each
+ * row fell back to the folder name and an entire workspace looked like a stack
+ * of identically named duplicates.
+ */
+function sessionTitleOf(item: Record<string, unknown>): string | undefined {
+  const values = recordOf(recordOf(item.projections).values)
+  const projected = typeof values.title === 'string' ? values.title.trim() : ''
+  if (projected.length > 0) return projected
+  // Tolerated for older Harness builds that may have exposed a plain field.
+  const flat = typeof item.title === 'string' ? item.title.trim() : ''
+  return flat.length > 0 ? flat : undefined
 }
 
 function selectionFor(item: Record<string, unknown>): { provider?: string; model?: string; reasoningEffort?: string } | undefined {

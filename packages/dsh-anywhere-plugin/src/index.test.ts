@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { PairingRateLimiter, apply, inject, normalizeSessionEvent, normalizeSessionEvents } from './index.js'
+import { PairingRateLimiter, apply, inject, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -180,5 +180,39 @@ describe('DSH Anywhere pairing security', () => {
     expect(await request()).toBe(401)
     expect(await request()).toBe(401)
     expect(await request()).toBe(429)
+  })
+})
+
+describe('session list rows', () => {
+  it('reads the display title from the title projection', () => {
+    // SessionSummary has no `title` field, so reading item.title made every row
+    // fall back to the folder name and a whole workspace looked like a stack of
+    // identically named duplicates.
+    const summary = normalizeSessionSummary({
+      sessionId: 'session-1',
+      cwd: '/Users/me/DSH-ANYWHERE',
+      updatedAt: 1,
+      projections: { asOfSeq: 3, values: { title: '\u54c8\u54c8' } },
+    })
+    expect(summary.title).toBe('\u54c8\u54c8')
+  })
+
+  it('falls back to the folder name only when no title exists', () => {
+    expect(normalizeSessionSummary({
+      sessionId: 'session-2',
+      cwd: '/Users/me/DSH-ANYWHERE',
+      updatedAt: 1,
+      projections: { asOfSeq: 1, values: { title: null } },
+    }).title).toBe('DSH-ANYWHERE')
+  })
+
+  it('ignores a blank projection and keeps the flat field as a fallback', () => {
+    expect(normalizeSessionSummary({
+      sessionId: 'session-3',
+      cwd: '/Users/me/DSH-ANYWHERE',
+      updatedAt: 1,
+      title: 'Flat title',
+      projections: { asOfSeq: 1, values: { title: '   ' } },
+    }).title).toBe('Flat title')
   })
 })
