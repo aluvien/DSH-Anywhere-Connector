@@ -197,4 +197,33 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(options.map(\.id), ["ws-a", "ws-b"])
         XCTAssertEqual(options.map(\.name), ["Alpha", "beta"])
     }
+
+    func testOnlyTheRunningTurnsToolCallsAreCurrent() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func event(_ type: String, _ sequence: Int64, _ payload: DSHJSONValue) -> DSHEvent {
+            DSHEvent(envelope: DSHEnvelope(messageId: "m\(sequence)", deviceId: "d", machineId: "m",
+                                           sessionId: "s", sequence: sequence, type: type, payload: payload))
+        }
+        func tool(_ id: String) -> DSHJSONValue {
+            .object(["id": .string(id), "name": .string("bash"),
+                     "status": .string("succeeded"), "detail": .string("ok")])
+        }
+
+        // First turn: two calls.
+        reducer.reduce(event("turn.state.changed", 1, .object(["sessionId": .string("s"), "state": .string("running")])), into: &state)
+        reducer.reduce(event("tool.completed", 2, tool("t1")), into: &state)
+        reducer.reduce(event("tool.completed", 3, tool("t2")), into: &state)
+        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.map(\.id), ["t1", "t2"])
+        XCTAssertEqual(state.toolsBySession["s"]?.count, 2)
+
+        // Second turn starts: progress resets, but history is retained.
+        reducer.reduce(event("turn.state.changed", 4, .object(["sessionId": .string("s"), "state": .string("running")])), into: &state)
+        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.count, 0)
+        XCTAssertEqual(state.toolsBySession["s"]?.count, 2, "history must not be discarded")
+
+        reducer.reduce(event("tool.completed", 5, tool("t3")), into: &state)
+        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.map(\.id), ["t3"])
+        XCTAssertEqual(state.toolsBySession["s"]?.map(\.id), ["t1", "t2", "t3"])
+    }
 }

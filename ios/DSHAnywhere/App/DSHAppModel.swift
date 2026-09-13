@@ -68,6 +68,11 @@ final class DSHAppModel: ObservableObject {
         state.toolsBySession[sessionID, default: []]
     }
 
+    /// Tool calls belonging to the turn that is running now.
+    func currentTurnTools(for sessionID: String) -> [DSHToolActivity] {
+        state.currentTurnToolsBySession[sessionID, default: []]
+    }
+
     func turnState(for sessionID: String) -> String {
         state.turnStateBySession[sessionID, default: "idle"]
     }

@@ -4,6 +4,10 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var sessions: [DSHSessionSummary] = []
     public var messagesBySession: [String: [DSHChatMessage]] = [:]
     public var toolsBySession: [String: [DSHToolActivity]] = [:]
+    /// Tool calls made by the turn currently running, reset at each turn start.
+    /// The full history above never shrinks, so rendering it while a turn runs
+    /// made every earlier turn's calls reappear at once.
+    public var currentTurnToolsBySession: [String: [DSHToolActivity]] = [:]
     public var pendingApprovals: [DSHApprovalRequest] = []
     public var pendingQuestions: [DSHQuestionRequest] = []
     public var turnStateBySession: [String: String] = [:]
@@ -77,8 +81,10 @@ public struct DSHEventReducer: Sendable {
             state.messagesBySession[sessionId] = messages
         case .toolStarted(let tool):
             appendOrReplace(tool, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
+            appendOrReplace(tool, in: &state.currentTurnToolsBySession, sessionId: event.envelope.sessionId)
         case .toolCompleted(let tool):
             appendOrReplace(tool, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
+            appendOrReplace(tool, in: &state.currentTurnToolsBySession, sessionId: event.envelope.sessionId)
         case .approvalRequested(let approval):
             if !state.pendingApprovals.contains(where: { $0.id == approval.id }) {
                 state.pendingApprovals.append(approval)
@@ -93,6 +99,11 @@ public struct DSHEventReducer: Sendable {
             state.pendingQuestions.removeAll { $0.id == resolution.id }
         case .turnStateChanged(let turn):
             state.turnStateBySession[turn.sessionId] = turn.state
+            if turn.state.lowercased() == "running" {
+                // Start a fresh progress list, so the transcript shows this
+                // turn's work rather than replaying every earlier call.
+                state.currentTurnToolsBySession[turn.sessionId] = []
+            }
         case .modelCatalog(let catalog):
             state.modelCatalog = catalog
         case .usageUpdated(let update):

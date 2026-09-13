@@ -53,7 +53,10 @@ struct ConversationView: View {
                     // while a turn runs so the work is watchable, then collapse
                     // away when it ends so only the answers remain.
                     if isRunning {
-                        ForEach(model.tools(for: sessionID)) { tool in
+                        // Only this turn's calls: the full history is
+                        // append-only, so showing it here made a new turn open
+                        // with every previous bash card already on screen.
+                        ForEach(model.currentTurnTools(for: sessionID)) { tool in
                             ToolActivityCard(tool: tool)
                         }
                     }
@@ -126,7 +129,7 @@ struct ConversationView: View {
             .onChange(of: model.messages(for: sessionID).count) { _, _ in
                 scrollToLatest(proxy)
             }
-            .onChange(of: model.tools(for: sessionID).count) { _, _ in
+            .onChange(of: model.currentTurnTools(for: sessionID).count) { _, _ in
                 scrollToLatest(proxy)
             }
             .onChange(of: isRunning) { _, _ in
