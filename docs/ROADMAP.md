@@ -80,7 +80,12 @@ git 历史。本文件记录**尚未实施**的剩余工作：阶段 4。
   - 校验失败统一返回同一个错误，避免调用方据此探测某个码是否存在。
   - 新增 3 项测试：签发/单次消费/不可改投/权限边界、旧 pairingSecret 仍然可用、
     过期与重放。
-  - **Connector 与 App 尚未改用**：目前仍走长期密钥，码的签发入口只有测试覆盖。
+  - **Connector 与 App 已接入**（build 21）：`dsh-anywhere pair` 用机器令牌换码并输出
+    code/expiresAt/pairingLink；协议链接与 iOS 的 DSHPairingLink 都能携带 code；配对页
+    仍是一个输入框，由 DSHPairingCredential.detect 按形状区分码与密钥（两者长度不重叠，
+    不需要用户选模式）。旧的长期密钥链接保持可用，既有安装无需重新配对。
+  - 实测：在本机运行 `dsh-anywhere pair` 得到 relay 回应的 HTTP 404——因为线上还是
+    r6、没有该端点。这同时验证了命令可用，以及 relay 拒绝时不会把空码交给用户显示。
 
 ### 缺口（以下均需先定账号策略）
 
