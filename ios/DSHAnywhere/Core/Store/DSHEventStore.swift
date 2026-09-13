@@ -182,8 +182,8 @@ public enum DSHSessionGrouping: String, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .byWorkspace: return "By workspace"
-        case .flat: return "Flat list"
+        case .byWorkspace: return DSHLocalization.string("By workspace")
+        case .flat: return DSHLocalization.string("Flat list")
         }
     }
 }

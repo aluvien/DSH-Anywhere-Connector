@@ -205,6 +205,21 @@ final class DSHProtocolTests: XCTestCase {
             XCTAssertEqual(error, .http(status: 404, message: "not_found"))
         }
     }
+    func testLanguageIdentifiersMatchTheLocalizationFolders() {
+        // The raw values are the .lproj folder names the catalogue compiles to.
+        // A mismatch would not fail to build; it would silently serve English,
+        // which is exactly the kind of bug nobody notices until a user reports it.
+        XCTAssertEqual(DSHLanguage.english.rawValue, "en")
+        XCTAssertEqual(DSHLanguage.simplifiedChinese.rawValue, "zh-Hans")
+        XCTAssertEqual(DSHLanguage.allCases.count, 3)
+    }
+
+    func testFollowSystemMeansNoLocaleOverride() {
+        XCTAssertNil(DSHLanguage.system.locale, "system must fall through to the device")
+        XCTAssertEqual(DSHLanguage.simplifiedChinese.locale?.identifier, "zh-Hans")
+        XCTAssertEqual(DSHLanguage.english.locale?.identifier, "en")
+    }
+
 }
 
 

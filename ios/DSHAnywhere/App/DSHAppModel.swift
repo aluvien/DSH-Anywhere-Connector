@@ -19,6 +19,10 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.object(forKey: DSHAppModel.groupingKey) as? Bool ?? true
     @Published var collapsedSessionGroups: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.collapsedGroupsKey) ?? [])
+    /// Interface language. "Follow the device" is the default, and the choice
+    /// survives relaunch like the other browsing preferences.
+    @Published var language: DSHLanguage =
+        DSHLanguage(rawValue: UserDefaults.standard.string(forKey: DSHAppModel.languageKey) ?? "") ?? .system
     @Published var errorMessage: String?
     /// Every Mac this iPhone is paired with, and which one is active.
     @Published private(set) var machines: [DSHRemoteProfile]
@@ -36,6 +40,7 @@ final class DSHAppModel: ObservableObject {
     private var awaitingCreatedSession: String?
     private let profiles = DSHProfileStore()
     static let groupingKey = "dsh-anywhere.group-by-workspace"
+    static let languageKey = "dsh-anywhere.language"
     static let collapsedGroupsKey = "dsh-anywhere.collapsed-groups"
 
     init(transport: any DSHAppTransport = DSHRemoteTransport(),
@@ -102,13 +107,13 @@ final class DSHAppModel: ObservableObject {
         let trimmedSecret = pairingSecret.trimmingCharacters(in: .whitespacesAndNewlines)
         let address = serverAddress.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedMachineID.isEmpty else {
-            errorMessage = "Enter the machine ID shown by DSH Anywhere Connector."
+            errorMessage = DSHLocalization.string("Enter the machine ID shown by DSH Anywhere Connector.")
             return
         }
         // One field accepts either shape: an 8-character one-time code or the
         // longer pairing secret, distinguished by length.
         guard let credential = DSHPairingCredential.detect(trimmedSecret) else {
-            errorMessage = "Enter the pairing code or secret shown by DSH Anywhere Connector."
+            errorMessage = DSHLocalization.string("Enter the pairing code or secret shown by DSH Anywhere Connector.")
             return
         }
         guard !address.isEmpty else {
@@ -292,6 +297,14 @@ final class DSHAppModel: ObservableObject {
 
     var sessionGrouping: DSHSessionGrouping {
         groupsSessionsByWorkspace ? .byWorkspace : .flat
+    }
+
+    func setLanguage(_ value: DSHLanguage) {
+        language = value
+        UserDefaults.standard.set(value.rawValue, forKey: Self.languageKey)
+        // Plain strings built in helpers resolve immediately; SwiftUI text
+        // follows the environment locale the root view sets from `language`.
+        DSHLocalization.language = value
     }
 
     func setGroupsSessionsByWorkspace(_ value: Bool) {

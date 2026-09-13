@@ -110,6 +110,19 @@ struct SettingsView: View {
                     Text("Devices paired to this Mac, as reported by the relay. Revoking one signs that device out immediately.")
                 }
 
+                Section {
+                    Picker("Language", selection: Binding(
+                        get: { model.language },
+                        set: model.setLanguage
+                    )) {
+                        ForEach(DSHLanguage.allCases) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                } footer: {
+                    Text("Follow System uses your device language. The choice applies immediately.")
+                }
+
                 Section("Connection") {
                     LabeledContent("Machine") {
                         Text(model.machineName)

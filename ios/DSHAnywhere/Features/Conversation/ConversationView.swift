@@ -391,21 +391,23 @@ private struct PermissionMenu: View {
 
     private func permissionLabel(_ value: String) -> String {
         switch value {
-        case "ask": return "Ask"
-        case "never": return "No approvals"
-        case "read-only": return "Read only"
-        case "danger-full-access": return "Full access"
-        default: return "Workspace"
+        case "ask": return DSHLocalization.string("Ask")
+        case "never": return DSHLocalization.string("No approvals")
+        case "read-only": return DSHLocalization.string("Read only")
+        case "danger-full-access": return DSHLocalization.string("Full access")
+        default: return DSHLocalization.string("Workspace")
         }
     }
 
     private var permissionModes: [(mode: String, title: String, icon: String)] {
+        // Titles are localized here rather than left to `Label`, which only
+        // localizes a literal and takes this value as a plain String.
         [
-            ("ask", "Ask every time", "questionmark.circle"),
-            ("never", "Never ask", "checkmark.circle"),
-            ("read-only", "Read only", "eye"),
-            ("workspace-write", "Workspace changes", "folder"),
-            ("danger-full-access", "Full access", "exclamationmark.triangle")
+            ("ask", DSHLocalization.string("Ask every time"), "questionmark.circle"),
+            ("never", DSHLocalization.string("Never ask"), "checkmark.circle"),
+            ("read-only", DSHLocalization.string("Read only"), "eye"),
+            ("workspace-write", DSHLocalization.string("Workspace changes"), "folder"),
+            ("danger-full-access", DSHLocalization.string("Full access"), "exclamationmark.triangle")
         ]
     }
 }

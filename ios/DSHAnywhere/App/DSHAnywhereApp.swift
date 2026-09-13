@@ -4,6 +4,11 @@ import SwiftUI
 struct DSHAnywhereApp: App {
     @StateObject private var model = DSHAppModel()
 
+    init() {
+        // Plain strings built in helpers read this; keep it correct from launch.
+        DSHLocalization.language = DSHAppModel().language
+    }
+
     var body: some Scene {
         WindowGroup {
             DSHRootView()
@@ -23,6 +28,10 @@ struct DSHRootView: View {
                 PairingView()
             }
         }
+        // SwiftUI resolves `Text("…")` against this locale, so switching the
+        // preference re-renders every literal without a relaunch and without a
+        // bundle-swizzling hack.
+        .environment(\.locale, model.language.locale ?? Locale.current)
         .alert("Something went wrong", isPresented: Binding(get: {
             model.errorMessage != nil
         }, set: { if !$0 { model.errorMessage = nil } })) {

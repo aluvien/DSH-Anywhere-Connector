@@ -336,6 +336,61 @@ private enum DSHTranscriptArrival {
 
 }
 
+/// The language the interface is shown in.
+public enum DSHLanguage: String, CaseIterable, Sendable, Identifiable {
+    case system
+    case simplifiedChinese = "zh-Hans"
+    case english = "en"
+
+    public var id: String { rawValue }
+
+    /// nil means "follow the device".
+    public var locale: Locale? {
+        self == .system ? nil : Locale(identifier: rawValue)
+    }
+
+    /// Each option is written in its own language, so it stays readable even
+    /// when the interface is in a language you cannot read.
+    public var displayName: String {
+        switch self {
+        case .system: return DSHLocalization.string("Follow System")
+        case .simplifiedChinese: return "简体中文"
+        case .english: return "English"
+        }
+    }
+}
+
+/// Localizes strings that are built outside SwiftUI.
+///
+/// `Text("…")` follows the environment locale, so views need no help. Plain
+/// strings produced by helpers (`permissionLabel`, the connection state, the
+/// model's error messages) do not, so they come through here.
+public enum DSHLocalization {
+    /// Guarded by `lock`. The `nonisolated(unsafe)` annotation is what tells the
+    /// compiler that the locking is the safety argument — it is the supported
+    /// escape hatch, not a way of ignoring the check.
+    nonisolated(unsafe) private static var storedLanguage: DSHLanguage = .system
+    private static let lock = NSLock()
+
+    /// Kept in step with the stored preference by the app model.
+    public static var language: DSHLanguage {
+        get { lock.withLock { storedLanguage } }
+        set { lock.withLock { storedLanguage = newValue } }
+    }
+
+    private static var selectedBundle: Bundle? {
+        guard let locale = language.locale,
+              let path = Bundle.main.path(forResource: locale.identifier, ofType: "lproj"),
+              let bundle = Bundle(path: path) else { return nil }
+        return bundle
+    }
+
+    public static func string(_ key: String) -> String {
+        selectedBundle?.localizedString(forKey: key, value: key, table: nil)
+            ?? Bundle.main.localizedString(forKey: key, value: key, table: nil)
+    }
+}
+
 /// One row of the transcript, in the order the events actually arrived.
 public enum DSHTranscriptEntry: Identifiable, Sendable, Equatable {
     case turn(DSHTranscriptBlock)

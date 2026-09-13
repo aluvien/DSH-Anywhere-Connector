@@ -208,11 +208,14 @@ struct SessionListView: View {
 
     private var connectionLabel: String {
         switch model.connectionState {
-        case .connected: return "Connected"
-        case .connecting: return "Connecting…"
-        case .reconnecting(let attempt): return "Reconnecting (\(attempt))…"
-        case .failed: return "Connection failed"
-        case .disconnected: return "Disconnected"
+        case .connected: return DSHLocalization.string("Connected")
+        case .connecting: return DSHLocalization.string("Connecting…")
+        // Built from a translated stem rather than an interpolated key: a
+        // format-string key would have to match the catalogue exactly.
+        case .reconnecting(let attempt):
+            return "\(DSHLocalization.string("Connecting…")) (\(attempt))"
+        case .failed: return DSHLocalization.string("Connection failed")
+        case .disconnected: return DSHLocalization.string("Disconnected")
         }
     }
 

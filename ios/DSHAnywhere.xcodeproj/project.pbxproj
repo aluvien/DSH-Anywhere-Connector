@@ -24,6 +24,7 @@
 		B00000000000000000000010 /* Features/Settings/SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000010 /* Features/Settings/SettingsView.swift */; };
 		B00000000000000000000011 /* Core/Store/DSHProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */; };
 		B0000000000000000000000E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000E /* Assets.xcassets */; };
+		B00000000000000000000012 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000020 /* Localizable.xcstrings */; };
 		B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000101 /* Core/DSHProtocolTests.swift */; };
 		B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000102 /* Core/DSHEventStoreTests.swift */; };
 		B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */; };
@@ -58,6 +59,7 @@
 		F00000000000000000000010 /* Features/Settings/SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/SettingsView.swift; sourceTree = "<group>"; };
 		F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Store/DSHProfileStore.swift; sourceTree = "<group>"; };
 		F0000000000000000000000E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F00000000000000000000020 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		F00000000000000000000101 /* Core/DSHProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProtocolTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000102 /* Core/DSHEventStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHEventStoreTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHWebSocketConnectionTests.swift; sourceTree = "<group>"; };
@@ -113,6 +115,7 @@
 				F00000000000000000000010 /* Features/Settings/SettingsView.swift */,
 				F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */,
 				F0000000000000000000000E /* Assets.xcassets */,
+				F00000000000000000000020 /* Localizable.xcstrings */,
 			);
 			path = DSHAnywhere;
 			sourceTree = "<group>";
@@ -219,6 +222,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B0000000000000000000000E /* Assets.xcassets in Resources */,
+				B00000000000000000000012 /* Localizable.xcstrings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -305,7 +309,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
@@ -330,7 +334,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
