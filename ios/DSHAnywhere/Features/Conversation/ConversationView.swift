@@ -182,18 +182,22 @@ struct ConversationView: View {
             }
 
             HStack(alignment: .bottom, spacing: 8) {
+                // Icon per button must say what the button does: "/" for the
+                // slash commands, a picture for the photo picker, and the
+                // paperclip for files. The old trio used a "+" for commands and
+                // gave the paperclip to photos, which read as the opposite.
                 Button { showCommandMenu = true } label: {
-                    Image(systemName: "plus.circle.fill").font(.title3)
+                    Image(systemName: "slash.circle").font(.title3)
                 }
                 .accessibilityLabel("Commands")
 
                 PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                    Image(systemName: "paperclip").font(.title3)
+                    Image(systemName: "photo").font(.title3)
                 }
                 .accessibilityLabel("Attach photo")
 
                 Button { showFileImporter = true } label: {
-                    Image(systemName: "doc.badge.plus").font(.title3)
+                    Image(systemName: "paperclip").font(.title3)
                 }
                 .accessibilityLabel("Attach file")
 
@@ -348,8 +352,10 @@ private struct UsageFooter: View {
                 metric("chart.bar.xaxis", tokenText)
                 separator
                 metric("externaldrive.badge.checkmark", cacheText)
-                Spacer(minLength: 0)
             }
+            // Centred rather than left-aligned: the composer is a narrow band on
+            // a phone, so a centred row reads as a balanced footer under it.
+            .frame(maxWidth: .infinity, alignment: .center)
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -431,10 +437,22 @@ private struct CommandMenuSheet: View {
         NavigationStack {
             List(commands, id: \.0) { item in
                 Button { onCommand(item.0) } label: {
-                    Label { Text(item.1).foregroundStyle(.primary) } icon: {
+                    Label {
+                        // Show the literal command the row runs, so the sheet
+                        // teaches the slash syntax instead of only describing it:
+                        // icon, "/command", a space, then the Chinese gloss.
+                        HStack(spacing: 0) {
+                            Text("/\(item.0)")
+                                .font(.body.monospaced())
+                                .foregroundStyle(.tint)
+                            Text(" \(item.1)")
+                                .foregroundStyle(.primary)
+                        }
+                    } icon: {
                         Image(systemName: item.2).foregroundStyle(.tint)
                     }
                 }
+                .accessibilityLabel("/\(item.0) \(item.1)")
             }
             .navigationTitle("Commands")
             .toolbar {
