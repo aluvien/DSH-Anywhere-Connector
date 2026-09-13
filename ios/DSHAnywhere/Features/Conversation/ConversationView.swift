@@ -466,11 +466,12 @@ private struct UsageFooter: View {
 
     private var cacheText: String {
         guard let hit = usage?.cacheHitPercent else { return "—" }
-        // One decimal, and rounded rather than truncated: at one decimal a
-        // truncated 99.9% would still read 99.9 only by luck, and the old
-        // integer form made 99.0 and 99.9 indistinguishable — which is exactly
-        // the range where cache behaviour matters.
-        return String(format: "%.1f%%", hit)
+        // Two decimals, rounded rather than truncated. The integer form this
+        // replaced made 99.0 and 99.9 identical — exactly the range where cache
+        // behaviour matters. Note the resolution behind the second decimal
+        // depends on session size: at ~700K tokens one step of 0.01% is roughly
+        // 7,000 tokens, so in a large session it will rarely move.
+        return String(format: "%.2f%%", hit)
     }
 
     private func compactNumber(_ value: Double?) -> String {
