@@ -66,6 +66,50 @@ struct SettingsView: View {
                     Text("Pairing another Mac adds it here instead of replacing the current one. Tap to switch, swipe to remove.")
                 }
 
+                Section {
+                    if let error = model.devicesError {
+                        Text(error)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else if model.pairedDevices.isEmpty {
+                        Text("No devices reported.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.pairedDevices) { device in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(device.name)
+                                    Text(Date(timeIntervalSince1970: Double(device.createdAt) / 1_000),
+                                         style: .relative)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if device.deviceId == model.currentDeviceId {
+                                    // The Relay refuses a self-revoke, so the
+                                    // row says why instead of offering it.
+                                    Text("This iPhone")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                if device.deviceId != model.currentDeviceId {
+                                    Button(role: .destructive) {
+                                        model.revokeDevice(device)
+                                    } label: {
+                                        Label("Revoke", systemImage: "trash")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Devices")
+                } footer: {
+                    Text("Devices paired to this Mac, as reported by the relay. Revoking one signs that device out immediately.")
+                }
+
                 Section("Connection") {
                     LabeledContent("Machine") {
                         Text(model.machineName)
@@ -108,6 +152,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .task { model.refreshPairedDevices() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }

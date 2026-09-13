@@ -113,4 +113,88 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(block.visibleMessages.map(\.id), ["a2"])
         XCTAssertEqual(block.reasoning, "thinking")
     }
+
+    // MARK: - Relay device management
+
+    private func stubbedSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DSHStubURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    func testDeviceListSendsTheDeviceTokenAndDecodesTheRelayShape() async throws {
+        DSHStubURLProtocol.handler = { _ in
+            (200, Data(#"{"devices":[{"deviceId":"device_1","name":"iPhone","createdAt":1735000000000}]}"#.utf8))
+        }
+        defer { DSHStubURLProtocol.handler = nil }
+
+        let client = DSHAPIClient(relayBaseURL: URL(string: "https://relay.example.com")!,
+                                  session: stubbedSession())
+        let devices = try await client.devices(machineId: "mac-1", token: "device-token")
+
+        XCTAssertEqual(devices.map(\.deviceId), ["device_1"])
+        XCTAssertEqual(devices.first?.name, "iPhone")
+        // The path and bearer header are the parts a refactor can silently break.
+        XCTAssertEqual(DSHStubURLProtocol.lastRequest?.httpMethod, "GET")
+        XCTAssertEqual(DSHStubURLProtocol.lastRequest?.url?.path, "/v1/machines/mac-1/devices")
+        XCTAssertEqual(DSHStubURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer device-token")
+    }
+
+    func testRevokeUsesDeleteOnTheDevicePath() async throws {
+        DSHStubURLProtocol.handler = { _ in (200, Data(#"{"revoked":true,"deviceId":"device_2"}"#.utf8)) }
+        defer { DSHStubURLProtocol.handler = nil }
+
+        let client = DSHAPIClient(relayBaseURL: URL(string: "https://relay.example.com")!,
+                                  session: stubbedSession())
+        try await client.revokeDevice(machineId: "mac-1", deviceId: "device_2", token: "device-token")
+
+        XCTAssertEqual(DSHStubURLProtocol.lastRequest?.httpMethod, "DELETE")
+        XCTAssertEqual(DSHStubURLProtocol.lastRequest?.url?.path, "/v1/machines/mac-1/devices/device_2")
+    }
+
+    func testDeviceListSurfacesTheRelayErrorInsteadOfEmptySuccess() async throws {
+        // An older relay answers 404 here; that must surface as an error, not as
+        // a machine that happens to have no devices.
+        DSHStubURLProtocol.handler = { _ in (404, Data(#"{"error":"not_found"}"#.utf8)) }
+        defer { DSHStubURLProtocol.handler = nil }
+
+        let client = DSHAPIClient(relayBaseURL: URL(string: "https://relay.example.com")!,
+                                  session: stubbedSession())
+        do {
+            _ = try await client.devices(machineId: "mac-1", token: "device-token")
+            XCTFail("expected the relay error to surface")
+        } catch let error as DSHAPIError {
+            XCTAssertEqual(error, .http(status: 404, message: "not_found"))
+        }
+    }
+}
+
+
+/// Intercepts requests so the Relay HTTP calls can be asserted without a server.
+final class DSHStubURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) -> (Int, Data))?
+    nonisolated(unsafe) static var lastRequest: URLRequest?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lastRequest = request
+        guard let handler = Self.handler else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        let (status, data) = handler(request)
+        guard let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil) else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

@@ -22,6 +22,11 @@ final class DSHAppModel: ObservableObject {
     @Published var errorMessage: String?
     /// Every Mac this iPhone is paired with, and which one is active.
     @Published private(set) var machines: [DSHRemoteProfile]
+    /// Devices paired to the active machine, as the Relay reports them.
+    @Published private(set) var pairedDevices: [DSHRelayDevice] = []
+    /// Kept apart from `errorMessage` so a device-list failure does not pop an
+    /// alert over whatever the user is doing in Settings.
+    @Published var devicesError: String?
 
     private let transport: any DSHAppTransport
     private let reducer = DSHEventReducer()
@@ -152,6 +157,39 @@ final class DSHAppModel: ObservableObject {
             self.isPaired = !self.machines.isEmpty
         }
     }
+
+    /// Loads the device list for the active machine from the Relay. The Relay
+    /// refuses this on older builds, so a failure is reported in Settings rather
+    /// than treated as a broken app.
+    func refreshPairedDevices() {
+        guard isPaired else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.pairedDevices = try await self.transport.pairedDevices()
+                self.devicesError = nil
+            } catch {
+                self.pairedDevices = []
+                self.devicesError = error.localizedDescription
+            }
+        }
+    }
+
+    func revokeDevice(_ device: DSHRelayDevice) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.transport.revokeDevice(device.deviceId)
+                self.refreshPairedDevices()
+            } catch {
+                self.devicesError = error.localizedDescription
+            }
+        }
+    }
+
+    /// The device id of the phone holding this app, so Settings can label it and
+    /// avoid offering a self-revoke the Relay would refuse anyway.
+    var currentDeviceId: String? { profiles.activeProfile?.deviceId }
 
     func connect() {
         guard isPaired, eventTask == nil else { return }

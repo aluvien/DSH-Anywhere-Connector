@@ -13,6 +13,10 @@ protocol DSHAppTransport: Sendable {
     func setActiveMachine(_ machineId: String) async
     /// Forgets one paired Mac, leaving the others intact.
     func removeMachine(_ machineId: String) async throws
+    /// Devices paired to the active machine, straight from the Relay.
+    func pairedDevices() async throws -> [DSHRelayDevice]
+    /// Revokes one device. The Relay refuses to let a device revoke itself.
+    func revokeDevice(_ deviceId: String) async throws
 }
 
 actor DSHRemoteTransport: DSHAppTransport {
@@ -91,6 +95,18 @@ actor DSHRemoteTransport: DSHAppTransport {
         store.remove(machineId)
     }
 
+    func pairedDevices() async throws -> [DSHRelayDevice] {
+        let (profile, token) = try loadCredentials()
+        return try await DSHAPIClient(relayBaseURL: profile.relayBaseURL)
+            .devices(machineId: profile.machineId, token: token)
+    }
+
+    func revokeDevice(_ deviceId: String) async throws {
+        let (profile, token) = try loadCredentials()
+        try await DSHAPIClient(relayBaseURL: profile.relayBaseURL)
+            .revokeDevice(machineId: profile.machineId, deviceId: deviceId, token: token)
+    }
+
     private func loadCredentials() throws -> (DSHRemoteProfile, String) {
         guard let profile = store.activeProfile,
               let token = try tokenStore.read(account: profile.deviceId) else {
@@ -166,6 +182,10 @@ actor DSHPreviewTransport: DSHAppTransport {
     func setActiveMachine(_ machineId: String) async {}
 
     func removeMachine(_ machineId: String) async throws {}
+
+    func pairedDevices() async throws -> [DSHRelayDevice] { [] }
+
+    func revokeDevice(_ deviceId: String) async throws {}
 
     private func emit(type: String, sessionID: String? = nil, payload: DSHJSONValue) {
         let envelope = DSHEnvelope(messageId: UUID().uuidString, deviceId: deviceID,
