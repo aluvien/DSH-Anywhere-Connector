@@ -191,6 +191,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         version: PROTOCOL_VERSION,
         schemaRevision: RELAY_SCHEMA_REVISION,
         build: "2026-09-13",
+        // Device management did not change the routed wire schema, so the
+        // revision stays put; this flag is how a caller tells whether the
+        // deployed Relay actually serves those routes yet.
+        deviceManagement: true,
       });
       return;
     }
