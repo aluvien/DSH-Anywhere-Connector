@@ -154,6 +154,77 @@ private extension DSHEvent {
     }
 }
 
+/// How the sessions list arranges what it shows.
+public enum DSHSessionGrouping: String, CaseIterable, Sendable {
+    case byWorkspace
+    case flat
+
+    public var title: String {
+        switch self {
+        case .byWorkspace: return "By workspace"
+        case .flat: return "Flat list"
+        }
+    }
+}
+
+/// One section of the sessions list.
+public struct DSHSessionGroup: Identifiable, Sendable, Equatable {
+    public let id: String
+    public let title: String
+    public var sessions: [DSHSessionSummary]
+    /// True for the bucket holding sessions that belong to no workspace, which
+    /// is sorted last and never merged with a real workspace of the same name.
+    public let isUnfiled: Bool
+
+    public init(id: String, title: String, sessions: [DSHSessionSummary], isUnfiled: Bool = false) {
+        self.id = id; self.title = title; self.sessions = sessions; self.isUnfiled = isUnfiled
+    }
+}
+
+public extension Array where Element == DSHSessionSummary {
+    static let unfiledGroupTitle = "Other"
+    static let flatGroupID = "__flat__"
+
+    /// Sections the list should render, already filtered and sorted.
+    ///
+    /// Sessions outside every registered workspace are collected into one
+    /// bucket instead of being split per directory: the Harness sidebar only
+    /// lists registered workspaces, so inventing a group per cwd made the two
+    /// disagree and buried the real ones.
+    func groupedForList(_ grouping: DSHSessionGrouping, showArchived: Bool) -> [DSHSessionGroup] {
+        let visible = filter { showArchived || $0.archived != true }
+        let recentFirst = visible.sorted { $0.updatedAt > $1.updatedAt }
+
+        switch grouping {
+        case .flat:
+            guard !recentFirst.isEmpty else { return [] }
+            return [DSHSessionGroup(id: Self.flatGroupID, title: "", sessions: recentFirst)]
+        case .byWorkspace:
+            let buckets = Dictionary(grouping: visible) { $0.workspaceName ?? Self.unfiledGroupTitle }
+            return buckets.keys.sorted { left, right in
+                if left == Self.unfiledGroupTitle { return false }
+                if right == Self.unfiledGroupTitle { return true }
+                return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
+            }
+            .compactMap { key in
+                let sessions = (buckets[key] ?? []).sorted { $0.updatedAt > $1.updatedAt }
+                guard !sessions.isEmpty else { return nil }
+                // A workspace genuinely named "Other" must not absorb the bucket.
+                let unfiled = key == Self.unfiledGroupTitle
+                    && sessions.allSatisfy { $0.workspaceName == nil }
+                return DSHSessionGroup(
+                    id: unfiled ? Self.unfiledGroupID : key,
+                    title: key,
+                    sessions: sessions,
+                    isUnfiled: unfiled
+                )
+            }
+        }
+    }
+
+    static let unfiledGroupID = "__unfiled__"
+}
+
 @MainActor
 public final class DSHEventStore {
     public private(set) var state: DSHStoreState

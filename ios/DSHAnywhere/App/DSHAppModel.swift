@@ -13,12 +13,20 @@ final class DSHAppModel: ObservableObject {
     @Published var selectedSessionID: String?
     @Published var draft = ""
     @Published var showArchivedSessions = false
+    /// List arrangement and per-section collapse survive relaunch: they are
+    /// browsing preferences, not session state.
+    @Published var groupsSessionsByWorkspace: Bool =
+        UserDefaults.standard.object(forKey: DSHAppModel.groupingKey) as? Bool ?? true
+    @Published var collapsedSessionGroups: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.collapsedGroupsKey) ?? [])
     @Published var errorMessage: String?
 
     private let transport: any DSHAppTransport
     private let reducer = DSHEventReducer()
     private var eventTask: Task<Void, Never>?
     private let deviceID = "ios-device"
+    static let groupingKey = "dsh-anywhere.group-by-workspace"
+    static let collapsedGroupsKey = "dsh-anywhere.collapsed-groups"
 
     init(transport: any DSHAppTransport = DSHRemoteTransport(),
          initialState: DSHStoreState = .init(), isPaired: Bool? = nil) {
@@ -167,6 +175,22 @@ final class DSHAppModel: ObservableObject {
     func setShowArchived(_ value: Bool) {
         showArchivedSessions = value
         refreshSessions(includeArchived: value)
+    }
+
+    var sessionGrouping: DSHSessionGrouping {
+        groupsSessionsByWorkspace ? .byWorkspace : .flat
+    }
+
+    func setGroupsSessionsByWorkspace(_ value: Bool) {
+        groupsSessionsByWorkspace = value
+        UserDefaults.standard.set(value, forKey: Self.groupingKey)
+    }
+
+    func isGroupCollapsed(_ id: String) -> Bool { collapsedSessionGroups.contains(id) }
+
+    func setGroup(_ id: String, collapsed: Bool) {
+        if collapsed { collapsedSessionGroups.insert(id) } else { collapsedSessionGroups.remove(id) }
+        UserDefaults.standard.set(Array(collapsedSessionGroups), forKey: Self.collapsedGroupsKey)
     }
 
     func archive(_ session: DSHSessionSummary, archived: Bool = true) {

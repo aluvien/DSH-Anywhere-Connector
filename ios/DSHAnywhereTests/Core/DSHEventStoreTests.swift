@@ -131,4 +131,42 @@ final class DSHEventStoreTests: XCTestCase {
         // reasoning forward rather than dropping it.
         XCTAssertEqual(message?.reasoning, "Let me think.")
     }
+
+    func testSessionsOutsideEveryWorkspaceShareOneBucket() {
+        let sessions = [
+            DSHSessionSummary(id: "a", title: "Real work", updatedAt: 30, workspaceName: "project-a"),
+            DSHSessionSummary(id: "b", title: "Loose one", updatedAt: 20, cwd: "/tmp/one"),
+            DSHSessionSummary(id: "c", title: "Loose two", updatedAt: 10, cwd: "/tmp/two"),
+        ]
+
+        let groups = sessions.groupedForList(.byWorkspace, showArchived: false)
+
+        // Two directories with no workspace must not become two workspaces.
+        XCTAssertEqual(groups.map(\.title), ["project-a", "Other"])
+        XCTAssertEqual(groups[1].sessions.map(\.id), ["b", "c"])
+        XCTAssertTrue(groups[1].isUnfiled)
+    }
+
+    func testFlatGroupingKeepsOneRecencySortedList() {
+        let sessions = [
+            DSHSessionSummary(id: "old", title: "Old", updatedAt: 1, workspaceName: "z"),
+            DSHSessionSummary(id: "new", title: "New", updatedAt: 9, workspaceName: "a"),
+        ]
+
+        let groups = sessions.groupedForList(.flat, showArchived: false)
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].sessions.map(\.id), ["new", "old"])
+    }
+
+    func testGroupingHonoursTheArchiveFilter() {
+        let sessions = [
+            DSHSessionSummary(id: "live", title: "Live", updatedAt: 2, workspaceName: "w"),
+            DSHSessionSummary(id: "gone", title: "Gone", updatedAt: 1, workspaceName: "w", archived: true),
+        ]
+
+        XCTAssertEqual(sessions.groupedForList(.byWorkspace, showArchived: false)[0].sessions.map(\.id), ["live"])
+        XCTAssertEqual(sessions.groupedForList(.byWorkspace, showArchived: true)[0].sessions.map(\.id), ["live", "gone"])
+        XCTAssertTrue(sessions.filter { $0.archived == true }.groupedForList(.byWorkspace, showArchived: false).isEmpty)
+    }
 }

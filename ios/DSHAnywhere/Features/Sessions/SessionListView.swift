@@ -4,45 +4,42 @@ struct SessionListView: View {
     @EnvironmentObject private var model: DSHAppModel
     @State private var navigationPath: [String] = []
     @State private var didRefresh = false
-    @State private var collapsedGroups: Set<String> = []
+    @State private var showSettings = false
 
-    /// Sessions outside every registered workspace land in one group rather than
-    /// one group per directory. Splitting them per cwd made the phone list
-    /// disagree with the Harness sidebar, which only lists registered
-    /// workspaces — 29 of 36 sessions were phantom workspaces in practice.
-    private static let unfiledGroup = "Other"
-
-    private var groupedSessions: [(String, [DSHSessionSummary])] {
-        let visibleSessions = model.sessions.filter {
-            model.showArchivedSessions || $0.archived != true
-        }
-        let groups = Dictionary(grouping: visibleSessions) { session in
-            session.workspaceName ?? Self.unfiledGroup
-        }
-        // Registered workspaces first, the unfiled bucket last.
-        return groups.keys.sorted { left, right in
-            if left == Self.unfiledGroup { return false }
-            if right == Self.unfiledGroup { return true }
-            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
-        }
-        .map { ($0, (groups[$0] ?? []).sorted { $0.updatedAt > $1.updatedAt }) }
+    /// Grouping, filtering and sorting live in Core so they are unit-tested;
+    /// this view only arranges what it is handed. Sessions outside every
+    /// registered workspace share one bucket, never one group per directory.
+    private var groups: [DSHSessionGroup] {
+        model.sessions.groupedForList(model.sessionGrouping, showArchived: model.showArchivedSessions)
     }
 
-    private func isExpanded(_ group: String) -> Binding<Bool> {
+    private func isExpanded(_ id: String) -> Binding<Bool> {
         Binding(
-            get: { !collapsedGroups.contains(group) },
-            set: { expanded in
-                if expanded { collapsedGroups.remove(group) } else { collapsedGroups.insert(group) }
-            }
+            get: { !model.isGroupCollapsed(id) },
+            set: { model.setGroup(id, collapsed: !$0) }
         )
+    }
+
+    @ViewBuilder
+    private func sectionHeader(_ group: DSHSessionGroup) -> some View {
+        // A flat list has no sections to label.
+        if !group.title.isEmpty {
+            HStack {
+                Text(group.title)
+                Spacer()
+                Text("\(group.sessions.count)")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
     }
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
-                ForEach(groupedSessions, id: \.0) { group, sessions in
-                    Section(isExpanded: isExpanded(group)) {
-                        ForEach(sessions) { session in
+                ForEach(groups) { group in
+                    Section(isExpanded: isExpanded(group.id)) {
+                        ForEach(group.sessions) { session in
                             NavigationLink(value: session.id) {
                                 SessionRow(session: session)
                             }
@@ -65,13 +62,7 @@ struct SessionListView: View {
                             }
                         }
                     } header: {
-                        HStack {
-                            Text(group)
-                            Spacer()
-                            Text("\(sessions.count)")
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
+                        sectionHeader(group)
                     }
                 }
                 Section { EmptyView() } header: { connectionHeader }
@@ -79,7 +70,7 @@ struct SessionListView: View {
                     .listRowInsets(EdgeInsets())
             }
             .overlay {
-                if groupedSessions.isEmpty {
+                if groups.isEmpty {
                     ContentUnavailableView("No sessions", systemImage: "bubble.left.and.bubble.right",
                                            description: Text("Create your first Harness session."))
                 }
@@ -90,8 +81,8 @@ struct SessionListView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { model.forgetPairing() } label: {
-                        Label("Disconnect", systemImage: "rectangle.portrait.and.arrow.right")
+                    Button { showSettings = true } label: {
+                        Label("Settings", systemImage: "gearshape")
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -99,16 +90,29 @@ struct SessionListView: View {
                         Button { model.createSession() } label: {
                             Label("New session", systemImage: "plus")
                         }
+                        Toggle(isOn: Binding(
+                            get: { model.groupsSessionsByWorkspace },
+                            set: model.setGroupsSessionsByWorkspace
+                        )) {
+                            Label("Group by workspace", systemImage: "square.grid.2x2")
+                        }
                         Toggle(isOn: Binding(get: { model.showArchivedSessions }, set: model.setShowArchived)) {
                             Label("Show archived", systemImage: "archivebox")
                         }
                         Button { refreshSessions() } label: {
                             Label("Refresh", systemImage: "arrow.clockwise")
                         }
+                        Divider()
+                        Button { showSettings = true } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
                     } label: {
                         Label("Session actions", systemImage: didRefresh ? "checkmark.circle.fill" : "ellipsis.circle")
                     }
                 }
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView().environmentObject(model)
             }
             .onChange(of: model.selectedSessionID) { _, sessionID in
                 guard let sessionID else { return }
@@ -181,8 +185,20 @@ private struct SessionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(session.title.isEmpty ? "Untitled session" : session.title)
-                .font(.body.weight(.medium))
+            // Title and recency share one line, so a row costs two lines instead
+            // of three and more sessions fit on a phone screen.
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(session.title.isEmpty ? "Untitled session" : session.title)
+                    .font(.body.weight(.medium))
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                if session.updatedAt > 0 {
+                    Text(Date(timeIntervalSince1970: Double(session.updatedAt) / 1_000), style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .layoutPriority(1)
+                }
+            }
             HStack(spacing: 6) {
                 if let cwd = session.cwd {
                     Label(cwd, systemImage: "folder")
@@ -200,11 +216,6 @@ private struct SessionRow: View {
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
-            if session.updatedAt > 0 {
-                Text(Date(timeIntervalSince1970: Double(session.updatedAt) / 1_000), style: .relative)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
         }
         .padding(.vertical, 4)
     }
