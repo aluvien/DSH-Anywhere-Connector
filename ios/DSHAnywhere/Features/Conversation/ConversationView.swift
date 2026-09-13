@@ -631,8 +631,155 @@ private struct MessageBubble: View {
     }
 
     @ViewBuilder private var messageText: some View {
-        if let markdown = try? AttributedString(markdown: message.markdown) { Text(markdown) }
-        else { Text(message.markdown) }
+        MarkdownBlockText(text: message.markdown)
+    }
+}
+
+/// Renders markdown block by block.
+///
+/// `AttributedString(markdown:)` interprets inline syntax only, so headings,
+/// fenced code, lists and tables reached the reader as their literal markers —
+/// `#`, ``` ``` ``` and `|` included. Block structure is recognised first
+/// (`DSHMarkdown`), then each block is styled; inline markup inside a block is
+/// still left to `AttributedString`.
+private struct MarkdownBlockText: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(DSHMarkdown.blocks(from: text)) { block in
+                MarkdownBlockView(block: block)
+            }
+        }
+    }
+}
+
+private struct MarkdownBlockView: View {
+    let block: DSHMarkdownBlock
+
+    var body: some View {
+        switch block.kind {
+        case .heading(let level, let text):
+            inline(text)
+                .font(level <= 2 ? .headline : .subheadline.weight(.semibold))
+                .padding(.top, 2)
+
+        case .paragraph(let text):
+            inline(text)
+
+        case .code(let language, let body):
+            VStack(alignment: .leading, spacing: 6) {
+                if let language, !language.isEmpty {
+                    Text(language)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                // Code keeps its own line breaks, so it scrolls sideways instead
+                // of wrapping into an unreadable column.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(body)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.tertiarySystemBackground), in: .rect(cornerRadius: 10))
+
+        case .bullets(let items):
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•").foregroundStyle(.secondary)
+                        inline(item)
+                    }
+                }
+            }
+
+        case .numbers(let items):
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("\(index + 1).").foregroundStyle(.secondary).monospacedDigit()
+                        inline(item)
+                    }
+                }
+            }
+
+        case .quote(let text):
+            HStack(alignment: .top, spacing: 8) {
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.4))
+                    .frame(width: 3)
+                inline(text).foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+
+        case .table(let header, let rows):
+            MarkdownTableView(header: header, rows: rows)
+
+        case .divider:
+            Divider()
+        }
+    }
+
+    private func inline(_ text: String) -> Text {
+        // Preserving whitespace keeps an authored line break inside a paragraph
+        // instead of collapsing the block onto one line.
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attributed)
+        }
+        return Text(text)
+    }
+}
+
+/// A markdown table, kept rectangular so columns line up even when a row is
+/// short, and scrollable because a wide table cannot wrap usefully.
+private struct MarkdownTableView: View {
+    let header: [String]
+    let rows: [[String]]
+
+    private var columns: Int { max(header.count, 1) }
+
+    private func padded(_ row: [String]) -> [String] {
+        row.count >= columns
+            ? Array(row.prefix(columns))
+            : row + Array(repeating: "", count: columns - row.count)
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                GridRow {
+                    ForEach(Array(header.enumerated()), id: \.offset) { _, cell in
+                        inline(cell).font(.caption.weight(.semibold))
+                    }
+                }
+                Divider().gridCellColumns(columns)
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(Array(padded(row).enumerated()), id: \.offset) { _, cell in
+                            inline(cell).font(.caption)
+                        }
+                    }
+                }
+            }
+            .padding(10)
+        }
+        .background(Color(.tertiarySystemBackground), in: .rect(cornerRadius: 10))
+    }
+
+    private func inline(_ text: String) -> Text {
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attributed)
+        }
+        return Text(text)
     }
 }
 

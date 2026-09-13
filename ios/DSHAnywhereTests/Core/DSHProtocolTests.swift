@@ -220,6 +220,77 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(DSHLanguage.english.locale?.identifier, "en")
     }
 
+
+    // MARK: - Markdown blocks
+
+    func testHeadingsCodeListsAndTablesAreRecognised() {
+        // The whole point: `AttributedString(markdown:)` would hand every one of
+        // these back as its literal markers.
+        let source = """
+        ## Summary
+
+        Some prose.
+
+        ```sh
+        curl -s https://example.com/health
+        ```
+
+        - first
+        - second
+
+        | a | b |
+        |---|---|
+        | 1 | 2 |
+
+        ---
+        """
+
+        let kinds = DSHMarkdown.blocks(from: source).map(\.kind)
+
+        XCTAssertEqual(kinds.count, 6)
+        guard case .heading(let level, let text) = kinds[0] else { return XCTFail("expected heading") }
+        XCTAssertEqual(level, 2)
+        XCTAssertEqual(text, "Summary")
+        guard case .paragraph(let prose) = kinds[1] else { return XCTFail("expected paragraph") }
+        XCTAssertEqual(prose, "Some prose.")
+        guard case .code(let language, let body) = kinds[2] else { return XCTFail("expected code") }
+        XCTAssertEqual(language, "sh")
+        XCTAssertEqual(body, "curl -s https://example.com/health")
+        guard case .bullets(let items) = kinds[3] else { return XCTFail("expected bullets") }
+        XCTAssertEqual(items, ["first", "second"])
+        guard case .table(let header, let rows) = kinds[4] else { return XCTFail("expected table") }
+        XCTAssertEqual(header, ["a", "b"])
+        XCTAssertEqual(rows, [["1", "2"]])
+        XCTAssertEqual(kinds[5], .divider)
+    }
+
+    func testCodeFenceWithoutClosingStillEndsTheBlock() {
+        // Swallowing the remainder as code would hide everything after it.
+        let kinds = DSHMarkdown.blocks(from: "```\nlet x = 1\nafter").map(\.kind)
+        XCTAssertEqual(kinds.count, 1)
+        guard case .code(_, let body) = kinds[0] else { return XCTFail("expected code") }
+        XCTAssertEqual(body, "let x = 1\nafter")
+    }
+
+    func testHashInsideTextIsNotAHeading() {
+        // "#######" is too deep, and "#tag" has no space, so neither is a heading.
+        let kinds = DSHMarkdown.blocks(from: "#tag\n####### nope").map(\.kind)
+        XCTAssertEqual(kinds.count, 1, "both lines belong to one paragraph")
+        guard case .paragraph = kinds[0] else { return XCTFail("expected paragraph") }
+    }
+
+    func testTableSeparatorIsRequired() {
+        // A pipe line with no separator row is prose, not a table.
+        let kinds = DSHMarkdown.blocks(from: "| not | a table |").map(\.kind)
+        guard case .paragraph = kinds[0] else { return XCTFail("expected paragraph") }
+    }
+
+    func testNumberOfListItemKeepsItsOwnNumberingOrder() {
+        let kinds = DSHMarkdown.blocks(from: "1. one\n2. two").map(\.kind)
+        guard case .numbers(let items) = kinds[0] else { return XCTFail("expected numbers") }
+        XCTAssertEqual(items, ["one", "two"])
+    }
+
 }
 
 

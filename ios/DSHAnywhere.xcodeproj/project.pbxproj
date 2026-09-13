@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		B00000000000000000000001 /* Core/Protocol/DSHProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */; };
+		B00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift */; };
 		B00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */; };
 		B00000000000000000000003 /* Core/Networking/DSHAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */; };
 		B00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */; };
@@ -43,6 +44,7 @@
 
 /* Begin PBXFileReference section */
 		F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHProtocol.swift; sourceTree = "<group>"; };
+		F00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHMarkdown.swift; sourceTree = "<group>"; };
 		F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Security/DSHKeychainTokenStore.swift; sourceTree = "<group>"; };
 		F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Networking/DSHAPIClient.swift; sourceTree = "<group>"; };
 		F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Networking/DSHWebSocketConnection.swift; sourceTree = "<group>"; };
@@ -99,6 +101,7 @@
 			isa = PBXGroup;
 			children = (
 				F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */,
+				F00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift */,
 				F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */,
 				F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */,
 				F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */,
@@ -241,6 +244,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B00000000000000000000001 /* Core/Protocol/DSHProtocol.swift in Sources */,
+				B00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift in Sources */,
 				B00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift in Sources */,
 				B00000000000000000000003 /* Core/Networking/DSHAPIClient.swift in Sources */,
 				B00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift in Sources */,
@@ -309,7 +313,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
@@ -334,7 +338,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
