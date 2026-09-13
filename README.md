@@ -187,6 +187,9 @@ xcodebuild \
 
 - launchd 安装脚本适合源码私测；还没有签名安装器和自动更新机制。
 - Relay 的 JSON registry 尚未接 PostgreSQL、账号、设备撤销和多租户 ACL。
-- pairing secret 目前可重复使用，公开发布前必须改为一次性/可轮换凭证。
+- pairing secret 目前仍可重复使用。**relay 已支持**短时效、单次使用的配对码
+  （`POST /v1/machines/:id/pairing-codes`，机器令牌签发，10 分钟过期、用后即废、
+  且绑定单一机器），但 Connector 与 App 尚未改用，公开发布前应完成接入并停用
+  长期密钥。
 - Relay payload 目前是协议对象，不是应用层 E2EE；Relay 只应部署在自己信任的服务器。
 - APNs、后台通知、附件、二维码/深链配对和 App Store/TestFlight 发布尚未完成。

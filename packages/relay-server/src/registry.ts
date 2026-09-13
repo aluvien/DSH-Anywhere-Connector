@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -47,6 +47,30 @@ export interface DeviceSummary {
   readonly createdAt: number;
 }
 
+/** A freshly minted single-use pairing code and when it stops working. */
+export interface IssuedPairingCode {
+  readonly code: string;
+  readonly expiresAt: number;
+}
+
+interface PairingCodeRecord {
+  readonly machineId: string;
+  readonly expiresAt: number;
+}
+
+const PAIRING_CODE_TTL_MS = 10 * 60_000;
+const PAIRING_CODE_LENGTH = 8;
+/** No 0/O/1/I/L: the code is read off a screen and typed by a human. */
+const PAIRING_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+function newPairingCode(): string {
+  let code = "";
+  for (let index = 0; index < PAIRING_CODE_LENGTH; index += 1) {
+    code += PAIRING_CODE_ALPHABET[randomInt(PAIRING_CODE_ALPHABET.length)];
+  }
+  return code;
+}
+
 const emptyRegistry = (): RegistryFile => ({ version: 1, machines: {}, devices: {} });
 
 export const hashSecret = (value: string): string =>
@@ -64,6 +88,8 @@ const newSecret = (): string => randomBytes(32).toString("base64url");
 export class Registry {
   private state: RegistryFile = emptyRegistry();
   private persistQueue: Promise<void> = Promise.resolve();
+  /** Single-use pairing codes, held in memory only. See issuePairingCode. */
+  private readonly pairingCodes = new Map<string, PairingCodeRecord>();
 
   public constructor(private readonly path: string) {}
 
@@ -100,6 +126,45 @@ export class Registry {
   public async pairDevice(machineId: string, pairingSecret: string, name: string): Promise<DevicePairing | undefined> {
     const machine = this.state.machines[machineId];
     if (machine === undefined || !secretEquals(machine.pairingSecretHash, pairingSecret)) return undefined;
+    return await this.registerDevice(machineId, machine.name, name);
+  }
+
+  /**
+   * Mints a short-lived, single-use pairing code for one machine.
+   *
+   * Codes are deliberately **not persisted**: they live for minutes and the
+   * owner can always mint another, so surviving a restart is not worth a
+   * persisted-schema change. Only the hash is held in memory, so a leaked
+   * registry dump would not reveal an unused code either.
+   */
+  public issuePairingCode(machineId: string, now = Date.now(), ttlMs = PAIRING_CODE_TTL_MS): IssuedPairingCode | undefined {
+    if (this.state.machines[machineId] === undefined) return undefined;
+    this.sweepPairingCodes(now);
+    const code = newPairingCode();
+    const expiresAt = now + ttlMs;
+    this.pairingCodes.set(hashSecret(code), { machineId, expiresAt });
+    return { code, expiresAt };
+  }
+
+  /**
+   * Redeems a pairing code. The code is bound to one machine and consumed on
+   * use, so a leaked code cannot be replayed or redirected at another machine.
+   */
+  public async pairDeviceWithCode(machineId: string, code: string, name: string,
+                                  now = Date.now()): Promise<DevicePairing | undefined> {
+    this.sweepPairingCodes(now);
+    const key = hashSecret(code.trim().toUpperCase());
+    const record = this.pairingCodes.get(key);
+    if (record === undefined || record.machineId !== machineId) return undefined;
+    const machine = this.state.machines[machineId];
+    if (machine === undefined) return undefined;
+    // Consume before creating the device: a second attempt with the same code
+    // must fail even if device creation were to throw.
+    this.pairingCodes.delete(key);
+    return await this.registerDevice(machineId, machine.name, name);
+  }
+
+  private async registerDevice(machineId: string, machineName: string, name: string): Promise<DevicePairing> {
     const deviceId = `device_${randomUUID()}`;
     const deviceToken = newSecret();
     this.state.devices[deviceId] = {
@@ -110,7 +175,13 @@ export class Registry {
       createdAt: Date.now(),
     };
     await this.persist();
-    return { deviceId, deviceToken, machineName: machine.name };
+    return { deviceId, deviceToken, machineName };
+  }
+
+  private sweepPairingCodes(now: number): void {
+    for (const [key, record] of this.pairingCodes) {
+      if (now >= record.expiresAt) this.pairingCodes.delete(key);
+    }
   }
 
   /** Devices paired to one machine, oldest first. Never exposes token hashes. */

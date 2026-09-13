@@ -56,14 +56,30 @@ const RegisterMachineRequestSchema = (value: unknown): { machineName: string } |
   return machineName.length >= 1 && machineName.length <= 256 ? { machineName } : undefined;
 };
 
-const PairDeviceRequestSchema = (value: unknown): { machineId: string; pairingSecret: string; deviceName: string } | undefined => {
-  if (!isRecord(value) || Object.keys(value).length !== 3) return undefined;
+/**
+ * Accepts either credential shape: the long-lived `pairingSecret` (unchanged,
+ * so existing installs keep working) or a single-use `pairingCode` minted by the
+ * machine. Exactly one of the two must be present.
+ */
+const PairDeviceRequestSchema = (
+  value: unknown,
+): { machineId: string; pairingSecret?: string; pairingCode?: string; deviceName: string } | undefined => {
+  if (!isRecord(value)) return undefined;
   const { machineId, pairingSecret, deviceName } = value;
+  const pairingCode = value.pairingCode;
   if (typeof machineId !== "string" || machineId.length < 1 || machineId.length > 256) return undefined;
-  if (typeof pairingSecret !== "string" || pairingSecret.length < 1 || pairingSecret.length > 1024) return undefined;
   if (typeof deviceName !== "string") return undefined;
   const name = deviceName.trim();
-  return name.length >= 1 && name.length <= 256 ? { machineId, pairingSecret, deviceName: name } : undefined;
+  if (name.length < 1 || name.length > 256) return undefined;
+  const hasSecret = typeof pairingSecret === "string" && pairingSecret.length >= 1 && pairingSecret.length <= 1024;
+  const hasCode = typeof pairingCode === "string" && pairingCode.trim().length >= 1 && pairingCode.length <= 64;
+  if (!hasSecret && !hasCode) return undefined;
+  return {
+    machineId,
+    ...(hasSecret ? { pairingSecret } : {}),
+    ...(hasCode ? { pairingCode } : {}),
+    deviceName: name,
+  };
 };
 
 export async function createRelayServer(options: RelayServerOptions): Promise<RunningRelayServer> {
@@ -191,10 +207,11 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         version: PROTOCOL_VERSION,
         schemaRevision: RELAY_SCHEMA_REVISION,
         build: "2026-09-13",
-        // Device management did not change the routed wire schema, so the
-        // revision stays put; this flag is how a caller tells whether the
-        // deployed Relay actually serves those routes yet.
+        // Neither device management nor one-time pairing codes changed the
+        // routed wire schema, so the revision stays put; these flags are how a
+        // caller tells whether the deployed Relay serves those routes yet.
         deviceManagement: true,
+        oneTimePairingCodes: true,
       });
       return;
     }
@@ -227,12 +244,35 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       }
       if (attempt === undefined || now - attempt.startedAt >= pairRateWindowMs) pairAttempts.set(key, { startedAt: now, count: 1 });
       else attempt.count += 1;
-      const pairing = await registry.pairDevice(body.machineId, body.pairingSecret, body.deviceName);
+      const pairing = body.pairingCode === undefined
+        ? await registry.pairDevice(body.machineId, body.pairingSecret!, body.deviceName)
+        : await registry.pairDeviceWithCode(body.machineId, body.pairingCode, body.deviceName);
       if (pairing === undefined) {
-        respondJson(response, 401, { error: "invalid_pairing_secret" });
+        // One message for both shapes: distinguishing "expired" from "wrong"
+        // would let a caller probe which codes exist.
+        respondJson(response, 401, { error: "invalid_pairing_credential" });
         return;
       }
       respondJson(response, 201, pairing);
+      return;
+    }
+    const pairingCodeMatch = /^\/v1\/machines\/([^/]+)\/pairing-codes$/.exec(url.pathname);
+    if (request.method === "POST" && pairingCodeMatch !== null) {
+      const machineId = decodeURIComponent(pairingCodeMatch[1]!);
+      const principal = authenticateBearer(request, registry);
+      // Machine token only. Minting a pairing code is the capability that lets a
+      // new device in, so it stays with the machine operator instead of
+      // spreading to every already-paired device.
+      if (principal === undefined || principal.role !== "machine" || principal.machineId !== machineId) {
+        respondJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      const issued = registry.issuePairingCode(machineId);
+      if (issued === undefined) {
+        respondJson(response, 404, { error: "unknown_machine" });
+        return;
+      }
+      respondJson(response, 201, issued);
       return;
     }
     const devicesMatch = /^\/v1\/machines\/([^/]+)\/devices$/.exec(url.pathname);

@@ -5,6 +5,7 @@ import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION, type RelayMessage } from "@dsh-anywhere/protocol";
 import { createRelayServer, type RunningRelayServer } from "../src/server.js";
+import { Registry } from "../src/registry.js";
 
 interface Registration {
   readonly machineId: string;
@@ -349,5 +350,59 @@ describe("Relay server", () => {
     // Unknown ids are 404, not a cross-machine success.
     expect((await revoke(server.url, machineA.machineId, "device_missing", machineA.machineToken)).status).toBe(404);
     expect((await devices(server.url, machineA.machineId, "nonsense")).status).toBe(401);
+  });
+
+  it("mints a one-time code that pairs exactly once and only for its machine", async () => {
+    const server = await relay();
+    const machineA = await register(server.url, "Mac A");
+    const machineB = await register(server.url, "Mac B");
+
+    const minted = await post<{ code: string; expiresAt: number }>(
+      server.url, `/v1/machines/${machineA.machineId}/pairing-codes`, {}, machineA.machineToken);
+    expect(minted.status).toBe(201);
+    // No 0/O/1/I/L: a human reads this off a screen.
+    expect(minted.body.code).toMatch(/^[A-HJ-KM-NP-Z2-9]{8}$/);
+
+    const phoneA = await pair(server.url, machineA, "iPhone A");
+    // Minting is the capability that lets a new device in, so an already-paired
+    // device must not be able to hand out more.
+    expect((await post(server.url, `/v1/machines/${machineA.machineId}/pairing-codes`, {}, phoneA.deviceToken)).status).toBe(401);
+    // Nor may another machine mint for this one.
+    expect((await post(server.url, `/v1/machines/${machineA.machineId}/pairing-codes`, {}, machineB.machineToken)).status).toBe(401);
+
+    const paired = await post<{ deviceToken: string }>(server.url, "/v1/pair",
+      { machineId: machineA.machineId, pairingCode: minted.body.code, deviceName: "iPhone B" });
+    expect(paired.status).toBe(201);
+
+    // Single use: replaying the same code must not mint a second device.
+    expect((await post(server.url, "/v1/pair",
+      { machineId: machineA.machineId, pairingCode: minted.body.code, deviceName: "iPhone C" })).status).toBe(401);
+    // Nor may it be redirected at a different machine.
+    expect((await post(server.url, "/v1/pair",
+      { machineId: machineB.machineId, pairingCode: minted.body.code, deviceName: "iPhone D" })).status).toBe(401);
+  });
+
+  it("keeps the long-lived pairing secret working", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const legacy = await post<{ deviceToken: string }>(server.url, "/v1/pair",
+      { machineId: machine.machineId, pairingSecret: machine.pairingSecret, deviceName: "Old client" });
+    // Adding one-time codes must not force every existing install to re-pair.
+    expect(legacy.status).toBe(201);
+  });
+
+  it("expires a pairing code instead of honouring it late", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-registry-"));
+    directories.push(directory);
+    const registry = new Registry(join(directory, "registry.json"));
+    await registry.load();
+    const machine = await registry.registerMachine("Mac");
+
+    const stale = registry.issuePairingCode(machine.machineId, 1_000, 500)!;
+    expect(await registry.pairDeviceWithCode(machine.machineId, stale.code, "iPhone", 2_000)).toBeUndefined();
+
+    const fresh = registry.issuePairingCode(machine.machineId, 3_000, 500)!;
+    expect(await registry.pairDeviceWithCode(machine.machineId, fresh.code, "iPhone", 3_100)).toBeDefined();
+    expect(await registry.pairDeviceWithCode(machine.machineId, fresh.code, "iPhone 2", 3_200)).toBeUndefined();
   });
 });
