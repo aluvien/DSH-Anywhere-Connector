@@ -102,6 +102,13 @@ final class DSHAppModel: ObservableObject {
         state.attachmentsBySession[sessionID, default: []]
     }
 
+    /// Drops a staged upload before the message goes out. The bytes are already
+    /// on the Mac, but nothing was sent with them yet, so this only discards the
+    /// reference — which is exactly what makes the chip safe to remove.
+    func discardAttachment(_ id: String, for sessionID: String) {
+        state.attachmentsBySession[sessionID]?.removeAll { $0.id == id }
+    }
+
     func pair() {
         let trimmedMachineID = machineID.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSecret = pairingSecret.trimmingCharacters(in: .whitespacesAndNewlines)

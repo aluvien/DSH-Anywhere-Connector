@@ -1259,6 +1259,17 @@
           }
         }
       }
+    },
+    "Remove attachment": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "移除附件"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

@@ -222,11 +222,24 @@ struct ConversationView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(attachments) { attachment in
-                            Label(attachment.name, systemImage: "paperclip")
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(.thinMaterial, in: .capsule)
+                            HStack(spacing: 6) {
+                                Label(attachment.name, systemImage: "paperclip")
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                Button {
+                                    model.discardAttachment(attachment.id, for: sessionID)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove attachment")
+                            }
+                            .padding(.leading, 8)
+                            .padding(.trailing, 6)
+                            .padding(.vertical, 5)
+                            .background(.thinMaterial, in: .capsule)
                         }
                     }
                     .padding(.horizontal, 4)
