@@ -236,9 +236,23 @@ struct ConversationView: View {
 
                     ModelMenu(sessionID: sessionID)
 
+                    if let ratio = contextRatio {
+                        ContextRing(ratio: ratio)
+                    }
+
                     if isRunning {
                         Button(action: { model.cancelTurn(for: sessionID) }) {
-                            Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
+                            // Drawn rather than a symbol: `stop.circle.fill`
+                            // renders as a thin ring around a bare square on the
+                            // bar, which read as a tiny floating glyph instead of
+                            // a button the same weight as send.
+                            ZStack {
+                                Circle().fill(.red)
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(.white)
+                                    .frame(width: 11, height: 11)
+                            }
+                            .frame(width: 28, height: 28)
                         }
                         .accessibilityLabel("Stop turn")
                     } else {
@@ -260,6 +274,13 @@ struct ConversationView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    /// Context window usage, shown as a ring beside the model.
+    private var contextRatio: Double? {
+        guard let usage = model.usage(for: sessionID),
+              let used = usage.contextUsed, let window = usage.contextWindow, window > 0 else { return nil }
+        return min(1, max(0, used / window))
     }
 
     /// Keeps the newest output on screen, unless the reader has scrolled away.
@@ -291,6 +312,26 @@ struct ConversationView: View {
     }
 }
 
+/// Context usage as a small ring. The old labelled bar took a whole line under
+/// the composer for one number; a ring sits in the control row for free.
+private struct ContextRing: View {
+    let ratio: Double
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.secondary.opacity(0.22), lineWidth: 2.5)
+            Circle()
+                .trim(from: 0, to: ratio)
+                .stroke(ratio > 0.9 ? Color.orange : Color.accentColor,
+                        style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityLabel("Context \(Int(ratio * 100)) percent used")
+    }
+}
+
 private struct ModelMenu: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
@@ -317,7 +358,12 @@ private struct ModelMenu: View {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "cpu")
-                Text(model.modelDisplayName(for: sessionID)).lineLimit(1)
+                // Only the model itself, not "provider/model": the provider is
+                // the same across the catalogue and pushed the useful part into
+                // an ellipsis.
+                Text(model.shortModelName(for: sessionID))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Image(systemName: "chevron.up.chevron.down").font(.caption2)
             }
             .font(.subheadline)
@@ -338,10 +384,13 @@ private struct PermissionMenu: View {
                 }
             }
         } label: {
-            Label(permissionLabel(model.permissionMode(for: sessionID)), systemImage: "checkmark.shield")
-                .font(.subheadline)
+            // Icon only: the label cost ~80pt of a row that also holds three
+            // attachments, the model and send. The mode is still announced.
+            Image(systemName: "checkmark.shield")
+                .font(.title3)
         }
-        .accessibilityLabel("Permission mode")
+        .accessibilityLabel("Permission: \(permissionLabel(model.permissionMode(for: sessionID)))")
+        .accessibilityHint("Changes the sandbox and approval policy for this session")
     }
 
     private func permissionLabel(_ value: String) -> String {
@@ -390,17 +439,6 @@ private struct UsageFooter: View {
             .lineLimit(1)
             .minimumScaleFactor(0.7)
 
-            if let ratio = contextRatio {
-                HStack(spacing: 6) {
-                    ProgressView(value: ratio)
-                        .progressViewStyle(.linear)
-                        .tint(ratio > 0.9 ? .orange : .accentColor)
-                        .frame(height: 2)
-                    Text("\(Int(ratio * 100))%")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-            }
         }
     }
 
@@ -413,11 +451,6 @@ private struct UsageFooter: View {
             Image(systemName: icon).font(.system(size: 9, weight: .medium))
             Text(text)
         }
-    }
-
-    private var contextRatio: Double? {
-        guard let used = usage?.contextUsed, let window = usage?.contextWindow, window > 0 else { return nil }
-        return min(1, max(0, used / window))
     }
 
     private var activityText: String {

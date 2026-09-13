@@ -187,12 +187,15 @@ public extension Array where Element == DSHSessionSummary {
 
     /// Sections the list should render, already filtered and sorted.
     ///
-    /// Sessions outside every registered workspace are collected into one
-    /// bucket instead of being split per directory: the Harness sidebar only
-    /// lists registered workspaces, so inventing a group per cwd made the two
-    /// disagree and buried the real ones.
+    /// Sessions outside every registered workspace are dropped rather than
+    /// collected into an "Other" bucket. That bucket was mostly sessions the
+    /// user never opened: delegated subagent runs have no workspace either, and
+    /// mixing them with real work made the bottom of the list look like junk.
+    /// The Harness sidebar only lists registered workspaces, so this also keeps
+    /// the two views agreeing.
     func groupedForList(_ grouping: DSHSessionGrouping, showArchived: Bool) -> [DSHSessionGroup] {
         let visible = filter { showArchived || $0.archived != true }
+            .filter { $0.workspaceName != nil }
         let recentFirst = visible.sorted { $0.updatedAt > $1.updatedAt }
 
         switch grouping {

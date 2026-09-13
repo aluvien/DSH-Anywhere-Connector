@@ -88,12 +88,13 @@ struct SessionListView: View {
                         .resizable()
                         .scaledToFit()
                         .frame(width: 28, height: 28)
-                        .clipShape(.circle)
                         .accessibilityHidden(true)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    // One capsule holding filter and settings, instead of two
-                    // separate circular buttons.
+                    // Two adjacent toolbar items, not two circular buttons with
+                    // custom chrome: the system already draws one shared capsule
+                    // around grouped items, and our own material layer inside it
+                    // read as a second colour.
                     HStack(spacing: 0) {
                         Menu {
                             Button { model.createSession() } label: {
@@ -130,8 +131,6 @@ struct SessionListView: View {
                         }
                         .accessibilityLabel("Settings")
                     }
-                    .background(.thinMaterial, in: .capsule)
-                    .overlay(Capsule().stroke(Color.secondary.opacity(0.18), lineWidth: 0.5))
                 }
             }
             .sheet(isPresented: $showSettings) {

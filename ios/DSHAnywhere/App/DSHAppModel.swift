@@ -329,6 +329,13 @@ final class DSHAppModel: ObservableObject {
                                          sessionId: sessionID, name: name, data: data))
     }
 
+    /// Just the model, without its provider prefix: rows and the composer both
+    /// ran out of width showing "provider/model" when only the model differs.
+    func shortModelName(for sessionID: String) -> String {
+        let full = modelDisplayName(for: sessionID)
+        return full.split(separator: "/").last.map(String.init) ?? full
+    }
+
     func modelDisplayName(for sessionID: String) -> String {
         guard let session = sessions.first(where: { $0.id == sessionID }) else {
             return modelCatalog?.default.model ?? "Select model"

@@ -132,7 +132,7 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(message?.reasoning, "Let me think.")
     }
 
-    func testSessionsOutsideEveryWorkspaceShareOneBucket() {
+    func testSessionsOutsideEveryWorkspaceAreNotListed() {
         let sessions = [
             DSHSessionSummary(id: "a", title: "Real work", updatedAt: 30, workspaceName: "project-a"),
             DSHSessionSummary(id: "b", title: "Loose one", updatedAt: 20, cwd: "/tmp/one"),
@@ -141,10 +141,23 @@ final class DSHEventStoreTests: XCTestCase {
 
         let groups = sessions.groupedForList(.byWorkspace, showArchived: false)
 
-        // Two directories with no workspace must not become two workspaces.
-        XCTAssertEqual(groups.map(\.title), ["project-a", "Other"])
-        XCTAssertEqual(groups[1].sessions.map(\.id), ["b", "c"])
-        XCTAssertTrue(groups[1].isUnfiled)
+        // They must not invent one workspace per directory *nor* collect into an
+        // "Other" bucket: delegated subagent runs have no workspace either, so
+        // that bucket mixed junk with real sessions.
+        XCTAssertEqual(groups.map(\.title), ["project-a"])
+        XCTAssertEqual(groups[0].sessions.map(\.id), ["a"])
+    }
+
+    func testFlatModeAlsoOmitsSessionsWithNoWorkspace() {
+        let sessions = [
+            DSHSessionSummary(id: "a", title: "Real work", updatedAt: 30, workspaceName: "project-a"),
+            DSHSessionSummary(id: "b", title: "Loose one", updatedAt: 40, cwd: "/tmp/one"),
+        ]
+
+        let groups = sessions.groupedForList(.flat, showArchived: false)
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].sessions.map(\.id), ["a"])
     }
 
     func testFlatGroupingKeepsOneRecencySortedList() {
