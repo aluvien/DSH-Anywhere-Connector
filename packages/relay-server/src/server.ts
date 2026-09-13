@@ -231,6 +231,53 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       respondJson(response, 201, pairing);
       return;
     }
+    const devicesMatch = /^\/v1\/machines\/([^/]+)\/devices$/.exec(url.pathname);
+    if (request.method === "GET" && devicesMatch !== null) {
+      const principal = authenticateBearer(request, registry);
+      const machineId = decodeURIComponent(devicesMatch[1]!);
+      // The machine may manage its own devices, and so may one of those
+      // devices: the phone is usually the thing that wants to tidy the list.
+      if (principal === undefined || principal.machineId !== machineId) {
+        respondJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      respondJson(response, 200, { devices: registry.listDevices(machineId) });
+      return;
+    }
+
+    const revokeMatch = /^\/v1\/machines\/([^/]+)\/devices\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && revokeMatch !== null) {
+      const principal = authenticateBearer(request, registry);
+      const machineId = decodeURIComponent(revokeMatch[1]!);
+      const deviceId = decodeURIComponent(revokeMatch[2]!);
+      if (principal === undefined || principal.machineId !== machineId) {
+        respondJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (principal.role === "device" && principal.deviceId === deviceId) {
+        // Revoking yourself would strand the caller holding a token it can no
+        // longer use, with no way back in. Make it an explicit disconnect.
+        respondJson(response, 409, {
+          error: "self_revoke",
+          message: "A device cannot revoke itself. Disconnect instead.",
+        });
+        return;
+      }
+      if (!await registry.revokeDevice(machineId, deviceId)) {
+        respondJson(response, 404, { error: "unknown_device" });
+        return;
+      }
+      // A revoked credential must stop working at once, not whenever the socket
+      // happens to drop.
+      for (const connection of connections) {
+        if (connection.principal.role === "device" && connection.principal.deviceId === deviceId) {
+          connection.ws.close(4401, "device revoked");
+        }
+      }
+      respondJson(response, 200, { revoked: true, deviceId });
+      return;
+    }
+
     respondJson(response, 404, { error: "not_found" });
   }
 

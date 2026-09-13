@@ -40,6 +40,13 @@ export interface DevicePairing {
   readonly machineName: string;
 }
 
+/** A device as its owner may see it. Only token hashes are ever stored. */
+export interface DeviceSummary {
+  readonly deviceId: string;
+  readonly name: string;
+  readonly createdAt: number;
+}
+
 const emptyRegistry = (): RegistryFile => ({ version: 1, machines: {}, devices: {} });
 
 export const hashSecret = (value: string): string =>
@@ -106,8 +113,27 @@ export class Registry {
     return { deviceId, deviceToken, machineName: machine.name };
   }
 
-  public authenticate(token: string): RelayPrincipal | undefined {
-    for (const machine of Object.values(this.state.machines)) {
+  /** Devices paired to one machine, oldest first. Never exposes token hashes. */
+  public listDevices(machineId: string): readonly DeviceSummary[] {
+    return Object.values(this.state.devices)
+      .filter((device) => device.machineId === machineId)
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map((device) => ({ deviceId: device.id, name: device.name, createdAt: device.createdAt }));
+  }
+
+  /**
+   * Removes one device. Returns false when the id is unknown or belongs to a
+   * different machine, so a caller can never revoke across a machine boundary.
+   */
+  public async revokeDevice(machineId: string, deviceId: string): Promise<boolean> {
+    const device = this.state.devices[deviceId];
+    if (device === undefined || device.machineId !== machineId) return false;
+    delete this.state.devices[deviceId];
+    await this.persist();
+    return true;
+  }
+
+  public authenticate(token: string): RelayPrincipal | undefined {    for (const machine of Object.values(this.state.machines)) {
       if (secretEquals(machine.tokenHash, token)) return { role: "machine", machineId: machine.id };
     }
     for (const device of Object.values(this.state.devices)) {

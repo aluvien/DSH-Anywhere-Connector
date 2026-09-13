@@ -285,4 +285,69 @@ describe("Relay server", () => {
     });
     expect(second.status).toBe(429);
   });
+
+  async function devices(base: string, machineId: string, token: string) {
+    const response = await fetch(`${base}/v1/machines/${machineId}/devices`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return { status: response.status, body: await response.json() as { devices?: { deviceId: string; name: string }[] } };
+  }
+
+  async function revoke(base: string, machineId: string, deviceId: string, token: string) {
+    const response = await fetch(`${base}/v1/machines/${machineId}/devices/${deviceId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return { status: response.status, body: await response.json() as { error?: string } };
+  }
+
+  it("lists a machine's devices without ever returning credential material", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    await pair(server.url, machine, "iPhone A");
+    await pair(server.url, machine, "iPhone B");
+
+    const listed = await devices(server.url, machine.machineId, machine.machineToken);
+
+    expect(listed.status).toBe(200);
+    expect(listed.body.devices?.map((device) => device.name)).toEqual(["iPhone A", "iPhone B"]);
+    // Only hashes are stored, and nothing credential-shaped may be echoed back.
+    expect(JSON.stringify(listed.body)).not.toContain("token");
+  });
+
+  it("lets one device of a machine revoke a sibling, but not itself", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const phoneA = await pair(server.url, machine, "iPhone A");
+    const phoneB = await pair(server.url, machine, "iPhone B");
+
+    // A device may tidy up its siblings, which is the common case: the phone is
+    // what usually manages the list.
+    const removed = await revoke(server.url, machine.machineId, phoneB.deviceId, phoneA.deviceToken);
+    expect(removed.status).toBe(200);
+
+    // The revoked credential must stop working immediately.
+    const rejected = await devices(server.url, machine.machineId, phoneB.deviceToken);
+    expect(rejected.status).toBe(401);
+
+    // Revoking yourself would strand the caller with a token it cannot use and
+    // no way back in, so it is refused rather than silently locking it out.
+    const self = await revoke(server.url, machine.machineId, phoneA.deviceId, phoneA.deviceToken);
+    expect(self.status).toBe(409);
+    expect(self.body.error).toBe("self_revoke");
+  });
+
+  it("keeps device management inside one machine", async () => {
+    const server = await relay();
+    const machineA = await register(server.url, "Mac A");
+    const machineB = await register(server.url, "Mac B");
+    const phoneA = await pair(server.url, machineA, "iPhone A");
+
+    // Machine B holds a valid token, but not for machine A's devices.
+    expect((await devices(server.url, machineA.machineId, machineB.machineToken)).status).toBe(401);
+    expect((await revoke(server.url, machineA.machineId, phoneA.deviceId, machineB.machineToken)).status).toBe(401);
+    // Unknown ids are 404, not a cross-machine success.
+    expect((await revoke(server.url, machineA.machineId, "device_missing", machineA.machineToken)).status).toBe(404);
+    expect((await devices(server.url, machineA.machineId, "nonsense")).status).toBe(401);
+  });
 });
