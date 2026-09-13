@@ -98,6 +98,25 @@ struct ConversationView: View {
             .scrollDismissesKeyboard(.interactively)
             .scrollBounceBehavior(.always)
             .safeAreaInset(edge: .bottom) { composer }
+            // Only while the reader is away from the newest output: the whole
+            // point is to not need this button when already at the bottom.
+            .overlay(alignment: .bottomTrailing) {
+                if !isFollowingLatest {
+                    Button {
+                        isFollowingLatest = true
+                        withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title2)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, Color.accentColor)
+                            .shadow(radius: 3, y: 1)
+                    }
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 12)
+                    .accessibilityLabel("Jump to latest output")
+                }
+            }
             .navigationTitle(session?.title ?? "Conversation")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -638,6 +657,8 @@ private struct MessageBubble: View {
 
     @ViewBuilder private var messageText: some View {
         MarkdownBlockText(text: message.markdown)
+            // Long-press to select and copy a reply.
+            .textSelection(.enabled)
     }
 }
 
@@ -662,6 +683,7 @@ private struct MarkdownBlockText: View {
 
 private struct MarkdownBlockView: View {
     let block: DSHMarkdownBlock
+    @State private var copied = false
 
     var body: some View {
         switch block.kind {
@@ -675,10 +697,31 @@ private struct MarkdownBlockView: View {
 
         case .code(let language, let body):
             VStack(alignment: .leading, spacing: 6) {
-                if let language, !language.isEmpty {
-                    Text(language)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                HStack {
+                    if let language, !language.isEmpty {
+                        Text(language)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    // Copying a fence by hand means selecting across a
+                    // horizontally scrolling view, which iOS makes painful.
+                    Button {
+                        UIPasteboard.general.string = body
+                        copied = true
+                    } label: {
+                        // A ternary is a String, not a literal, so `Label`
+                        // would not localize it.
+                        Label(copied ? DSHLocalization.string("Copied") : DSHLocalization.string("Copy"),
+                              systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(copied
+                        ? DSHLocalization.string("Code copied")
+                        : DSHLocalization.string("Copy code"))
                 }
                 // Code keeps its own line breaks, so it scrolls sideways instead
                 // of wrapping into an unreadable column.
@@ -691,6 +734,13 @@ private struct MarkdownBlockView: View {
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.tertiarySystemBackground), in: .rect(cornerRadius: 10))
+            .onChange(of: copied) { _, isCopied in
+                guard isCopied else { return }
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    copied = false
+                }
+            }
 
         case .bullets(let items):
             VStack(alignment: .leading, spacing: 4) {

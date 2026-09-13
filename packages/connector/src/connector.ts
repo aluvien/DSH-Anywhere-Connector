@@ -75,7 +75,12 @@ export class DSHAnywhereConnector {
   private awaitingPong = false;
   private relayAttempts = 0;
   private bridgeAttempts = 0;
-  private sequence = 0;
+  // Seeded from the clock, not zero: the counter is what the phone orders its
+  // transcript by and what `replayAfter` filters on, and the device remembers
+  // the last value it saw. Restarting the connector used to reset it to 1, so
+  // every new event sorted as "oldest" *and* fell below the device's remembered
+  // sequence — new output arrived out of order, or was dropped entirely.
+  private sequence = Date.now();
   private running = false;
   private state: ConnectorState = "stopped";
   private readonly pendingEvents: EventEnvelope[] = [];
@@ -264,7 +269,7 @@ export class DSHAnywhereConnector {
         machineId: this.config.machineId,
         deviceId: command.deviceId,
         sessionId,
-        sequence: 1,
+        sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "session.created",
         payload: SessionSummarySchema.parse(Object.keys(summary).length > 0 ? summary : fallbackSummary),
@@ -291,7 +296,7 @@ export class DSHAnywhereConnector {
         messageId: command.requestId,
         machineId: this.config.machineId,
         deviceId: command.deviceId,
-        sequence: 1,
+        sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "session.snapshot",
         payload: items,
@@ -305,7 +310,7 @@ export class DSHAnywhereConnector {
         messageId: command.requestId,
         machineId: this.config.machineId,
         deviceId: command.deviceId,
-        sequence: 1,
+        sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "model.catalog",
         payload: ModelCatalogPayloadSchema.parse(data),
@@ -324,7 +329,7 @@ export class DSHAnywhereConnector {
         machineId: this.config.machineId,
         deviceId: command.deviceId,
         ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }),
-        sequence: 1,
+        sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "command.result",
         payload: CommandResultPayloadSchema.parse({
@@ -346,7 +351,7 @@ export class DSHAnywhereConnector {
         machineId: this.config.machineId,
         deviceId: command.deviceId,
         ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }),
-        sequence: 1,
+        sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "attachment.uploaded",
         payload: AttachmentUploadedPayloadSchema.parse({
@@ -372,7 +377,7 @@ export class DSHAnywhereConnector {
       machineId: this.config.machineId,
       deviceId: command.deviceId,
       ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }),
-      sequence: 1,
+      sequence: ++this.sequence,
       timestamp: Date.now(),
       type: "protocol.error",
       payload: { code: "bridge-request-failed", message: reason, retryable: isRetryable(error) },
@@ -401,7 +406,7 @@ export class DSHAnywhereConnector {
       messageId: randomUUID(),
       machineId: this.config.machineId,
       deviceId,
-      sequence: 1,
+      sequence: ++this.sequence,
       timestamp: Date.now(),
       type: "session.snapshot",
       payload: compatibleItems,
@@ -411,7 +416,7 @@ export class DSHAnywhereConnector {
       messageId,
       machineId: this.config.machineId,
       deviceId,
-      sequence: 1,
+      sequence: ++this.sequence,
       timestamp: Date.now(),
       type: "session.snapshot",
       payload: items,
