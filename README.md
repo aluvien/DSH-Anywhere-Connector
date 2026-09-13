@@ -1,195 +1,393 @@
 # DSH Anywhere
 
-面向 DeepSeek Harness 的原生 iOS 远程客户端。公网只运行 Relay；每台 Mac 安装
-`DSH Anywhere Connector`，Connector 主动向 Relay 建立 WSS，再把本机 Harness
-桥接给已经配对的 iPhone。用户不需要安装 Tailscale 或 frpc，也不需要把 Mac
-端口暴露到公网。
+在 iPhone 上使用你 Mac 上的 [DeepSeek Harness](https://github.com/deepseek-ai)。会话、文件、
+命令都留在本机，手机只是一个远程操作的窗口。
 
-```text
-iPhone（SwiftUI） ← HTTPS/WSS → 自有服务器 Relay ← WSS（出站） ← Mac Connector
-                                                               ↕ localhost
-                                                        DSH Harness + Cordis plugin
+```
+iPhone ──HTTPS/WSS──▶ Relay（你的服务器） ◀──WSS 出站── Mac Connector ──▶ 本机 Harness :3080
 ```
 
-## 当前状态
+三个组件，各自解决一件事：
 
-这是可运行的私测 vertical slice：Relay、Connector、Cordis 适配插件和原生 iOS
-Relay transport 已实现并有自动化测试。服务器的 JSON registry、手工安装流程和
-pairing secret 仍适合个人/受控测试，不是公开 SaaS 的最终账号系统。
+| 组件 | 位置 | 作用 |
+|---|---|---|
+| **Connector** | 你的 Mac | 主动向 Relay 建立**出站**连接，把本机 Harness 桥接出去 |
+| **Relay** | 你的服务器 | 只做消息转发与设备鉴权，**不接触你的代码或密钥** |
+| **Bridge** | 你的 Mac | 本机 Harness 实例（`dsh web`）+ DSH Anywhere 插件，提供 `:3080` 上的界面与 API |
 
-## 1. 在自己的服务器运行 Relay
+**为什么是这个形状**：Mac 不需要公网 IP、不需要端口映射、不需要开放入站端口——它只
+向外连。服务器上跑的 Relay 保存的是「哪台机器注册过、哪些设备配过对」，没有会话内容。
 
-服务器要求 Node.js 22+ 或 Docker，以及一个 HTTPS 域名。Relay 默认监听本机
-`127.0.0.1:8787`，由 Nginx/Caddy 反向代理；代理必须支持 WebSocket Upgrade。
+---
+
+## 一、服务端部署（Relay）
+
+### 前置条件
+
+- 一台有公网 IP 的 Linux 服务器
+- Docker 与 Compose 插件（`docker compose version` 能跑通）
+- 一个已解析到该服务器的域名
+- 一个 HTTPS 证书
+
+> **必须用 HTTPS/WSS。** iOS 的 App Transport Security 会拒绝明文连接。证书推荐用
+> Caddy 或 certbot 自动签发。
+
+### 1. 准备代码与配置
+
+上传发布包（`artifacts/server/DSH-ANYWHERE-RELAY-SERVER-*.zip`）到服务器并解压。
+**包里没有顶层目录**，请直接解压到项目根目录：
 
 ```sh
-cp deploy/relay/.env.example deploy/relay/.env
-# 编辑 .env，设置至少 32 字节的 DSH_RELAY_BOOTSTRAP_TOKEN
-docker compose --env-file deploy/relay/.env \
-  -f deploy/relay/compose.yaml up -d --build
+APP=/opt/dsh-anywhere
+mkdir -p "$APP"
+ZIP=/opt/DSH-ANYWHERE-RELAY-SERVER-20260913-r7-clean.zip
+unzip -o "$ZIP" -d "$APP"
 ```
 
-然后把 `deploy/relay/nginx-location.conf` 合并进 HTTPS server block，并确认：
+生成 bootstrap token 并写入 `.env`：
 
 ```sh
-curl https://your-relay.example/health
+cd "$APP/deploy/relay"
+cp .env.example .env
+printf 'DSH_RELAY_BOOTSTRAP_TOKEN=%s\n' "$(openssl rand -base64 48)" > .env
+chmod 600 .env
 ```
 
-应返回 `{"ok":true,...}`。当前的 `dsh.biaozhu.me` 如果仍反代到个人 Mac 的
-3080，不能直接用于多人 Relay；必须改为反代服务器本机的 Relay 8787。
+> **发布包里不含 `.env`**，只含 `.env.example`，所以重复解压不会覆盖你的 token。
+> 这个 token 是**注册新 Mac 的凭据**，泄露等于任何人都能往你的 Relay 上挂机器。
 
-### 协议变更后必须重新部署 Relay
-
-Relay 会把每条转发消息的 body 拿去和严格的 `WireMessage` 联合类型做校验，遇到
-不认识的事件或命令类型会直接回 `invalid_message` 并丢弃，**不会**透传。而 Relay
-镜像是在构建时把 `packages/protocol` 一起打进去的，所以：
-
-- 上游协议一旦新增事件或命令（例如 `question.asked`、`question.answer`、
-  `assistant.reasoning`），**必须重新构建并重启服务器上的 Relay**，否则新功能
-  会在 Relay 这一跳被悄悄丢掉，表现是手机端「什么都没有」，而 Mac 和 App 两侧
-  看起来都正常。
-- 判断是否需要重部署看 `/health` 的 `schemaRevision`，它与
-  `packages/relay-server/src/server.ts` 里的 `RELAY_SCHEMA_REVISION` 必须一致。
-  改动 wire schema 时把该常量加一。
-
-服务器上的操作（路径按实际部署位置）：
+### 2. 构建并启动
 
 ```sh
-cd /opt/dsh-anywhere
-git pull        # 或上传新的源码包
-cd deploy/relay
 docker compose --env-file .env -f compose.yaml up -d --build
-curl https://your-relay.example/health   # 确认 schemaRevision 已变为新值
+docker compose --env-file .env -f compose.yaml ps
 ```
 
-Mac 侧的 bridge 与 Connector 也要重启才会加载新的插件与转发规则。
+首次构建要拉基础镜像，需要几分钟。容器只监听 `127.0.0.1:8787`，**不直接对外**——
+对外由 Nginx 反代。
 
-## 2. 在 Mac 注册 Connector
+### 3. Nginx 反向代理 + TLS
 
-在本项目根目录构建，然后只由管理员执行一次 setup。bootstrap token 不要交给
-终端用户：
+把 `deploy/relay/nginx-location.conf` 的内容放进你的 HTTPS `server` 块：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;      # WebSocket 必需
+    proxy_set_header Connection "upgrade";       # WebSocket 必需
+    proxy_read_timeout 3600s;                    # 长连接必需
+    proxy_send_timeout 3600s;
+}
+```
+
+三个常被忽略的点：`Upgrade`/`Connection` 头不转发会导致**连接建立后立刻断开**；
+`proxy_read_timeout` 太短会让空闲会话被掐断；`X-Forwarded-Proto` 影响 Relay 生成的链接。
+
+### 4. 验证
 
 ```sh
+curl -s https://你的域名/health
+```
+
+正常输出类似：
+
+```json
+{"ok":true,"version":1,"schemaRevision":3,"build":"2026-09-13",
+ "deviceManagement":true,"oneTimePairingCodes":true}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `schemaRevision` | **被转发的消息结构版本**。这个数字变了，说明必须重新部署 Relay，否则新客户端会发出旧 Relay 拒绝的消息 |
+| `deviceManagement` | 是否提供设备列表与撤销路由 |
+| `oneTimePairingCodes` | 是否提供一次性配对码 |
+
+后两个是**能力标记**：只加路由、不改消息结构时不会升 `schemaRevision`，所以就靠它们
+判断线上到底部署到哪一版。
+
+### 升级
+
+```sh
+ZIP=/opt/DSH-ANYWHERE-RELAY-SERVER-<新版本>.zip
+APP=/opt/dsh-anywhere
+
+# 1) 先备份（token 与源码，出问题能退回去）
+BACKUP="$APP/../dsh-relay-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
+cp -a "$APP/deploy/relay/.env" "$BACKUP/relay.env"
+tar czf "$BACKUP/source.tar.gz" -C "$APP" \
+  deploy packages package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json README.md
+
+# 2) 覆盖并重建
+unzip -o "$ZIP" -d "$APP"
+cd "$APP/deploy/relay"
+docker compose --env-file .env -f compose.yaml up -d --build
+
+# 3) 验证
+curl -s https://你的域名/health
+```
+
+**不需要重新配对。** 机器注册与设备令牌存在 Docker 卷 `relay-data`（容器内
+`/data/registry.json`），`up -d --build` 不碰卷，所以 Mac 与手机的凭据都还在。
+
+回滚：
+
+```sh
+cd "$APP" && tar xzf "$BACKUP/source.tar.gz"
+cd "$APP/deploy/relay" && docker compose --env-file .env -f compose.yaml up -d --build
+```
+
+---
+
+## 二、本地安装（Mac）
+
+### 前置条件
+
+- macOS
+- **Node.js 22+**
+- **pnpm**
+- **DeepSeek Harness**：`dsh` 命令可用（`dsh --version`）
+- 服务端已部署完成，并拿到 `DSH_RELAY_BOOTSTRAP_TOKEN`
+
+### 1. 安装
+
+**把这套代码放在 `~/DSH-ANYWHERE`，不要放在 `~/Documents`。** macOS 的隐私保护会阻止
+launchd 执行「文稿」目录里的脚本，表现为服务反复启动失败。
+
+```sh
+git clone https://github.com/aluvien/DSH-Anywhere-Connector.git DSH-ANYWHERE
+cd DSH-ANYWHERE
 pnpm install
 pnpm build
-node packages/connector/lib/cli.js setup \
-  --relay https://your-relay.example \
-  --bootstrap-token '<server bootstrap token>' \
-  --machine-name 'My Mac'
 ```
 
-命令会在 macOS 默认目录写入权限为 0600 的 `connector.json` 和 `bridge.env`，并
-打印本机的 `machineId`、`pairingSecret`，以及一条 `pairingLink`。pairing secret
-只应通过安全渠道交给该 Mac 的 iPhone 用户；不要提交到 Git 或粘贴到公共聊天。
+### 2. 注册这台 Mac 到 Relay
 
-setup 现在也把 `pairingSecret` 写进 `connector.json`（同样是 0600），这样本地
-bridge 可以把它渲染成二维码，不必再手工转抄一次。
-
-当前私测启动需要两个进程：
+bootstrap token 通过环境变量传入，**不要写进任何文件**：
 
 ```sh
-# 终端 1：启动本地 Harness bridge；脚本会自动读取 setup 写入的 bridge.env
-./scripts/run-bridge.sh
-
-# 终端 2：启动 Connector（只建立出站连接）
-./scripts/run-connector.sh
+export DSH_ANYWHERE_RELAY_URL='https://你的域名'
+export DSH_ANYWHERE_BOOTSTRAP_TOKEN='服务器 .env 里那个 token'
+export DSH_ANYWHERE_MACHINE_NAME='My Mac'
+./scripts/install-macos-bundle.sh
 ```
 
-bridge 启动后，在 **Mac 本机**打开下面这个地址即可看到配对二维码，用 iPhone
-扫描就不用再手输 machineId 和 pairing secret：
+脚本会：
 
-```text
+1. 调 `/v1/machines/register` 注册这台机器，取得 `machineId` / `machineToken` / `pairingSecret`
+2. 把配置写到 `~/Library/Application Support/DSH Anywhere/connector.json`，权限 `0600`
+3. 生成 `bridge.env`（Bridge 用它加载插件）
+4. 注册两个 launchd 服务并启动
+
+**这台 Mac 已经注册过时不要重复注册**，改用：
+
+```sh
+git pull
+pnpm install && pnpm build
+./scripts/install-macos-services.sh    # 只重装服务，不重新注册
+```
+
+### 3. 两个 launchd 服务
+
+| 服务 | 作用 |
+|---|---|
+| `com.dsh-anywhere.connector` | 维持到 Relay 的出站连接，转发消息 |
+| `com.dsh-anywhere.bridge` | 本机 Harness + 插件，监听 `127.0.0.1:3080` |
+
+两个都是 `RunAtLoad` + `KeepAlive`：开机自启，崩溃自动拉起。
+
+```sh
+launchctl list | grep dsh-anywhere                     # 看状态与 PID
+tail -f ~/Library/Logs/DSH\ Anywhere/connector.log     # Connector 日志
+tail -f ~/Library/Logs/DSH\ Anywhere/bridge.log        # Bridge 日志
+```
+
+### 4. 验证
+
+```sh
+curl -s http://127.0.0.1:3080/dsh-anywhere/v1/health
+node packages/connector/lib/cli.js status
+```
+
+### 5. 改了代码之后怎么让它生效
+
+**这一点最容易搞错：三类改动需要三种不同的生效方式。**
+
+| 改了什么 | 怎么生效 |
+|---|---|
+| iOS App（`ios/`） | 重新装 App，与 Mac 无关 |
+| `packages/connector`、`packages/dsh-anywhere-plugin` | **重启对应服务** |
+| `packages/protocol`（消息结构） | 重启服务 **且重新部署 Relay** |
+
+```sh
+pnpm build                                              # 先构建
+
+launchctl kickstart -k gui/$(id -u)/com.dsh-anywhere.connector
+launchctl kickstart -k gui/$(id -u)/com.dsh-anywhere.bridge
+```
+
+启动脚本带 `DSH_ANYWHERE_SKIP_BUILD=1`，**重启不会替你重新构建**，所以必须先 `pnpm build`。
+
+**判断服务是否已经加载了新代码**——比较产物时间与进程启动时间：
+
+```sh
+stat -f "%Sm" packages/dsh-anywhere-plugin/lib/index.js                      # 产物时间
+ps -p $(launchctl list | awk '/dsh-anywhere.bridge/{print $1}') -o lstart=   # 进程启动时间
+```
+
+产物比进程新，就说明进程还在跑旧代码。这一条能省下大量「我明明改了怎么没效果」的时间。
+
+> 重启 Bridge 会**中断正在使用 `:3080` 的对话**。会话是持久化的，重开
+> <http://127.0.0.1:3080> 即可恢复。
+
+---
+
+## 三、手机配对（扫码）
+
+配对就是把三样东西交给手机：**Relay 地址**、**机器 ID**、**配对凭据**。三种方式，推荐
+第一种。
+
+### 方式 A：命令行生成一次性配对码（推荐）
+
+在 Mac 上：
+
+```sh
+node packages/connector/lib/cli.js pair
+```
+
+输出：
+
+```json
+{
+  "machineId": "machine_xxxxxxxx",
+  "pairingCode": "ABCD2345",
+  "expiresAt": 1757752800000,
+  "pairingLink": "dshanywhere://pair?relay=https://...&machineId=...&code=ABCD2345"
+}
+```
+
+然后在手机上打开 App → **Pair with Mac** → 手动输入机器 ID 与配对码。
+
+**这个码 10 分钟内有效，且只能用一次。** 即使泄露也无法重放，更不能改投到别的机器。
+
+### 方式 B：扫网页上的二维码（推荐给「就想扫一下」的情况）
+
+在 Mac 上打开：
+
+```
 http://127.0.0.1:3080/dsh-anywhere/v1/pairing
 ```
 
-该页面只在回环地址提供服务，并且会校验 Host 头，因此即使这台 Mac 的 3080 端口
-被反向代理暴露到公网，这个页面也不会随之对外可访问。
+页面上有一个二维码。**这个页面只监听本机（loopback），不要试图从外网打开它**——它存在
+的意义就是「只有坐在这台 Mac 前面的人才能看到」。
 
-macOS 用户服务也可以由安装脚本生成（会加载两个用户级 launchd agent，并自动重启
-进程）：
+然后在手机上：
 
-```sh
-./scripts/install-macos-services.sh
+1. 打开 DSH Anywhere
+2. 点 **Scan pairing code**
+3. 授权相机，对准 Mac 屏幕上的二维码
+
+扫到即自动填入并开始配对。
+
+> 页面上的凭据会**优先显示一次性码**（Connector 每 5 分钟换一个新码），并在下方标明
+> 「还剩多少分钟」。只有在取不到新码时（例如 Relay 尚未支持该路由）才回退显示长期
+> 密钥。**不要长期把长期密钥的二维码留在屏幕上。**
+
+### 方式 C：手动输入
+
+配对页可直接填：**Relay 地址**、**Machine ID**、**配对码或密钥**。
+
+凭据只有一个输入框，按形状自动区分两者：8 位、且只含
+`ABCDEFGHJKMNPQRSTUVWXYZ23456789`（去掉了 `0/O/1/I/L`，因为这个码要被人从屏幕上读出
+来）的是一次性码，其余按长期密钥处理。两者长度不可能重叠，所以不需要你选模式。
+
+### 二维码里是什么
+
+二维码编码的是一个自定义协议的链接：
+
+```
+dshanywhere://pair?relay=<Relay 的 https 地址>&machineId=<机器 ID>&code=<一次性码>
 ```
 
-卸载这两个 agent：
+令牌字段是 `code`（一次性码）或 `secret`（长期密钥）二选一。App 的扫码器解析这个格式，
+非本协议的二维码会被忽略并继续扫描。
+
+> **注意**：App 目前**没有向 iOS 注册 `dshanywhere://` 这个 URL scheme**，所以从 Safari
+> 或信息里点这样的链接不会唤起 App。扫码必须**在 App 内**进行（即方式 B）。方式 A 与 C
+> 不受影响。
+
+### 配对之后
+
+- 凭据存在 iOS 钥匙串；Mac 上的 `machineToken` 不动
+- 一个 iPhone 可以配对**多台 Mac**，在「设置 → Machines」切换；「Devices」里可撤销其他设备
+- 换手机或重装 App：重新走一次配对即可，不需要动 Mac
+- 撤销某台设备：设置 → Devices → Revoke（立即生效，该设备的连接会被断开）
+
+---
+
+## 四、iOS App
+
+### 自己构建
+
+需要 Xcode，部署目标 **iOS 17.0**，Bundle ID `me.aluvien.DSHAnywhere`。
 
 ```sh
-./scripts/install-macos-services.sh --uninstall
+open ios/DSHAnywhere.xcodeproj
 ```
 
-也可以显式指定自定义配置：
+选择你的 Team 签名后 Run 到真机。**扫码需要真机**——模拟器没有可用相机（App 会提示改为
+手动输入）。
 
-```sh
-DSH_ANYWHERE_CONFIG=/path/to/connector.json ./scripts/run-bridge.sh
-DSH_ANYWHERE_CONFIG=/path/to/connector.json ./scripts/run-connector.sh
-```
+### 界面语言
 
-用户不需要配置 frpc/Tailscale；Mac 只需要能访问 Relay 的 HTTPS/WSS 域名。
+设置 → **语言**，可选**跟随系统**（默认）、简体中文、English。切换**立即生效**，不需要
+重启 App。
 
-## 3. 在原生 iOS App 配对
+### 当前功能
 
-用 Xcode 打开 [`ios/DSHAnywhere.xcodeproj`](ios/DSHAnywhere.xcodeproj)，在
-Signing & Capabilities 选择自己的 Team 和 Bundle ID，运行到 iPhone。配对页点
-**Scan pairing code** 扫上面那个网页的二维码即可，也可以手工填写：
+- 会话列表：按工作区分组、可折叠；新建会话时可选工作区
+- 对话页：工具调用按**真实发生顺序**穿插在消息之间；一轮结束只留最终回答，思维链折叠
+- Markdown 按块渲染：标题、代码块、列表、表格、引用
+- 提问卡片可直接作答；审批可允许一次或拒绝
+- 多机器切换、设备列表与撤销、图片与文件上传
 
-- Relay HTTPS 地址，例如 `https://your-relay.example`
-- Connector 输出的 `machineId`
-- Connector 输出的 `pairingSecret`
-
-扫码只接受 `dshanywhere://pair` 链接（由 `packages/protocol` 的 `pairingLink`
-生成）。扫到别的二维码会提示并继续扫描，不会填入半截凭证；相机权限只用于这一步。
-
-App 通过 `POST /v1/pair` 换取设备令牌，并把令牌放进 iOS Keychain。之后 iOS
-通过 `/v1/connect` 的 Relay WebSocket 收发会话、Prompt、工具状态和审批操作。
-
-首页默认只显示未存档会话，网页端存档过的会话不会出现在列表里；需要查看时用
-右上角菜单里的 **Show archived** 打开。
+---
 
 ## 代码结构
 
-```text
-packages/protocol/              TypeScript/Zod 严格 wire protocol
-packages/relay-server/          公网 Relay、注册、配对、同机路由
-packages/connector/             Mac Connector CLI 与双 WebSocket 转发
-packages/dsh-anywhere-plugin/   DeepSeek Harness / Cordis 本地适配层
-ios/DSHAnywhere/Core/           Swift 协议、HTTP、Relay WebSocket、Keychain
-ios/DSHAnywhere/Features/       SwiftUI 配对、会话、对话、审批界面
-deploy/relay/                   Docker Compose 与反向代理模板
-docs/HANDOFF.md                 当前实现、边界和后续任务
+```
+packages/
+  protocol/             共享类型与 Zod 校验：被转发的每条消息都在这里定义
+  relay-server/         服务器：注册、配对、设备管理、消息转发
+  connector/            Mac 侧：出站连接、命令转发、CLI
+  dsh-anywhere-plugin/  跑在 Harness 里的插件：会话与事件、配对页、提问
+ios/DSHAnywhere/
+  Core/                 协议、事件存储、网络、钥匙串（被 App 与测试共用）
+  Features/             会话、对话、配对、设置
+  App/                  应用外壳与全局状态
+deploy/relay/           Dockerfile、compose、Nginx 片段
 ```
 
 ## 验证
 
 ```sh
-pnpm check
-pnpm build
-
-cd ios
-SWIFTPM_MODULECACHE_OVERRIDE=/tmp/dsh-spm-module-cache \
-CLANG_MODULE_CACHE_PATH=/tmp/dsh-clang-module-cache \
-swift test --disable-sandbox --scratch-path /tmp/dsh-anywhere-swift-build
+pnpm -r test                              # TypeScript：protocol / connector / relay / plugin
+cd ios && swift test --disable-sandbox    # Swift：协议、事件存储、markdown 解析
 ```
 
-无签名构建 iOS App：
+`RELAY_SCHEMA_REVISION` 定义在 `packages/relay-server/src/server.ts`。**改动
+`packages/protocol` 里被转发的消息类型时必须同时提升它**，否则旧 Relay 会拒收新客户端
+的消息，而错误信息只会说 `invalid_message`。
 
-```sh
-xcodebuild \
-  -project ios/DSHAnywhere.xcodeproj \
-  -scheme DSHAnywhere \
-  -sdk iphonesimulator \
-  -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath /tmp/dsh-anywhere-derived \
-  CODE_SIGNING_ALLOWED=NO build
-```
+## 安全边界
 
-## 目前的边界
-
-- launchd 安装脚本适合源码私测；还没有签名安装器和自动更新机制。
-- Relay 的 JSON registry 尚未接 PostgreSQL、账号、设备撤销和多租户 ACL。
-- pairing secret 目前仍可重复使用。**relay 已支持**短时效、单次使用的配对码
-  （`POST /v1/machines/:id/pairing-codes`，机器令牌签发，10 分钟过期、用后即废、
-  且绑定单一机器），但 Connector 与 App 尚未改用，公开发布前应完成接入并停用
-  长期密钥。
-- Relay payload 目前是协议对象，不是应用层 E2EE；Relay 只应部署在自己信任的服务器。
-- APNs、后台通知、附件、二维码/深链配对和 App Store/TestFlight 发布尚未完成。
+- 服务器只保存机器与设备的**哈希**，没有会话内容、没有代码
+- 所有凭据文件权限 `0600`；日志输出经过 `redactSecrets`
+- 配对网页**只监听 loopback**，且校验 Host 头
+- 一次性配对码：10 分钟有效、用后即废、绑定单一机器；签发权限仅限机器令牌
+- 长期密钥仍可重复使用，**公开发布前应完全停用**；目前二维码已优先使用一次性码
+- Relay 的持久化仍是单文件 JSON，适合单用户/小规模；账号体系与更大规模存储尚未实现
