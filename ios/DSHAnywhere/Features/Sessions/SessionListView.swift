@@ -65,9 +65,6 @@ struct SessionListView: View {
                         sectionHeader(group)
                     }
                 }
-                Section { EmptyView() } header: { connectionHeader }
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
             }
             .overlay {
                 if groups.isEmpty {
@@ -75,11 +72,18 @@ struct SessionListView: View {
                                            description: Text("Create your first Harness session."))
                 }
             }
+            // The page never needed the word "Sessions": there is only one list.
+            // Which Mac you are looking at, and whether it is reachable, is the
+            // thing that actually changes. The title stays for the back-button
+            // label and for VoiceOver; the principal item replaces it visually.
             .navigationTitle("Sessions")
+            .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: String.self) { id in
                 ConversationView(sessionID: id)
             }
             .toolbar {
+                ToolbarItem(placement: .principal) { connectionTitle }
+
                 // Brand mark rather than a control on the left, matching the
                 // reference app: the two things you can actually do live in the
                 // capsule on the right.
@@ -180,19 +184,24 @@ struct SessionListView: View {
         }
     }
 
-    private var connectionHeader: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(connectionColor)
-                .frame(width: 8, height: 8)
-            Text(connectionLabel)
-                .font(.caption)
-            Spacer()
+    /// Machine name with its reachability underneath, in the title position.
+    private var connectionTitle: some View {
+        VStack(spacing: 1) {
             Text(model.machineName)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.headline)
+                .lineLimit(1)
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(connectionColor)
+                    .frame(width: 6, height: 6)
+                Text(connectionLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
-        .textCase(nil)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(model.machineName), \(connectionLabel)")
     }
 
     private var connectionLabel: String {
