@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { pairingLink } from "@dsh-anywhere/protocol";
 import { loadConfig, defaultConfigPath, redactSecrets, type ConnectorConfig } from "./config.js";
 import { DSHAnywhereConnector, bridgeAPIURL } from "./connector.js";
-import { setupConnector } from "./setup.js";
+import { setupConnector, requestPairingCode } from "./setup.js";
 
-type Command = "start" | "status" | "setup";
+type Command = "start" | "status" | "setup" | "pair";
 
 export async function runCli(
   args: readonly string[],
@@ -13,10 +14,26 @@ export async function runCli(
   const stderr = dependencies.stderr ?? console.error;
   const parsed = parseArgs(args);
   if (parsed === undefined) {
-    stderr("Usage: dsh-anywhere <start|status> [--config <path>] | setup --relay <https://...> --bootstrap-token <token> --machine-name <name> [--bridge-base-url <url>] [--config <path>]");
+    stderr("Usage: dsh-anywhere <start|status|pair> [--config <path>] | setup --relay <https://...> --bootstrap-token <token> --machine-name <name> [--bridge-base-url <url>] [--config <path>]");
     return 64;
   }
   try {
+    if (parsed.command === "pair") {
+      const config = await loadConfig(parsed.configPath);
+      const issued = await requestPairingCode(config, dependencies.fetch ?? fetch);
+      stdout(JSON.stringify({
+        machineId: config.machineId,
+        pairingCode: issued.code,
+        expiresAt: issued.expiresAt,
+        // Single-use and short-lived, unlike the pairingSecret printed by setup.
+        pairingLink: pairingLink({
+          relay: config.relayURL,
+          machineId: config.machineId,
+          pairingCode: issued.code,
+        }),
+      }));
+      return 0;
+    }
     if (parsed.command === "setup") {
       const result = await setupConnector({
         relay: parsed.relay,
@@ -86,7 +103,7 @@ export async function connectorStatus(config: ConnectorConfig, request: typeof f
 }
 
 type ParsedArgs =
-  | { readonly command: "start" | "status"; readonly configPath: string }
+  | { readonly command: "start" | "status" | "pair"; readonly configPath: string }
   | {
     readonly command: "setup";
     readonly configPath: string;
@@ -98,7 +115,7 @@ type ParsedArgs =
 
 function parseArgs(args: readonly string[]): ParsedArgs | undefined {
   const [command, ...rest] = args;
-  if (command !== "start" && command !== "status" && command !== "setup") return undefined;
+  if (command !== "start" && command !== "status" && command !== "setup" && command !== "pair") return undefined;
   let configPath = defaultConfigPath();
   const options: Record<string, string> = {};
   for (let index = 0; index < rest.length; index += 1) {

@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { pairingLink } from "@dsh-anywhere/protocol";
+import { pairingLink, relayHTTPSURL } from "@dsh-anywhere/protocol";
 import { ConfigError, parseConfig, type ConnectorConfig } from "./config.js";
 
 export interface SetupOptions {
@@ -152,6 +152,40 @@ function asRegistration(value: unknown): Registration | undefined {
   if (typeof body.machineToken !== "string" || body.machineToken.length === 0) return undefined;
   if (typeof body.pairingSecret !== "string" || body.pairingSecret.length === 0) return undefined;
   return { machineId: body.machineId, machineToken: body.machineToken, pairingSecret: body.pairingSecret };
+}
+
+/**
+ * Asks the Relay to mint a single-use pairing code for this machine.
+ *
+ * Only the machine token can do this: issuing a code is the capability that
+ * lets a new device in, so it stays with the machine operator. The code is
+ * short-lived and consumed on use, replacing the long-lived pairing secret for
+ * anything paired from now on.
+ */
+export async function requestPairingCode(
+  config: ConnectorConfig,
+  request: typeof fetch = fetch,
+): Promise<{ code: string; expiresAt: number }> {
+  const base = trailingSlash(relayHTTPSURL(config.relayURL));
+  const url = new URL(`v1/machines/${encodeURIComponent(config.machineId)}/pairing-codes`, base);
+  const response = await request(url.toString(), {
+    method: "POST",
+    headers: { authorization: `Bearer ${config.machineToken}`, "content-type": "application/json" },
+    body: "{}",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new SetupError(`Relay refused to issue a pairing code (HTTP ${response.status})`);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new SetupError("Relay returned an invalid pairing code response");
+  }
+  const record = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+  if (typeof record.code !== "string" || record.code.length === 0 || typeof record.expiresAt !== "number") {
+    throw new SetupError("Relay returned an invalid pairing code response");
+  }
+  return { code: record.code, expiresAt: record.expiresAt };
 }
 
 function trailingSlash(value: string): string {

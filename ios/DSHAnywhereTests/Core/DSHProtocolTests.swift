@@ -63,7 +63,7 @@ final class DSHProtocolTests: XCTestCase {
         ))
         XCTAssertEqual(link.relay, "https://relay.example.com")
         XCTAssertEqual(link.machineId, "machine_macmini")
-        XCTAssertEqual(link.pairingSecret, "s3cret-value-long-enough")
+        XCTAssertEqual(link.credential, .secret("s3cret-value-long-enough"))
     }
 
     func testPairingLinkRejectsForeignOrIncompleteCodes() {
@@ -72,7 +72,35 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertNil(DSHPairingLink(urlString: "https://example.com/?machineId=mac-1"))
         XCTAssertNil(DSHPairingLink(urlString: "dshanywhere://pair?machineId=mac-1"))
         XCTAssertNil(DSHPairingLink(urlString: "dshanywhere://pair?relay=https%3A%2F%2Fr.example&machineId=mac-1&secret="))
+        XCTAssertNil(DSHPairingLink(urlString: "dshanywhere://pair?relay=https%3A%2F%2Fr.example&machineId=mac-1"))
         XCTAssertNil(DSHPairingLink(urlString: "not a url"))
+    }
+
+    func testPairingLinkCarriesASingleUseCode() throws {
+        let link = try XCTUnwrap(DSHPairingLink(
+            urlString: "dshanywhere://pair?relay=https%3A%2F%2Frelay.example.com&machineId=machine_macmini&code=abcd2345"
+        ))
+        // Codes are normalised to upper case so a hand-typed lower-case entry
+        // still matches the Relay's hashed lookup.
+        XCTAssertEqual(link.credential, .code("ABCD2345"))
+    }
+
+    func testPairingLinkPrefersTheCodeWhenBothArePresent() throws {
+        let link = try XCTUnwrap(DSHPairingLink(
+            urlString: "dshanywhere://pair?relay=https%3A%2F%2Fr.example&machineId=m&code=abcd2345&secret=long-lived-secret"
+        ))
+        XCTAssertEqual(link.credential, .code("ABCD2345"))
+    }
+
+    func testPairingCredentialDetectionSeparatesCodesFromSecrets() {
+        // One field accepts both, so the split must be by shape alone.
+        XCTAssertEqual(DSHPairingCredential.detect("abcd2345"), .code("ABCD2345"))
+        XCTAssertEqual(DSHPairingCredential.detect("  abcd2345  "), .code("ABCD2345"))
+        XCTAssertEqual(DSHPairingCredential.detect("s3cret-value-long-enough"), .secret("s3cret-value-long-enough"))
+        // 8 characters, but not the code alphabet: 0/O/1/I/L are excluded.
+        XCTAssertEqual(DSHPairingCredential.detect("ABCDEFG0"), .secret("ABCDEFG0"))
+        XCTAssertNil(DSHPairingCredential.detect("   "))
+        XCTAssertNil(DSHPairingCredential.detect(""))
     }
 
     func testPairingLinkRejectsARelayTheClientCannotDial() {

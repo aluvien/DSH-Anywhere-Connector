@@ -551,11 +551,15 @@ export const assertSequence = (previousSequence: number | undefined, sequence: u
  */
 export const PAIRING_LINK_SCHEME = "dshanywhere";
 
-export interface PairingLinkPayload {
-  readonly relay: string;
-  readonly machineId: string;
-  readonly pairingSecret: string;
-}
+/**
+ * A pairing link carries exactly one credential: the long-lived `secret`, or a
+ * single-use `code` minted by the machine. Modelling it as a union rather than
+ * two optional fields means a caller cannot build a link with neither, and
+ * existing links keep parsing unchanged.
+ */
+export type PairingLinkPayload =
+  | { readonly relay: string; readonly machineId: string; readonly pairingSecret: string }
+  | { readonly relay: string; readonly machineId: string; readonly pairingCode: string };
 
 /** Rewrites a stored wss:// (or ws://) relay address into its HTTPS form. */
 export const relayHTTPSURL = (value: string): string => {
@@ -572,7 +576,8 @@ export const pairingLink = (payload: PairingLinkPayload): string => {
   const url = new URL(`${PAIRING_LINK_SCHEME}://pair`);
   url.searchParams.set("relay", relayHTTPSURL(payload.relay));
   url.searchParams.set("machineId", payload.machineId);
-  url.searchParams.set("secret", payload.pairingSecret);
+  if ("pairingSecret" in payload) url.searchParams.set("secret", payload.pairingSecret);
+  else url.searchParams.set("code", payload.pairingCode);
   return url.toString();
 };
 
@@ -588,10 +593,19 @@ export const parsePairingLink = (value: string): PairingLinkPayload | undefined 
   const relay = url.searchParams.get("relay");
   const machineId = url.searchParams.get("machineId");
   const pairingSecret = url.searchParams.get("secret");
-  if (relay === null || machineId === null || pairingSecret === null) return undefined;
-  if (machineId.trim() === "" || pairingSecret.trim() === "") return undefined;
+  const pairingCode = url.searchParams.get("code");
+  if (relay === null || machineId === null || machineId.trim() === "") return undefined;
+  const secret = pairingSecret?.trim() ?? "";
+  const code = pairingCode?.trim().toUpperCase() ?? "";
+  if (secret === "" && code === "") return undefined;
   try {
-    return { relay: relayHTTPSURL(relay), machineId: machineId.trim(), pairingSecret: pairingSecret.trim() };
+    const resolvedRelay = relayHTTPSURL(relay);
+    const resolvedMachineId = machineId.trim();
+    // A link carrying both is ambiguous; the one-time code wins because it is
+    // the narrower credential and what a freshly minted link carries.
+    return code !== ""
+      ? { relay: resolvedRelay, machineId: resolvedMachineId, pairingCode: code }
+      : { relay: resolvedRelay, machineId: resolvedMachineId, pairingSecret: secret };
   } catch {
     return undefined;
   }

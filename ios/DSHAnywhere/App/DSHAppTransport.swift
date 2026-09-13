@@ -4,7 +4,7 @@ import Foundation
 /// Production code can provide a WebSocket-backed implementation, while
 /// previews and tests can inject the in-memory implementation below.
 protocol DSHAppTransport: Sendable {
-    func pair(serverAddress: String, machineId: String, pairingSecret: String, deviceName: String) async throws -> DSHRemoteProfile
+    func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile
     func connect() async -> AsyncThrowingStream<DSHEvent, Error>
     func send(_ command: DSHCommand) async throws
     func disconnect() async
@@ -32,10 +32,10 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     nonisolated static var isConfigured: Bool { !DSHProfileStore().profiles.isEmpty }
 
-    func pair(serverAddress: String, machineId: String, pairingSecret: String, deviceName: String) async throws -> DSHRemoteProfile {
+    func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile {
         let baseURL = try DSHAPIClient.relayBaseURL(from: serverAddress)
         let result = try await DSHAPIClient(relayBaseURL: baseURL).pair(
-            machineId: machineId, pairingSecret: pairingSecret, deviceName: deviceName
+            machineId: machineId, credential: credential, deviceName: deviceName
         )
         try tokenStore.save(result.token, account: result.profile.deviceId)
         // Adds to the machine list rather than replacing it, so pairing a second
@@ -124,7 +124,7 @@ actor DSHPreviewTransport: DSHAppTransport {
     private let deviceID = "preview-device"
     private let machineID = "preview-machine"
 
-    func pair(serverAddress: String, machineId: String, pairingSecret: String, deviceName: String) async throws -> DSHRemoteProfile {
+    func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile {
         DSHRemoteProfile(relayBaseURL: URL(string: "https://preview.invalid")!,
                          deviceId: deviceID, machineId: machineID, machineName: "Preview Mac")
     }

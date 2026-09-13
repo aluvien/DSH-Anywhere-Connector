@@ -262,12 +262,33 @@ public struct DSHQuestionAnswer: Sendable, Equatable {
 /// Scanned `dshanywhere://pair` payload. Mirrors `parsePairingLink` in
 /// packages/protocol so the QR format keeps a single definition across the
 /// TypeScript connector and this client.
+/// Exactly one credential authorises a pairing: the long-lived secret, or a
+/// single-use code minted by the Mac. An enum keeps "both" and "neither"
+/// unrepresentable.
+public enum DSHPairingCredential: Equatable, Sendable {
+    case secret(String)
+    case code(String)
+
+    /// Codes are 8 characters drawn from an alphabet without 0/O/1/I/L; secrets
+    /// are 43-character base64url. The lengths cannot overlap, so a single text
+    /// field can accept either without asking the user to pick a mode.
+    public static func detect(_ raw: String) -> DSHPairingCredential? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let upper = trimmed.uppercased()
+        let isCode = upper.count == 8 && upper.allSatisfy { codeAlphabet.contains($0) }
+        return isCode ? .code(upper) : .secret(trimmed)
+    }
+
+    public static let codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+}
+
 public struct DSHPairingLink: Equatable, Sendable {
     public let relay: String
     public let machineId: String
-    public let pairingSecret: String
+    public let credential: DSHPairingCredential
 
-    /// Returns nil for anything that is not a complete pairing code, so the
+    /// Returns nil for anything that is not a complete pairing link, so the
     /// scanner can keep looking instead of filling in half a credential.
     public init?(urlString: String) {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -282,14 +303,21 @@ public struct DSHPairingLink: Equatable, Sendable {
 
         guard let relay = value("relay"), !relay.isEmpty,
               let machineId = value("machineId"), !machineId.isEmpty,
-              let pairingSecret = value("secret"), !pairingSecret.isEmpty,
               let relayURL = URL(string: relay),
               let scheme = relayURL.scheme?.lowercased(),
               scheme == "https" || scheme == "http" else { return nil }
 
+        // A link carrying both is ambiguous; the code wins, matching
+        // parsePairingLink in packages/protocol.
+        let code = value("code")?.uppercased() ?? ""
+        let secret = value("secret") ?? ""
+        guard let credential = code.isEmpty
+            ? (secret.isEmpty ? nil : DSHPairingCredential.secret(secret))
+            : DSHPairingCredential.code(code) else { return nil }
+
         self.relay = relay
         self.machineId = machineId
-        self.pairingSecret = pairingSecret
+        self.credential = credential
     }
 }
 

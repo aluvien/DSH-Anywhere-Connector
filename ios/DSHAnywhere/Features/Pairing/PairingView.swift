@@ -42,7 +42,7 @@ struct PairingView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .frame(maxWidth: 320)
-                SecureField("Pairing secret", text: $model.pairingSecret)
+                SecureField("Pairing code or secret", text: $model.pairingSecret)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 320)
                 Button {
@@ -52,7 +52,9 @@ struct PairingView: View {
                         .frame(maxWidth: 320)
                 }
                 .buttonStyle(.bordered)
-                .disabled(model.isPairing || model.machineID.isEmpty || model.pairingSecret.count < 32 || model.serverAddress.isEmpty)
+                .disabled(model.isPairing || model.machineID.isEmpty
+                          || DSHPairingCredential.detect(model.pairingSecret) == nil
+                          || model.serverAddress.isEmpty)
                 .overlay { if model.isPairing { ProgressView() } }
                 Spacer()
                 Text("Your API keys stay on your Mac.")
@@ -65,7 +67,10 @@ struct PairingView: View {
                 PairingScannerSheet { link in
                     model.serverAddress = link.relay
                     model.machineID = link.machineId
-                    model.pairingSecret = link.pairingSecret
+                    switch link.credential {
+                    case .secret(let value): model.pairingSecret = value
+                    case .code(let value): model.pairingSecret = value
+                    }
                     showScanner = false
                     model.pair()
                 }

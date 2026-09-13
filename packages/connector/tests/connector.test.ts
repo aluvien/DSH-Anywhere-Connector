@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { PROTOCOL_VERSION } from "@dsh-anywhere/protocol";
 import { DSHAnywhereConnector, backoffDelay, bridgeRequestFor } from "../src/connector.js";
+import { requestPairingCode } from "../src/setup.js";
 import type { ConnectorConfig } from "../src/config.js";
 
 const config: ConnectorConfig = {
@@ -165,3 +166,30 @@ class FakeSocket {
     for (const listener of this.listeners.get(event) ?? []) listener(...args);
   }
 }
+
+describe("one-time pairing codes", () => {
+  it("requests a code from the relay with the machine token", async () => {
+    const calls: { url: string; method?: string | undefined; authorization?: string | undefined }[] = [];
+    const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      calls.push({ url: String(input), method: init?.method, authorization: headers.get("authorization") ?? undefined });
+      return new Response(JSON.stringify({ code: "ABCD2345", expiresAt: 1_700_000_000_000 }),
+        { status: 201, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+
+    const issued = await requestPairingCode(config, fetchMock);
+
+    expect(issued).toEqual({ code: "ABCD2345", expiresAt: 1_700_000_000_000 });
+    // The stored relay URL is wss://; device management is an HTTPS API.
+    expect(calls[0]!.url).toBe("http://127.0.0.1:4100/v1/machines/machine-1/pairing-codes");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.authorization).toBe("Bearer machine-secret");
+  });
+
+  it("surfaces a relay refusal instead of returning a broken code", async () => {
+    const fetchMock = (async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 })) as unknown as typeof fetch;
+    // An older relay answers 404 for this route; either way the caller must not
+    // be handed an empty code to display.
+    await expect(requestPairingCode(config, fetchMock)).rejects.toThrow(/HTTP 401/);
+  });
+});

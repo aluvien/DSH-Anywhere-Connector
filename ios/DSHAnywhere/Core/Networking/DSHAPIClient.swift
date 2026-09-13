@@ -66,11 +66,11 @@ public final class DSHAPIClient: @unchecked Sendable {
         return url
     }
 
-    public func pair(machineId: String, pairingSecret: String, deviceName: String) async throws -> (profile: DSHRemoteProfile, token: String) {
+    public func pair(machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> (profile: DSHRemoteProfile, token: String) {
         let response: PairResponse = try await perform(
             method: "POST",
             path: ["v1", "pair"],
-            body: PairRequest(machineId: machineId, pairingSecret: pairingSecret, deviceName: deviceName)
+            body: PairRequest(machineId: machineId, credential: credential, deviceName: deviceName)
         )
         let profile = DSHRemoteProfile(relayBaseURL: relayBaseURL, deviceId: response.deviceId,
                                        machineId: machineId, machineName: response.machineName ?? machineId)
@@ -133,8 +133,20 @@ public final class DSHAPIClient: @unchecked Sendable {
 
 private struct PairRequest: Encodable {
     let machineId: String
-    let pairingSecret: String
+    let pairingSecret: String?
+    let pairingCode: String?
     let deviceName: String
+
+    /// Synthesized encoding omits nil optionals, so the Relay sees exactly one
+    /// credential field rather than an empty one alongside the real value.
+    init(machineId: String, credential: DSHPairingCredential, deviceName: String) {
+        self.machineId = machineId
+        self.deviceName = deviceName
+        switch credential {
+        case .secret(let value): self.pairingSecret = value; self.pairingCode = nil
+        case .code(let value): self.pairingSecret = nil; self.pairingCode = value
+        }
+    }
 }
 
 /// One device paired to a machine, as the Relay reports it. The Relay stores

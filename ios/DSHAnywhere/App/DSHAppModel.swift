@@ -98,8 +98,10 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "Enter the machine ID shown by DSH Anywhere Connector."
             return
         }
-        guard trimmedSecret.count >= 32 else {
-            errorMessage = "Enter the pairing secret shown by DSH Anywhere Connector."
+        // One field accepts either shape: an 8-character one-time code or the
+        // longer pairing secret, distinguished by length.
+        guard let credential = DSHPairingCredential.detect(trimmedSecret) else {
+            errorMessage = "Enter the pairing code or secret shown by DSH Anywhere Connector."
             return
         }
         guard !address.isEmpty else {
@@ -113,7 +115,7 @@ final class DSHAppModel: ObservableObject {
             do {
                 let profile = try await self.transport.pair(
                     serverAddress: address, machineId: trimmedMachineID,
-                    pairingSecret: trimmedSecret, deviceName: "iPhone"
+                    credential: credential, deviceName: "iPhone"
                 )
                 UserDefaults.standard.set(address, forKey: "dsh-anywhere.server-address")
                 self.machineName = profile.machineName
