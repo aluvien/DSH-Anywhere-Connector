@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { dirname, join } from "node:path";
 import { pairingLink } from "@dsh-anywhere/protocol";
 import { loadConfig, defaultConfigPath, redactSecrets, type ConnectorConfig } from "./config.js";
 import { DSHAnywhereConnector, bridgeAPIURL } from "./connector.js";
@@ -60,7 +61,11 @@ export async function runCli(
       stdout(JSON.stringify(result));
       return result.ok ? 0 : 1;
     }
-    const connector = new DSHAnywhereConnector(config);
+    const connector = new DSHAnywhereConnector(config, {
+      // Publish a fresh single-use code beside the config so the local pairing
+      // page shows a code instead of the long-lived secret.
+      pairingCodePath: join(dirname(parsed.configPath), "pairing-code.json"),
+    });
     connector.start();
     const stop = () => {
       void connector.stop().finally(() => process.exit(0));

@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { PairingRateLimiter, apply, inject, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary } from './index.js'
+import { PairingRateLimiter, apply, inject, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -230,3 +233,48 @@ describe('session list rows', () => {
     }).title).toBe('Flat title')
   })
 })
+
+describe('pairing page material', () => {
+  async function fixture(files: Record<string, unknown>): Promise<string> {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pairing-'))
+    const configPath = join(directory, 'connector.json')
+    for (const [name, value] of Object.entries(files)) {
+      await writeFile(join(directory, name), JSON.stringify(value), 'utf8')
+    }
+    return configPath
+  }
+
+  const connector = { relayURL: 'wss://relay.example.com', machineId: 'machine_1', pairingSecret: 'long-lived-secret-value' }
+
+  it('prefers a live one-time code over the long-lived secret', async () => {
+    const configPath = await fixture({
+      'connector.json': connector,
+      'pairing-code.json': { machineId: 'machine_1', code: 'ABCD2345', expiresAt: Date.now() + 60_000 },
+    })
+
+    const material = await readPairingMaterial(configPath)
+
+    // The code is narrower: it expires and is consumed on use.
+    expect(material?.link).toContain('code=ABCD2345')
+    expect(material?.link).not.toContain('secret=')
+    expect(material?.expiresAt).toBeGreaterThan(Date.now())
+  })
+
+  it('falls back to the secret when no code is published', async () => {
+    const material = await readPairingMaterial(await fixture({ 'connector.json': connector }))
+    expect(material?.link).toContain('secret=long-lived-secret-value')
+    expect(material?.expiresAt).toBeUndefined()
+  })
+
+  it('ignores an expired code rather than showing a dead one', async () => {
+    // A stale file must not walk the user into a failure they cannot diagnose.
+    const configPath = await fixture({
+      'connector.json': connector,
+      'pairing-code.json': { machineId: 'machine_1', code: 'ABCD2345', expiresAt: Date.now() - 1 },
+    })
+
+    const material = await readPairingMaterial(configPath)
+
+    expect(material?.link).toContain('secret=long-lived-secret-value')
+  })
+});

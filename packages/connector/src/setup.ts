@@ -188,6 +188,18 @@ export async function requestPairingCode(
   return { code: record.code, expiresAt: record.expiresAt };
 }
 
+/**
+ * Publishes the current one-time code where the local bridge's pairing page can
+ * read it. Written 0600 in the same directory as the connector config, which
+ * already holds the machine token and pairing secret.
+ */
+export async function writePairingCodeFile(
+  path: string,
+  payload: { readonly machineId: string; readonly code: string; readonly expiresAt: number },
+): Promise<void> {
+  await atomicWrite(path, `${JSON.stringify(payload, null, 2)}\n`);
+}
+
 function trailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
 }

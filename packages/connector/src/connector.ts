@@ -15,8 +15,11 @@ import {
 } from "@dsh-anywhere/protocol";
 import WebSocket, { type RawData } from "ws";
 import { redactSecrets, type ConnectorConfig } from "./config.js";
+import { requestPairingCode, writePairingCodeFile } from "./setup.js";
 
 const MAX_REPLAY_EVENTS = 2_000;
+/** Comfortably inside the relay's 10-minute code lifetime. */
+const PAIRING_CODE_REFRESH_MS = 5 * 60_000;
 
 export interface Logger {
   info(message: string): void;
@@ -41,6 +44,12 @@ export interface ConnectorDependencies {
   readonly reconnectBaseMs?: number;
   readonly reconnectMaxMs?: number;
   readonly heartbeatMs?: number;
+  /**
+   * Where to publish the current one-time pairing code for the local pairing
+   * page. Omitting it publishes nothing, and the page keeps using the
+   * long-lived secret.
+   */
+  readonly pairingCodePath?: string;
 }
 
 export type ConnectorState = "stopped" | "connecting" | "connected" | "reconnecting";
@@ -61,6 +70,8 @@ export class DSHAnywhereConnector {
   private relayTimer: NodeJS.Timeout | undefined;
   private bridgeTimer: NodeJS.Timeout | undefined;
   private heartbeatTimer: NodeJS.Timeout | undefined;
+  private pairingCodeTimer: NodeJS.Timeout | undefined;
+  private readonly pairingCodePath: string | undefined;
   private awaitingPong = false;
   private relayAttempts = 0;
   private bridgeAttempts = 0;
@@ -84,6 +95,7 @@ export class DSHAnywhereConnector {
     this.reconnectBaseMs = dependencies.reconnectBaseMs ?? 500;
     this.reconnectMaxMs = dependencies.reconnectMaxMs ?? 30_000;
     this.heartbeatMs = dependencies.heartbeatMs ?? 25_000;
+    this.pairingCodePath = dependencies.pairingCodePath;
   }
 
   get status(): ConnectorState {
@@ -96,6 +108,7 @@ export class DSHAnywhereConnector {
     this.state = "connecting";
     this.connectRelay();
     this.connectBridge();
+    this.startPairingCodeRefresh();
   }
 
   async stop(): Promise<void> {
@@ -461,6 +474,37 @@ export class DSHAnywhereConnector {
     for (const event of pending) this.sendEvent(event);
   }
 
+  /**
+   * Keeps a live single-use code available to the local pairing page, refreshed
+   * well inside the relay's code lifetime so the page never shows something
+   * already dead.
+   *
+   * A relay that predates the endpoint, or a transient failure, is logged and
+   * ignored: pairing must not depend on this, and the page falls back to the
+   * long-lived secret.
+   */
+  private startPairingCodeRefresh(): void {
+    if (this.pairingCodePath === undefined) return;
+    void this.refreshPairingCode();
+    this.pairingCodeTimer = setInterval(() => void this.refreshPairingCode(), PAIRING_CODE_REFRESH_MS);
+  }
+
+  private async refreshPairingCode(): Promise<void> {
+    const path = this.pairingCodePath;
+    if (path === undefined || !this.running) return;
+    try {
+      const issued = await requestPairingCode(this.config, this.request);
+      await writePairingCodeFile(path, { machineId: this.config.machineId, ...issued });
+    } catch (error) {
+      this.log("warn", `Could not publish a one-time pairing code: ${safeError(error, this.config)}`);
+    }
+  }
+
+  private stopPairingCodeRefresh(): void {
+    if (this.pairingCodeTimer !== undefined) clearInterval(this.pairingCodeTimer);
+    this.pairingCodeTimer = undefined;
+  }
+
   private startHeartbeat(socket: WebSocketLike): void {
     this.stopHeartbeat();
     this.awaitingPong = false;
@@ -508,6 +552,7 @@ export class DSHAnywhereConnector {
     this.relayTimer = undefined;
     this.bridgeTimer = undefined;
     this.stopHeartbeat();
+    this.stopPairingCodeRefresh();
   }
 
   private log(level: keyof Logger, message: string): void {

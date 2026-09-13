@@ -255,9 +255,32 @@ interface PairingMaterial {
   readonly link: string
   readonly relay: string
   readonly machineId: string
+  /** Set when the link carries a single-use code rather than the long secret. */
+  readonly expiresAt?: number
 }
 
-async function readPairingMaterial(configPath: string): Promise<PairingMaterial | undefined> {
+/**
+ * The connector keeps a freshly minted single-use code beside its config. A code
+ * is preferred over the long-lived secret because it expires and is consumed on
+ * use, so a QR left on screen is not a standing credential.
+ */
+async function readPairingCode(configPath: string): Promise<{ code: string; expiresAt: number } | undefined> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(join(dirname(configPath), 'pairing-code.json'), 'utf8'))
+  } catch {
+    return undefined
+  }
+  const record = recordOf(parsed)
+  const code = typeof record.code === 'string' ? record.code.trim() : ''
+  const expiresAt = typeof record.expiresAt === 'number' ? record.expiresAt : 0
+  // An expired file counts as absent: showing a dead code would walk the user
+  // into a failure they have no way to diagnose.
+  if (code === '' || expiresAt <= Date.now()) return undefined
+  return { code, expiresAt }
+}
+
+export async function readPairingMaterial(configPath: string): Promise<PairingMaterial | undefined> {
   let parsed: unknown
   try {
     parsed = JSON.parse(await readFile(configPath, 'utf8'))
@@ -267,9 +290,19 @@ async function readPairingMaterial(configPath: string): Promise<PairingMaterial 
   const record = recordOf(parsed)
   const relay = typeof record.relayURL === 'string' ? record.relayURL : undefined
   const machineId = typeof record.machineId === 'string' ? record.machineId : undefined
-  const pairingSecret = typeof record.pairingSecret === 'string' ? record.pairingSecret : undefined
-  if (relay === undefined || machineId === undefined || pairingSecret === undefined) return undefined
+  if (relay === undefined || machineId === undefined) return undefined
+  const issued = await readPairingCode(configPath)
   try {
+    if (issued !== undefined) {
+      return {
+        link: pairingLink({ relay, machineId, pairingCode: issued.code }),
+        relay: relayHTTPSURL(relay),
+        machineId,
+        expiresAt: issued.expiresAt,
+      }
+    }
+    const pairingSecret = typeof record.pairingSecret === 'string' ? record.pairingSecret : undefined
+    if (pairingSecret === undefined) return undefined
     return {
       link: pairingLink({ relay, machineId, pairingSecret }),
       relay: relayHTTPSURL(relay),
@@ -334,8 +367,21 @@ async function pairingPageHTML(configPath: string): Promise<string> {
       <dt>Machine</dt><dd>${escapeHTML(material.machineId)}</dd>
     </dl>
     <button id="copy" type="button">Copy pairing link</button>
-    <p class="hint">Served on loopback only &mdash; the secret never leaves this Mac.</p>
+    ${credentialNote(material)}
+    <p class="hint">Served on loopback only &mdash; the credential never leaves this Mac.</p>
   `, material.link)
+}
+
+/**
+ * Says plainly which kind of credential the code above carries: the difference
+ * decides whether it can be reused and how long it stays valid.
+ */
+function credentialNote(material: PairingMaterial): string {
+  if (material.expiresAt === undefined) {
+    return '<p class="hint">Long-lived pairing secret &mdash; reusable until rotated.</p>'
+  }
+  const minutes = Math.max(1, Math.round((material.expiresAt - Date.now()) / 60_000))
+  return `<p class="hint">Single-use code &mdash; expires in about ${minutes} minute${minutes === 1 ? '' : 's'}.</p>`
 }
 
 function pairingPageShell(body: string, link?: string): string {
