@@ -198,32 +198,43 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(options.map(\.name), ["Alpha", "beta"])
     }
 
-    func testOnlyTheRunningTurnsToolCallsAreCurrent() {
-        var state = DSHStoreState()
-        let reducer = DSHEventReducer()
-        func event(_ type: String, _ sequence: Int64, _ payload: DSHJSONValue) -> DSHEvent {
-            DSHEvent(envelope: DSHEnvelope(messageId: "m\(sequence)", deviceId: "d", machineId: "m",
-                                           sessionId: "s", sequence: sequence, type: type, payload: payload))
-        }
-        func tool(_ id: String) -> DSHJSONValue {
-            .object(["id": .string(id), "name": .string("bash"),
-                     "status": .string("succeeded"), "detail": .string("ok")])
-        }
+    func testTranscriptInterleavesMessagesAndToolCallsByArrival() {
+        // A message, then a call, then another message — the shape of a real
+        // turn. Rendering messages and tools as two runs put the call last.
+        let messages = [
+            DSHChatMessage(id: "m1", role: .assistant, markdown: "reading", sequence: 2),
+            DSHChatMessage(id: "m2", role: .assistant, markdown: "done", sequence: 4),
+        ]
+        let tools = [
+            DSHToolActivity(id: "bash-1", name: "bash", status: "succeeded", detail: "ok", sequence: 3),
+        ]
 
-        // First turn: two calls.
-        reducer.reduce(event("turn.state.changed", 1, .object(["sessionId": .string("s"), "state": .string("running")])), into: &state)
-        reducer.reduce(event("tool.completed", 2, tool("t1")), into: &state)
-        reducer.reduce(event("tool.completed", 3, tool("t2")), into: &state)
-        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.map(\.id), ["t1", "t2"])
-        XCTAssertEqual(state.toolsBySession["s"]?.count, 2)
+        let entries = messages.transcriptEntries(with: tools)
 
-        // Second turn starts: progress resets, but history is retained.
-        reducer.reduce(event("turn.state.changed", 4, .object(["sessionId": .string("s"), "state": .string("running")])), into: &state)
-        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.count, 0)
-        XCTAssertEqual(state.toolsBySession["s"]?.count, 2, "history must not be discarded")
+        XCTAssertEqual(entries.map(\.id), ["turn-m1", "tool-bash-1", "turn-m2"])
+    }
 
-        reducer.reduce(event("tool.completed", 5, tool("t3")), into: &state)
-        XCTAssertEqual(state.currentTurnToolsBySession["s"]?.map(\.id), ["t3"])
-        XCTAssertEqual(state.toolsBySession["s"]?.map(\.id), ["t1", "t2", "t3"])
+    func testMissingSequencesFallBackToArrivalOrderInsteadOfIDOrder() {
+        // State persisted before sequences existed carries none at all. Any
+        // arbitrary tie-break (id order, say) would scramble the transcript, so
+        // ties must keep the order the arrays already hold.
+        let messages = [
+            DSHChatMessage(id: "zzz", role: .user, markdown: "first"),
+            DSHChatMessage(id: "aaa", role: .assistant, markdown: "second"),
+        ]
+
+        let entries = messages.transcriptEntries(with: [])
+
+        XCTAssertEqual(entries.map(\.id), ["turn-zzz", "turn-aaa"])
+    }
+
+    func testToolCallWithoutASequenceStillLandsAfterEarlierMessages() {
+        let messages = [DSHChatMessage(id: "m1", role: .assistant, markdown: "x", sequence: 5)]
+        let tools = [DSHToolActivity(id: "t1", name: "bash")]
+
+        let entries = messages.transcriptEntries(with: tools)
+
+        // 0 < 5, so the unsequenced call sorts before the sequenced message.
+        XCTAssertEqual(entries.map(\.id), ["tool-t1", "turn-m1"])
     }
 }

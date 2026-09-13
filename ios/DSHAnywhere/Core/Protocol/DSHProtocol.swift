@@ -321,6 +321,93 @@ public struct DSHPairingLink: Equatable, Sendable {
     }
 }
 
+/// What arrived in a transcript, before any grouping. Declared at file scope
+/// because Swift cannot nest a type inside a generic function.
+private enum DSHTranscriptArrival {
+    case message(DSHChatMessage)
+    case tool(DSHToolActivity)
+
+    var sequence: Int64 {
+        switch self {
+        case .message(let message): return message.sequence ?? 0
+        case .tool(let tool): return tool.sequence ?? 0
+        }
+    }
+
+}
+
+/// One row of the transcript, in the order the events actually arrived.
+public enum DSHTranscriptEntry: Identifiable, Sendable, Equatable {
+    case turn(DSHTranscriptBlock)
+    case tool(DSHToolActivity)
+
+    public var id: String {
+        switch self {
+        case .turn(let block): return "turn-\(block.id)"
+        case .tool(let tool): return "tool-\(tool.id)"
+        }
+    }
+
+    var sequence: Int64 {
+        switch self {
+        case .turn(let block): return block.sequence
+        case .tool(let tool): return tool.sequence ?? 0
+        }
+    }
+}
+
+public extension Array where Element == DSHChatMessage {
+    /// Messages and tool calls interleaved by arrival sequence.
+    ///
+    /// Rendering them as two separate runs put every tool call after every
+    /// message, which is not the order the turn happened in: in reality the
+    /// model writes, calls a tool, writes again, and so on.
+    func transcriptEntries(with tools: [DSHToolActivity]) -> [DSHTranscriptEntry] {
+        // Stable by construction: a tie keeps arrival order. Sorting on the
+        // sequence alone is not enough, because state persisted before
+        // sequences existed carries none, and any arbitrary tie-break (id
+        // order, say) would scramble the whole transcript on upgrade.
+        var ordered: [(order: Int, arrival: DSHTranscriptArrival)] = []
+        for message in self { ordered.append((ordered.count, .message(message))) }
+        for tool in tools { ordered.append((ordered.count, .tool(tool))) }
+        ordered.sort { left, right in
+            left.arrival.sequence == right.arrival.sequence
+                ? left.order < right.order
+                : left.arrival.sequence < right.arrival.sequence
+        }
+        let arrivals = ordered.map(\.arrival)
+
+        var entries: [DSHTranscriptEntry] = []
+        var run: [DSHChatMessage] = []
+        func flushRun() {
+            guard let first = run.first else { return }
+            entries.append(.turn(DSHTranscriptBlock(id: first.id, messages: run)))
+            run = []
+        }
+
+        for arrival in arrivals {
+            switch arrival {
+            case .message(let message):
+                if message.role == .assistant {
+                    run.append(message)
+                } else {
+                    // A user message stands alone and ends any assistant run.
+                    flushRun()
+                    entries.append(.turn(DSHTranscriptBlock(id: message.id, messages: [message])))
+                }
+            case .tool(let tool):
+                // Break the run here. Grouping blindly merged a whole turn's
+                // messages into one block, which pushed every call made between
+                // them to the end — the very clumping this ordering is for.
+                flushRun()
+                entries.append(.tool(tool))
+            }
+        }
+        flushRun()
+        return entries
+    }
+}
+
 /// Relay messages deliberately wrap the existing Harness protocol. Keeping the
 /// wrapper separate means a Relay acknowledgement can never be mistaken for a
 /// Harness event by the store.
@@ -559,14 +646,17 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     /// Chain-of-thought for this message, kept out of `markdown` so the reply
     /// reads cleanly; the transcript folds it behind a disclosure.
     public var reasoning: String?
+    /// Sequence of the event that produced this message. Client-side only.
+    public var sequence: Int64?
 
     public init(id: String, role: DSHMessageRole, markdown: String,
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, contextWindow: Double? = nil,
-                reasoning: String? = nil) {
+                reasoning: String? = nil, sequence: Int64? = nil) {
         self.id = id; self.role = role; self.markdown = markdown; self.usage = usage
         self.provider = provider; self.model = model; self.reasoningEffort = reasoningEffort
         self.contextWindow = contextWindow; self.reasoning = reasoning
+        self.sequence = sequence
     }
 }
 
@@ -586,6 +676,9 @@ public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
 
     public var isUserTurn: Bool { messages.first?.role == .user }
 
+    /// Sequence of the first message, used to interleave with tool calls.
+    public var sequence: Int64 { messages.first?.sequence ?? 0 }
+
     /// Answers in order. An empty markdown only happens when reasoning arrived
     /// before the streamed text, so it must not produce an empty bubble.
     public var visibleMessages: [DSHChatMessage] {
@@ -603,22 +696,6 @@ public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
 }
 
 public extension Array where Element == DSHChatMessage {
-    /// Collapses consecutive assistant messages into a single block so a turn's
-    /// reasoning can be folded once instead of once per message.
-    func groupedIntoTranscriptBlocks() -> [DSHTranscriptBlock] {
-        var blocks: [DSHTranscriptBlock] = []
-        for message in self {
-            let canAppend = !blocks.isEmpty
-                && message.role == .assistant
-                && blocks[blocks.count - 1].messages.first?.role == .assistant
-            if canAppend {
-                blocks[blocks.count - 1].messages.append(message)
-            } else {
-                blocks.append(DSHTranscriptBlock(id: message.id, messages: [message]))
-            }
-        }
-        return blocks
-    }
 }
 
 public struct DSHPermissionUpdate: Codable, Sendable, Equatable {
@@ -695,9 +772,14 @@ public struct DSHToolActivity: Codable, Sendable, Equatable, Identifiable {
     public let name: String
     public var status: String
     public var detail: String?
+    /// Sequence of the event that produced this call. Client-side only, and
+    /// optional so decoding a payload that omits it still works.
+    public var sequence: Int64?
 
-    public init(id: String, name: String, status: String = "running", detail: String? = nil) {
+    public init(id: String, name: String, status: String = "running", detail: String? = nil,
+                sequence: Int64? = nil) {
         self.id = id; self.name = name; self.status = status; self.detail = detail
+        self.sequence = sequence
     }
 }
 

@@ -109,6 +109,15 @@ final class DSHProtocolTests: XCTestCase {
         ))
     }
 
+    /// Goes through `transcriptEntries`, the path the app actually renders, so
+    /// these assertions cannot pass while the real grouping is broken.
+    private func turnBlocks(_ messages: [DSHChatMessage]) -> [DSHTranscriptBlock] {
+        messages.transcriptEntries(with: []).compactMap {
+            if case .turn(let block) = $0 { return block }
+            return nil
+        }
+    }
+
     func testConsecutiveAssistantMessagesBecomeOneTurnBlock() {
         let messages = [
             DSHChatMessage(id: "u1", role: .user, markdown: "do it"),
@@ -118,7 +127,7 @@ final class DSHProtocolTests: XCTestCase {
             DSHChatMessage(id: "a3", role: .assistant, markdown: "done"),
         ]
 
-        let blocks = messages.groupedIntoTranscriptBlocks()
+        let blocks = turnBlocks(messages)
 
         // One turn = one block, so the phone folds that turn's reasoning once
         // instead of once per assistant message.
@@ -133,10 +142,10 @@ final class DSHProtocolTests: XCTestCase {
     func testTurnBlockHidesAnswersThatHaveNotStreamedYet() {
         // Reasoning can land before the streamed text, producing a message with
         // an empty body; it must contribute reasoning without an empty bubble.
-        let block = [
+        let block = turnBlocks([
             DSHChatMessage(id: "a1", role: .assistant, markdown: "", reasoning: "thinking"),
             DSHChatMessage(id: "a2", role: .assistant, markdown: "the answer"),
-        ].groupedIntoTranscriptBlocks()[0]
+        ])[0]
 
         XCTAssertEqual(block.visibleMessages.map(\.id), ["a2"])
         XCTAssertEqual(block.reasoning, "thinking")

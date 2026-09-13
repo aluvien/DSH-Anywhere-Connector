@@ -4,10 +4,6 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var sessions: [DSHSessionSummary] = []
     public var messagesBySession: [String: [DSHChatMessage]] = [:]
     public var toolsBySession: [String: [DSHToolActivity]] = [:]
-    /// Tool calls made by the turn currently running, reset at each turn start.
-    /// The full history above never shrinks, so rendering it while a turn runs
-    /// made every earlier turn's calls reappear at once.
-    public var currentTurnToolsBySession: [String: [DSHToolActivity]] = [:]
     public var pendingApprovals: [DSHApprovalRequest] = []
     public var pendingQuestions: [DSHQuestionRequest] = []
     public var turnStateBySession: [String: String] = [:]
@@ -50,7 +46,9 @@ public struct DSHEventReducer: Sendable {
         case .sessionCreated(let session):
             upsert(session, into: &state.sessions)
         case .userMessageAccepted(let message):
-            appendOrReplace(message, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
+            var stamped = message
+            stamped.sequence = event.envelope.sequence
+            appendOrReplace(stamped, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
         case .assistantMessageCompleted(let message):
             // A completion replaces the streaming partial, so carry the
             // reasoning that arrived as its own event back onto the message.
@@ -58,6 +56,11 @@ public struct DSHEventReducer: Sendable {
             if let sessionId = event.envelope.sessionId,
                let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }) {
                 completed.reasoning = existing.reasoning
+                // Keep where the message started rather than where it finished,
+                // so interleaving with tool calls stays chronological.
+                completed.sequence = existing.sequence
+            } else {
+                completed.sequence = event.envelope.sequence
             }
             appendOrReplace(completed, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
         case .assistantReasoning(let reasoning):
@@ -67,7 +70,8 @@ public struct DSHEventReducer: Sendable {
                 messages[index].reasoning = reasoning.text
             } else {
                 messages.append(DSHChatMessage(id: reasoning.messageId, role: .assistant,
-                                               markdown: "", reasoning: reasoning.text))
+                                               markdown: "", reasoning: reasoning.text,
+                                               sequence: event.envelope.sequence))
             }
             state.messagesBySession[sessionId] = messages
         case .assistantMessageDelta(let delta):
@@ -76,15 +80,26 @@ public struct DSHEventReducer: Sendable {
             if let index = messages.firstIndex(where: { $0.id == delta.messageId }) {
                 messages[index].markdown += delta.text
             } else {
-                messages.append(DSHChatMessage(id: delta.messageId, role: .assistant, markdown: delta.text))
+                messages.append(DSHChatMessage(id: delta.messageId, role: .assistant, markdown: delta.text,
+                                               sequence: event.envelope.sequence))
             }
             state.messagesBySession[sessionId] = messages
         case .toolStarted(let tool):
-            appendOrReplace(tool, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
-            appendOrReplace(tool, in: &state.currentTurnToolsBySession, sessionId: event.envelope.sessionId)
+            var stamped = tool
+            stamped.sequence = event.envelope.sequence
+            appendOrReplace(stamped, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
         case .toolCompleted(let tool):
-            appendOrReplace(tool, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
-            appendOrReplace(tool, in: &state.currentTurnToolsBySession, sessionId: event.envelope.sessionId)
+            var stamped = tool
+            // Keep the arrival order of the call itself: a completion carries a
+            // later sequence but must not jump ahead of calls made after it.
+            let existing = event.envelope.sessionId.flatMap { state.toolsBySession[$0] }?
+                .first { $0.id == tool.id }
+            if let existing {
+                stamped.sequence = existing.sequence
+            } else {
+                stamped.sequence = event.envelope.sequence
+            }
+            appendOrReplace(stamped, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
         case .approvalRequested(let approval):
             if !state.pendingApprovals.contains(where: { $0.id == approval.id }) {
                 state.pendingApprovals.append(approval)
@@ -99,11 +114,6 @@ public struct DSHEventReducer: Sendable {
             state.pendingQuestions.removeAll { $0.id == resolution.id }
         case .turnStateChanged(let turn):
             state.turnStateBySession[turn.sessionId] = turn.state
-            if turn.state.lowercased() == "running" {
-                // Start a fresh progress list, so the transcript shows this
-                // turn's work rather than replaying every earlier call.
-                state.currentTurnToolsBySession[turn.sessionId] = []
-            }
         case .modelCatalog(let catalog):
             state.modelCatalog = catalog
         case .usageUpdated(let update):

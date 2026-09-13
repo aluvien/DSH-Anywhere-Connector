@@ -68,10 +68,12 @@ final class DSHAppModel: ObservableObject {
         state.toolsBySession[sessionID, default: []]
     }
 
-    /// Tool calls belonging to the turn that is running now.
-    func currentTurnTools(for sessionID: String) -> [DSHToolActivity] {
-        state.currentTurnToolsBySession[sessionID, default: []]
+    /// The transcript in the order things actually happened: messages and tool
+    /// calls interleaved by arrival sequence.
+    func transcriptEntries(for sessionID: String) -> [DSHTranscriptEntry] {
+        messages(for: sessionID).transcriptEntries(with: tools(for: sessionID))
     }
+
 
     func turnState(for sessionID: String) -> String {
         state.turnStateBySession[sessionID, default: "idle"]

@@ -32,32 +32,32 @@ struct ConversationView: View {
         model.pendingApprovals.contains { $0.sessionId == sessionID }
             || model.pendingQuestions.contains { $0.sessionId == sessionID }
     }
-    /// Assistant messages are grouped per turn so each turn folds its reasoning
-    /// exactly once, below the answers it produced.
-    private var transcriptBlocks: [DSHTranscriptBlock] {
-        model.messages(for: sessionID).groupedIntoTranscriptBlocks()
+    /// Messages and tool calls in one list, ordered by when they arrived.
+    ///
+    /// They used to render as two separate runs — every message, then every tool
+    /// card — which stacked a turn's calls into one lump instead of showing the
+    /// back-and-forth that actually happened.
+    private var transcriptEntries: [DSHTranscriptEntry] {
+        model.transcriptEntries(for: sessionID)
     }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(transcriptBlocks) { block in
-                        if block.isUserTurn {
-                            MessageBubble(message: block.messages[0]).id(block.id)
-                        } else {
-                            AssistantTurnView(block: block).id(block.id)
-                        }
-                    }
-                    // Tool cards are progress, not history: they stay visible
-                    // while a turn runs so the work is watchable, then collapse
-                    // away when it ends so only the answers remain.
-                    if isRunning {
-                        // Only this turn's calls: the full history is
-                        // append-only, so showing it here made a new turn open
-                        // with every previous bash card already on screen.
-                        ForEach(model.currentTurnTools(for: sessionID)) { tool in
-                            ToolActivityCard(tool: tool)
+                    ForEach(transcriptEntries) { entry in
+                        switch entry {
+                        case .turn(let block):
+                            if block.isUserTurn {
+                                MessageBubble(message: block.messages[0]).id(entry.id)
+                            } else {
+                                AssistantTurnView(block: block).id(entry.id)
+                            }
+                        case .tool(let tool):
+                            // Kept in place rather than hidden until a turn runs:
+                            // popping them in and out is what made a new message
+                            // look like it "suddenly" produced a wall of calls.
+                            ToolActivityCard(tool: tool).id(entry.id)
                         }
                     }
                     ForEach(model.commandResults(for: sessionID)) { result in
@@ -129,7 +129,7 @@ struct ConversationView: View {
             .onChange(of: model.messages(for: sessionID).count) { _, _ in
                 scrollToLatest(proxy)
             }
-            .onChange(of: model.currentTurnTools(for: sessionID).count) { _, _ in
+            .onChange(of: transcriptEntries.count) { _, _ in
                 scrollToLatest(proxy)
             }
             .onChange(of: isRunning) { _, _ in
