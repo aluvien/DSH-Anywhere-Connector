@@ -80,35 +80,58 @@ struct SessionListView: View {
                 ConversationView(sessionID: id)
             }
             .toolbar {
+                // Brand mark rather than a control on the left, matching the
+                // reference app: the two things you can actually do live in the
+                // capsule on the right.
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { showSettings = true } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
+                    Image("WhaleLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 28, height: 28)
+                        .clipShape(.circle)
+                        .accessibilityHidden(true)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { model.createSession() } label: {
-                            Label("New session", systemImage: "plus")
+                    // One capsule holding filter and settings, instead of two
+                    // separate circular buttons.
+                    HStack(spacing: 0) {
+                        Menu {
+                            Button { model.createSession() } label: {
+                                Label("New session", systemImage: "plus")
+                            }
+                            Divider()
+                            Toggle(isOn: Binding(
+                                get: { model.groupsSessionsByWorkspace },
+                                set: model.setGroupsSessionsByWorkspace
+                            )) {
+                                Label("Group by workspace", systemImage: "square.grid.2x2")
+                            }
+                            Toggle(isOn: Binding(get: { model.showArchivedSessions }, set: model.setShowArchived)) {
+                                Label("Show archived", systemImage: "archivebox")
+                            }
+                            Button { refreshSessions() } label: {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                            }
+                        } label: {
+                            Image(systemName: didRefresh
+                                  ? "checkmark.circle.fill"
+                                  : "line.3.horizontal.decrease")
+                                .frame(width: 44, height: 32)
+                                .contentShape(Rectangle())
                         }
-                        Toggle(isOn: Binding(
-                            get: { model.groupsSessionsByWorkspace },
-                            set: model.setGroupsSessionsByWorkspace
-                        )) {
-                            Label("Group by workspace", systemImage: "square.grid.2x2")
-                        }
-                        Toggle(isOn: Binding(get: { model.showArchivedSessions }, set: model.setShowArchived)) {
-                            Label("Show archived", systemImage: "archivebox")
-                        }
-                        Button { refreshSessions() } label: {
-                            Label("Refresh", systemImage: "arrow.clockwise")
-                        }
-                        Divider()
+                        .accessibilityLabel("Filter and sort sessions")
+
+                        Divider().frame(height: 18)
+
                         Button { showSettings = true } label: {
-                            Label("Settings", systemImage: "gearshape")
+                            Image(systemName: "gearshape")
+                                .frame(width: 44, height: 32)
+                                .contentShape(Rectangle())
                         }
-                    } label: {
-                        Label("Session actions", systemImage: didRefresh ? "checkmark.circle.fill" : "ellipsis.circle")
+                        .accessibilityLabel("Settings")
                     }
+                    .background(.thinMaterial, in: .capsule)
+                    .overlay(Capsule().stroke(Color.secondary.opacity(0.18), lineWidth: 0.5))
                 }
             }
             .sheet(isPresented: $showSettings) {

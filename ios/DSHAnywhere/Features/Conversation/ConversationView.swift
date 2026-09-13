@@ -181,11 +181,10 @@ struct ConversationView: View {
         DSHSessionSummary(id: sessionID, title: "Conversation")
     }
 
-    /// Native input bar: a single `.bar` material band across the bottom, with
-    /// the text field carrying the only rounded fill. The previous version
-    /// nested a hand-drawn rounded card with its own material and stroke inside
-    /// another material band, which is what read as a redundant background and
-    /// made the whole bar feel heavy.
+    /// Input bar arranged like the reference app: the text field spans the full
+    /// width on top, and every control lives in one row beneath it inside the
+    /// same rounded container. The text is the primary thing; the controls
+    /// gather under it instead of flanking it.
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
             let attachments = pendingAttachments
@@ -204,56 +203,57 @@ struct ConversationView: View {
                 }
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                // Icon per button must say what the button does: "/" for the
-                // slash commands, a picture for the photo picker, and the
-                // paperclip for files. The old trio used a "+" for commands and
-                // gave the paperclip to photos, which read as the opposite.
-                Button { showCommandMenu = true } label: {
-                    Image(systemName: "slash.circle").font(.title3)
-                }
-                .accessibilityLabel("Commands")
-
-                PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                    Image(systemName: "photo").font(.title3)
-                }
-                .accessibilityLabel("Attach photo")
-
-                Button { showFileImporter = true } label: {
-                    Image(systemName: "paperclip").font(.title3)
-                }
-                .accessibilityLabel("Attach file")
-
+            VStack(spacing: 8) {
                 TextField("Send a message, / command, @ file or conversation",
                           text: $model.draft, axis: .vertical)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
                     .focused($isDraftFocused)
                     .onSubmit { send() }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 18))
 
-                if isRunning {
-                    Button(action: { model.cancelTurn(for: sessionID) }) {
-                        Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
+                HStack(spacing: 10) {
+                    // Icon per button must say what the button does: "/" for the
+                    // slash commands, a picture for the photo picker, and the
+                    // paperclip for files.
+                    Button { showCommandMenu = true } label: {
+                        Image(systemName: "slash.circle").font(.title3)
                     }
-                    .accessibilityLabel("Stop turn")
-                } else {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up.circle.fill").font(.title).foregroundStyle(.tint)
+                    .accessibilityLabel("Commands")
+
+                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                        Image(systemName: "photo").font(.title3)
                     }
-                    .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              && pendingAttachments.isEmpty)
-                    .accessibilityLabel("Send message")
+                    .accessibilityLabel("Attach photo")
+
+                    Button { showFileImporter = true } label: {
+                        Image(systemName: "paperclip").font(.title3)
+                    }
+                    .accessibilityLabel("Attach file")
+
+                    PermissionMenu(sessionID: sessionID)
+
+                    Spacer(minLength: 4)
+
+                    ModelMenu(sessionID: sessionID)
+
+                    if isRunning {
+                        Button(action: { model.cancelTurn(for: sessionID) }) {
+                            Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
+                        }
+                        .accessibilityLabel("Stop turn")
+                    } else {
+                        Button(action: send) {
+                            Image(systemName: "arrow.up.circle.fill").font(.title).foregroundStyle(.tint)
+                        }
+                        .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  && pendingAttachments.isEmpty)
+                        .accessibilityLabel("Send message")
+                    }
                 }
             }
-
-            HStack(spacing: 10) {
-                PermissionMenu(sessionID: sessionID)
-                Spacer(minLength: 0)
-                ModelMenu(sessionID: sessionID)
-            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 20))
 
             UsageFooter(usage: model.usage(for: sessionID))
         }
