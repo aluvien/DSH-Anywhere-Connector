@@ -9,18 +9,24 @@ protocol DSHAppTransport: Sendable {
     func send(_ command: DSHCommand) async throws
     func disconnect() async
     func forgetPairing() async throws
+    /// Chooses which paired Mac subsequent connections target.
+    func setActiveMachine(_ machineId: String) async
+    /// Forgets one paired Mac, leaving the others intact.
+    func removeMachine(_ machineId: String) async throws
 }
 
 actor DSHRemoteTransport: DSHAppTransport {
-    private static let profileKey = "dsh-anywhere.relay-profile"
     private let tokenStore: any DSHTokenStore
+    private let store: DSHProfileStore
     private var connection: DSHWebSocketConnection?
 
-    init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore()) {
+    init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
+         store: DSHProfileStore = DSHProfileStore()) {
         self.tokenStore = tokenStore
+        self.store = store
     }
 
-    nonisolated static var isConfigured: Bool { UserDefaults.standard.data(forKey: profileKey) != nil }
+    nonisolated static var isConfigured: Bool { !DSHProfileStore().profiles.isEmpty }
 
     func pair(serverAddress: String, machineId: String, pairingSecret: String, deviceName: String) async throws -> DSHRemoteProfile {
         let baseURL = try DSHAPIClient.relayBaseURL(from: serverAddress)
@@ -28,7 +34,9 @@ actor DSHRemoteTransport: DSHAppTransport {
             machineId: machineId, pairingSecret: pairingSecret, deviceName: deviceName
         )
         try tokenStore.save(result.token, account: result.profile.deviceId)
-        UserDefaults.standard.set(try JSONEncoder().encode(result.profile), forKey: Self.profileKey)
+        // Adds to the machine list rather than replacing it, so pairing a second
+        // Mac no longer makes the first one unreachable.
+        store.upsert(result.profile)
         return result.profile
     }
 
@@ -64,16 +72,27 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func forgetPairing() async throws {
         await disconnect()
-        if let data = UserDefaults.standard.data(forKey: Self.profileKey),
-           let profile = try? JSONDecoder().decode(DSHRemoteProfile.self, from: data) {
+        guard let profile = store.activeProfile else { return }
+        try tokenStore.delete(account: profile.deviceId)
+        store.remove(profile.machineId)
+    }
+
+    func setActiveMachine(_ machineId: String) async {
+        // The socket carries the old machine's identity, so it cannot be reused.
+        await disconnect()
+        store.setActive(machineId)
+    }
+
+    func removeMachine(_ machineId: String) async throws {
+        if store.activeMachineId == machineId { await disconnect() }
+        if let profile = store.profiles.first(where: { $0.machineId == machineId }) {
             try tokenStore.delete(account: profile.deviceId)
         }
-        UserDefaults.standard.removeObject(forKey: Self.profileKey)
+        store.remove(machineId)
     }
 
     private func loadCredentials() throws -> (DSHRemoteProfile, String) {
-        guard let data = UserDefaults.standard.data(forKey: Self.profileKey),
-              let profile = try? JSONDecoder().decode(DSHRemoteProfile.self, from: data),
+        guard let profile = store.activeProfile,
               let token = try tokenStore.read(account: profile.deviceId) else {
             throw DSHAPIError.missingCredentials
         }
@@ -143,6 +162,10 @@ actor DSHPreviewTransport: DSHAppTransport {
     }
 
     func forgetPairing() async throws { await disconnect() }
+
+    func setActiveMachine(_ machineId: String) async {}
+
+    func removeMachine(_ machineId: String) async throws {}
 
     private func emit(type: String, sessionID: String? = nil, payload: DSHJSONValue) {
         let envelope = DSHEnvelope(messageId: UUID().uuidString, deviceId: deviceID,

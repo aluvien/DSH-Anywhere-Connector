@@ -26,6 +26,46 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    if model.machines.isEmpty {
+                        Text("No paired Macs yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.machines, id: \.machineId) { machine in
+                            Button {
+                                model.switchMachine(machine)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(machine.machineName)
+                                            .foregroundStyle(.primary)
+                                        Text(machine.relayBaseURL.absoluteString)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    if machine.machineId == model.activeMachine?.machineId {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(.tint)
+                                    }
+                                }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    model.removeMachine(machine)
+                                } label: {
+                                    Label("Remove", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Machines")
+                } footer: {
+                    Text("Pairing another Mac adds it here instead of replacing the current one. Tap to switch, swipe to remove.")
+                }
+
                 Section("Connection") {
                     LabeledContent("Machine") {
                         Text(model.machineName)

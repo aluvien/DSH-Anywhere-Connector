@@ -22,10 +22,12 @@
 		B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */; };
 		B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */; };
 		B00000000000000000000010 /* Features/Settings/SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000010 /* Features/Settings/SettingsView.swift */; };
+		B00000000000000000000011 /* Core/Store/DSHProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */; };
 		B0000000000000000000000E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000E /* Assets.xcassets */; };
 		B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000101 /* Core/DSHProtocolTests.swift */; };
 		B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000102 /* Core/DSHEventStoreTests.swift */; };
 		B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */; };
+		B00000000000000000000104 /* Core/DSHProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000104 /* Core/DSHProfileStoreTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,10 +56,12 @@
 		F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ApprovalCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/QuestionCard.swift; sourceTree = "<group>"; };
 		F00000000000000000000010 /* Features/Settings/SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/SettingsView.swift; sourceTree = "<group>"; };
+		F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Store/DSHProfileStore.swift; sourceTree = "<group>"; };
 		F0000000000000000000000E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F00000000000000000000101 /* Core/DSHProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProtocolTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000102 /* Core/DSHEventStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHEventStoreTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHWebSocketConnectionTests.swift; sourceTree = "<group>"; };
+		F00000000000000000000104 /* Core/DSHProfileStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProfileStoreTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000201 /* DSHAnywhere.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DSHAnywhere.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F00000000000000000000202 /* DSHAnywhereTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DSHAnywhereTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -107,6 +111,7 @@
 				F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */,
 				F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */,
 				F00000000000000000000010 /* Features/Settings/SettingsView.swift */,
+				F00000000000000000000011 /* Core/Store/DSHProfileStore.swift */,
 				F0000000000000000000000E /* Assets.xcassets */,
 			);
 			path = DSHAnywhere;
@@ -118,6 +123,7 @@
 				F00000000000000000000101 /* Core/DSHProtocolTests.swift */,
 				F00000000000000000000102 /* Core/DSHEventStoreTests.swift */,
 				F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */,
+				F00000000000000000000104 /* Core/DSHProfileStoreTests.swift */,
 			);
 			path = DSHAnywhereTests;
 			sourceTree = "<group>";
@@ -245,6 +251,7 @@
 				B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */,
 				B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */,
 				B00000000000000000000010 /* Features/Settings/SettingsView.swift in Sources */,
+				B00000000000000000000011 /* Core/Store/DSHProfileStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -255,6 +262,7 @@
 				B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */,
 				B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */,
 				B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */,
+				B00000000000000000000104 /* Core/DSHProfileStoreTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -297,7 +305,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 18;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
@@ -322,7 +330,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 18;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";

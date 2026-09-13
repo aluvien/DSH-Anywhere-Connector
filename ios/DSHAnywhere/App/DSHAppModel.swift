@@ -20,11 +20,14 @@ final class DSHAppModel: ObservableObject {
     @Published var collapsedSessionGroups: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.collapsedGroupsKey) ?? [])
     @Published var errorMessage: String?
+    /// Every Mac this iPhone is paired with, and which one is active.
+    @Published private(set) var machines: [DSHRemoteProfile]
 
     private let transport: any DSHAppTransport
     private let reducer = DSHEventReducer()
     private var eventTask: Task<Void, Never>?
     private let deviceID = "ios-device"
+    private let profiles = DSHProfileStore()
     static let groupingKey = "dsh-anywhere.group-by-workspace"
     static let collapsedGroupsKey = "dsh-anywhere.collapsed-groups"
 
@@ -32,8 +35,17 @@ final class DSHAppModel: ObservableObject {
          initialState: DSHStoreState = .init(), isPaired: Bool? = nil) {
         self.transport = transport
         self.state = initialState
+        let stored = DSHProfileStore()
+        self.machines = stored.profiles
         self.isPaired = isPaired ?? DSHRemoteTransport.isConfigured
+        if let active = stored.activeProfile {
+            self.machineName = active.machineName
+            self.machineID = active.machineId
+        }
     }
+
+    /// The Mac the app is currently talking to.
+    var activeMachine: DSHRemoteProfile? { profiles.activeProfile }
 
     var sessions: [DSHSessionSummary] { state.sessions }
     var modelCatalog: DSHModelCatalog? { state.modelCatalog }
@@ -98,9 +110,46 @@ final class DSHAppModel: ObservableObject {
                 )
                 UserDefaults.standard.set(address, forKey: "dsh-anywhere.server-address")
                 self.machineName = profile.machineName
+                self.machineID = profile.machineId
+                self.refreshMachines()
                 self.isPaired = true
                 self.connect()
             } catch { self.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func refreshMachines() {
+        machines = profiles.profiles
+    }
+
+    /// Points the app at another paired Mac. The socket is torn down first
+    /// because it carries the previous machine's identity.
+    func switchMachine(_ machine: DSHRemoteProfile) {
+        guard machine.machineId != activeMachine?.machineId else { return }
+        eventTask?.cancel()
+        eventTask = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.transport.setActiveMachine(machine.machineId)
+            self.machineName = machine.machineName
+            self.machineID = machine.machineId
+            self.state = DSHStoreState()
+            self.refreshMachines()
+            self.connect()
+        }
+    }
+
+    func removeMachine(_ machine: DSHRemoteProfile) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do { try await self.transport.removeMachine(machine.machineId) }
+            catch { self.errorMessage = error.localizedDescription }
+            self.refreshMachines()
+            if let active = self.profiles.activeProfile {
+                self.machineName = active.machineName
+                self.machineID = active.machineId
+            }
+            self.isPaired = !self.machines.isEmpty
         }
     }
 
