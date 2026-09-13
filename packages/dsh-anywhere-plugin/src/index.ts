@@ -576,7 +576,11 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   }) as never, { global: true })
 
   ctx.on('session/created' as never, ((session: unknown) => {
-    publish({ type: 'session.created', payload: normalizeLiveSession(session, ctx, metadata) })
+    const summary = normalizeLiveSession(session, ctx, metadata)
+    // Without this a delegated subagent still pops into the user's list, since
+    // the Harness announces every new session.
+    if (isSubagentSession(summary)) return
+    publish({ type: 'session.created', payload: summary })
   }) as never, { global: true })
 
   ctx.on('agent/status' as never, ((value: { agent: { id: string }; status: string }) => {
@@ -912,8 +916,21 @@ async function listSummaries(
   includeArchived: boolean,
 ): Promise<ReturnType<typeof normalizeSessionSummary>[]> {
   const result = await ctx.sessionController.list({}, AbortSignal.timeout(15_000))
-  const summaries = result.items.map((item) => normalizeSessionSummary(item, ctx, metadata))
+  const summaries = result.items
+    .map((item) => normalizeSessionSummary(item, ctx, metadata))
+    // A subagent session is how the agent delegates its own work, not a
+    // conversation the user started. Listing them buried the real ones: 18 of
+    // 40 rows were subagents in practice, each titled with its task prompt.
+    .filter((item) => !isSubagentSession(item))
   return includeArchived ? summaries : summaries.filter((item) => item.archived !== true)
+}
+
+/**
+ * Subagent sessions link back to the session that spawned them. `origin` is the
+ * explicit marker; the parent link is the fallback for builds that set only it.
+ */
+export function isSubagentSession(item: { origin?: string; parentSessionId?: string }): boolean {
+  return item.origin === 'subagent' || item.parentSessionId !== undefined
 }
 
 async function publishModelCatalog(
@@ -1087,6 +1104,7 @@ export function normalizeSessionSummary(
     ...(typeof item.running === 'boolean' ? { running: item.running } : {}),
     ...(typeof item.blank === 'boolean' ? { blank: item.blank } : {}),
     ...(typeof item.parentSessionId === 'string' ? { parentSessionId: item.parentSessionId } : {}),
+    ...(item.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
     ...(selection === undefined ? {} : selection),
     ...(permissionMode === undefined ? {} : { permissionMode }),
   }
@@ -1095,10 +1113,17 @@ export function normalizeSessionSummary(
 function normalizeLiveSession(value: unknown, ctx?: NativeContext, metadata?: SessionMetadataStore): ReturnType<typeof normalizeSessionSummary> {
   const session = recordOf(value)
   const header = recordOf(session.header)
+  // Carry the spawn link through so a freshly delegated subagent can be told
+  // apart from a session the user just started.
+  const parentSessionId = typeof session.parentSessionId === 'string'
+    ? session.parentSessionId
+    : typeof header.parentSessionId === 'string' ? header.parentSessionId : undefined
   return normalizeSessionSummary({
     sessionId: typeof session.id === 'string' ? session.id : 'unknown',
     cwd: header.cwd,
     updatedAt: Date.now(),
+    ...(parentSessionId === undefined ? {} : { parentSessionId }),
+    ...(session.origin === 'subagent' ? { origin: 'subagent' } : {}),
   }, ctx, metadata)
 }
 

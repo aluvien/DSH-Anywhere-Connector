@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { PairingRateLimiter, apply, inject, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial } from './index.js'
+import { PairingRateLimiter, apply, inject, isSubagentSession, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -276,5 +276,29 @@ describe('pairing page material', () => {
     const material = await readPairingMaterial(configPath)
 
     expect(material?.link).toContain('secret=long-lived-secret-value')
+  })
+});
+
+describe('subagent sessions stay out of the user list', () => {
+  it('recognises a subagent by its spawn link or its origin marker', () => {
+    // Either signal alone is enough: 18 of 40 rows were subagents in practice,
+    // each titled with the task prompt handed to it.
+    expect(isSubagentSession({ parentSessionId: 'session-parent' })).toBe(true)
+    expect(isSubagentSession({ origin: 'subagent' })).toBe(true)
+    expect(isSubagentSession({ title: 'iOS客户端开发' })).toBe(false)
+  })
+
+  it('passes the spawn link through summary normalization', () => {
+    const summary = normalizeSessionSummary({
+      sessionId: 'session-child',
+      cwd: '/tmp/work',
+      updatedAt: 1,
+      parentSessionId: 'session-parent',
+      origin: 'subagent',
+    })
+    // Without this the filter upstream has nothing to act on.
+    expect(summary.parentSessionId).toBe('session-parent')
+    expect(summary.origin).toBe('subagent')
+    expect(isSubagentSession(summary)).toBe(true)
   })
 });
