@@ -42,7 +42,12 @@ public struct DSHEventReducer: Sendable {
         case .connectionReady:
             state.connectionState = .connected
         case .sessionSnapshot(let sessions):
-            state.sessions = sessions
+            // Only touch the array when the content actually changed. The
+            // Connector pushes a snapshot often — on reconnect, on every
+            // explicit refresh — and most carry the same sessions. Reassigning
+            // anyway made SwiftUI re-diff every row on the home screen, which is
+            // what showed up as flicker each time data refreshed.
+            if sessions != state.sessions { state.sessions = sessions }
         case .sessionCreated(let session):
             upsert(session, into: &state.sessions)
         case .userMessageAccepted(let message):
