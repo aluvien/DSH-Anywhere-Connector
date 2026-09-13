@@ -342,9 +342,26 @@ export const SessionCreatePayloadSchema = StrictObject({
 });
 export const SessionOpenPayloadSchema = StrictObject({ sessionId: IdentifierSchema });
 export const ConnectionResumePayloadSchema = StrictObject({ lastSequence: z.number().int().nonnegative() });
+/**
+ * A reference to a file that was already uploaded. The Harness resolves these
+ * receipt ids out of the prompt content and binds them to the message, which is
+ * why they must travel inside `content` rather than beside it.
+ */
+export const PromptFilePartSchema = StrictObject({
+  type: z.literal("file"),
+  receiptId: IdentifierSchema,
+});
+
 export const PromptSendPayloadSchema = StrictObject({
   text: z.string().max(100_000).optional(),
+  /**
+   * Files to attach. Declared here because this object is strict: while it was
+   * undeclared, a prompt carrying an attachment was rejected whole by the Relay
+   * — taking the typed text with it, so the file arrived and the message did not.
+   */
+  attachments: z.array(PromptFilePartSchema).max(16).optional(),
   content: z.array(z.union([
+    PromptFilePartSchema,
     StrictObject({ type: z.literal("text"), text: z.string().max(100_000) }),
     StrictObject({
       type: z.literal("image"),

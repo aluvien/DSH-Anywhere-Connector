@@ -21,7 +21,7 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024;
  * 3: added `assistant.reasoning`, `question.asked`, `question.resolved` events
  *    and the `question.answer` command.
  */
-const RELAY_SCHEMA_REVISION = 3;
+const RELAY_SCHEMA_REVISION = 4;
 
 export interface RelayServerOptions {
   readonly bootstrapToken: string;

@@ -802,6 +802,7 @@ async function handleHttp(
     const parsed = PromptSendPayloadSchema.safeParse({
       ...(body.text === undefined ? {} : { text: body.text }),
       ...(body.content === undefined ? {} : { content: body.content }),
+      ...(body.attachments === undefined ? {} : { attachments: body.attachments }),
       ...(body.mode === undefined ? {} : { mode: body.mode }),
       ...(body.clientTimeZone === undefined ? {} : { clientTimeZone: body.clientTimeZone }),
     })
@@ -810,7 +811,11 @@ async function handleHttp(
     const mode = parsed.data.mode === 'steer' ? 'steer' : 'queue'
     const requestId = optionalStringOf(body.requestId) ?? randomUUID()
     const clientTimeZone = parsed.data.clientTimeZone
-    const content = parsed.data.content ?? (text.length === 0 ? [] : [{ type: 'text' as const, text }])
+    // Attachments have to sit inside `content`: that is where the Harness looks
+    // for receipt ids to bind to the message. Sending them in a field of their
+    // own is what made the file arrive without the text that accompanied it.
+    const content = parsed.data.content
+      ?? [...(text.length === 0 ? [] : [{ type: 'text' as const, text }]), ...(parsed.data.attachments ?? [])]
     const result = await ctx.sessionController.prompt({
       requestId,
       sessionId: decodeURIComponent(promptMatch[1]!),

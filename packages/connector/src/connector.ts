@@ -592,6 +592,7 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         body: {
           ...(command.payload.text === undefined ? {} : { text: command.payload.text }),
           ...(command.payload.content === undefined ? {} : { content: command.payload.content }),
+          ...(command.payload.attachments === undefined ? {} : { attachments: command.payload.attachments }),
           ...(command.payload.mode === undefined ? {} : { mode: command.payload.mode }),
           ...(command.payload.clientTimeZone === undefined ? {} : { clientTimeZone: command.payload.clientTimeZone }),
           requestId: command.requestId,

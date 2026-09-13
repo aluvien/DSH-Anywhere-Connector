@@ -65,10 +65,16 @@ describe("Relay and bridge forwarding", () => {
         timestamp: 2, type: "connection.resume", payload: { lastSequence: 0 } },
     }));
     await vi.waitFor(() => expect(relay.sent).toHaveLength(2));
-    expect(JSON.parse(relay.sent[1]!)).toMatchObject({
+    const replayed = JSON.parse(relay.sent[1]!) as { body: { type: string; sequence: number } };
+    expect(replayed).toMatchObject({
       type: "relay.payload", sender: "machine", targetDeviceId: "phone-1",
-      body: { type: "connection.ready", sequence: 1 },
+      body: { type: "connection.ready" },
     });
+    // The sequence must be a clock-seeded value, not the old process-local
+    // counter that restarted at 1: the phone orders its transcript by it and
+    // drops anything below the last value it saw, so a reset silently loses
+    // every event after a connector restart.
+    expect(replayed.body.sequence).toBeGreaterThan(1_000_000_000_000);
     await connector.stop();
   });
 

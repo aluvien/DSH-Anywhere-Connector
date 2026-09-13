@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PROTOCOL_VERSION,
+  CommandEnvelopeSchema,
   EventEnvelopeSchema,
   PairingRequestSchema,
   PairingResponseSchema,
@@ -190,5 +191,43 @@ describe("DSH Anywhere wire protocol", () => {
       type: "question.answer",
       payload: { questionId: "question_1", answers: [] },
     })).toThrow();
+  });
+});
+
+describe("prompt attachments", () => {
+  const base = { version: PROTOCOL_VERSION, timestamp: 1, machineId: "machine_1",
+                 deviceId: "device_1", sessionId: "session_1" };
+
+  it("accepts a prompt that carries attachments", () => {
+    // The regression this locks in: `attachments` was not declared, the payload
+    // schema is strict, so the Relay rejected the whole prompt — the file had
+    // already been uploaded separately, so it appeared while the text did not.
+    const message = {
+      type: "prompt.send",
+      requestId: "req_1",
+      ...base,
+      payload: { text: "look at this", attachments: [{ type: "file", receiptId: "receipt_1" }] },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(true);
+  });
+
+  it("accepts a file reference inside content, which is where the Harness looks", () => {
+    const message = {
+      type: "prompt.send",
+      requestId: "req_2",
+      ...base,
+      payload: { content: [{ type: "file", receiptId: "receipt_1" }, { type: "text", text: "hi" }] },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(true);
+  });
+
+  it("still rejects an undeclared field", () => {
+    const message = {
+      type: "prompt.send",
+      requestId: "req_3",
+      ...base,
+      payload: { text: "hi", receipts: ["receipt_1"] },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
   });
 });
