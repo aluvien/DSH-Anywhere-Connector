@@ -108,6 +108,42 @@ describe("Relay and bridge forwarding", () => {
     expect(relay.sent.join(" ")).not.toContain("bridge-secret");
     await connector.stop();
   });
+
+  it("echoes the create request id so the phone can match the reply to its tap", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      sessionId: "session-9",
+      summary: { id: "session-9", title: "From the phone", updatedAt: 1, cwd: "/tmp/work" },
+    }), { status: 201, headers: { "content-type": "application/json" } }));
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined },
+      heartbeatMs: 60_000,
+    });
+    connector.start();
+    relay.emit("open");
+    bridge.emit("open");
+    relay.emit("message", JSON.stringify({ type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+
+    relay.emit("message", JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "relay-message-2",
+      sender: "device", body: command("session.create"),
+    }));
+
+    const bodies = () => relay.sent.map((raw) => JSON.parse(raw)).map((message) => message.body);
+    await vi.waitFor(() => expect(bodies().some((body) => body?.type === "session.created")).toBe(true));
+    const created = bodies().find((body) => body?.type === "session.created");
+
+    // The phone opens a new session only when this id matches the request it
+    // sent. Losing it silently breaks "New session" with no error anywhere.
+    expect(created.messageId).toBe("request-1");
+    expect(created.sessionId).toBe("session-9");
+    expect(created.payload.title).toBe("From the phone");
+    await connector.stop();
+  });
 });
 
 class FakeSocket {

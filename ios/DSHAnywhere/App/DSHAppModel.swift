@@ -32,6 +32,8 @@ final class DSHAppModel: ObservableObject {
     private let reducer = DSHEventReducer()
     private var eventTask: Task<Void, Never>?
     private let deviceID = "ios-device"
+    /// The `session.create` request whose reply should open a session, if any.
+    private var awaitingCreatedSession: String?
     private let profiles = DSHProfileStore()
     static let groupingKey = "dsh-anywhere.group-by-workspace"
     static let collapsedGroupsKey = "dsh-anywhere.collapsed-groups"
@@ -229,21 +231,26 @@ final class DSHAppModel: ObservableObject {
 
     func createSession() {
         let known = Set(sessions.map(\.id))
-        let command = DSHCommand(version: 1, deviceId: deviceID, machineId: machineID,
+        // Remember which request asked for this session. The connector echoes it
+        // back as the created event's messageId, which is what lets the reply be
+        // matched to this tap instead of guessed at.
+        let requestId = UUID().uuidString
+        awaitingCreatedSession = requestId
+        let command = DSHCommand(requestId: requestId, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
                                   payload: .object(["title": .string("New session")]))
         send(command)
-        // `session.created` is what normally opens the new session. This is the
-        // fallback for when that event is dropped: re-request the list, and if a
-        // session we did not know about appeared, open it. Either path makes the
-        // tap do something visible instead of silently having no effect.
+        // Fallback for when `session.created` never arrives (dropped event, older
+        // connector): re-request the list and open a session we did not know
+        // about. Either path makes the tap do something visible.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            try? await Task.sleep(for: .seconds(1))
-            guard self.selectedSessionID == nil else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            guard self.awaitingCreatedSession == requestId else { return }
             self.refreshSessions()
-            try? await Task.sleep(for: .seconds(1))
-            guard self.selectedSessionID == nil else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            guard self.awaitingCreatedSession == requestId else { return }
+            self.awaitingCreatedSession = nil
             if let created = self.sessions.first(where: { !known.contains($0.id) }) {
                 self.selectedSessionID = created.id
             }
@@ -353,9 +360,17 @@ final class DSHAppModel: ObservableObject {
 
     private func reduce(_ event: DSHEvent) {
         reducer.reduce(event, into: &state)
-        if case .sessionCreated(let session) = event.kind, selectedSessionID == nil {
-            selectedSessionID = session.id
-        }
+        guard case .sessionCreated(let session) = event.kind else { return }
+        // Open the session only when *this* device asked for it. The previous
+        // check was `selectedSessionID == nil`, which had two failure modes: the
+        // flag is only cleared by the list view, so if that view was not on
+        // screen when a session arrived it stayed set and silently disabled
+        // navigation from then on; and the Harness announces every new session,
+        // so an unrelated one could steal the screen. Matching the request id
+        // removes both.
+        guard let expected = awaitingCreatedSession, event.envelope.messageId == expected else { return }
+        awaitingCreatedSession = nil
+        selectedSessionID = session.id
     }
 
     static func preview() -> DSHAppModel {

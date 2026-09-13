@@ -109,10 +109,23 @@ git 历史。本文件记录**尚未实施**的剩余工作：阶段 4。
 
 ---
 
-## 未验证事项（沿用自阶段 1/2）
+## 未验证事项
 
-- **New session 不跳转**：未能在静态分析中定位。已加两条兜底（失败弹窗、
-  创建后拉取列表并 diff 出新会话再跳转），但根因仍未确认。装 build 16 后点一次，
-  若有弹窗则说明是命令失败，把弹窗文案带回来即可定位。
+- **New session 不跳转**：已定位到触发条件本身的缺陷并修复（build 20），但**尚未
+  在真机上确认**。调查过程与结论：
+  - 先排除了两条猜测：`sendEvent` 实际会用 `++this.sequence` 覆盖字面量 sequence，
+    所以不是序号被丢弃；`DSHWebSocketConnection.normalized()` 会用连接配置里的真实
+    deviceId 覆写命令，所以硬编码的 `"ios-device"` 不会触发 relay 的
+    `body_device_mismatch`。
+  - 直接调用本机 bridge 的 `POST /sessions` 验证：返回 `{sessionId, agentPreset,
+    summary}`，形状正确，connector 的 `SessionSummarySchema.parse` 也不会拒绝。
+    服务端这一跳是好的。
+  - 定位到客户端：原触发条件是 `selectedSessionID == nil`，而该值只由列表视图的
+    `onChange` 清空。若事件到达时列表不在屏上，它会一直保持非 nil，**从此永久
+    禁用跳转**；且 Harness 会广播任何新会话，可能把用户拽进别处创建的会话。
+  - 改为按 requestId 关联：connector 会把 `command.requestId` 回显为事件的
+    `messageId`，客户端只在 id 匹配时打开，随后清除。新增 connector 测试锁定该契约。
+  - 该修复无法单测覆盖（DSHAppModel 位于 App target，不在 SwiftPM 包内），
+    因此仍需装机点一次确认。
 - **提问卡片端到端**：插件与 relay 侧已就绪，尚未在真机上验证「手机与浏览器同时
   收到、先答的赢」。
