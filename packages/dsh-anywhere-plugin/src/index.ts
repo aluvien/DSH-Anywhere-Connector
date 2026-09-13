@@ -33,7 +33,11 @@ export const name = 'dsh-anywhere-native-bridge'
 // Harness web UI. It must be injected explicitly or Cordis exposes it as a
 // throwing optional getter and the mobile list cannot distinguish archived
 // sessions from active ones.
-export const inject = ['webServer', 'sessionController', 'workspaceRegistry']
+// typertGateway is what actually stores an uploaded file. Accessing it
+// without declaring it here throws before any of our own checks run, which is
+// why uploads failed with "cannot get property \"typertGateway\" without
+// inject" rather than our 501 message.
+export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway']
 
 export interface Config {
   readonly routePrefix?: string

@@ -1,6 +1,32 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    " %@": {},
+    "·": {},
+    "/%@": {},
+    "/%@ %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "/%1$@ %2$@"
+          }
+        }
+      }
+    },
+    "%@, %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "%1$@, %2$@"
+          }
+        }
+      }
+    },
+    "%lld": {},
+    "%lld.": {},
+    "•": {},
     "About": {
       "extractionState": "manual",
       "localizations": {
@@ -19,6 +45,17 @@
           "stringUnit": {
             "state": "translated",
             "value": "允许一次"
+          }
+        }
+      }
+    },
+    "Archive": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "归档"
           }
         }
       }
@@ -100,6 +137,17 @@
         }
       }
     },
+    "Camera unavailable": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "相机不可用"
+          }
+        }
+      }
+    },
     "Cancel": {
       "extractionState": "manual",
       "localizations": {
@@ -118,6 +166,28 @@
           "stringUnit": {
             "state": "translated",
             "value": "更改此会话的沙箱与审批策略"
+          }
+        }
+      }
+    },
+    "Command completed": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "命令已完成"
+          }
+        }
+      }
+    },
+    "Command not found": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "找不到该命令"
           }
         }
       }
@@ -184,6 +254,17 @@
           "stringUnit": {
             "state": "translated",
             "value": "连接失败"
+          }
+        }
+      }
+    },
+    "Context %lld percent used": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上下文已用 %lld 个百分点"
           }
         }
       }
@@ -364,6 +445,17 @@
         }
       }
     },
+    "Follow System uses your device language. The choice applies immediately.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「跟随系统」使用设备语言。选择会立即生效。"
+          }
+        }
+      }
+    },
     "Full access": {
       "extractionState": "manual",
       "localizations": {
@@ -386,6 +478,18 @@
         }
       }
     },
+    "Hide reasoning": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "收起思考过程"
+          }
+        }
+      }
+    },
+    "https://dsh.example.com": {},
     "Language": {
       "extractionState": "manual",
       "localizations": {
@@ -393,6 +497,17 @@
           "stringUnit": {
             "state": "translated",
             "value": "语言"
+          }
+        }
+      }
+    },
+    "Machine": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "机器"
           }
         }
       }
@@ -551,6 +666,17 @@
         }
       }
     },
+    "Other answer": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "其他答案"
+          }
+        }
+      }
+    },
     "Pair with Mac": {
       "extractionState": "manual",
       "localizations": {
@@ -606,6 +732,17 @@
         }
       }
     },
+    "Permission: %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "权限：%@"
+          }
+        }
+      }
+    },
     "Read only": {
       "extractionState": "manual",
       "localizations": {
@@ -613,6 +750,28 @@
           "stringUnit": {
             "state": "translated",
             "value": "只读"
+          }
+        }
+      }
+    },
+    "Reasoning behind %lld answers in this turn": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本轮 %lld 条回答的思考过程"
+          }
+        }
+      }
+    },
+    "Reasoning behind this answer": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这条回答的思考过程"
           }
         }
       }
@@ -668,6 +827,17 @@
           "stringUnit": {
             "state": "translated",
             "value": "拒绝"
+          }
+        }
+      }
+    },
+    "Relay": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Relay"
           }
         }
       }
@@ -826,6 +996,17 @@
         }
       }
     },
+    "Show reasoning": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "查看思考过程"
+          }
+        }
+      }
+    },
     "Something went wrong": {
       "extractionState": "manual",
       "localizations": {
@@ -844,6 +1025,17 @@
           "stringUnit": {
             "state": "translated",
             "value": "开始对话"
+          }
+        }
+      }
+    },
+    "Status": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "状态"
           }
         }
       }
@@ -877,6 +1069,61 @@
           "stringUnit": {
             "state": "translated",
             "value": "此 iPhone"
+          }
+        }
+      }
+    },
+    "Tool %@, %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "工具 %@，%@"
+          }
+        }
+      }
+    },
+    "Type your answer": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "输入你的答案"
+          }
+        }
+      }
+    },
+    "Unarchive": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "取消归档"
+          }
+        }
+      }
+    },
+    "Unrecognised code %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法识别的码 %@"
+          }
+        }
+      }
+    },
+    "Version": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "版本"
           }
         }
       }
@@ -936,13 +1183,13 @@
         }
       }
     },
-    "Follow System uses your device language. The choice applies immediately.": {
+    "Workspace write": {
       "extractionState": "manual",
       "localizations": {
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "「跟随系统」使用设备语言。选择会立即生效。"
+            "value": "工作区可写"
           }
         }
       }

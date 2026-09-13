@@ -389,24 +389,30 @@ private struct PermissionMenu: View {
         .accessibilityHint("Changes the sandbox and approval policy for this session")
     }
 
+    /// The Harness persists a preset as sandbox mode + approval policy, so a
+    /// session can report a raw sandbox mode rather than a preset name.
     private func permissionLabel(_ value: String) -> String {
         switch value {
-        case "ask": return DSHLocalization.string("Ask")
-        case "never": return DSHLocalization.string("No approvals")
-        case "read-only": return DSHLocalization.string("Read only")
         case "danger-full-access": return DSHLocalization.string("Full access")
-        default: return DSHLocalization.string("Workspace")
+        case "workspace-write": return DSHLocalization.string("Workspace write")
+        // read-only and ask arrive from sessions configured outside the app.
+        case "read-only": return DSHLocalization.string("Read only")
+        case "ask": return DSHLocalization.string("Ask")
+        default: return DSHLocalization.string("Workspace write")
         }
     }
 
+    /// Exactly the presets the Harness defines, and no more.
+    ///
+    /// Each preset is a sandbox mode *plus* an approval policy. The picker used
+    /// to offer five entries that mixed the two concepts ("ask", "never",
+    /// "read-only"), and the Harness rejects anything outside this pair with
+    /// 400 — so three of the five could never take effect.
     private var permissionModes: [(mode: String, title: String, icon: String)] {
         // Titles are localized here rather than left to `Label`, which only
         // localizes a literal and takes this value as a plain String.
         [
-            ("ask", DSHLocalization.string("Ask every time"), "questionmark.circle"),
-            ("never", DSHLocalization.string("Never ask"), "checkmark.circle"),
-            ("read-only", DSHLocalization.string("Read only"), "eye"),
-            ("workspace-write", DSHLocalization.string("Workspace changes"), "folder"),
+            ("workspace-write", DSHLocalization.string("Workspace write"), "folder"),
             ("danger-full-access", DSHLocalization.string("Full access"), "exclamationmark.triangle")
         ]
     }
