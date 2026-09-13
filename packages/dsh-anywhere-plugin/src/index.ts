@@ -37,6 +37,13 @@ export const name = 'dsh-anywhere-native-bridge'
 // without declaring it here throws before any of our own checks run, which is
 // why uploads failed with "cannot get property \"typertGateway\" without
 // inject" rather than our 501 message.
+/**
+ * Commands whose completion is a state change rather than conversation output.
+ * They are issued by the app itself, and their effect reaches the phone as its
+ * own event, so a transcript row for them is noise that never clears.
+ */
+const COMMAND_RESULT_SUPPRESSED = new Set(['permission', 'permissions', 'model'])
+
 export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway']
 
 export interface Config {
@@ -1291,6 +1298,12 @@ export function normalizeSessionEvents(
       },
     }]
   }
+  // Commands the app issues as control actions — permission and model changes —
+  // are state changes, not conversation. Their effect is already broadcast as
+  // `permission.updated` / the model selection, so publishing them here left a
+  // permanent "Permission preset: …" card at the bottom of the session that
+  // never went away.
+  if (COMMAND_RESULT_SUPPRESSED.has(stringOr(data.name, ''))) return []
   if (type === 'command/run') {
     const commandId = stringOr(data.commandId, randomUUID())
     const name = stringOr(data.name, 'command')
@@ -1302,6 +1315,15 @@ export function normalizeSessionEvents(
     }]
   }
   if (type === 'command/done') {
+    const doneName = stringOr(data.name, '')
+    const doneId = stringOr(data.commandId, '')
+    const knownName = toolNames.get(doneId) ?? doneName
+    if (COMMAND_RESULT_SUPPRESSED.has(doneName) || COMMAND_RESULT_SUPPRESSED.has(knownName)) {
+      // Still forget the name so the map cannot grow.
+      toolNames.delete(doneId)
+      return []
+    }
+
     const commandId = stringOr(data.commandId, randomUUID())
     const kind = data.kind === 'error' ? 'error' : 'success'
     const name = toolNames.get(commandId) ?? 'command'

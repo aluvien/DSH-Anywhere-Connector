@@ -1248,6 +1248,17 @@
           }
         }
       }
+    },
+    "Could not read that photo. If it is stored in iCloud, open it in Photos once so it downloads, then try again.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法读取这张照片。如果它存在 iCloud 中，请先在「照片」里打开一次让它下载，然后重试。"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

@@ -157,10 +157,18 @@ struct ConversationView: View {
             .onChange(of: selectedPhoto) { _, item in
                 guard let item else { return }
                 Task { @MainActor in
-                    if let data = try? await item.loadTransferable(type: Data.self) {
+                    defer { selectedPhoto = nil }
+                    do {
+                        guard let data = try await item.loadTransferable(type: Data.self) else {
+                            reportPhotoFailure()
+                            return
+                        }
                         model.uploadAttachment(name: "photo.jpg", data: data, for: sessionID)
+                    } catch {
+                        // `try?` used to swallow this, so a failure looked like
+                        // the button doing nothing at all.
+                        reportPhotoFailure()
                     }
-                    selectedPhoto = nil
                 }
             }
             .sheet(isPresented: $showCommandMenu) {
@@ -309,6 +317,13 @@ struct ConversationView: View {
         model.sendPrompt(model.draft, attachments: receipts, to: sessionID)
         sentAttachmentIDs.formUnion(receipts)
         model.draft = ""
+    }
+
+    /// A photo that is only in iCloud cannot be read without downloading it
+    /// first, and the picker gives no hint of that — so say it.
+    private func reportPhotoFailure() {
+        model.errorMessage = DSHLocalization.string(
+            "Could not read that photo. If it is stored in iCloud, open it in Photos once so it downloads, then try again.")
     }
 
     private func refreshSession() {
