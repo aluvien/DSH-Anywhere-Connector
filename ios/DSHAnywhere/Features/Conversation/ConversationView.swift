@@ -71,9 +71,12 @@ struct ConversationView: View {
                 .padding()
             }
             .defaultScrollAnchor(.bottom)
-            // Dragging the transcript puts the keyboard away, which is the
-            // gesture people reach for after reading the latest reply.
+            // Dragging the transcript puts the keyboard away. `.always` keeps
+            // the bounce gesture available even when a short conversation has
+            // nothing to scroll, which is what the removed keyboard "Done" bar
+            // was working around.
             .scrollDismissesKeyboard(.interactively)
+            .scrollBounceBehavior(.always)
             .safeAreaInset(edge: .bottom) { composer }
             .navigationTitle(session?.title ?? "Conversation")
             .navigationBarTitleDisplayMode(.inline)
@@ -96,12 +99,6 @@ struct ConversationView: View {
                     } label: {
                         Image(systemName: didRefresh ? "checkmark.circle.fill" : "ellipsis.circle")
                     }
-                }
-                // Swiping the transcript dismisses the keyboard, but a short
-                // conversation has nothing to scroll, so keep an explicit exit.
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") { isDraftFocused = false }
                 }
             }
             .task(id: sessionID) {
@@ -161,6 +158,11 @@ struct ConversationView: View {
         DSHSessionSummary(id: sessionID, title: "Conversation")
     }
 
+    /// Native input bar: a single `.bar` material band across the bottom, with
+    /// the text field carrying the only rounded fill. The previous version
+    /// nested a hand-drawn rounded card with its own material and stroke inside
+    /// another material band, which is what read as a redundant background and
+    /// made the whole bar feel heavy.
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
             let attachments = pendingAttachments
@@ -172,63 +174,65 @@ struct ConversationView: View {
                                 .font(.caption)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 5)
-                                .background(Color.secondary.opacity(0.12))
-                                .clipShape(Capsule())
+                                .background(.thinMaterial, in: .capsule)
                         }
                     }
-                    .padding(.horizontal)
+                    .padding(.horizontal, 4)
                 }
             }
-            VStack(spacing: 8) {
-                TextField("Send a message, / command, @ file or conversation", text: $model.draft, axis: .vertical)
+
+            HStack(alignment: .bottom, spacing: 8) {
+                Button { showCommandMenu = true } label: {
+                    Image(systemName: "plus.circle.fill").font(.title3)
+                }
+                .accessibilityLabel("Commands")
+
+                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    Image(systemName: "paperclip").font(.title3)
+                }
+                .accessibilityLabel("Attach photo")
+
+                Button { showFileImporter = true } label: {
+                    Image(systemName: "doc.badge.plus").font(.title3)
+                }
+                .accessibilityLabel("Attach file")
+
+                TextField("Send a message, / command, @ file or conversation",
+                          text: $model.draft, axis: .vertical)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
                     .focused($isDraftFocused)
                     .onSubmit { send() }
-                HStack(spacing: 10) {
-                    Button { showCommandMenu = true } label: {
-                        Image(systemName: "plus.circle.fill").font(.title3)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 18))
+
+                if isRunning {
+                    Button(action: { model.cancelTurn(for: sessionID) }) {
+                        Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
                     }
-                    .accessibilityLabel("Commands")
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                        Image(systemName: "paperclip").font(.title3)
+                    .accessibilityLabel("Stop turn")
+                } else {
+                    Button(action: send) {
+                        Image(systemName: "arrow.up.circle.fill").font(.title).foregroundStyle(.tint)
                     }
-                    .accessibilityLabel("Attach photo")
-                    Button { showFileImporter = true } label: {
-                        Image(systemName: "doc.badge.plus").font(.title3)
-                    }
-                    .accessibilityLabel("Attach file")
-                    PermissionMenu(sessionID: sessionID)
-                    Spacer()
-                    ModelMenu(sessionID: sessionID)
-                    if isRunning {
-                        Button(action: { model.cancelTurn(for: sessionID) }) {
-                            Image(systemName: "stop.fill").foregroundStyle(.red)
-                        }
-                        .accessibilityLabel("Stop turn")
-                    } else {
-                        Button(action: send) {
-                            Image(systemName: "arrow.up.circle.fill").font(.title).foregroundStyle(.tint)
-                        }
-                        .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                  && pendingAttachments.isEmpty)
-                        .accessibilityLabel("Send message")
-                    }
+                    .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              && pendingAttachments.isEmpty)
+                    .accessibilityLabel("Send message")
                 }
-                UsageFooter(usage: model.usage(for: sessionID))
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            // No fill of its own: the composer already sits on the
-            // `.ultraThinMaterial` band below, and stacking a second material
-            // here is what made the card read as a redundant background behind
-            // the text field. The stroke alone defines the card.
-            .clipShape(RoundedRectangle(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.secondary.opacity(0.2)))
-            .padding(.horizontal, 8)
-            .padding(.bottom, 4)
+
+            HStack(spacing: 10) {
+                PermissionMenu(sessionID: sessionID)
+                Spacer(minLength: 0)
+                ModelMenu(sessionID: sessionID)
+            }
+
+            UsageFooter(usage: model.usage(for: sessionID))
         }
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
     }
 
     private func send() {
