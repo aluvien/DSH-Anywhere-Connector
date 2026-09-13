@@ -88,10 +88,12 @@ struct SessionListView: View {
                 // reference app: the two things you can actually do live in the
                 // capsule on the right.
                 ToolbarItem(placement: .topBarLeading) {
-                    Image("WhaleLogo")
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 28, height: 28)
+                    // The emoji, not the app icon: the icon artwork is a bright
+                    // whale on an opaque dark field, so reusing it put a dark
+                    // square in the bar, and keying the background out washed the
+                    // whale out. The emoji is already just the whale.
+                    Text(verbatim: "🐳")
+                        .font(.system(size: 24))
                         .accessibilityHidden(true)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -248,7 +250,12 @@ private struct SessionRow: View {
                         .lineLimit(1)
                 }
                 if let model = session.model {
-                    Label(model, systemImage: "cpu")
+                    // Only the model, not "provider/model": the provider is the
+                    // same everywhere and its extra width wrapped the row onto a
+                    // third line.
+                    Label(model.split(separator: "/").last.map(String.init) ?? model,
+                          systemImage: "cpu")
+                        .lineLimit(1)
                 }
                 if session.archived == true {
                     Label("Archived", systemImage: "archivebox")
