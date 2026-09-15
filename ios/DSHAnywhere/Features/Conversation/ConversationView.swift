@@ -129,6 +129,19 @@ struct ConversationView: View {
         model.transcriptEntries(for: sessionID)
     }
 
+    /// Streaming deltas replace the last message's value in place, so the
+    /// array count does not change while an answer is being generated.  Keep a
+    /// small, cheap signature of the newest message to make SwiftUI observe
+    /// those in-place edits and follow the live output without hashing the
+    /// entire transcript on every token.
+    private var latestStreamingSignature: String {
+        guard let message = model.messages(for: sessionID).last else { return "" }
+        let markdownTail = String(message.markdown.suffix(64))
+        let reasoning = message.reasoning ?? ""
+        let reasoningTail = String(reasoning.suffix(64))
+        return "\(message.id)|\(message.markdown.count)|\(markdownTail)|\(reasoning.count)|\(reasoningTail)"
+    }
+
     private var conversationTitle: String {
         let value = session?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? DSHLocalization.string("New session") : value
@@ -194,6 +207,14 @@ struct ConversationView: View {
             }
             .defaultScrollAnchor(.bottom)
             .background(Color(.systemBackground))
+            .refreshable {
+                // Remote's pull-to-refresh rehydrates both the task metadata
+                // and the durable transcript without creating a second socket
+                // or replaying the whole event stream.
+                model.refreshSessions(includeArchived: true)
+                model.sendModelCatalog()
+                model.openSession(sessionID)
+            }
             // Dragging the transcript puts the keyboard away. `.always` keeps
             // the bounce gesture available even when a short conversation has
             // nothing to scroll, which is what the removed keyboard "Done" bar
@@ -241,6 +262,13 @@ struct ConversationView: View {
                 model.markSessionRead(sessionID)
             }
             .onChange(of: transcriptEntries.count) { _, _ in
+                scrollToLatest(proxy)
+            }
+            .onChange(of: latestStreamingSignature) { _, _ in
+                // Assistant deltas mutate the current message instead of
+                // appending a new one.  This observer keeps a reader at the
+                // bottom during a live answer while `scrollToLatest` still
+                // respects the manual-scroll guard above.
                 scrollToLatest(proxy)
             }
             .onChange(of: isRunning) { _, _ in
@@ -320,71 +348,74 @@ struct ConversationView: View {
         }
     }
 
-    /// Happy's conversation header uses the same 44pt controls as the home
-    /// header: a glass back circle, a text-sized title pill, and a gear-shaped
-    /// settings action. The native navigation bar is hidden so its default
-    /// title/ellipsis cannot add a second, differently-sized toolbar.
+    /// Remote's task header is intentionally quiet: the task title is centred,
+    /// the second line carries the mode and project, and the two native
+    /// controls stay in fixed 44pt slots.  Keeping the title out of a capsule
+    /// gives the transcript more vertical space and matches the task-detail
+    /// rhythm used by ChatGPT Remote.
     private var happyConversationHeader: some View {
-        HStack(spacing: 8) {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 20, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Back")
-
-            Spacer(minLength: 0)
-
-            VStack(spacing: 1) {
+        ZStack {
+            VStack(spacing: 2) {
                 Text(conversationTitle)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 17, weight: .semibold))
                     .lineLimit(1)
-                Text(conversationSubtitle)
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(deviceStatusColor)
+                        .frame(width: 6, height: 6)
+                    Text(conversationSubtitle)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
-            .padding(.horizontal, 14)
-            .frame(minHeight: 44)
-            .frame(maxWidth: 210)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay { Capsule().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+            .frame(maxWidth: .infinity)
+            .allowsHitTesting(false)
 
-            Spacer(minLength: 0)
+            HStack(spacing: 10) {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Back")
 
-            Menu {
-                Button { showModelPicker = true } label: {
-                    Label("Select model", systemImage: "cpu")
+                Spacer(minLength: 0)
+
+                Menu {
+                    Button { showModelPicker = true } label: {
+                        Label("Select model", systemImage: "cpu")
+                    }
+                    Button { showPermissionPicker = true } label: {
+                        Label("Permission", systemImage: "checkmark.shield")
+                    }
+                    Button { refreshSession() } label: {
+                        Label("Refresh session info", systemImage: "arrow.clockwise")
+                    }
+                    Divider()
+                    Button(role: .destructive) { archiveSession() } label: {
+                        Label("Archive session", systemImage: "archivebox")
+                    }
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 19, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
                 }
-                Button { showPermissionPicker = true } label: {
-                    Label("Permission", systemImage: "checkmark.shield")
-                }
-                Button { refreshSession() } label: {
-                    Label("Refresh session info", systemImage: "arrow.clockwise")
-                }
-                Divider()
-                Button(role: .destructive) { archiveSession() } label: {
-                    Label("Archive session", systemImage: "archivebox")
-                }
-            } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 19, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Session settings")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Session settings")
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
         .padding(.bottom, 8)
-        // Keep the page background continuous like Happy. The three controls
-        // already carry their own material, so an opaque toolbar slab only
-        // creates a visible seam while scrolling.
+        .background(Color(.systemBackground).opacity(0.96))
     }
 
     /// Happy's empty conversation state is intentionally sparse: a laptop,
@@ -560,7 +591,7 @@ struct ConversationView: View {
     /// the permission, model and send controls remain in this same editor.
     private var compactComposer: some View {
         DSHCompactComposer(text: $model.draft,
-                           placeholder: "Send a message, / command, @ file or conversation",
+                           placeholder: DSHLocalization.string("Send a message, / command, @ file or conversation"),
                            hasAttachments: hasDraftAttachments,
                            onSubmit: send) {
             DSHComposerQuickActionsMenu(

@@ -68,14 +68,18 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.object(forKey: DSHAppModel.messageActionsKey) as? Bool ?? false
     @Published var collapseComposerControls: Bool =
         UserDefaults.standard.object(forKey: DSHAppModel.composerCollapsedKey) as? Bool ?? true
+    /// Both home experiences remain in the app so a user can switch between
+    /// the Remote task browser and the original Happy-inspired list without
+    /// changing the paired Harness or losing any session state.
+    @Published var useRemoteTaskLayout: Bool =
+        UserDefaults.standard.object(forKey: DSHAppModel.homeLayoutKey) as? Bool ?? true
     /// List arrangement and per-section collapse survive relaunch: they are
     /// browsing preferences, not session state.
-    /// Happy's phone home is a flat, activity-sorted list.  Keep the old
-    /// grouping preference under its legacy key, but start the new UI in flat
-    /// mode so an upgrade does not unexpectedly reopen the former project-card
-    /// layout.
+    /// ChatGPT Remote's task home is organised by project. Keep the preference
+    /// under the existing key so an upgrade preserves a deliberate user choice,
+    /// while fresh installs open in the project-card layout by default.
     @Published var groupsSessionsByWorkspace: Bool =
-        UserDefaults.standard.object(forKey: DSHAppModel.groupingKey) as? Bool ?? false
+        UserDefaults.standard.object(forKey: DSHAppModel.groupingKey) as? Bool ?? true
     @Published var collapsedSessionGroups: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.collapsedGroupsKey) ?? [])
     @Published private(set) var workspaceAliases: [String: String] =
@@ -123,8 +127,12 @@ final class DSHAppModel: ObservableObject {
     private var pendingMessageAttachmentsBySession: [String: [[DSHMessageAttachment]]] = [:]
     private var attachmentDataByReceipt: [String: Data] = [:]
     private let deviceID = "ios-device"
-    /// The `session.create` request whose reply should open a session, if any.
-    private var awaitingCreatedSession: String?
+    /// Every in-flight `session.create` request keeps the snapshot it was
+    /// created against. The Connector echoes that request id in
+    /// `session.created`; keeping this as a map (rather than one global slot)
+    /// means two quick taps cannot make the first task lose its initial prompt
+    /// or navigate to the wrong session.
+    private var pendingSessionCreationKnownIDs: [String: Set<String>] = [:]
     /// Attachments selected in the shared new-session composer stay local until
     /// the session exists. They are uploaded and sent as one initial prompt
     /// immediately after the matching `session.created` event arrives.
@@ -138,6 +146,7 @@ final class DSHAppModel: ObservableObject {
     static let turnUsageKey = "dsh-anywhere.show-turn-usage"
     static let messageActionsKey = "dsh-anywhere.show-message-actions-by-default"
     static let composerCollapsedKey = "dsh-anywhere.collapse-composer-controls"
+    static let homeLayoutKey = "dsh-anywhere.home-layout-remote"
     static let workspaceAliasesKey = "dsh-anywhere.workspace-aliases"
     static let hiddenWorkspacesKey = "dsh-anywhere.hidden-workspaces"
     static let hiddenMessagesKey = "dsh-anywhere.hidden-messages"
@@ -341,6 +350,8 @@ final class DSHAppModel: ObservableObject {
         eventFlushTask?.cancel()
         eventFlushTask = nil
         pendingEvents.removeAll(keepingCapacity: false)
+        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
+        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
@@ -431,6 +442,8 @@ final class DSHAppModel: ObservableObject {
         eventFlushTask?.cancel()
         eventFlushTask = nil
         pendingEvents.removeAll(keepingCapacity: false)
+        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
+        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
         Task { await transport.disconnect() }
         state.transportState = .disconnected
         state.machineOnline = false
@@ -444,6 +457,8 @@ final class DSHAppModel: ObservableObject {
         eventFlushTask?.cancel()
         eventFlushTask = nil
         pendingEvents.removeAll(keepingCapacity: false)
+        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
+        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
         Task { @MainActor [weak self] in
             do { try await self?.transport.forgetPairing() }
             catch { self?.errorMessage = error.localizedDescription }
@@ -456,10 +471,12 @@ final class DSHAppModel: ObservableObject {
     /// immediately after a rename while the authoritative snapshot is in
     /// flight, so the new-session picker never briefly shows the old title.
     var workspaces: [DSHWorkspaceOption] {
-        sessions.workspaceOptions().map { workspace in
-            DSHWorkspaceOption(id: workspace.id,
-                               name: workspaceAliases[workspace.id] ?? workspace.name)
-        }
+        sessions.workspaceOptions()
+            .filter { !hiddenWorkspaceIDs.contains($0.id) }
+            .map { workspace in
+                DSHWorkspaceOption(id: workspace.id,
+                                   name: workspaceAliases[workspace.id] ?? workspace.name)
+            }
     }
 
     /// Starts a session, optionally inside a workspace.
@@ -479,9 +496,10 @@ final class DSHAppModel: ObservableObject {
         let known = Set(sessions.map(\.id))
         // Remember which request asked for this session. The connector echoes it
         // back as the created event's messageId, which is what lets the reply be
-        // matched to this tap instead of guessed at.
+        // matched to this tap instead of guessed at. Multiple entries are
+        // allowed, so rapid new-task taps remain independent.
         let requestId = UUID().uuidString
-        awaitingCreatedSession = requestId
+        pendingSessionCreationKnownIDs[requestId] = known
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         var payload: [String: DSHJSONValue] = ["title": .string(cleanTitle.isEmpty ? "新会话" : cleanTitle)]
         if let workingDirectory {
@@ -526,14 +544,20 @@ final class DSHAppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             try? await Task.sleep(for: .seconds(1.5))
-            guard self.awaitingCreatedSession == requestId else { return }
+            guard self.pendingSessionCreationKnownIDs[requestId] != nil else { return }
             self.refreshSessions()
             try? await Task.sleep(for: .seconds(1.5))
-            guard self.awaitingCreatedSession == requestId else { return }
-            self.awaitingCreatedSession = nil
-            if let created = self.sessions.first(where: { !known.contains($0.id) }) {
+            guard let known = self.pendingSessionCreationKnownIDs[requestId] else { return }
+            let candidates = self.sessions.filter { !known.contains($0.id) }
+            // A list snapshot has no request id. Only use it as a fallback
+            // when exactly one new session exists; guessing among several
+            // tasks would open the wrong conversation, which is worse than
+            // leaving the user on the task browser where all of them are
+            // visible.
+            if candidates.count == 1, let created = candidates.first {
                 self.completeCreatedSession(created, requestID: requestId)
             } else {
+                self.pendingSessionCreationKnownIDs.removeValue(forKey: requestId)
                 self.pendingInitialMessagesByRequestID.removeValue(forKey: requestId)
             }
         }
@@ -598,6 +622,11 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.set(value, forKey: Self.composerCollapsedKey)
     }
 
+    func setUseRemoteTaskLayout(_ value: Bool) {
+        useRemoteTaskLayout = value
+        UserDefaults.standard.set(value, forKey: Self.homeLayoutKey)
+    }
+
     func isGroupCollapsed(_ id: String) -> Bool { collapsedSessionGroups.contains(id) }
 
     func setGroup(_ id: String, collapsed: Bool) {
@@ -623,6 +652,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     func deleteWorkspace(_ group: DSHSessionGroup) {
+        guard !group.isUnfiled, group.id != DSHSessionGroup.flatGroupID else { return }
         hiddenWorkspaceIDs.insert(group.id)
         UserDefaults.standard.set(Array(hiddenWorkspaceIDs), forKey: Self.hiddenWorkspacesKey)
         send(DSHCommand.deleteWorkspace(deviceId: deviceID, machineId: machineID,
@@ -891,12 +921,13 @@ final class DSHAppModel: ObservableObject {
         // navigation from then on; and the Harness announces every new session,
         // so an unrelated one could steal the screen. Matching the request id
         // removes both.
-        guard let expected = awaitingCreatedSession, event.envelope.messageId == expected else { return }
-        completeCreatedSession(session, requestID: expected)
+        let requestID = event.envelope.messageId
+        guard pendingSessionCreationKnownIDs[requestID] != nil else { return }
+        completeCreatedSession(session, requestID: requestID)
     }
 
     private func completeCreatedSession(_ session: DSHSessionSummary, requestID: String) {
-        awaitingCreatedSession = nil
+        pendingSessionCreationKnownIDs.removeValue(forKey: requestID)
         selectedSessionID = session.id
         guard let pending = pendingInitialMessagesByRequestID.removeValue(forKey: requestID) else { return }
         Task { @MainActor [weak self] in
@@ -951,6 +982,7 @@ final class DSHAppModel: ObservableObject {
                                       model: "deepseek-v4.1-flash", branch: "main")
         var state = DSHStoreState()
         state.sessions = [session, second, third]
+        state.hasLoadedSessions = true
         state.transportState = .connected
         state.machineOnline = true
         state.bridgeReachable = true

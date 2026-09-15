@@ -750,7 +750,7 @@ private struct NewSessionSheet: View {
     private let initialWorkspaceID: String?
     @State private var workspaceID: String
     @State private var permissionMode = "workspace-write"
-    @State private var sessionTitle = "新会话"
+    @State private var sessionTitle = ""
     @State private var workingDirectory = ""
     @State private var branch = "main"
     @State private var sessionMode = "standard"
@@ -764,9 +764,10 @@ private struct NewSessionSheet: View {
     @State private var showInitialFileImporter = false
     @State private var showInitialCommandMenu = false
 
-    init(initialWorkspaceID: String? = nil) {
+    init(initialWorkspaceID: String? = nil, initialPrompt: String = "") {
         self.initialWorkspaceID = initialWorkspaceID
         _workspaceID = State(initialValue: initialWorkspaceID ?? "")
+        _initialPrompt = State(initialValue: initialPrompt)
     }
 
     private var selectedWorkspace: DSHWorkspaceOption? {
@@ -786,10 +787,41 @@ private struct NewSessionSheet: View {
                 .onTapGesture { dismiss() }
 
             VStack(spacing: 0) {
-                Spacer(minLength: 88)
+                HStack(spacing: 12) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .frame(width: 40, height: 40)
+                            .background(Color(.secondarySystemBackground), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
+
+                    Spacer(minLength: 0)
+
+                    Text("New task")
+                        .font(.headline.weight(.semibold))
+
+                    Spacer(minLength: 0)
+
+                    // Keep the header balanced while the create action stays
+                    // in the shared composer below.
+                    Color.clear
+                        .frame(width: 40, height: 40)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+
+                Spacer(minLength: 24)
 
                 VStack(alignment: .leading, spacing: 26) {
                     compactConfiguration
+
+                    TextField("Task title (optional)", text: $sessionTitle)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 21, weight: .semibold))
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 38)
 
                     if !initialAttachments.isEmpty {
                         initialAttachmentStrip
@@ -1266,7 +1298,7 @@ private struct NewSessionSheet: View {
     /// new session.
     private var initialPromptEditor: some View {
         DSHCompactComposer(text: $initialPrompt,
-                           placeholder: "Send a message, / command, @ file or conversation",
+                           placeholder: DSHLocalization.string("Send a message, / command, @ file or conversation"),
                            hasAttachments: !initialAttachments.isEmpty,
                            onSubmit: createSession) {
             DSHComposerQuickActionsMenu(
@@ -1748,5 +1780,723 @@ private struct HappySessionRow: View {
 struct SessionListView_Previews: PreviewProvider {
     static var previews: some View {
         SessionListView().environmentObject(DSHAppModel.preview())
+    }
+}
+
+// MARK: - ChatGPT Remote task home
+
+/// The production home for DSH Anywhere.  The older `SessionListView` remains
+/// in the target as a rollback/reference surface, while this view owns the
+/// native Remote task experience: project cards, task rows, one stable header,
+/// and a real text field for starting work.
+struct DSHRemoteHomeView: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @State private var navigationPath: [String] = []
+    @State private var showSettings = false
+    @State private var showNewTask = {
+        #if DEBUG
+        return ProcessInfo.processInfo.arguments.contains("--dsh-preview-new-session")
+        #else
+        return false
+        #endif
+    }()
+    @State private var newTaskWorkspaceID: String?
+    @State private var newTaskPrompt = ""
+    @State private var didRefresh = false
+    @State private var renameWorkspaceID = ""
+    @State private var renameWorkspaceText = ""
+    @State private var showRenameWorkspace = false
+    @State private var pendingWorkspaceDeletion: DSHSessionGroup?
+    @State private var showDeleteWorkspaceConfirmation = false
+
+    private var groupedSessions: [DSHSessionGroup] {
+        model.sessions
+            .groupedForList(.byWorkspace, showArchived: model.showArchivedSessions)
+            .filter { !model.hiddenWorkspaceIDs.contains($0.id) }
+            .map { group in
+                let title = group.id == DSHSessionGroup.flatGroupID
+                    ? group.title
+                    : model.workspaceDisplayName(for: group.id, fallback: group.title)
+                return DSHSessionGroup(id: group.id, title: title,
+                                       sessions: group.sessions,
+                                       isUnfiled: group.isUnfiled)
+            }
+    }
+
+    private var flatSessions: [DSHSessionSummary] {
+        model.sessions
+            .groupedForList(.flat, showArchived: model.showArchivedSessions)
+            .flatMap(\.sessions)
+            .filter { session in
+                guard let workspaceID = session.workspaceId else { return true }
+                return !model.hiddenWorkspaceIDs.contains(workspaceID)
+            }
+    }
+
+    private var hasArchivedSessions: Bool {
+        model.sessions.contains { $0.archived == true }
+    }
+
+    private var deviceName: String {
+        let value = model.machineName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? "Mac" : value
+    }
+
+    private var deviceStatusColor: Color {
+        switch model.deviceStatus {
+        case .offline: return .gray
+        case .error: return .red
+        case .online: return .green
+        case .approvalRequired: return .yellow
+        }
+    }
+
+    private var deviceStatusLabel: String {
+        switch model.deviceStatus {
+        case .offline: return DSHLocalization.string("Offline")
+        case .error: return DSHLocalization.string("Connection error")
+        case .online: return DSHLocalization.string("Connected")
+        case .approvalRequired: return DSHLocalization.string("Permission confirmation required")
+        }
+    }
+
+    /// A session snapshot is authoritative only after the first one arrives.
+    /// Treat the socket handshake as a separate loading phase so a reconnect
+    /// never flashes an empty task browser before the existing tasks are
+    /// restored. Once the machine is known to be offline/failed, switch to the
+    /// actionable unreachable state instead of spinning forever.
+    private var isLoadingTasks: Bool {
+        guard !model.hasLoadedSessions else { return false }
+        switch model.connectionState {
+        case .connecting, .reconnecting:
+            return true
+        case .connected:
+            return model.deviceStatus != .offline && model.deviceStatus != .error
+        case .disconnected, .failed:
+            return false
+        }
+    }
+
+    var body: some View {
+        NavigationStack(path: $navigationPath) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    if isLoadingTasks {
+                        remoteLoadingState
+                    } else if model.groupsSessionsByWorkspace {
+                        if groupedSessions.isEmpty {
+                            remoteEmptyState
+                        } else {
+                            ForEach(groupedSessions) { group in
+                                remoteWorkspaceCard(group)
+                            }
+                        }
+                    } else {
+                        if flatSessions.isEmpty {
+                            remoteEmptyState
+                        } else {
+                            ForEach(flatSessions) { session in
+                                NavigationLink(value: session.id) {
+                                    DSHRemoteTaskRow(session: session, showWorkspaceName: true)
+                                        .environmentObject(model)
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu { archiveAction(for: session) }
+                            }
+                        }
+                    }
+
+                    if hasArchivedSessions {
+                        archivedDivider
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 18)
+                .id(model.groupsSessionsByWorkspace ? "remote-workspaces" : "remote-flat")
+            }
+            .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.interactively)
+            .refreshable {
+                model.refreshSessions(includeArchived: model.showArchivedSessions)
+                model.sendModelCatalog()
+            }
+            .background(Color(.systemBackground))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                remoteHeader
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                DSHRemoteTaskComposer(text: $newTaskPrompt,
+                                      modelLabel: defaultModelLabel,
+                                      onNewTask: { openNewTask() })
+            }
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(for: String.self) { id in
+                ConversationView(sessionID: id)
+            }
+            .transaction { transaction in
+                // A task snapshot can contain hundreds of changed sessions
+                // after a reconnect. Do not animate the entire list tree.
+                transaction.animation = nil
+            }
+            .fullScreenCover(isPresented: $showNewTask, onDismiss: {
+                newTaskPrompt = ""
+                newTaskWorkspaceID = nil
+            }) {
+                NewSessionSheet(initialWorkspaceID: newTaskWorkspaceID,
+                                initialPrompt: newTaskPrompt)
+                    .environmentObject(model)
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView().environmentObject(model)
+            }
+            .alert("重命名项目", isPresented: $showRenameWorkspace) {
+                TextField("项目名称", text: $renameWorkspaceText)
+                Button("取消", role: .cancel) { }
+                Button("保存") {
+                    model.renameWorkspace(id: renameWorkspaceID, to: renameWorkspaceText)
+                }
+            }
+            .confirmationDialog("删除项目？", isPresented: $showDeleteWorkspaceConfirmation,
+                                titleVisibility: .visible,
+                                presenting: pendingWorkspaceDeletion) { group in
+                Button("删除并归档会话", role: .destructive) {
+                    model.deleteWorkspace(group)
+                }
+                Button("取消", role: .cancel) { }
+            } message: { group in
+                Text("将删除项目“\(group.title)”并归档其中的 \(group.sessions.count) 个会话。项目目录和历史记录仍保留在 Mac 上。")
+            }
+            .onChange(of: model.selectedSessionID) { _, sessionID in
+                guard let sessionID else { return }
+                if navigationPath.last != sessionID {
+                    navigationPath.append(sessionID)
+                }
+                model.selectedSessionID = nil
+            }
+            .task {
+                if !model.hasLoadedSessions {
+                    model.refreshSessions()
+                }
+            }
+        }
+    }
+
+    private var remoteLoadingState: some View {
+        VStack(spacing: 12) {
+            Spacer(minLength: 116)
+            ProgressView()
+                .controlSize(.large)
+                .tint(.secondary)
+            Text(DSHLocalization.string("Loading tasks…"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 116)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(DSHLocalization.string("Loading tasks…"))
+    }
+
+    private var remoteHeader: some View {
+        ZStack {
+            VStack(spacing: 2) {
+                Text("Remote")
+                    .font(.system(size: 18, weight: .semibold))
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(deviceStatusColor)
+                        .frame(width: 7, height: 7)
+                    Text("\(deviceStatusLabel) · \(deviceName)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .allowsHitTesting(false)
+
+            HStack(spacing: 10) {
+                Menu {
+                    Button { openNewTask() } label: {
+                        Label("New task", systemImage: "plus")
+                    }
+                    Divider()
+                    Toggle(isOn: Binding(get: {
+                        model.groupsSessionsByWorkspace
+                    }, set: model.setGroupsSessionsByWorkspace)) {
+                        Label("Group by workspace", systemImage: "square.grid.2x2")
+                    }
+                    Toggle(isOn: Binding(get: {
+                        model.showArchivedSessions
+                    }, set: model.setShowArchived)) {
+                        Label("Show archived", systemImage: "archivebox")
+                    }
+                    Divider()
+                    Button { refreshTasks() } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    Button { showSettings = true } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                } label: {
+                    Image(systemName: "square.grid.3x3.fill")
+                        .font(.system(size: 19, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(Color(.secondarySystemBackground), in: Circle())
+                        .overlay { Circle().stroke(Color.primary.opacity(0.13), lineWidth: 0.75) }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remote menu")
+
+                Spacer(minLength: 0)
+
+                HStack(spacing: 0) {
+                    Menu {
+                        Toggle(isOn: Binding(get: {
+                            model.groupsSessionsByWorkspace
+                        }, set: model.setGroupsSessionsByWorkspace)) {
+                            Label("Group by workspace", systemImage: "square.grid.2x2")
+                        }
+                        Toggle(isOn: Binding(get: {
+                            model.showArchivedSessions
+                        }, set: model.setShowArchived)) {
+                            Label("Show archived", systemImage: "archivebox")
+                        }
+                        Divider()
+                        Button { refreshTasks() } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                    } label: {
+                        Image(systemName: didRefresh ? "checkmark" : "line.3.horizontal.decrease")
+                            .font(.system(size: 18, weight: .medium))
+                            .frame(width: 48, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Filter tasks")
+
+                    Divider()
+                        .frame(height: 22)
+                        .overlay(Color.primary.opacity(0.14))
+
+                    Button { showSettings = true } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 18, weight: .medium))
+                            .frame(width: 48, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Settings")
+                }
+                .frame(width: 98, height: 44)
+                .background(Color(.secondarySystemBackground), in: Capsule())
+                .overlay { Capsule().stroke(Color.primary.opacity(0.13), lineWidth: 0.75) }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .background(Color(.systemBackground).opacity(0.96))
+    }
+
+    @ViewBuilder
+    private func remoteWorkspaceCard(_ group: DSHSessionGroup) -> some View {
+        let expanded = !model.isGroupCollapsed(group.id)
+
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 11) {
+                Button {
+                    toggleGroup(group, expanded: expanded)
+                } label: {
+                    Image(systemName: expanded ? "folder.fill" : "folder")
+                        .font(.system(size: 20, weight: .medium))
+                        .frame(width: 28, height: 36)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    toggleGroup(group, expanded: expanded)
+                } label: {
+                    Text(group.title.isEmpty ? DSHLocalization.string("Sessions") : group.title)
+                        .font(.system(size: 18, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 6)
+
+                Menu {
+                    Button { openNewTask(for: group) } label: {
+                        Label("New task", systemImage: "plus")
+                    }
+                    Button { toggleGroup(group, expanded: expanded) } label: {
+                        Label(expanded ? "Collapse project" : "Expand project",
+                              systemImage: expanded ? "chevron.up" : "chevron.down")
+                    }
+                    Button { refreshTasks() } label: {
+                        Label("Refresh project", systemImage: "arrow.clockwise")
+                    }
+                    if !group.isUnfiled {
+                        Button { beginRename(group) } label: {
+                            Label("Rename project", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) { beginDelete(group) } label: {
+                            Label("Delete project", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 34, height: 36)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Project options")
+
+                Button { openNewTask(for: group) } label: {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 18, weight: .medium))
+                        .frame(width: 34, height: 36)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("New task in \(group.title)")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+
+            if expanded {
+                Divider().opacity(0.48)
+                ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
+                    NavigationLink(value: session.id) {
+                        DSHRemoteTaskRow(session: session, showWorkspaceName: false)
+                            .environmentObject(model)
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu { archiveAction(for: session) }
+
+                    if index < group.sessions.count - 1 {
+                        Divider().padding(.leading, 68).opacity(0.42)
+                    }
+                }
+            }
+        }
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.primary.opacity(0.075), lineWidth: 0.75)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private var remoteEmptyState: some View {
+        VStack(spacing: 12) {
+            Spacer(minLength: 96)
+            Image(systemName: model.deviceStatus == .online
+                  ? "bubble.left.and.bubble.right"
+                  : "cloud")
+                .font(.system(size: 52, weight: .regular))
+                .foregroundStyle(.secondary)
+            Text(model.deviceStatus == .online
+                 ? DSHLocalization.string("No tasks yet")
+                 : "\(deviceName) \(DSHLocalization.string("is unreachable"))")
+                .font(.title3.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text(model.deviceStatus == .online
+                 ? DSHLocalization.string("Start one on a connected machine.")
+                 : DSHLocalization.string("Bring a machine online to start a session."))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button {
+                if model.deviceStatus == .online { openNewTask() } else { showSettings = true }
+            } label: {
+                Text(model.deviceStatus == .online
+                     ? DSHLocalization.string("New task")
+                     : DSHLocalization.string("Troubleshoot"))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            Spacer(minLength: 96)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var archivedDivider: some View {
+        Button {
+            model.setShowArchived(!model.showArchivedSessions)
+        } label: {
+            HStack(spacing: 10) {
+                Rectangle().fill(Color.secondary.opacity(0.28)).frame(height: 1)
+                Text(DSHLocalization.string(model.showArchivedSessions ? "Hide archived" : "Show archived"))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                Image(systemName: model.showArchivedSessions ? "chevron.up" : "chevron.down")
+                    .font(.caption.weight(.semibold))
+                Rectangle().fill(Color.secondary.opacity(0.28)).frame(height: 1)
+            }
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func archiveAction(for session: DSHSessionSummary) -> some View {
+        Button {
+            model.archive(session, archived: session.archived != true)
+        } label: {
+            Label(DSHLocalization.string(session.archived == true ? "Unarchive" : "Archive"),
+                  systemImage: session.archived == true ? "tray.and.arrow.up" : "archivebox")
+        }
+    }
+
+    private var defaultModelLabel: String {
+        guard let selection = model.modelCatalog?.default else {
+            return DSHLocalization.string("Select model")
+        }
+        return model.modelLabel(for: selection)
+    }
+
+    private func toggleGroup(_ group: DSHSessionGroup, expanded: Bool) {
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            model.setGroup(group.id, collapsed: expanded)
+        }
+    }
+
+    private func openNewTask(for group: DSHSessionGroup) {
+        let workspace = group.sessions.first.flatMap { session -> DSHWorkspaceOption? in
+            guard let id = session.workspaceId else { return nil }
+            return DSHWorkspaceOption(id: id,
+                                      name: model.workspaceDisplayName(for: id,
+                                                                        fallback: session.workspaceName ?? group.title))
+        }
+        openNewTask(for: workspace)
+    }
+
+    private func openNewTask(for workspace: DSHWorkspaceOption? = nil) {
+        newTaskWorkspaceID = workspace?.id
+        showNewTask = true
+    }
+
+    private func beginRename(_ group: DSHSessionGroup) {
+        renameWorkspaceID = group.id
+        renameWorkspaceText = group.title
+        showRenameWorkspace = true
+    }
+
+    private func beginDelete(_ group: DSHSessionGroup) {
+        pendingWorkspaceDeletion = group
+        showDeleteWorkspaceConfirmation = true
+    }
+
+    private func refreshTasks() {
+        model.refreshSessions()
+        didRefresh = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            didRefresh = false
+        }
+    }
+}
+
+/// A task row intentionally contains enough context to be useful without
+/// opening it: title, project (in flat mode), mode/model, running/unread state,
+/// and the last activity time.  SF Symbols are used instead of avatars so the
+/// list remains stable while a task is streaming.
+private struct DSHRemoteTaskRow: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let session: DSHSessionSummary
+    let showWorkspaceName: Bool
+
+    private var title: String {
+        let value = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? DSHLocalization.string("New session") : value
+    }
+
+    private var unread: Bool { model.isSessionUnread(session) }
+
+    private var iconName: String {
+        if session.running == true { return "arrow.triangle.2.circlepath" }
+        let mode = (session.mode ?? session.agentPreset ?? "").lowercased()
+        if mode.contains("ptc") || mode.contains("plan") { return "list.clipboard" }
+        let lowerTitle = title.lowercased()
+        if lowerTitle.contains("bash") || lowerTitle.contains("command") || lowerTitle.contains("run") {
+            return "terminal"
+        }
+        if lowerTitle.contains("refactor") || lowerTitle.contains("code") {
+            return "doc.text"
+        }
+        return "bubble.left"
+    }
+
+    private var iconColor: Color {
+        if session.running == true { return .accentColor }
+        if unread { return .green }
+        return .secondary
+    }
+
+    private var updatedLabel: String {
+        guard session.updatedAt > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: TimeInterval(session.updatedAt) / 1_000)
+        if Calendar.current.isDateInToday(date) {
+            return Self.timeFormatter.string(from: date)
+        }
+        if Calendar.current.isDateInYesterday(date) {
+            return DSHLocalization.string("Yesterday")
+        }
+        return Self.dayFormatter.string(from: date)
+    }
+
+    private var contextLabel: String {
+        var values: [String] = []
+        if showWorkspaceName,
+           let workspace = session.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !workspace.isEmpty {
+            values.append(workspace)
+        }
+        values.append(model.modeLabel(for: session.id))
+        let shortModel = model.shortModelName(for: session.id)
+        if !shortModel.isEmpty { values.append(shortModel) }
+        return values.joined(separator: " · ")
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "M月d日"
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(.tertiarySystemBackground))
+                Image(systemName: iconName)
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundStyle(iconColor)
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text(title)
+                        .font(.system(size: 16, weight: unread ? .semibold : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if unread || session.running == true {
+                        Circle()
+                            .fill(session.running == true ? Color.accentColor : Color.green)
+                            .frame(width: 7, height: 7)
+                            .accessibilityLabel(session.running == true ? "Running" : "Unread")
+                    }
+                    Spacer(minLength: 6)
+                    if !updatedLabel.isEmpty {
+                        Text(updatedLabel)
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                Text(contextLabel)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+    }
+}
+
+/// A real `TextField` keeps the keyboard and interactive dismissal semantics
+/// native. Tapping the arrow hands the current draft to the full-screen New
+/// Task sheet, where device/project/branch/mode/model/permission can be chosen.
+private struct DSHRemoteTaskComposer: View {
+    @Binding var text: String
+    let modelLabel: String
+    let onNewTask: () -> Void
+
+    private var canSubmit: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onNewTask) {
+                Image(systemName: "plus")
+                    .font(.system(size: 20, weight: .regular))
+                    .frame(width: 42, height: 42)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("New task")
+
+            Divider()
+                .frame(height: 24)
+                .overlay(Color.primary.opacity(0.14))
+
+            TextField("Plan, ask, build…", text: $text, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 17))
+                .lineLimit(1...3)
+                .onSubmit {
+                    if canSubmit { onNewTask() }
+                }
+
+            Spacer(minLength: 4)
+
+            Menu {
+                Text(modelLabel)
+                    .font(.caption)
+                Button { onNewTask() } label: {
+                    Label("Choose model in new task", systemImage: "cpu")
+                }
+            } label: {
+                Text(modelLabel)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+
+            Button(action: onNewTask) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 42, height: 42)
+                    .background(canSubmit ? Color.accentColor : Color(.tertiarySystemBackground), in: Circle())
+                    .foregroundStyle(canSubmit ? Color.white : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSubmit)
+            .accessibilityLabel("Start task")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 25, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 25, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.75)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 7)
+        .padding(.bottom, 8)
+        .background(Color(.systemBackground).opacity(0.94))
     }
 }

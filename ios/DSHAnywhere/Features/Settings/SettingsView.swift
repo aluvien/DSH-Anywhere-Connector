@@ -11,6 +11,23 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Interface") {
+                    Picker("Home layout", selection: Binding(
+                        get: { model.useRemoteTaskLayout },
+                        set: model.setUseRemoteTaskLayout
+                    )) {
+                        Text("Remote tasks").tag(true)
+                        Text("Classic").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(model.useRemoteTaskLayout
+                         ? "Remote shows projects and tasks in a native task browser."
+                         : "Classic keeps the previous Happy-inspired session list.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Sessions") {
                     Toggle(isOn: Binding(
                         get: { model.groupsSessionsByWorkspace },
