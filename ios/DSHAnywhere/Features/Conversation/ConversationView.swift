@@ -148,14 +148,13 @@ struct ConversationView: View {
     }
 
     private var conversationSubtitle: String {
-        let mode = model.modeLabel(for: sessionID)
         if let workspace = session?.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines), !workspace.isEmpty {
-            return "\(mode) · \(workspace)"
+            return workspace
         }
         if let cwd = session?.cwd, let last = cwd.split(separator: "/").last, !last.isEmpty {
-            return "\(mode) · \(last)"
+            return String(last)
         }
-        return "\(mode) · DSH Anywhere"
+        return "DSH Anywhere"
     }
 
     var body: some View {
@@ -348,30 +347,28 @@ struct ConversationView: View {
         }
     }
 
-    /// Remote's task header is intentionally quiet: the task title is centred,
-    /// the second line carries the mode and project, and the two native
-    /// controls stay in fixed 44pt slots.  Keeping the title out of a capsule
-    /// gives the transcript more vertical space and matches the task-detail
-    /// rhythm used by ChatGPT Remote.
+    /// Remote's task header is intentionally quiet: the title and project are
+    /// presented as one centred capsule, with the back control on the left and
+    /// the project mark/options control on the right. This is the same visual
+    /// hierarchy as the Remote task detail screen; connection status remains
+    /// in the composer status row below the transcript.
     private var happyConversationHeader: some View {
         ZStack {
-            VStack(spacing: 2) {
+            VStack(spacing: 1) {
                 Text(conversationTitle)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: 16, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(deviceStatusColor)
-                        .frame(width: 6, height: 6)
-                    Text(conversationSubtitle)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                Text(conversationSubtitle)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay { Capsule().stroke(Color.primary.opacity(0.10), lineWidth: 0.75) }
             .allowsHitTesting(false)
 
             HStack(spacing: 10) {
@@ -402,11 +399,8 @@ struct ConversationView: View {
                         Label("Archive session", systemImage: "archivebox")
                     }
                 } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 19, weight: .medium))
+                    DSHHappyAvatar(size: 44)
                         .frame(width: 44, height: 44)
-                        .background(.ultraThinMaterial, in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Session settings")

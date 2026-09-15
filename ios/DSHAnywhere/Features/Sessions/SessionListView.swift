@@ -559,7 +559,7 @@ struct SessionListView: View {
                 Button {
                     toggle(group, currentlyExpanded: expanded)
                 } label: {
-                    Image(systemName: expanded ? "folder.fill" : "folder")
+                    Image(systemName: "folder")
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(.primary)
                         .frame(width: 34, height: 34)
@@ -776,10 +776,10 @@ private struct NewSessionSheet: View {
 
     var body: some View {
         ZStack {
-            // The reference is a native full-screen compose surface with the
-            // current page softly visible underneath. The empty region is the
-            // cancellation target, so there is no second toolbar competing
-            // with the compact controls at the bottom.
+            // Remote presents a quiet, full-screen compose surface. The empty
+            // region is the cancellation target; the only persistent content
+            // is the machine/project context and the shared composer at the
+            // bottom. There is intentionally no second navigation bar here.
             Rectangle()
                 .fill(.ultraThinMaterial)
                 .ignoresSafeArea()
@@ -787,41 +787,10 @@ private struct NewSessionSheet: View {
                 .onTapGesture { dismiss() }
 
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 16, weight: .semibold))
-                            .frame(width: 40, height: 40)
-                            .background(Color(.secondarySystemBackground), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close")
-
-                    Spacer(minLength: 0)
-
-                    Text("New task")
-                        .font(.headline.weight(.semibold))
-
-                    Spacer(minLength: 0)
-
-                    // Keep the header balanced while the create action stays
-                    // in the shared composer below.
-                    Color.clear
-                        .frame(width: 40, height: 40)
-                }
-                .padding(.horizontal, 18)
-                .padding(.top, 12)
-
-                Spacer(minLength: 24)
+                Spacer(minLength: 0)
 
                 VStack(alignment: .leading, spacing: 26) {
                     compactConfiguration
-
-                    TextField("Task title (optional)", text: $sessionTitle)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 21, weight: .semibold))
-                        .padding(.horizontal, 14)
-                        .frame(minHeight: 38)
 
                     if !initialAttachments.isEmpty {
                         initialAttachmentStrip
@@ -831,7 +800,7 @@ private struct NewSessionSheet: View {
                 }
                 .frame(maxWidth: 560)
                 .padding(.horizontal, 18)
-                .padding(.bottom, 8)
+                .padding(.bottom, 14)
             }
         }
         .presentationBackground(.clear)
@@ -1927,7 +1896,6 @@ struct DSHRemoteHomeView: View {
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 DSHRemoteTaskComposer(text: $newTaskPrompt,
-                                      modelLabel: defaultModelLabel,
                                       onNewTask: { openNewTask() })
             }
             .navigationTitle("")
@@ -1941,13 +1909,18 @@ struct DSHRemoteHomeView: View {
                 // after a reconnect. Do not animate the entire list tree.
                 transaction.animation = nil
             }
-            .fullScreenCover(isPresented: $showNewTask, onDismiss: {
+            // A large native sheet keeps the home surface visible behind the
+            // composer and restores the edge-swipe/downward-dismiss behavior
+            // users expect from Remote's new-task flow.
+            .sheet(isPresented: $showNewTask, onDismiss: {
                 newTaskPrompt = ""
                 newTaskWorkspaceID = nil
             }) {
                 NewSessionSheet(initialWorkspaceID: newTaskWorkspaceID,
                                 initialPrompt: newTaskPrompt)
                     .environmentObject(model)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.hidden)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(model)
@@ -2003,7 +1976,7 @@ struct DSHRemoteHomeView: View {
     private var remoteHeader: some View {
         ZStack {
             VStack(spacing: 2) {
-                Text("Remote")
+                Text(DSHLocalization.string("Sessions"))
                     .font(.system(size: 18, weight: .semibold))
                 HStack(spacing: 5) {
                     Circle()
@@ -2045,8 +2018,7 @@ struct DSHRemoteHomeView: View {
                     Image(systemName: "square.grid.3x3.fill")
                         .font(.system(size: 19, weight: .medium))
                         .frame(width: 44, height: 44)
-                        .background(Color(.secondarySystemBackground), in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.13), lineWidth: 0.75) }
+                        .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Remote menu")
@@ -2089,12 +2061,12 @@ struct DSHRemoteHomeView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Settings")
                 }
-                .frame(width: 98, height: 44)
+                .frame(width: 132, height: 44)
                 .background(Color(.secondarySystemBackground), in: Capsule())
                 .overlay { Capsule().stroke(Color.primary.opacity(0.13), lineWidth: 0.75) }
             }
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 20)
         .padding(.top, 6)
         .padding(.bottom, 8)
         .background(Color(.systemBackground).opacity(0.96))
@@ -2109,7 +2081,7 @@ struct DSHRemoteHomeView: View {
                 Button {
                     toggleGroup(group, expanded: expanded)
                 } label: {
-                    Image(systemName: expanded ? "folder.fill" : "folder")
+                    Image(systemName: "folder")
                         .font(.system(size: 20, weight: .medium))
                         .frame(width: 28, height: 36)
                 }
@@ -2175,7 +2147,7 @@ struct DSHRemoteHomeView: View {
                     .contextMenu { archiveAction(for: session) }
 
                     if index < group.sessions.count - 1 {
-                        Divider().padding(.leading, 68).opacity(0.42)
+                        Divider().padding(.leading, 74).opacity(0.42)
                     }
                 }
             }
@@ -2248,13 +2220,6 @@ struct DSHRemoteHomeView: View {
             Label(DSHLocalization.string(session.archived == true ? "Unarchive" : "Archive"),
                   systemImage: session.archived == true ? "tray.and.arrow.up" : "archivebox")
         }
-    }
-
-    private var defaultModelLabel: String {
-        guard let selection = model.modelCatalog?.default else {
-            return DSHLocalization.string("Select model")
-        }
-        return model.modelLabel(for: selection)
     }
 
     private func toggleGroup(_ group: DSHSessionGroup, expanded: Bool) {
@@ -2349,17 +2314,11 @@ private struct DSHRemoteTaskRow: View {
         return Self.dayFormatter.string(from: date)
     }
 
-    private var contextLabel: String {
-        var values: [String] = []
-        if showWorkspaceName,
-           let workspace = session.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !workspace.isEmpty {
-            values.append(workspace)
-        }
-        values.append(model.modeLabel(for: session.id))
-        let shortModel = model.shortModelName(for: session.id)
-        if !shortModel.isEmpty { values.append(shortModel) }
-        return values.joined(separator: " · ")
+    private var workspaceLabel: String? {
+        guard showWorkspaceName,
+              let workspace = session.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !workspace.isEmpty else { return nil }
+        return workspace
     }
 
     private static let timeFormatter: DateFormatter = {
@@ -2385,7 +2344,7 @@ private struct DSHRemoteTaskRow: View {
                     .font(.system(size: 19, weight: .medium))
                     .foregroundStyle(iconColor)
             }
-            .frame(width: 42, height: 42)
+            .frame(width: 46, height: 46)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
@@ -2407,11 +2366,13 @@ private struct DSHRemoteTaskRow: View {
                             .monospacedDigit()
                     }
                 }
-                Text(contextLabel)
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if let workspaceLabel {
+                    Text(workspaceLabel)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -2430,7 +2391,6 @@ private struct DSHRemoteTaskRow: View {
 /// Task sheet, where device/project/branch/mode/model/permission can be chosen.
 private struct DSHRemoteTaskComposer: View {
     @Binding var text: String
-    let modelLabel: String
     let onNewTask: () -> Void
 
     private var canSubmit: Bool {
@@ -2461,30 +2421,14 @@ private struct DSHRemoteTaskComposer: View {
 
             Spacer(minLength: 4)
 
-            Menu {
-                Text(modelLabel)
-                    .font(.caption)
-                Button { onNewTask() } label: {
-                    Label("Choose model in new task", systemImage: "cpu")
-                }
-            } label: {
-                Text(modelLabel)
-                    .font(.system(size: 13, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-
             Button(action: onNewTask) {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 17, weight: .semibold))
                     .frame(width: 42, height: 42)
-                    .background(canSubmit ? Color.accentColor : Color(.tertiarySystemBackground), in: Circle())
-                    .foregroundStyle(canSubmit ? Color.white : Color.secondary)
+                    .background(Color.accentColor, in: Circle())
+                    .foregroundStyle(Color.white)
             }
             .buttonStyle(.plain)
-            .disabled(!canSubmit)
             .accessibilityLabel("Start task")
         }
         .padding(.horizontal, 12)
