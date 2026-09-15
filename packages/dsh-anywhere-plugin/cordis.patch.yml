@@ -5,6 +5,7 @@
         - webServer
         - sessionController
         - workspaceRegistry
+        - typertGateway
       config:
         routePrefix: /dsh-anywhere/v1
         approvalTimeoutMs: 120000

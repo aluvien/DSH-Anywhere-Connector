@@ -12,25 +12,42 @@ const config: ConnectorConfig = {
   bridgeToken: "bridge-secret",
 };
 
-function command(type: "session.list" | "session.create" | "prompt.send" | "turn.cancel" | "approval.decide") {
+function command(type: "session.list" | "session.open" | "session.create" | "prompt.send" | "turn.cancel" | "approval.decide"
+  | "workspace.rename" | "workspace.delete") {
   const base = { version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1 };
   if (type === "session.list") return { ...base, type, payload: {} } as const;
+  if (type === "session.open") return { ...base, type, sessionId: "session-1", payload: { sessionId: "session-1" } } as const;
   if (type === "session.create") return { ...base, type, payload: { workingDirectory: "/tmp", initialPrompt: "hello" } } as const;
   if (type === "prompt.send") return { ...base, type, sessionId: "session-1", payload: { text: "hello" } } as const;
   if (type === "turn.cancel") return { ...base, type, sessionId: "session-1", payload: {} } as const;
+  if (type === "workspace.rename") return { ...base, type, payload: { workspaceId: "workspace-1", title: "Renamed" } } as const;
+  if (type === "workspace.delete") return { ...base, type, payload: { workspaceId: "workspace-1" } } as const;
   return { ...base, type, payload: { approvalId: "approval-1", allow: true } } as const;
 }
 
 describe("bridge command mapping", () => {
   it("preserves prompt requestId and maps every supported endpoint", () => {
     expect(bridgeRequestFor(command("session.list"))).toEqual({ method: "GET", path: "/sessions" });
+    expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: {} });
     expect(bridgeRequestFor(command("session.create"))).toEqual({ method: "POST", path: "/sessions", body: { cwd: "/tmp" } });
+    expect(bridgeRequestFor({
+      ...command("session.create"),
+      payload: { workingDirectory: "/tmp", initialPrompt: "hello", permissionMode: "danger-full-access" },
+    })).toEqual({
+      method: "POST", path: "/sessions", body: { cwd: "/tmp", permissionMode: "danger-full-access" },
+    });
     expect(bridgeRequestFor(command("prompt.send"))).toEqual({
       method: "POST", path: "/sessions/session-1/prompt", body: { text: "hello", requestId: "request-1" },
     });
     expect(bridgeRequestFor(command("turn.cancel"))).toEqual({ method: "POST", path: "/sessions/session-1/cancel", body: {} });
     expect(bridgeRequestFor(command("approval.decide"))).toEqual({
       method: "POST", path: "/approvals/approval-1/decision", body: { decision: "allowed-once" },
+    });
+    expect(bridgeRequestFor(command("workspace.rename"))).toEqual({
+      method: "POST", path: "/workspaces/workspace-1/rename", body: { title: "Renamed" },
+    });
+    expect(bridgeRequestFor(command("workspace.delete"))).toEqual({
+      method: "POST", path: "/workspaces/workspace-1/delete", body: {},
     });
   });
 

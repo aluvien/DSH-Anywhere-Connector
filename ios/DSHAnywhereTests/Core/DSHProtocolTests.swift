@@ -21,6 +21,53 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(prompt.payload, .object(["text": .string("hello")]))
     }
 
+    func testOpenSessionCommandCarriesTheSessionID() {
+        let command = DSHCommand.openSession(deviceId: "d", machineId: "m", sessionId: "s")
+        XCTAssertEqual(command.type, "session.open")
+        XCTAssertEqual(command.sessionId, "s")
+        XCTAssertEqual(command.payload, .object(["sessionId": .string("s")]))
+    }
+
+    func testModelSelectionCarriesTheCatalogReasoningEffort() {
+        let command = DSHCommand.selectModel(deviceId: "device", machineId: "machine",
+                                             sessionId: "session", provider: "deepseek",
+                                             model: "deepseek-v4.1-flash",
+                                             reasoningEffort: "high")
+        XCTAssertEqual(command.type, "session.model")
+        XCTAssertEqual(command.payload, .object([
+            "provider": .string("deepseek"),
+            "model": .string("deepseek-v4.1-flash"),
+            "reasoningEffort": .string("high"),
+        ]))
+    }
+
+    func testAttachmentPromptKeepsTextInsideCanonicalContent() throws {
+        let prompt = DSHCommand.sendPrompt(deviceId: "d", machineId: "m", sessionId: "s",
+                                            text: "这是啥?",
+                                            attachments: [.object(["type": .string("file"),
+                                                                  "receiptId": .string("receipt-1")])])
+        guard case .object(let payload) = prompt.payload,
+              case .array(let content) = payload["content"] else {
+            return XCTFail("attachment prompt must carry a content array")
+        }
+        XCTAssertEqual(content.first,
+                       .object(["type": .string("text"), "text": .string("这是啥?")]))
+        XCTAssertEqual(content.last,
+                       .object(["type": .string("file"), "receiptId": .string("receipt-1")]))
+    }
+
+    func testProtocolErrorIsDecodedAndCorrelatedByMessageId() throws {
+        let envelope = DSHEnvelope(messageId: "request-1", deviceId: "d", machineId: "m",
+                                   sequence: 1, type: "protocol.error",
+                                   payload: .object(["code": .string("bridge-request-failed"),
+                                                     "message": .string("upload failed"),
+                                                     "retryable": .bool(true)]))
+        let event = DSHEvent(envelope: envelope)
+        XCTAssertEqual(event.kind, .protocolError(DSHProtocolError(code: "bridge-request-failed",
+                                                                     message: "upload failed",
+                                                                     retryable: true)))
+    }
+
     func testRelayURLPreservesTheRelayOrigin() throws {
         XCTAssertEqual(
             try DSHAPIClient.relayBaseURL(from: "https://relay.example.com").absoluteString,
@@ -149,6 +196,18 @@ final class DSHProtocolTests: XCTestCase {
 
         XCTAssertEqual(block.visibleMessages.map(\.id), ["a2"])
         XCTAssertEqual(block.reasoning, "thinking")
+    }
+
+    func testAttachmentOnlyUserMessageRemainsVisible() {
+        let attachment = DSHMessageAttachment(id: "receipt-1", name: "photo.jpg",
+                                               mediaType: "image/jpeg", receiptId: "receipt-1")
+        let block = turnBlocks([
+            DSHChatMessage(id: "u1", role: .user, markdown: "", attachments: [attachment])
+        ])[0]
+
+        // An image-only prompt has an empty text field, but it is still a real
+        // user turn and must render its thumbnail in the transcript.
+        XCTAssertEqual(block.visibleMessages.map(\.id), ["u1"])
     }
 
     // MARK: - Relay device management

@@ -53,6 +53,33 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertEqual(commands.map(\.type), ["connection.resume", "session.list", "model.catalog"])
         await connection.disconnect()
     }
+
+    func testMachinePresenceIsForwardedToTheUIStream() async throws {
+        let presence = DSHRelayPresenceMessage(type: "relay.presence", machineId: "machine",
+                                               role: .machine, online: false,
+                                               deviceId: nil, serverTime: 2)
+        let fake = RecordingWebSocketTask(additionalMessages: [
+            .data(try JSONEncoder().encode(presence)),
+        ])
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1),
+                                                maximumReconnectAttempts: 0)
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        let stream = await connection.connect()
+        var iterator = stream.makeAsyncIterator()
+
+        var sawOfflinePresence = false
+        for _ in 0..<4 {
+            guard let event = try await iterator.next() else { break }
+            if case .machinePresence(false) = event.kind {
+                sawOfflinePresence = true
+                break
+            }
+        }
+        XCTAssertTrue(sawOfflinePresence)
+        await connection.disconnect()
+    }
 }
 
 private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Sendable {
@@ -60,6 +87,11 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
     private(set) var sentCommands: [DSHCommand] = []
     private var receiveContinuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
     private var sentReady = false
+    private var additionalMessages: [URLSessionWebSocketTask.Message]
+
+    init(additionalMessages: [URLSessionWebSocketTask.Message] = []) {
+        self.additionalMessages = additionalMessages
+    }
 
     func resume() { resumeCount += 1 }
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
@@ -81,6 +113,7 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
                                              connectionId: "connection", serverTime: 1)
             return .data(try JSONEncoder().encode(ready))
         }
+        if !additionalMessages.isEmpty { return additionalMessages.removeFirst() }
         return try await withCheckedThrowingContinuation { continuation in receiveContinuation = continuation }
     }
 }

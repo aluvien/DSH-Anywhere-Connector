@@ -1,6 +1,91 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import ImageIO
+import UIKit
+
+struct DSHStagedAttachment: Identifiable, Sendable {
+    let id = UUID()
+    let name: String
+    let data: Data
+    let isImage: Bool
+}
+
+/// Shared compact composer chrome used by both an existing conversation and
+/// the new-session screen. The caller owns the whole control row so collapsing
+/// it can replace *only* command/photo/file with a plus menu. Permission,
+/// model, context and send/stop controls therefore stay byte-for-byte the same
+/// as the expanded editor instead of drifting into a second visual language.
+struct DSHCompactComposer<Controls: View>: View {
+    @Binding var text: String
+    let placeholder: String
+    let hasAttachments: Bool
+    let onSubmit: () -> Void
+    let controls: Controls
+    @FocusState private var isFocused: Bool
+
+    init(text: Binding<String>,
+         placeholder: String,
+         hasAttachments: Bool = false,
+         onSubmit: @escaping () -> Void,
+         @ViewBuilder controls: () -> Controls) {
+        _text = text
+        self.placeholder = placeholder
+        self.hasAttachments = hasAttachments
+        self.onSubmit = onSubmit
+        self.controls = controls()
+    }
+
+    private var canSubmit: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasAttachments
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            TextField(placeholder, text: $text, axis: .vertical)
+                .lineLimit(1...5)
+                .textFieldStyle(.plain)
+                .font(.system(size: 17))
+                .focused($isFocused)
+                .onSubmit {
+                    if canSubmit { onSubmit() }
+                }
+
+            HStack(spacing: 10) {
+                controls
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+    }
+}
+
+/// A native anchored menu, deliberately not a sheet/card. These are the only
+/// three controls hidden by the compact-editor preference.
+struct DSHComposerQuickActionsMenu: View {
+    let onCommand: () -> Void
+    let onPhoto: () -> Void
+    let onFile: () -> Void
+
+    var body: some View {
+        Menu {
+            Button(action: onCommand) {
+                Label("Commands", systemImage: "slash.circle")
+            }
+            Button(action: onPhoto) {
+                Label("Attach photo", systemImage: "photo")
+            }
+            Button(action: onFile) {
+                Label("Attach file", systemImage: "paperclip")
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.title3)
+        }
+        .accessibilityLabel("More actions")
+    }
+}
 
 struct ConversationView: View {
     @EnvironmentObject private var model: DSHAppModel
@@ -8,11 +93,16 @@ struct ConversationView: View {
     let sessionID: String
 
     @State private var showFileImporter = false
+    @State private var showPhotoPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var showCommandMenu = false
     @State private var showModelPicker = false
     @State private var showPermissionPicker = false
-    @State private var sentAttachmentIDs = Set<String>()
+    /// Attachments stay entirely local while the composer is being edited.
+    /// They are uploaded only from `send()`, after the user has confirmed the
+    /// whole prompt, so cancelling/removing a chip never leaves a remote file.
+    @State private var draftAttachments: [DSHStagedAttachment] = []
+    @State private var isSending = false
     @State private var didRefresh = false
     /// Tracks the composer field so the keyboard can be dismissed explicitly.
     @FocusState private var isDraftFocused: Bool
@@ -23,13 +113,11 @@ struct ConversationView: View {
 
     private var session: DSHSessionSummary? { model.sessions.first { $0.id == sessionID } }
     private var isRunning: Bool { model.turnState(for: sessionID).lowercased() == "running" }
-    private var pendingAttachments: [DSHUploadedAttachment] {
-        model.attachments(for: sessionID).filter { !sentAttachmentIDs.contains($0.receiptId) }
-    }
-    /// A pending question or approval is a real request for input, so the
-    /// "start a conversation" placeholder must not sit above it.
-    private var hasBlockingInteraction: Bool {
-        model.pendingApprovals.contains { $0.sessionId == sessionID }
+    private var hasDraftAttachments: Bool { !draftAttachments.isEmpty }
+    private var hasRenderedContent: Bool {
+        !transcriptEntries.isEmpty
+            || !model.commandResults(for: sessionID).isEmpty
+            || model.pendingApprovals.contains { $0.sessionId == sessionID }
             || model.pendingQuestions.contains { $0.sessionId == sessionID }
     }
     /// Messages and tool calls in one list, ordered by when they arrived.
@@ -41,6 +129,22 @@ struct ConversationView: View {
         model.transcriptEntries(for: sessionID)
     }
 
+    private var conversationTitle: String {
+        let value = session?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? DSHLocalization.string("New session") : value
+    }
+
+    private var conversationSubtitle: String {
+        let mode = model.modeLabel(for: sessionID)
+        if let workspace = session?.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines), !workspace.isEmpty {
+            return "\(mode) · \(workspace)"
+        }
+        if let cwd = session?.cwd, let last = cwd.split(separator: "/").last, !last.isEmpty {
+            return "\(mode) · \(last)"
+        }
+        return "\(mode) · DSH Anywhere"
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -49,19 +153,20 @@ struct ConversationView: View {
                         switch entry {
                         case .turn(let block):
                             if block.isUserTurn {
-                                MessageBubble(message: block.messages[0]).id(entry.id)
+                                MessageBubble(sessionID: sessionID, message: block.messages[0]).id(entry.id)
                             } else {
-                                AssistantTurnView(block: block).id(entry.id)
+                                AssistantTurnView(sessionID: sessionID, block: block).id(entry.id)
                             }
                         case .tool(let tool):
                             // Kept in place rather than hidden until a turn runs:
                             // popping them in and out is what made a new message
                             // look like it "suddenly" produced a wall of calls.
                             ToolActivityCard(tool: tool).id(entry.id)
+                        case .command(let result):
+                            CommandResultCard(result: result).id(entry.id)
+                        case .modelChange(let notice):
+                            ModelChangeCard(notice: notice).id(entry.id)
                         }
-                    }
-                    ForEach(model.commandResults(for: sessionID)) { result in
-                        CommandResultCard(result: result)
                     }
                     ForEach(model.pendingApprovals.filter { $0.sessionId == sessionID }) { approval in
                         ApprovalCard(approval: approval) { allow in
@@ -73,11 +178,8 @@ struct ConversationView: View {
                             model.answer(question, answers: answers)
                         }
                     }
-                    if model.messages(for: sessionID).isEmpty, !hasBlockingInteraction {
-                        ContentUnavailableView("Start a conversation", systemImage: "sparkles",
-                                               description: Text("Send a prompt to your local DeepSeek Harness."))
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 80)
+                    if !hasRenderedContent {
+                        emptyConversationState
                     }
                     // Tracks whether the viewport is at the newest output. It
                     // vanishes as soon as the reader scrolls back, which is what
@@ -91,6 +193,7 @@ struct ConversationView: View {
                 .padding()
             }
             .defaultScrollAnchor(.bottom)
+            .background(Color(.systemBackground))
             // Dragging the transcript puts the keyboard away. `.always` keeps
             // the bounce gesture available even when a short conversation has
             // nothing to scroll, which is what the removed keyboard "Done" bar
@@ -117,36 +220,25 @@ struct ConversationView: View {
                     .accessibilityLabel("Jump to latest output")
                 }
             }
-            .navigationTitle(session?.title ?? "Conversation")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { showModelPicker = true } label: {
-                            Label("Select model", systemImage: "cpu")
-                        }
-                        Button { showPermissionPicker = true } label: {
-                            Label("Permission", systemImage: "checkmark.shield")
-                        }
-                        Button { refreshSession() } label: {
-                            Label("Refresh session info", systemImage: "arrow.clockwise")
-                        }
-                        Divider()
-                        Button(role: .destructive) { archiveSession() } label: {
-                            Label("Archive session", systemImage: "archivebox")
-                        }
-                    } label: {
-                        Image(systemName: didRefresh ? "checkmark.circle.fill" : "ellipsis.circle")
-                    }
-                }
-            }
+            .safeAreaInset(edge: .top, spacing: 0) { happyConversationHeader }
+            .toolbar(.hidden, for: .navigationBar)
+            // The custom Happy header intentionally hides SwiftUI's navigation
+            // bar. Re-enable UIKit's native edge-swipe pop gesture so the
+            // conversation still behaves like a normal NavigationStack page.
+            .background(DSHInteractivePopGestureEnabler())
             .task(id: sessionID) {
+                model.markSessionRead(sessionID)
                 model.sendModelCatalog()
+                model.openSession(sessionID)
             }
             // Auto-follow only while the reader is already at the newest output.
             // Scrolling back disarms it, so incoming work never yanks the view.
             .onChange(of: model.messages(for: sessionID).count) { _, _ in
+                model.markSessionRead(sessionID)
                 scrollToLatest(proxy)
+            }
+            .onChange(of: session?.updatedAt) { _, _ in
+                model.markSessionRead(sessionID)
             }
             .onChange(of: transcriptEntries.count) { _, _ in
                 scrollToLatest(proxy)
@@ -156,6 +248,8 @@ struct ConversationView: View {
             }
             .onChange(of: selectedPhoto) { _, item in
                 guard let item else { return }
+                // Both the expanded photo button and compact plus menu use the
+                // same staging path, so selection never uploads immediately.
                 Task { @MainActor in
                     defer { selectedPhoto = nil }
                     do {
@@ -163,7 +257,13 @@ struct ConversationView: View {
                             reportPhotoFailure()
                             return
                         }
-                        model.uploadAttachment(name: "photo.jpg", data: data, for: sessionID)
+                        // JPEG/downsampling is CPU work. Keep it off the main
+                        // actor so choosing a large iCloud photo does not make
+                        // the composer freeze before the user can press Send.
+                        let optimized = await optimizedPhotoDataOffMain(data)
+                        draftAttachments.append(DSHStagedAttachment(name: "photo.jpg",
+                                                                    data: optimized,
+                                                                    isImage: true))
                     } catch {
                         // `try?` used to swallow this, so a failure looked like
                         // the button doing nothing at all.
@@ -173,6 +273,11 @@ struct ConversationView: View {
             }
             .sheet(isPresented: $showCommandMenu) {
                 CommandMenuSheet(
+                    selectedPhoto: $selectedPhoto,
+                    onFile: {
+                        showCommandMenu = false
+                        showFileImporter = true
+                    },
                     onCommand: { command in
                         showCommandMenu = false
                         if command == "permission" { showPermissionPicker = true }
@@ -193,6 +298,9 @@ struct ConversationView: View {
                     .environmentObject(model)
                     .presentationDetents([.medium])
             }
+            .photosPicker(isPresented: $showPhotoPicker,
+                          selection: $selectedPhoto,
+                          matching: .images)
             .fileImporter(isPresented: $showFileImporter,
                           allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
                 guard case .success(let urls) = result else { return }
@@ -200,116 +308,350 @@ struct ConversationView: View {
                     let accessed = url.startAccessingSecurityScopedResource()
                     defer { if accessed { url.stopAccessingSecurityScopedResource() } }
                     if let data = try? Data(contentsOf: url) {
-                        model.uploadAttachment(name: url.lastPathComponent, data: data, for: sessionID)
+                        draftAttachments.append(DSHStagedAttachment(name: url.lastPathComponent,
+                                                                   data: data,
+                                                                   isImage: url.pathExtension.lowercased() == "png"
+                                                                    || url.pathExtension.lowercased() == "jpg"
+                                                                    || url.pathExtension.lowercased() == "jpeg"
+                                                                    || url.pathExtension.lowercased() == "heic"))
                     }
                 }
             }
         }
+    }
+
+    /// Happy's conversation header uses the same 44pt controls as the home
+    /// header: a glass back circle, a text-sized title pill, and a gear-shaped
+    /// settings action. The native navigation bar is hidden so its default
+    /// title/ellipsis cannot add a second, differently-sized toolbar.
+    private var happyConversationHeader: some View {
+        HStack(spacing: 8) {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 20, weight: .medium))
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Back")
+
+            Spacer(minLength: 0)
+
+            VStack(spacing: 1) {
+                Text(conversationTitle)
+                    .font(.system(size: 16, weight: .semibold))
+                    .lineLimit(1)
+                Text(conversationSubtitle)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .frame(minHeight: 44)
+            .frame(maxWidth: 210)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay { Capsule().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+
+            Spacer(minLength: 0)
+
+            Menu {
+                Button { showModelPicker = true } label: {
+                    Label("Select model", systemImage: "cpu")
+                }
+                Button { showPermissionPicker = true } label: {
+                    Label("Permission", systemImage: "checkmark.shield")
+                }
+                Button { refreshSession() } label: {
+                    Label("Refresh session info", systemImage: "arrow.clockwise")
+                }
+                Divider()
+                Button(role: .destructive) { archiveSession() } label: {
+                    Label("Archive session", systemImage: "archivebox")
+                }
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 19, weight: .medium))
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Session settings")
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        // Keep the page background continuous like Happy. The three controls
+        // already carry their own material, so an opaque toolbar slab only
+        // creates a visible seam while scrolling.
+    }
+
+    /// Happy's empty conversation state is intentionally sparse: a laptop,
+    /// machine/path, and two centred lines.  It leaves the lower third clear
+    /// for the status row and composer instead of putting a large card there.
+    private var emptyConversationState: some View {
+        let machine = model.machineName.isEmpty ? "Mac" : model.machineName
+        let path = session?.cwd.map(Self.displayPath) ?? conversationSubtitle
+        return VStack(spacing: 0) {
+            Image(systemName: "laptopcomputer")
+                .font(.system(size: 72, weight: .regular))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 14)
+
+            Text(machine)
+                .font(.system(size: 22, weight: .semibold))
+                .padding(.bottom, 4)
+
+            Text(path)
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 40)
+
+            Text("No messages yet")
+                .font(.system(size: 20, weight: .regular))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
+
+            Text("Created just now")
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 500)
+        .multilineTextAlignment(.center)
+    }
+
+    private static func displayPath(_ raw: String) -> String {
+        // The path belongs to the Mac, while this code runs in the iOS
+        // sandbox (whose FileManager home is unrelated).  Collapse the
+        // conventional `/Users/<name>` prefix without trying to read the Mac's
+        // filesystem from the phone.
+        let components = raw.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count >= 2, components[0] == "Users" else { return raw }
+        let suffix = components.dropFirst(2).joined(separator: "/")
+        return suffix.isEmpty ? "~" : "~/\(suffix)"
     }
 
     private var emptySession: DSHSessionSummary {
         DSHSessionSummary(id: sessionID, title: "Conversation")
     }
 
-    /// Input bar arranged like the reference app: the text field spans the full
-    /// width on top, and every control lives in one row beneath it inside the
-    /// same rounded container. The text is the primary thing; the controls
-    /// gather under it instead of flanking it.
+    /// Input bar arranged like the reference app.  A brand-new session uses
+    /// Happy's quiet two-line card; once the user types or attaches something,
+    /// the controls expand to expose commands, attachments, permissions and
+    /// model selection without changing the send path.
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            let attachments = pendingAttachments
-            if !attachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(attachments) { attachment in
-                            HStack(spacing: 6) {
-                                Label(attachment.name, systemImage: "paperclip")
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                Button {
-                                    model.discardAttachment(attachment.id, for: sessionID)
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Remove attachment")
-                            }
-                            .padding(.leading, 8)
-                            .padding(.trailing, 6)
-                            .padding(.vertical, 5)
-                            .background(.thinMaterial, in: .capsule)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                }
+            if !draftAttachments.isEmpty {
+                draftAttachmentStrip
             }
 
-            VStack(spacing: 8) {
-                TextField("Send a message, / command, @ file or conversation",
-                          text: $model.draft, axis: .vertical)
-                    .lineLimit(1...5)
-                    .textFieldStyle(.plain)
-                    .focused($isDraftFocused)
-                    .onSubmit { send() }
+            // Keep reachability and branch visible while reading a running
+            // conversation too.  The original implementation hid this row
+            // as soon as the first transcript entry arrived, which made the
+            // status jump above the composer and left no persistent context.
+            sessionStatusBar
 
-                HStack(spacing: 10) {
-                    // Icon per button must say what the button does: "/" for the
-                    // slash commands, a picture for the photo picker, and the
-                    // paperclip for files.
-                    Button { showCommandMenu = true } label: {
-                        Image(systemName: "slash.circle").font(.title3)
-                    }
-                    .accessibilityLabel("Commands")
-
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                        Image(systemName: "photo").font(.title3)
-                    }
-                    .accessibilityLabel("Attach photo")
-
-                    Button { showFileImporter = true } label: {
-                        Image(systemName: "paperclip").font(.title3)
-                    }
-                    .accessibilityLabel("Attach file")
-
-                    PermissionMenu(sessionID: sessionID)
-
-                    Spacer(minLength: 4)
-
-                    ModelMenu(sessionID: sessionID)
-
-                    if let ratio = contextRatio {
-                        ContextRing(ratio: ratio)
-                    }
-
-                    if isRunning {
-                        Button(action: { model.cancelTurn(for: sessionID) }) {
-                            // The stock symbol, matching the send button's weight.
-                            Image(systemName: "stop.circle.fill")
-                                .font(.title)
-                                .foregroundStyle(.red)
-                        }
-                        .accessibilityLabel("Stop turn")
-                    } else {
-                        Button(action: send) {
-                            Image(systemName: "arrow.up.circle.fill").font(.title).foregroundStyle(.tint)
-                        }
-                        .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                  && pendingAttachments.isEmpty)
-                        .accessibilityLabel("Send message")
-                    }
-                }
+            if model.collapseComposerControls {
+                compactComposer
+            } else {
+                expandedComposer
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 20))
 
-            UsageFooter(usage: model.usage(for: sessionID))
+            if hasRenderedContent && model.showUsageFooter {
+                UsageFooter(usage: model.usage(for: sessionID))
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.bar)
+    }
+
+    private var draftAttachmentStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(draftAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        if attachment.isImage, let image = UIImage(data: attachment.data) {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 28, height: 28)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        Label(attachment.name, systemImage: attachment.isImage ? "photo" : "paperclip")
+                            .font(.caption)
+                            .lineLimit(1)
+                        Button {
+                            draftAttachments.removeAll { $0.id == attachment.id }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove attachment")
+                    }
+                    .padding(.leading, 8)
+                    .padding(.trailing, 6)
+                    .padding(.vertical, 5)
+                    .background(.thinMaterial, in: .capsule)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    /// The two small labels above Happy's empty-session composer: machine
+    /// reachability on the left and the current branch on the right.
+    private var sessionStatusBar: some View {
+        let branch: String
+        if let value = session?.branch?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+            branch = value
+        } else {
+            branch = "main"
+        }
+        return HStack {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(deviceStatusColor)
+                    .frame(width: 7, height: 7)
+                Text(deviceStatusLabel)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(deviceStatusColor)
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 12, weight: .medium))
+                Text(branch)
+                    .font(.system(size: 13, weight: .regular))
+            }
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 1)
+    }
+
+    private var deviceStatusColor: Color {
+        switch model.deviceStatus {
+        case .offline: return .gray
+        case .error: return .red
+        case .online: return .green
+        case .approvalRequired: return .yellow
+        }
+    }
+
+    private var deviceStatusLabel: String {
+        switch model.deviceStatus {
+        case .offline: return DSHLocalization.string("Offline")
+        case .error: return DSHLocalization.string("Error")
+        case .online: return DSHLocalization.string("Online")
+        case .approvalRequired: return DSHLocalization.string("Permission confirmation required")
+        }
+    }
+
+    /// Resting composer geometry: 44pt controls, a 24pt rounded card and no
+    /// extra usage line.  The plus button exposes only command/photo/file;
+    /// the permission, model and send controls remain in this same editor.
+    private var compactComposer: some View {
+        DSHCompactComposer(text: $model.draft,
+                           placeholder: "Send a message, / command, @ file or conversation",
+                           hasAttachments: hasDraftAttachments,
+                           onSubmit: send) {
+            DSHComposerQuickActionsMenu(
+                onCommand: { showCommandMenu = true },
+                onPhoto: { showPhotoPicker = true },
+                onFile: { showFileImporter = true }
+            )
+
+            PermissionMenu(sessionID: sessionID, compact: true)
+
+            Spacer(minLength: 4)
+
+            ModelMenu(sessionID: sessionID)
+
+            ReasoningEffortMenu(sessionID: sessionID)
+
+            if let ratio = contextRatio {
+                ContextRing(ratio: ratio)
+            }
+
+            composerSendControl
+        }
+    }
+
+    private var expandedComposer: some View {
+        VStack(spacing: 8) {
+            TextField("Send a message, / command, @ file or conversation",
+                      text: $model.draft, axis: .vertical)
+                .lineLimit(1...5)
+                .textFieldStyle(.plain)
+                .focused($isDraftFocused)
+                .onSubmit { send() }
+
+            HStack(spacing: 10) {
+                Button { showCommandMenu = true } label: {
+                    Image(systemName: "slash.circle").font(.title3)
+                }
+                .accessibilityLabel("Commands")
+
+                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    Image(systemName: "photo").font(.title3)
+                }
+                .accessibilityLabel("Attach photo")
+
+                Button { showFileImporter = true } label: {
+                    Image(systemName: "paperclip").font(.title3)
+                }
+                .accessibilityLabel("Attach file")
+
+                PermissionMenu(sessionID: sessionID)
+
+                Spacer(minLength: 4)
+
+                ModelMenu(sessionID: sessionID)
+
+                ReasoningEffortMenu(sessionID: sessionID)
+
+                if let ratio = contextRatio {
+                    ContextRing(ratio: ratio)
+                }
+
+                composerSendControl
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+    }
+
+    @ViewBuilder private var composerSendControl: some View {
+        if isSending {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Sending")
+        } else if isRunning {
+            Button(action: { model.cancelTurn(for: sessionID) }) {
+                Image(systemName: "stop.circle.fill")
+                    .font(.title)
+                    .foregroundStyle(.red)
+            }
+            .accessibilityLabel("Stop turn")
+        } else {
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title)
+                    .foregroundStyle(.tint)
+            }
+            .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      && !hasDraftAttachments)
+            .accessibilityLabel("Send message")
+        }
     }
 
     /// Context window usage, shown as a ring beside the model.
@@ -322,14 +664,59 @@ struct ConversationView: View {
     /// Keeps the newest output on screen, unless the reader has scrolled away.
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
         guard isFollowingLatest else { return }
-        withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
+        // Streaming deltas are intentionally not animated. The old
+        // `withAnimation` ran once per token and kept Core Animation busy even
+        // when the reader was already at the bottom, which made the phone warm
+        // and caused visible stutter. The explicit jump button below still uses
+        // an animation when the user asks for one.
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+        }
     }
 
     private func send() {
-        let receipts = pendingAttachments.map(\.receiptId)
-        model.sendPrompt(model.draft, attachments: receipts, to: sessionID)
-        sentAttachmentIDs.formUnion(receipts)
+        guard !isSending else { return }
+        let text = model.draft
+        let staged = draftAttachments
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || !staged.isEmpty else { return }
+
+        // Clear the editor immediately so a double tap cannot send the same
+        // draft twice. If an upload fails, restore the not-yet-uploaded chips
+        // below so the user can retry without selecting the files again.
         model.draft = ""
+        draftAttachments = []
+        isSending = true
+        Task { @MainActor in
+            var uploadedCount = 0
+            do {
+                var receipts: [String] = []
+                var messageAttachments: [DSHMessageAttachment] = []
+                receipts.reserveCapacity(staged.count)
+                for attachment in staged {
+                    let receipt = try await model.uploadAttachmentAndWait(name: attachment.name,
+                                                                           data: attachment.data,
+                                                                           for: sessionID)
+                    receipts.append(receipt)
+                    let mediaType = attachment.isImage ? "image/jpeg" : nil
+                    model.cacheAttachmentData(attachment.data, for: receipt)
+                    messageAttachments.append(DSHMessageAttachment(id: receipt,
+                                                                    name: attachment.name,
+                                                                    mediaType: mediaType,
+                                                                    receiptId: receipt))
+                    uploadedCount += 1
+                }
+                model.sendPrompt(text, attachments: receipts,
+                                 messageAttachments: messageAttachments, to: sessionID)
+            } catch {
+                model.draft = text
+                draftAttachments = Array(staged.dropFirst(uploadedCount))
+                model.errorMessage = error.localizedDescription
+            }
+            isSending = false
+        }
     }
 
     /// A photo that is only in iCloud cannot be read without downloading it
@@ -342,6 +729,7 @@ struct ConversationView: View {
     private func refreshSession() {
         model.refreshSessions(includeArchived: true)
         model.sendModelCatalog()
+        model.openSession(sessionID)
         didRefresh = true
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.2))
@@ -353,6 +741,113 @@ struct ConversationView: View {
         model.archive(session ?? emptySession, archived: true)
         dismiss()
     }
+}
+
+/// Restores the native UINavigationController interactive-pop gesture after a
+/// screen supplies its own navigation chrome. A transparent child controller
+/// reaches the NavigationStack's UIKit host without replacing navigation or
+/// emulating the gesture with a competing DragGesture over the transcript.
+private struct DSHInteractivePopGestureEnabler: UIViewControllerRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIViewController(context: Context) -> HostController {
+        HostController(coordinator: context.coordinator)
+    }
+
+    func updateUIViewController(_ controller: HostController, context: Context) {
+        controller.coordinator = context.coordinator
+        controller.attachIfPossible()
+    }
+
+    static func dismantleUIViewController(_ controller: HostController, coordinator: Coordinator) {
+        coordinator.restore()
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        weak var navigationController: UINavigationController?
+        weak var previousDelegate: UIGestureRecognizerDelegate?
+
+        func attach(to navigationController: UINavigationController) {
+            guard self.navigationController !== navigationController else {
+                navigationController.interactivePopGestureRecognizer?.isEnabled = true
+                return
+            }
+            restore()
+            self.navigationController = navigationController
+            let gesture = navigationController.interactivePopGestureRecognizer
+            previousDelegate = gesture?.delegate
+            gesture?.delegate = self
+            gesture?.isEnabled = true
+        }
+
+        func restore() {
+            guard let navigationController,
+                  let gesture = navigationController.interactivePopGestureRecognizer,
+                  gesture.delegate === self else { return }
+            gesture.delegate = previousDelegate
+            gesture.isEnabled = true
+            self.navigationController = nil
+            previousDelegate = nil
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let navigationController,
+                  navigationController.viewControllers.count > 1,
+                  navigationController.presentedViewController == nil else { return false }
+            return true
+        }
+    }
+
+    final class HostController: UIViewController {
+        var coordinator: Coordinator
+
+        init(coordinator: Coordinator) {
+            self.coordinator = coordinator
+            super.init(nibName: nil, bundle: nil)
+            view.backgroundColor = .clear
+            view.isUserInteractionEnabled = false
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            attachIfPossible()
+        }
+
+        override func didMove(toParent parent: UIViewController?) {
+            super.didMove(toParent: parent)
+            attachIfPossible()
+        }
+
+        func attachIfPossible() {
+            guard let navigationController else { return }
+            coordinator.attach(to: navigationController)
+        }
+    }
+}
+
+/// Camera-library originals can be 10–30 MB. Downsample them before putting
+/// them into a JSON/WebSocket command so the phone does not retain a giant
+/// decoded bitmap or hit the Connector's upload deadline.
+private func optimizedPhotoData(_ data: Data) -> Data {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return data }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: 2048
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+        return data
+    }
+    return UIImage(cgImage: image).jpegData(compressionQuality: 0.82) ?? data
+}
+
+func optimizedPhotoDataOffMain(_ data: Data) async -> Data {
+    await Task.detached(priority: .userInitiated) {
+        optimizedPhotoData(data)
+    }.value
 }
 
 /// Context usage as a small ring. The old labelled bar took a whole line under
@@ -378,6 +873,12 @@ private struct ContextRing: View {
 private struct ModelMenu: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
+    let compact: Bool
+
+    init(sessionID: String, compact: Bool = false) {
+        self.sessionID = sessionID
+        self.compact = compact
+    }
 
     var body: some View {
         Menu {
@@ -399,25 +900,78 @@ private struct ModelMenu: View {
                 Button("Refresh models") { model.sendModelCatalog() }
             }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "cpu")
-                // Only the model itself, not "provider/model": the provider is
-                // the same across the catalogue and pushed the useful part into
-                // an ellipsis.
-                Text(model.shortModelName(for: sessionID))
+            HStack(spacing: compact ? 5 : 4) {
+                if !compact { Image(systemName: "cpu") }
+                Text(displayName)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                    .minimumScaleFactor(0.78)
+                if !compact {
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                }
             }
-            .font(.subheadline)
+            .font(.system(size: compact ? 15 : 14, weight: .regular))
         }
         .accessibilityLabel("Model")
+    }
+
+    private var displayName: String {
+        let base = model.shortModelName(for: sessionID)
+        guard compact,
+              let effort = model.sessions.first(where: { $0.id == sessionID })?.reasoningEffort,
+              !effort.isEmpty else { return base }
+        return "\(base) · \(effort.capitalized)"
+    }
+}
+
+/// A separate selector placed immediately after the model name. The menu is
+/// absent when the live Harness catalog says the model has no effort choices.
+private struct ReasoningEffortMenu: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let sessionID: String
+
+    var body: some View {
+        if let configuration = model.reasoningConfiguration(for: sessionID) {
+            Menu {
+                ForEach(configuration.efforts) { effort in
+                    Button {
+                        model.selectModel(
+                            DSHModelSelection(provider: configuration.provider,
+                                              model: configuration.model,
+                                              reasoningEffort: effort.id),
+                            for: sessionID
+                        )
+                    } label: {
+                        Label(effort.name,
+                              systemImage: effort.id == configuration.selectedEffortID
+                                ? "checkmark" : "brain.head.profile")
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text(configuration.selectedEffort?.name ?? configuration.selectedEffortID)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2)
+                }
+                .font(.system(size: 14, weight: .regular))
+                .frame(maxWidth: 70)
+            }
+            .accessibilityLabel("Reasoning effort")
+        }
     }
 }
 
 private struct PermissionMenu: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
+    let compact: Bool
+
+    init(sessionID: String, compact: Bool = false) {
+        self.sessionID = sessionID
+        self.compact = compact
+    }
 
     var body: some View {
         Menu {
@@ -427,10 +981,22 @@ private struct PermissionMenu: View {
                 }
             }
         } label: {
-            // Icon only: the label cost ~80pt of a row that also holds three
-            // attachments, the model and send. The mode is still announced.
-            Image(systemName: "checkmark.shield")
-                .font(.title3)
+            if compact {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.shield")
+                        .font(.title3)
+                    Text(permissionLabel(model.permissionMode(for: sessionID)))
+                        .font(.system(size: 14, weight: .regular))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
+            } else {
+                // Icon only: the label cost ~80pt of a row that also holds
+                // three attachments, the model and send. The mode is still
+                // announced.
+                Image(systemName: "checkmark.shield")
+                    .font(.title3)
+            }
         }
         .accessibilityLabel("Permission: \(permissionLabel(model.permissionMode(for: sessionID)))")
         .accessibilityHint("Changes the sandbox and approval policy for this session")
@@ -449,18 +1015,16 @@ private struct PermissionMenu: View {
         }
     }
 
-    /// Exactly the presets the Harness defines, and no more.
-    ///
-    /// Each preset is a sandbox mode *plus* an approval policy. The picker used
-    /// to offer five entries that mixed the two concepts ("ask", "never",
-    /// "read-only"), and the Harness rejects anything outside this pair with
-    /// 400 — so three of the five could never take effect.
+    /// The three user-facing permission presets map directly to Harness
+    /// sandbox choices. Legacy ask/never values remain readable in the store
+    /// but are intentionally not offered as separate modes here.
     private var permissionModes: [(mode: String, title: String, icon: String)] {
         // Titles are localized here rather than left to `Label`, which only
         // localizes a literal and takes this value as a plain String.
         [
+            ("read-only", "仅可查看", "eye"),
             ("workspace-write", DSHLocalization.string("Workspace write"), "folder"),
-            ("danger-full-access", DSHLocalization.string("Full access"), "exclamationmark.triangle")
+            ("danger-full-access", "完全权限", "exclamationmark.triangle")
         ]
     }
 }
@@ -537,7 +1101,9 @@ private struct UsageFooter: View {
     }
 }
 
-private struct CommandMenuSheet: View {
+struct CommandMenuSheet: View {
+    @Binding var selectedPhoto: PhotosPickerItem?
+    let onFile: () -> Void
     let onCommand: (String) -> Void
     let onDismiss: () -> Void
 
@@ -553,28 +1119,47 @@ private struct CommandMenuSheet: View {
 
     var body: some View {
         NavigationStack {
-            List(commands, id: \.0) { item in
-                Button { onCommand(item.0) } label: {
-                    Label {
-                        // Show the literal command the row runs, so the sheet
-                        // teaches the slash syntax instead of only describing it:
-                        // icon, "/command", a space, then the Chinese gloss.
-                        HStack(spacing: 0) {
-                            Text("/\(item.0)")
-                                .font(.body.monospaced())
-                                .foregroundStyle(.tint)
-                            Text(" \(item.1)")
-                                .foregroundStyle(.primary)
-                        }
-                    } icon: {
-                        Image(systemName: item.2).foregroundStyle(.tint)
+            List {
+                Section("Attachments") {
+                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                        Label("Photo", systemImage: "photo")
+                    }
+                    Button(action: onFile) {
+                        Label("File", systemImage: "paperclip")
                     }
                 }
-                .accessibilityLabel("/\(item.0) \(item.1)")
+                Section("Commands") {
+                    ForEach(commands, id: \.0) { item in
+                        Button { onCommand(item.0) } label: {
+                            Label {
+                                // Show the literal command the row runs, so the sheet
+                                // teaches the slash syntax instead of only describing it:
+                                // icon, "/command", a space, then the Chinese gloss.
+                                HStack(spacing: 0) {
+                                    Text("/\(item.0)")
+                                        .font(.body.monospaced())
+                                        .foregroundStyle(.tint)
+                                    Text(" \(item.1)")
+                                        .foregroundStyle(.primary)
+                                }
+                            } icon: {
+                                Image(systemName: item.2).foregroundStyle(.tint)
+                            }
+                        }
+                        .accessibilityLabel("/\(item.0) \(item.1)")
+                    }
+                }
             }
-            .navigationTitle("Commands")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { Button("Done", action: onDismiss) }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemBackground))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HappySheetHeader(title: "Commands", onClose: onDismiss,
+                                 trailingTitle: "Done", trailingAction: onDismiss)
+            }
+            .toolbar(.hidden, for: .navigationBar)
+            .onChange(of: selectedPhoto) { _, item in
+                if item != nil { onDismiss() }
             }
         }
     }
@@ -612,7 +1197,13 @@ private struct ModelPickerSheet: View {
                                            description: Text("Reconnect to load available models."))
                 }
             }
-            .navigationTitle("Select model")
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemBackground))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HappySheetHeader(title: "Select model", onClose: { dismiss() })
+            }
+            .toolbar(.hidden, for: .navigationBar)
         }
     }
 }
@@ -622,11 +1213,9 @@ private struct PermissionPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let sessionID: String
     private let modes: [(mode: String, title: String)] = [
-        ("ask", "Ask every time"),
-        ("never", "Never ask"),
-        ("read-only", "Read only"),
-        ("workspace-write", "Workspace changes"),
-        ("danger-full-access", "Full access")
+        ("read-only", "仅可查看"),
+        ("workspace-write", "工作区内修改"),
+        ("danger-full-access", "完全权限")
     ]
 
     var body: some View {
@@ -643,8 +1232,58 @@ private struct PermissionPickerSheet: View {
                     }
                 }
             }
-            .navigationTitle("Permission")
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemBackground))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HappySheetHeader(title: "Permission", onClose: { dismiss() })
+            }
+            .toolbar(.hidden, for: .navigationBar)
         }
+    }
+}
+
+/// Shared 44pt sheet chrome for command, model and permission pickers. Keeping
+/// the close target in the same place prevents each modal from feeling like a
+/// different mini-app when it slides over the conversation screen.
+private struct HappySheetHeader: View {
+    let title: String
+    let onClose: () -> Void
+    var trailingTitle: String?
+    var trailingAction: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close")
+
+            Spacer(minLength: 0)
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+
+            if let trailingTitle, let trailingAction {
+                Button(trailingTitle, action: trailingAction)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(minWidth: 52, minHeight: 44)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+            } else {
+                Color.clear.frame(width: 52, height: 44)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        .background(Color(.systemBackground).opacity(0.96))
     }
 }
 
@@ -667,26 +1306,209 @@ private struct CommandResultCard: View {
     }
 }
 
-private struct MessageBubble: View {
-    let message: DSHChatMessage
+/// Inline, non-avatar system event used when a running session changes its
+/// model. It lives in the transcript sequence, so it scrolls with the answer
+/// that follows instead of becoming a permanent footer card.
+private struct ModelChangeCard: View {
+    let notice: DSHModelChangeNotice
+
+    private var fromLabel: String {
+        guard let previous = notice.previous else { return "初始模型" }
+        return compact(previous)
+    }
+
+    private var toLabel: String { compact(notice.current) }
 
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: 36) }
-            messageText
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
-                .foregroundStyle(message.role == .user ? .white : .primary)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-            if message.role != .user { Spacer(minLength: 36) }
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("模型已切换")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("\(fromLabel) → \(toLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(Self.timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(notice.timestamp) / 1_000)))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("模型已切换：\(fromLabel) 到 \(toLabel)")
+    }
+
+    private func compact(_ selection: DSHModelSelection) -> String {
+        let value = selection.model
+        let lowered = "\(selection.provider)/\(value)".lowercased()
+        if lowered.contains("deepseek") {
+            if lowered.contains("v4.1") && lowered.contains("flash") { return "DS V4.1F" }
+            if lowered.contains("v4.1") && (lowered.contains("reason") || lowered.contains("r1")) { return "DS V4.1R" }
+            if lowered.contains("v4.1") { return "DS V4.1" }
+        }
+        if lowered.contains("claude") {
+            if lowered.contains("opus") { return "Claude Opus" }
+            if lowered.contains("sonnet") { return "Claude Sonnet" }
+        }
+        return value
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+}
+
+private struct MessageBubble: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let sessionID: String
+    let message: DSHChatMessage
+    @State private var showActions = false
+    @State private var showDeleteConfirmation = false
+    @State private var didCopy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                if message.role == .user { Spacer(minLength: 36) }
+                messageContent
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(message.role == .user ? .white : .primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .contentShape(RoundedRectangle(cornerRadius: 16))
+                    .onTapGesture {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showActions = true
+                        }
+                    }
+                if message.role != .user { Spacer(minLength: 36) }
+            }
+
+            if model.showMessageActionsByDefault || showActions {
+                HStack(spacing: 12) {
+                    if message.role == .user { Spacer(minLength: 36) }
+
+                    Button(action: copyMessage) {
+                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                            .frame(width: 28, height: 24)
+                    }
+                    .accessibilityLabel(didCopy ? "Copied" : "Copy")
+
+                    Button(role: .destructive) {
+                        showDeleteConfirmation = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .frame(width: 28, height: 24)
+                    }
+                    .accessibilityLabel("Delete")
+
+                    if message.role != .user { Spacer(minLength: 36) }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .buttonStyle(.plain)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .confirmationDialog("Delete this message?",
+                            isPresented: $showDeleteConfirmation,
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                model.hideMessage(message.id, in: sessionID)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the message from this iPhone only. The original Harness history on your Mac is unchanged.")
         }
     }
 
-    @ViewBuilder private var messageText: some View {
-        MarkdownBlockText(text: message.markdown)
-            // Long-press to select and copy a reply.
-            .textSelection(.enabled)
+    private func copyMessage() {
+        let attachmentLines = message.attachments.map { "📎 \($0.name)" }
+        let value = ([message.markdown] + attachmentLines)
+            .filter { !$0.isEmpty }
+            .joined(separator: message.markdown.isEmpty ? "\n" : "\n\n")
+        UIPasteboard.general.string = value
+        didCopy = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            didCopy = false
+        }
+    }
+
+    @ViewBuilder private var messageContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !message.attachments.isEmpty {
+                MessageAttachmentsView(attachments: message.attachments)
+            }
+            if !message.markdown.isEmpty {
+                MarkdownBlockText(text: message.markdown)
+                    // Long-press to select and copy a reply.
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+private struct MessageAttachmentsView: View {
+    let attachments: [DSHMessageAttachment]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(attachments) { attachment in
+                MessageAttachmentPreview(attachment: attachment)
+            }
+        }
+        .frame(maxWidth: 280, alignment: .leading)
+    }
+}
+
+private struct MessageAttachmentPreview: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let attachment: DSHMessageAttachment
+    @State private var data: Data?
+
+    var body: some View {
+        Group {
+            if attachment.isImage, let data, let image = UIImage(data: data) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 260, maxHeight: 190)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    Text(attachment.name)
+                        .font(.caption2)
+                        .lineLimit(1)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: attachment.isImage ? "photo" : "paperclip")
+                        .font(.caption.weight(.semibold))
+                    Text(attachment.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .task(id: attachment.id) {
+            data = model.attachmentData(for: attachment)
+        }
     }
 }
 
@@ -871,16 +1693,20 @@ private struct MarkdownTableView: View {
 /// holding the whole turn's chain-of-thought. The transcript itself shows only
 /// final results; the reasoning lives in that one collapsed space.
 private struct AssistantTurnView: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let sessionID: String
     let block: DSHTranscriptBlock
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(block.visibleMessages) { message in
-                MessageBubble(message: message)
+                MessageBubble(sessionID: sessionID, message: message)
             }
             if !block.reasoning.isEmpty {
                 ThinkingDisclosure(text: block.reasoning,
-                                   answerCount: block.visibleMessages.count)
+                                   answerCount: block.visibleMessages.count,
+                                   usage: block.visibleMessages.last?.usage,
+                                   showUsage: model.showTurnUsage)
             }
         }
     }
@@ -892,6 +1718,8 @@ private struct AssistantTurnView: View {
 private struct ThinkingDisclosure: View {
     let text: String
     let answerCount: Int
+    let usage: DSHSessionUsage?
+    let showUsage: Bool
 
     @State private var isExpanded = false
 
@@ -910,6 +1738,12 @@ private struct ThinkingDisclosure: View {
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     Spacer(minLength: 0)
+                    if showUsage, let usage {
+                        Text(turnStats(usage))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -937,6 +1771,19 @@ private struct ThinkingDisclosure: View {
             }
         }
         .frame(maxWidth: 320, alignment: .leading)
+    }
+
+    private func turnStats(_ usage: DSHSessionUsage) -> String {
+        let input = usage.inputTokens ?? 0
+        let output = usage.outputTokens ?? 0
+        if input == 0 && output == 0 { return "" }
+        return "\(compact(input + output)) tok"
+    }
+
+    private func compact(_ value: Double) -> String {
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+        return String(Int(value))
     }
 }
 

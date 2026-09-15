@@ -165,6 +165,7 @@ public actor DSHWebSocketConnection {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         _state = .disconnected
+        yieldControl(type: "transport.state", value: _state)
         continuation?.finish()
         continuation = nil
         activeStream = nil
@@ -190,6 +191,7 @@ public actor DSHWebSocketConnection {
         var attempt = 0
         while !stopped && !Task.isCancelled {
             _state = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
+            yieldControl(type: "transport.state", value: _state)
             do {
                 var request = URLRequest(url: configuration.url)
                 request.setValue("Bearer \(configuration.bearerToken)", forHTTPHeaderField: "Authorization")
@@ -211,17 +213,22 @@ public actor DSHWebSocketConnection {
                 attempt += 1
                 if let maximum = configuration.maximumReconnectAttempts, attempt > maximum {
                     _state = .failed(error.localizedDescription)
+                    yieldControl(type: "transport.state", value: _state)
                     continuation?.finish(throwing: error)
                     continuation = nil
                     return
                 }
                 _state = .reconnecting(attempt: attempt)
+                yieldControl(type: "transport.state", value: _state)
                 let delay = configuration.backoff.delayNanoseconds(for: attempt)
                 do { try await Task.sleep(nanoseconds: delay) }
                 catch { break }
             }
         }
-        if !stopped { _state = .failed(DSHWebSocketError.closed.localizedDescription) }
+        if !stopped {
+            _state = .failed(DSHWebSocketError.closed.localizedDescription)
+            yieldControl(type: "transport.state", value: _state)
+        }
     }
 
     /// Returns true for the Relay handshake, which is the point at which a
@@ -244,6 +251,7 @@ public actor DSHWebSocketConnection {
                 throw DSHWebSocketError.unauthorizedRelayRole
             }
             _state = .connected
+            yieldControl(type: "transport.state", value: _state)
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
                                         lastSequence: _lastSequence), over: task)
             // A Relay handshake is the only readiness signal guaranteed on
@@ -253,7 +261,10 @@ public actor DSHWebSocketConnection {
             try await sendRelay(.listSessions(deviceId: configuration.deviceId,
                                               machineId: configuration.machineId), over: task)
             return true
-        case .presence:
+        case .presence(let presence):
+            if presence.machineId == configuration.machineId, presence.role == .machine {
+                yieldControl(type: "machine.presence", value: presence.online)
+            }
             return false
         case .error(let error):
             throw DSHWebSocketError.relay(code: error.code, message: error.message)
@@ -290,6 +301,21 @@ public actor DSHWebSocketConnection {
         let payload = try DSHRelayPayloadMessage.wrapping(machineId: configuration.machineId,
                                                            sender: .device, body: command)
         try await task.send(.data(try JSONEncoder().encode(payload)))
+    }
+
+    /// Feeds Relay control-plane state through the same batched UI stream as
+    /// Harness events without consuming a Connector sequence number.
+    private func yieldControl<T: Encodable>(type: String, value: T) {
+        guard let data = try? JSONEncoder().encode(value),
+              let payload = try? JSONDecoder().decode(DSHJSONValue.self, from: data) else { return }
+        continuation?.yield(DSHEvent(envelope: DSHEnvelope(
+            messageId: UUID().uuidString,
+            deviceId: configuration.deviceId,
+            machineId: configuration.machineId,
+            sequence: 0,
+            type: type,
+            payload: payload
+        )))
     }
 }
 

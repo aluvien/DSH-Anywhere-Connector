@@ -1,6 +1,6 @@
 # DSH Anywhere 交接记录
 
-更新时间：2026-09-13
+更新时间：2026-09-14
 
 ## 目标
 
@@ -87,6 +87,24 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
 - 本机当前 `security find-identity -v -p codesigning` 返回 0 个有效签名身份，因此还不能直接生成可安装 IPA 或上传 TestFlight/App Store；需要 Apple Developer
   证书/Provisioning Profile，并确认上传目标。
 
+### 最近更新（build 39 / Mac r11）
+
+- 新建会话增加 Harness 原生权限模式：`workspace-write`（工作区内修改）和
+  `danger-full-access`（完全访问）；模式在创建请求中传到本机 Bridge，并执行 Harness
+  `/permission` 保持真实沙箱状态一致。
+- 首页空态等待第一份权威 `session.snapshot` 后再显示，并关闭会话列表刷新时的隐式行动画，
+  解决首次连接和重连时的闪烁。
+- 图片/文件选择现在只是 iOS 本地草稿，输入区会显示可删除标签；点击发送后才上传、等待文件
+  receipt，再将 receipt 随 prompt 一起提交。上传失败会保留尚未完成的附件。
+- 最新本机包：`artifacts/macos/DSH-ANYWHERE-MAC-LOCAL-20260913-r11.zip`，SHA-256：
+  `d39a3ffe6b3ea4f28731269d695f337069c49c15762544bfd14a9945c1fb01c9`。
+- Relay 也要更新到 `artifacts/server/DSH-ANYWHERE-RELAY-SERVER-20260913-r11-clean.zip`，
+  因为 Relay 的严格协议 schema 需要认识 `session.create.permissionMode`；SHA-256：
+  `bb1fa04f0894261ff163a01225d19d2dd5955c6f4e509c68a6e83752e8023a92`。
+- 最新 iOS 无签名归档：`artifacts/ios/DSHAnywhere-0.0.1-build40-staged-attachments-unsigned.xcarchive`
+  （压缩包同名 `.zip`，SHA-256：
+  `fa5b658cb6c1a8e5d18bb1677d4d4e347bc336bb92025a2e36f5f212012e0465`）。
+
 ### Harness 工作台同步（2026-09-13）
 
 - 会话列表现在按 Harness workspace / 工作目录分组；默认隐藏已归档会话，工具栏可显式显示，
@@ -100,14 +118,44 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
   `danger-full-access`。切换会执行 Harness `/permission`，同步写入 sandbox mode 和 approval policy，
   不再只是改变手机端显示。
 - Mac 升级包发布在 `artifacts/macos/`；选择日期相同的最大 `r` 版本即可。压缩包不包含 token。
-- iOS Build 4 已写入 `ios/DSHAnywhere.xcodeproj/project.pbxproj`。本次修复 Swift Codable 将可选字段编码为
-  `null` 导致 Relay 严格 schema 拒绝的问题；`sessionId`/`targetDeviceId` 现在为空时直接省略。
-  上传前在已登录 Apple Developer
-  的 Xcode 中执行 Product → Archive，然后在 Organizer 中选择 Distribute App → TestFlight /
-  App Store Connect。
-- 验证：`pnpm -r build` 通过；Protocol 6、Plugin 13、Connector 10 项测试通过；
-  所有 iOS Swift 文件已通过语法解析，Core/AppModel 已通过 Swift 6 typecheck。
-  当前受限环境无法运行 SwiftUI macro host，因此仍需在真实 Xcode/真机环境做 UI 冒烟和 archive。
+- iOS Build 40 已写入 `ios/DSHAnywhere.xcodeproj/project.pbxproj`。上传前在已登录 Apple
+  Developer 的 Xcode 中执行 Product → Archive，然后在 Organizer 中选择 Distribute App →
+  TestFlight / App Store Connect。
+- 验证：`pnpm build`、Plugin 32、Connector 13 项测试通过；iOS 模拟器测试 46 项全部通过，
+  Release 真机无签名 archive 也已成功生成。
+
+### 首页项目浏览与实时渲染（build 41）
+
+- 首页改成轻量的项目/工作区浏览器：每个项目标题单独一行，左侧文件夹图标，右侧三点菜单和
+  新建会话按钮；会话行只显示标题和运行状态点，权限、模型、路径等信息留在会话详情页。
+- 项目菜单目前提供新建、展开/折叠、刷新、显示已归档和设置，避免出现看起来可点但没有行为的
+  装饰按钮；新建会话仍可在弹窗内选择工作区和权限模式。
+- 首页从系统 `List` 改为稳定的 `ScrollView`/`LazyVStack`，关闭快照重排动画；归档过滤仍由
+  `groupedForList` 统一处理。
+- `DSHAppModel` 将 WebSocket 事件按 50ms 窗口批量归并后一次发布状态，减少 SwiftUI 全局重绘；
+  对话流式输出自动跟随也取消逐 token 动画，避免高频 Core Animation 导致闪烁、发热和卡顿。
+- 本次 UI 更新需要上传 iOS build 41；无签名 archive/zip 为
+  `artifacts/ios/DSHAnywhere-0.0.1-build41-home-ui-unsigned.xcarchive`（压缩包同名 `.zip`），
+  ZIP SHA-256：`80bf0333e6b12397dc88b8b28799440f64d70978da5a6862c07e28bb6c1ad96f`。在有 Apple
+  Developer 证书的 Xcode Organizer 中重新签名后再上传。
+
+### 附件发送、黑屏保护与首页头部（build 42 / Mac r12）
+
+- 图片/文件选择仍只保存在 iPhone 当前输入草稿；点发送后才上传。相册图片会先缩小到最长边
+  2048px，再以 JPEG 压缩，减少大图经过 WSS/Relay/Connector 时的超时和内存压力；上传等待窗口
+  与 Connector 的本地 Harness 上传截止时间分开，Connector 现在给 `attachment.upload` 120 秒。
+- 带图片的 prompt 会把文字和 `file` receipt 一起放进 Harness 读取的 `content` 数组，修复“图片
+  发送成功但文字丢失”。Connector/手机会消费按 requestId 关联的 `protocol.error`，上传失败会
+  立即恢复文字和未完成附件，不再盲等到超时。
+- 会话内容为空或正在重连时显示明确的占位提示，避免审批/问题状态下出现整页黑屏；流式事件仍按
+  50ms 批处理，自动跟随不再逐 token 动画。
+- 首页恢复为参考图 4 的项目卡片头部：文件夹、连接状态、三点菜单和新建会话按钮；会话行只显示
+  标题并向右缩进，权限/模型继续放在会话页。
+- 最新本机升级包：`artifacts/macos/DSH-ANYWHERE-MAC-LOCAL-20260914-r12.zip`，SHA-256：
+  `a3c58d6a073464a5cab3657e151f839452cc9facf98bcfc6996ad58ad5b7623c`。
+- 最新 iOS 无签名归档：`artifacts/ios/DSHAnywhere-0.0.1-build42-attachments-home-unsigned.xcarchive.zip`，
+  SHA-256：`c28475a32e6052d904a69ce0608493af408ca60164dca099f6541181148f68e5`。在已登录 Apple
+  Developer 的 Xcode Organizer 中重新签名后上传 TestFlight。
 
 ## 当前个人环境
 
@@ -258,6 +306,29 @@ xcodebuild \
 - 二维码和深链配对，不再让用户手填 machineId/secret。
 - Relay 水平扩展、Redis presence、监控、日志轮转和版本回滚。
 - 自托管 Relay 文档与官方 Relay 的配置切换。
+
+## TestFlight 自动上传
+
+本机已配置 App Store Connect API Key（私钥不进仓库），发布脚本位于
+`scripts/release-testflight.sh`。它会自动递增 Build Number、使用 Xcode 自动签名、导出 IPA
+并上传到 TestFlight；默认读取
+`/Users/aluvien/.appstoreconnect/private_keys/AuthKey_3HM6YT6KMS.p8`。
+
+执行：
+
+```sh
+./scripts/release-testflight.sh
+```
+
+也可以显式指定构建号：
+
+```sh
+./scripts/release-testflight.sh 42
+```
+
+如更换团队或密钥，可通过 `ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_PATH` 覆盖默认值。脚本只负责
+归档和上传构建版本；TestFlight 外部测试审核和正式 App Store 审核仍需在 App Store Connect
+中确认。
 
 ## 安全边界
 

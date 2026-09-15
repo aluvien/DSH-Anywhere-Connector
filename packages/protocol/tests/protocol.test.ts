@@ -192,6 +192,27 @@ describe("DSH Anywhere wire protocol", () => {
       payload: { questionId: "question_1", answers: [] },
     })).toThrow();
   });
+
+  it("accepts workspace rename and delete commands", () => {
+    const fields = {
+      version: PROTOCOL_VERSION,
+      machineId: "mac-1",
+      deviceId: "iphone-1",
+      timestamp: 1_735_000_000_000,
+    };
+    expect(parseCommand({
+      ...fields,
+      requestId: "rename-1",
+      type: "workspace.rename",
+      payload: { workspaceId: "workspace-1", title: "Mobile project" },
+    }).type).toBe("workspace.rename");
+    expect(parseCommand({
+      ...fields,
+      requestId: "delete-1",
+      type: "workspace.delete",
+      payload: { workspaceId: "workspace-1" },
+    }).type).toBe("workspace.delete");
+  });
 });
 
 describe("prompt attachments", () => {

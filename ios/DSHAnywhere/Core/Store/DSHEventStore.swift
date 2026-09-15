@@ -2,6 +2,9 @@ import Foundation
 
 public struct DSHStoreState: Codable, Sendable, Equatable {
     public var sessions: [DSHSessionSummary] = []
+    /// Prevents the home screen from showing an empty-state flash while the
+    /// first authoritative snapshot is still travelling over the socket.
+    public var hasLoadedSessions = false
     public var messagesBySession: [String: [DSHChatMessage]] = [:]
     public var toolsBySession: [String: [DSHToolActivity]] = [:]
     public var pendingApprovals: [DSHApprovalRequest] = []
@@ -11,10 +14,22 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var usageBySession: [String: DSHSessionUsage] = [:]
     public var permissionBySession: [String: DSHPermissionUpdate] = [:]
     public var metadataBySession: [String: DSHSessionMetadataUpdate] = [:]
+    public var modelChangesBySession: [String: [DSHModelChangeNotice]] = [:]
     public var commandResultsBySession: [String: [DSHCommandResult]] = [:]
     public var attachmentsBySession: [String: [DSHUploadedAttachment]] = [:]
+    /// Errors are keyed by the request id carried as the error envelope's
+    /// message id.  Commands that wait for a correlated reply can fail fast.
+    public var protocolErrorsByRequestID: [String: String] = [:]
     public var unknownEvents: [DSHEnvelope] = []
     public var lastSequence: Int64 = 0
+    /// The socket to the public Relay and the presence of the Mac Connector
+    /// are independent. Keeping both prevents a healthy Relay from making an
+    /// offline Mac look reachable.
+    public var transportState: DSHConnectionState = .disconnected
+    public var machineOnline: Bool = false
+    /// `nil` means the Connector is present but the local Harness bridge has
+    /// not answered yet. Existing protocol events prove whether it is usable.
+    public var bridgeReachable: Bool?
     public var connectionState: DSHConnectionState = .disconnected
 
     public init() {}
@@ -26,6 +41,26 @@ public struct DSHEventReducer: Sendable {
     public init() {}
 
     public func reduce(_ event: DSHEvent, into state: inout DSHStoreState) {
+        // Transport controls are local, out-of-band signals and therefore do
+        // not participate in the Connector event sequence/replay window.
+        switch event.kind {
+        case .transportState(let value):
+            state.transportState = value
+            if value != .connected {
+                state.machineOnline = false
+                state.bridgeReachable = nil
+                state.connectionState = value
+            }
+            return
+        case .machinePresence(let online):
+            if !online || !state.machineOnline { state.bridgeReachable = nil }
+            state.machineOnline = online
+            state.connectionState = online ? .connected : .disconnected
+            return
+        default:
+            break
+        }
+
         if event.startsNewSequenceEpoch(comparedTo: state.lastSequence) {
             // A bridge/Connector restart resets its in-memory replay buffer to
             // sequence 1.  `session.snapshot` is a complete, authoritative
@@ -40,14 +75,19 @@ public struct DSHEventReducer: Sendable {
 
         switch event.kind {
         case .connectionReady:
+            state.transportState = .connected
+            state.machineOnline = true
+            state.bridgeReachable = true
             state.connectionState = .connected
         case .sessionSnapshot(let sessions):
+            state.bridgeReachable = true
             // Only touch the array when the content actually changed. The
             // Connector pushes a snapshot often — on reconnect, on every
             // explicit refresh — and most carry the same sessions. Reassigning
             // anyway made SwiftUI re-diff every row on the home screen, which is
             // what showed up as flicker each time data refreshed.
             if sessions != state.sessions { state.sessions = sessions }
+            state.hasLoadedSessions = true
         case .sessionCreated(let session):
             upsert(session, into: &state.sessions)
         case .userMessageAccepted(let message):
@@ -138,15 +178,37 @@ public struct DSHEventReducer: Sendable {
                 if let model = update.model { state.sessions[index].model = model }
                 if let effort = update.reasoningEffort { state.sessions[index].reasoningEffort = effort }
             }
+        case .modelChanged(let change):
+            var stamped = change
+            stamped.sequence = event.envelope.sequence
+            stamped.timestamp = event.envelope.timestamp
+            var values = state.modelChangesBySession[change.sessionId, default: []]
+            if let index = values.firstIndex(where: { $0.id == stamped.id }) {
+                values[index] = stamped
+            } else {
+                values.append(stamped)
+            }
+            state.modelChangesBySession[change.sessionId] = values
         case .commandResult(let result):
-            var values = state.commandResultsBySession[result.sessionId, default: []]
-            if let index = values.firstIndex(where: { $0.id == result.id }) { values[index] = result }
-            else { values.append(result) }
-            state.commandResultsBySession[result.sessionId] = values
+            // The command.result payload intentionally stays small and does
+            // not carry transport metadata. Stamp the enclosing event's
+            // sequence here so the transcript can place the acknowledgement
+            // where it happened instead of appending it after every message.
+            var stamped = result
+            stamped.sequence = event.envelope.sequence
+            var values = state.commandResultsBySession[stamped.sessionId, default: []]
+            if let index = values.firstIndex(where: { $0.id == stamped.id }) { values[index] = stamped }
+            else { values.append(stamped) }
+            state.commandResultsBySession[stamped.sessionId] = values
         case .attachmentUploaded(let attachment):
             var values = state.attachmentsBySession[attachment.sessionId, default: []]
             if !values.contains(where: { $0.id == attachment.id }) { values.append(attachment) }
             state.attachmentsBySession[attachment.sessionId] = values
+        case .protocolError(let error):
+            state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
+            if error.code == "bridge-request-failed" { state.bridgeReachable = false }
+        case .transportState, .machinePresence:
+            break
         case .unknown:
             state.unknownEvents.append(event.envelope)
         }
@@ -195,6 +257,7 @@ public enum DSHSessionGrouping: String, CaseIterable, Sendable {
 
 /// One section of the sessions list.
 public struct DSHSessionGroup: Identifiable, Sendable, Equatable {
+    public static let flatGroupID = "__flat__"
     public let id: String
     public let title: String
     public var sessions: [DSHSessionSummary]
@@ -254,24 +317,25 @@ public extension Array where Element == DSHSessionSummary {
             guard !recentFirst.isEmpty else { return [] }
             return [DSHSessionGroup(id: Self.flatGroupID, title: "", sessions: recentFirst)]
         case .byWorkspace:
-            let buckets = Dictionary(grouping: visible) { $0.workspaceName ?? Self.unfiledGroupTitle }
+            // Group by the stable registry id when one is available. The
+            // display title is mutable, so using it as an id made a project
+            // rename look like a delete plus a new project and broke the menu
+            // action that targets the remote WorkspaceRegistry.
+            let buckets = Dictionary(grouping: visible) { $0.workspaceId ?? $0.workspaceName ?? Self.unfiledGroupID }
             return buckets.keys.sorted { left, right in
-                if left == Self.unfiledGroupTitle { return false }
-                if right == Self.unfiledGroupTitle { return true }
-                return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
+                let leftTitle = buckets[left]?.first?.workspaceName ?? Self.unfiledGroupTitle
+                let rightTitle = buckets[right]?.first?.workspaceName ?? Self.unfiledGroupTitle
+                if left == Self.unfiledGroupID { return false }
+                if right == Self.unfiledGroupID { return true }
+                return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
             }
             .compactMap { key in
                 let sessions = (buckets[key] ?? []).sorted { $0.updatedAt > $1.updatedAt }
                 guard !sessions.isEmpty else { return nil }
-                // A workspace genuinely named "Other" must not absorb the bucket.
-                let unfiled = key == Self.unfiledGroupTitle
-                    && sessions.allSatisfy { $0.workspaceName == nil }
-                return DSHSessionGroup(
-                    id: unfiled ? Self.unfiledGroupID : key,
-                    title: key,
-                    sessions: sessions,
-                    isUnfiled: unfiled
-                )
+                let title = sessions.first?.workspaceName ?? Self.unfiledGroupTitle
+                let unfiled = key == Self.unfiledGroupID
+                return DSHSessionGroup(id: unfiled ? Self.unfiledGroupID : key,
+                                       title: title, sessions: sessions, isUnfiled: unfiled)
             }
         }
     }

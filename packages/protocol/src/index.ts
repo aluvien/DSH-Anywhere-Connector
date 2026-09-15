@@ -29,6 +29,10 @@ export const SessionSummarySchema = StrictObject({
   running: z.boolean().optional(),
   blank: z.boolean().optional(),
   parentSessionId: IdentifierSchema.optional(),
+  /** Harness agent preset/mode used when the session was created. */
+  agentPreset: z.string().min(1).max(256).optional(),
+  mode: z.string().min(1).max(256).optional(),
+  branch: z.string().min(1).max(512).optional(),
   provider: z.string().min(1).max(256).optional(),
   model: z.string().min(1).max(512).optional(),
   reasoningEffort: z.string().min(1).max(256).optional(),
@@ -123,6 +127,17 @@ export type SessionCreatedPayload = z.infer<typeof SessionCreatedPayloadSchema>;
 export const ChatRoleSchema = z.enum(["user", "assistant", "system"]);
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 
+/** Lightweight attachment metadata carried with a user message event. The
+ * image bytes stay in the local attachment cache; the event only needs the
+ * receipt/name so clients can associate a thumbnail with the message. */
+export const ChatAttachmentSchema = StrictObject({
+  id: IdentifierSchema,
+  name: z.string().min(1).max(512),
+  mediaType: z.string().min(1).max(256).optional(),
+  receiptId: IdentifierSchema.optional(),
+});
+export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
+
 export const AssistantMessageDeltaPayloadSchema = StrictObject({
   messageId: IdentifierSchema,
   text: z.string(),
@@ -133,6 +148,7 @@ export const ChatMessagePayloadSchema = StrictObject({
   id: IdentifierSchema,
   role: ChatRoleSchema,
   markdown: z.string(),
+  attachments: z.array(ChatAttachmentSchema).max(16).optional(),
   usage: z.lazy(() => SessionUsageSchema).optional(),
   provider: z.string().min(1).max(256).optional(),
   model: z.string().min(1).max(512).optional(),
@@ -223,6 +239,19 @@ export const SessionMetadataUpdatedPayloadSchema = StrictObject({
 });
 export type SessionMetadataUpdatedPayload = z.infer<typeof SessionMetadataUpdatedPayloadSchema>;
 
+/**
+ * A model selection is a visible transcript event when it changes in the
+ * middle of a session. Keeping the old and new values together lets clients
+ * render a compact inline notice while still offering the full provider/model
+ * names on demand.
+ */
+export const SessionModelChangedPayloadSchema = StrictObject({
+  sessionId: IdentifierSchema,
+  previous: ModelSelectionSchema.optional(),
+  current: ModelSelectionSchema,
+});
+export type SessionModelChangedPayload = z.infer<typeof SessionModelChangedPayloadSchema>;
+
 export const CommandResultPayloadSchema = StrictObject({
   sessionId: IdentifierSchema,
   requestId: IdentifierSchema,
@@ -302,6 +331,7 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("usage.updated", UsageUpdatedPayloadSchema),
   EventEnvelope("permission.updated", PermissionUpdatedPayloadSchema),
   EventEnvelope("session.metadata.updated", SessionMetadataUpdatedPayloadSchema),
+  EventEnvelope("session.model.changed", SessionModelChangedPayloadSchema),
   EventEnvelope("command.result", CommandResultPayloadSchema),
   EventEnvelope("attachment.uploaded", AttachmentUploadedPayloadSchema),
   EventEnvelope("assistant.reasoning", AssistantReasoningPayloadSchema),
@@ -338,6 +368,8 @@ export const SessionCreatePayloadSchema = StrictObject({
   workspaceId: IdentifierSchema.optional(),
   agentPreset: z.string().min(1).max(256).optional(),
   model: ModelSelectionSchema.optional(),
+  branch: z.string().min(1).max(512).optional(),
+  permissionMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
   initialPrompt: z.string().max(100_000).optional(),
 });
 export const SessionOpenPayloadSchema = StrictObject({ sessionId: IdentifierSchema });
@@ -386,6 +418,16 @@ export const ApprovalDecidePayloadSchema = StrictObject({
 export const DeviceRevokePayloadSchema = StrictObject({ targetDeviceId: IdentifierSchema });
 export const SessionArchivePayloadSchema = StrictObject({ archived: z.boolean() });
 export const SessionModelPayloadSchema = ModelSelectionSchema;
+/** Workspace mutations are kept separate from session commands so a project
+ * menu action can update the durable Harness registry instead of only changing
+ * a local iPhone alias. */
+export const WorkspaceRenamePayloadSchema = StrictObject({
+  workspaceId: IdentifierSchema,
+  title: z.string().min(1).max(512),
+});
+export const WorkspaceDeletePayloadSchema = StrictObject({
+  workspaceId: IdentifierSchema,
+});
 export const CommandExecutePayloadSchema = StrictObject({
   line: z.string().min(1).max(20_000),
   attachments: PromptSendPayloadSchema.shape.content.optional(),
@@ -419,6 +461,8 @@ export type ApprovalDecidePayload = z.infer<typeof ApprovalDecidePayloadSchema>;
 export type DeviceRevokePayload = z.infer<typeof DeviceRevokePayloadSchema>;
 export type SessionArchivePayload = z.infer<typeof SessionArchivePayloadSchema>;
 export type SessionModelPayload = z.infer<typeof SessionModelPayloadSchema>;
+export type WorkspaceRenamePayload = z.infer<typeof WorkspaceRenamePayloadSchema>;
+export type WorkspaceDeletePayload = z.infer<typeof WorkspaceDeletePayloadSchema>;
 export type CommandExecutePayload = z.infer<typeof CommandExecutePayloadSchema>;
 export type PermissionSetPayload = z.infer<typeof PermissionSetPayloadSchema>;
 export type AttachmentUploadPayload = z.infer<typeof AttachmentUploadPayloadSchema>;
@@ -434,6 +478,8 @@ export const CommandEnvelopeSchema = z.discriminatedUnion("type", [
   CommandEnvelope("approval.decide", ApprovalDecidePayloadSchema),
   CommandEnvelope("session.archive", SessionArchivePayloadSchema),
   CommandEnvelope("session.model", SessionModelPayloadSchema),
+  CommandEnvelope("workspace.rename", WorkspaceRenamePayloadSchema),
+  CommandEnvelope("workspace.delete", WorkspaceDeletePayloadSchema),
   CommandEnvelope("model.catalog", StrictObject({})),
   CommandEnvelope("command.execute", CommandExecutePayloadSchema),
   CommandEnvelope("permission.set", PermissionSetPayloadSchema),

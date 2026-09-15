@@ -3,6 +3,9 @@
 这个压缩包用于把本地 Bridge 和 Connector 放在 `~/DSH-ANYWHERE`，避免 macOS
 阻止 launchd 执行 `~/Documents` 里的脚本。
 
+当前修复包为 `DSH-ANYWHERE-MAC-LOCAL-20260914-r12.zip`。它必须替换旧的 r11，
+因为附件上传超时和“图片有、文字丢失”的修复在本机 Connector/插件中。
+
 ## 已经注册过这台 Mac
 
 不要直接解压到 `~`，否则会触发大量同名文件覆盖提示。升级时先解压到临时目录，再同步到固定安装目录：

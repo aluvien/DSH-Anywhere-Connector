@@ -150,7 +150,18 @@ public struct DSHCommand: Codable, Sendable, Equatable {
             "text": .string(text),
             "mode": .string(mode)
         ]
-        if !attachments.isEmpty { payload["content"] = .array(attachments) }
+        if !attachments.isEmpty {
+            // The Harness treats `content` as the canonical multipart prompt.
+            // Keep the text in that same array; sending it only beside a file
+            // reference makes the bridge accept the upload while silently
+            // dropping the text part.
+            var content: [DSHJSONValue] = []
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                content.append(.object(["type": .string("text"), "text": .string(text)]))
+            }
+            content.append(contentsOf: attachments)
+            payload["content"] = .array(content)
+        }
         return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
                           sessionId: sessionId, type: "prompt.send", payload: .object(payload))
     }
@@ -159,6 +170,17 @@ public struct DSHCommand: Codable, Sendable, Equatable {
                                     includeArchived: Bool = false) -> DSHCommand {
         DSHCommand(deviceId: deviceId, machineId: machineId, type: "session.list",
                    payload: .object(["includeArchived": .bool(includeArchived)]))
+    }
+
+    /// Requests the durable transcript for one existing session. The Connector
+    /// asks the Mac bridge to inspect that session and forwards the normalized
+    /// history as ordinary transcript events over the existing socket.
+    public static func openSession(deviceId: String, machineId: String,
+                                   sessionId: String,
+                                   requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   sessionId: sessionId, type: "session.open",
+                   payload: .object(["sessionId": .string(sessionId)]))
     }
 
     public static func archiveSession(deviceId: String, machineId: String, sessionId: String,
@@ -175,6 +197,23 @@ public struct DSHCommand: Codable, Sendable, Equatable {
         if let reasoningEffort { payload["reasoningEffort"] = .string(reasoningEffort) }
         return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
                           sessionId: sessionId, type: "session.model", payload: .object(payload))
+    }
+
+    public static func renameWorkspace(deviceId: String, machineId: String,
+                                       workspaceId: String, title: String,
+                                       requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   type: "workspace.rename",
+                   payload: .object(["workspaceId": .string(workspaceId),
+                                     "title": .string(title)]))
+    }
+
+    public static func deleteWorkspace(deviceId: String, machineId: String,
+                                       workspaceId: String,
+                                       requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   type: "workspace.delete",
+                   payload: .object(["workspaceId": .string(workspaceId)]))
     }
 
     public static func modelCatalog(deviceId: String, machineId: String,
@@ -326,11 +365,15 @@ public struct DSHPairingLink: Equatable, Sendable {
 private enum DSHTranscriptArrival {
     case message(DSHChatMessage)
     case tool(DSHToolActivity)
+    case command(DSHCommandResult)
+    case modelChange(DSHModelChangeNotice)
 
     var sequence: Int64 {
         switch self {
         case .message(let message): return message.sequence ?? 0
         case .tool(let tool): return tool.sequence ?? 0
+        case .command(let result): return result.sequence ?? 0
+        case .modelChange(let notice): return notice.sequence
         }
     }
 
@@ -395,11 +438,15 @@ public enum DSHLocalization {
 public enum DSHTranscriptEntry: Identifiable, Sendable, Equatable {
     case turn(DSHTranscriptBlock)
     case tool(DSHToolActivity)
+    case command(DSHCommandResult)
+    case modelChange(DSHModelChangeNotice)
 
     public var id: String {
         switch self {
         case .turn(let block): return "turn-\(block.id)"
         case .tool(let tool): return "tool-\(tool.id)"
+        case .command(let result): return "command-\(result.id)"
+        case .modelChange(let notice): return "model-change-\(notice.id)"
         }
     }
 
@@ -407,6 +454,8 @@ public enum DSHTranscriptEntry: Identifiable, Sendable, Equatable {
         switch self {
         case .turn(let block): return block.sequence
         case .tool(let tool): return tool.sequence ?? 0
+        case .command(let result): return result.sequence ?? 0
+        case .modelChange(let notice): return notice.sequence
         }
     }
 }
@@ -417,7 +466,9 @@ public extension Array where Element == DSHChatMessage {
     /// Rendering them as two separate runs put every tool call after every
     /// message, which is not the order the turn happened in: in reality the
     /// model writes, calls a tool, writes again, and so on.
-    func transcriptEntries(with tools: [DSHToolActivity]) -> [DSHTranscriptEntry] {
+    func transcriptEntries(with tools: [DSHToolActivity],
+                           commandResults: [DSHCommandResult] = [],
+                           modelChanges: [DSHModelChangeNotice] = []) -> [DSHTranscriptEntry] {
         // Stable by construction: a tie keeps arrival order. Sorting on the
         // sequence alone is not enough, because state persisted before
         // sequences existed carries none, and any arbitrary tie-break (id
@@ -425,6 +476,8 @@ public extension Array where Element == DSHChatMessage {
         var ordered: [(order: Int, arrival: DSHTranscriptArrival)] = []
         for message in self { ordered.append((ordered.count, .message(message))) }
         for tool in tools { ordered.append((ordered.count, .tool(tool))) }
+        for result in commandResults { ordered.append((ordered.count, .command(result))) }
+        for notice in modelChanges { ordered.append((ordered.count, .modelChange(notice))) }
         ordered.sort { left, right in
             left.arrival.sequence == right.arrival.sequence
                 ? left.order < right.order
@@ -456,6 +509,16 @@ public extension Array where Element == DSHChatMessage {
                 // them to the end — the very clumping this ordering is for.
                 flushRun()
                 entries.append(.tool(tool))
+            case .command(let result):
+                // Command acknowledgements are transcript content too. Keep
+                // them at the event's original sequence instead of rendering
+                // a second array after all messages (which pinned every
+                // "Command completed" card to the bottom of the conversation).
+                flushRun()
+                entries.append(.command(result))
+            case .modelChange(let notice):
+                flushRun()
+                entries.append(.modelChange(notice))
             }
         }
         flushRun()
@@ -577,6 +640,9 @@ public struct DSHSessionSummary: Codable, Sendable, Equatable, Identifiable {
     public var running: Bool?
     public var blank: Bool?
     public var parentSessionId: String?
+    public var agentPreset: String?
+    public var mode: String?
+    public var branch: String?
     public var provider: String?
     public var model: String?
     public var reasoningEffort: String?
@@ -588,11 +654,13 @@ public struct DSHSessionSummary: Codable, Sendable, Equatable, Identifiable {
                 archived: Bool? = nil, running: Bool? = nil, blank: Bool? = nil,
                 parentSessionId: String? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, permissionMode: String? = nil,
+                agentPreset: String? = nil, mode: String? = nil, branch: String? = nil,
                 usage: DSHSessionUsage? = nil) {
         self.id = id; self.title = title; self.updatedAt = updatedAt
         self.cwd = cwd; self.workspaceId = workspaceId; self.workspaceName = workspaceName
         self.archived = archived; self.running = running; self.blank = blank
-        self.parentSessionId = parentSessionId; self.provider = provider; self.model = model
+        self.parentSessionId = parentSessionId; self.agentPreset = agentPreset; self.mode = mode; self.branch = branch
+        self.provider = provider; self.model = model
         self.reasoningEffort = reasoningEffort; self.permissionMode = permissionMode; self.usage = usage
     }
 }
@@ -689,10 +757,34 @@ public struct DSHModelCatalog: Codable, Sendable, Equatable {
 
 public enum DSHMessageRole: String, Codable, Sendable { case user, assistant, system, tool }
 
+/// Metadata for a file/image that belongs to a chat message. The bytes are
+/// kept in the app's local thumbnail cache; the wire event only carries the
+/// receipt/name so a reconnect does not duplicate a large base64 payload.
+public struct DSHMessageAttachment: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let name: String
+    public let mediaType: String?
+    public let receiptId: String?
+
+    public init(id: String, name: String, mediaType: String? = nil, receiptId: String? = nil) {
+        self.id = id
+        self.name = name
+        self.mediaType = mediaType
+        self.receiptId = receiptId
+    }
+
+    public var isImage: Bool {
+        if mediaType?.lowercased().hasPrefix("image/") == true { return true }
+        let ext = (name as NSString).pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "heic", "webp", "gif"].contains(ext)
+    }
+}
+
 public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let role: DSHMessageRole
     public var markdown: String
+    public var attachments: [DSHMessageAttachment]
     public var usage: DSHSessionUsage?
     public var provider: String?
     public var model: String?
@@ -705,13 +797,36 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public var sequence: Int64?
 
     public init(id: String, role: DSHMessageRole, markdown: String,
+                attachments: [DSHMessageAttachment] = [],
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, contextWindow: Double? = nil,
                 reasoning: String? = nil, sequence: Int64? = nil) {
-        self.id = id; self.role = role; self.markdown = markdown; self.usage = usage
+        self.id = id; self.role = role; self.markdown = markdown; self.attachments = attachments; self.usage = usage
         self.provider = provider; self.model = model; self.reasoningEffort = reasoningEffort
         self.contextWindow = contextWindow; self.reasoning = reasoning
         self.sequence = sequence
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, role, markdown, attachments, usage, provider, model,
+             reasoningEffort, contextWindow, reasoning, sequence
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        role = try container.decode(DSHMessageRole.self, forKey: .role)
+        markdown = try container.decode(String.self, forKey: .markdown)
+        // Older Relay/Connector builds did not include this field.
+        attachments = try container.decodeIfPresent([DSHMessageAttachment].self,
+                                                     forKey: .attachments) ?? []
+        usage = try container.decodeIfPresent(DSHSessionUsage.self, forKey: .usage)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        contextWindow = try container.decodeIfPresent(Double.self, forKey: .contextWindow)
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
+        sequence = try container.decodeIfPresent(Int64.self, forKey: .sequence)
     }
 }
 
@@ -735,9 +850,11 @@ public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
     public var sequence: Int64 { messages.first?.sequence ?? 0 }
 
     /// Answers in order. An empty markdown only happens when reasoning arrived
-    /// before the streamed text, so it must not produce an empty bubble.
+    /// before the streamed text, so it must not produce an empty bubble. A
+    /// user message can legitimately have no text when it contains only an
+    /// image/file; keep those rows so the attachment thumbnail is visible.
     public var visibleMessages: [DSHChatMessage] {
-        messages.filter { !$0.markdown.isEmpty }
+        messages.filter { !$0.markdown.isEmpty || !$0.attachments.isEmpty }
     }
 
     /// Every reasoning fragment this turn produced, in arrival order.
@@ -783,6 +900,43 @@ public struct DSHSessionMetadataUpdate: Codable, Sendable, Equatable {
     }
 }
 
+/// A compact, inline transcript marker emitted when a session changes model.
+/// `sequence` is assigned from the enclosing Relay envelope and never travels
+/// over the wire as part of the payload.
+public struct DSHModelChangeNotice: Codable, Sendable, Equatable, Identifiable {
+    public let sessionId: String
+    public let previous: DSHModelSelection?
+    public let current: DSHModelSelection
+    public var sequence: Int64
+    public var timestamp: Int64
+
+    public var id: String {
+        "\(sessionId)-\(sequence)-\(current.provider)-\(current.model)"
+    }
+
+    public init(sessionId: String, previous: DSHModelSelection? = nil,
+                current: DSHModelSelection, sequence: Int64 = 0,
+                timestamp: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)) {
+        self.sessionId = sessionId
+        self.previous = previous
+        self.current = current
+        self.sequence = sequence
+        self.timestamp = timestamp
+    }
+
+    private enum CodingKeys: String, CodingKey { case sessionId, previous, current, sequence, timestamp }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        previous = try container.decodeIfPresent(DSHModelSelection.self, forKey: .previous)
+        current = try container.decode(DSHModelSelection.self, forKey: .current)
+        sequence = try container.decodeIfPresent(Int64.self, forKey: .sequence) ?? 0
+        timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
+            ?? Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+}
+
 public struct DSHCommandResult: Codable, Sendable, Equatable, Identifiable {
     public let sessionId: String
     public let requestId: String
@@ -790,11 +944,17 @@ public struct DSHCommandResult: Codable, Sendable, Equatable, Identifiable {
     public let commandId: String?
     public let kind: String?
     public let text: String?
+    /// Sequence is assigned by the event reducer from the enclosing event.
+    /// The relay payload predates this field, so it remains optional on the
+    /// wire while still allowing command acknowledgements to be interleaved
+    /// with messages and tool calls in the transcript.
+    public var sequence: Int64?
     public var id: String { requestId }
     public init(sessionId: String, requestId: String, matched: Bool,
-                commandId: String? = nil, kind: String? = nil, text: String? = nil) {
+                commandId: String? = nil, kind: String? = nil, text: String? = nil,
+                sequence: Int64? = nil) {
         self.sessionId = sessionId; self.requestId = requestId; self.matched = matched
-        self.commandId = commandId; self.kind = kind; self.text = text
+        self.commandId = commandId; self.kind = kind; self.text = text; self.sequence = sequence
     }
 }
 
@@ -913,6 +1073,21 @@ public struct DSHReasoning: Codable, Sendable, Equatable {
     public init(messageId: String, text: String) { self.messageId = messageId; self.text = text }
 }
 
+/// An error correlated to the command that caused it.  Connector errors use
+/// the command request id as the envelope message id, so the composer can stop
+/// waiting immediately instead of reporting a generic attachment timeout.
+public struct DSHProtocolError: Codable, Sendable, Equatable {
+    public let code: String
+    public let message: String
+    public let retryable: Bool
+
+    public init(code: String, message: String, retryable: Bool = false) {
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+    }
+}
+
 public struct DSHTurnState: Codable, Sendable, Equatable {
     public let sessionId: String
     public let state: String
@@ -921,6 +1096,11 @@ public struct DSHTurnState: Codable, Sendable, Equatable {
 }
 
 public enum DSHEventKind: Sendable, Equatable {
+    /// Phone-to-Relay socket state. This is deliberately separate from Mac
+    /// presence: the Relay can remain reachable after the Connector goes away.
+    case transportState(DSHConnectionState)
+    /// Live Relay presence for the paired Mac Connector.
+    case machinePresence(Bool)
     case connectionReady
     case sessionSnapshot([DSHSessionSummary])
     case sessionCreated(DSHSessionSummary)
@@ -936,11 +1116,13 @@ public enum DSHEventKind: Sendable, Equatable {
     case usageUpdated(DSHUsageUpdate)
     case permissionUpdated(DSHPermissionUpdate)
     case sessionMetadataUpdated(DSHSessionMetadataUpdate)
+    case modelChanged(DSHModelChangeNotice)
     case commandResult(DSHCommandResult)
     case attachmentUploaded(DSHUploadedAttachment)
     case assistantReasoning(DSHReasoning)
     case questionAsked(DSHQuestionRequest)
     case questionResolved(DSHQuestionResolution)
+    case protocolError(DSHProtocolError)
     case unknown
 }
 
@@ -964,6 +1146,8 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
 
     private static func decodeKind(type: String, payload: DSHJSONValue) -> DSHEventKind {
         switch type {
+        case "transport.state": return decode(DSHConnectionState.self, payload).map(DSHEventKind.transportState) ?? .unknown
+        case "machine.presence": return decode(Bool.self, payload).map(DSHEventKind.machinePresence) ?? .unknown
         case "connection.ready": return .connectionReady
         case "session.snapshot": return decode([DSHSessionSummary].self, payload).map(DSHEventKind.sessionSnapshot) ?? .unknown
         case "session.created": return decode(DSHSessionSummary.self, payload).map(DSHEventKind.sessionCreated) ?? .unknown
@@ -979,11 +1163,13 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "usage.updated": return decode(DSHUsageUpdate.self, payload).map(DSHEventKind.usageUpdated) ?? .unknown
         case "permission.updated": return decode(DSHPermissionUpdate.self, payload).map(DSHEventKind.permissionUpdated) ?? .unknown
         case "session.metadata.updated": return decode(DSHSessionMetadataUpdate.self, payload).map(DSHEventKind.sessionMetadataUpdated) ?? .unknown
+        case "session.model.changed": return decode(DSHModelChangeNotice.self, payload).map(DSHEventKind.modelChanged) ?? .unknown
         case "command.result": return decode(DSHCommandResult.self, payload).map(DSHEventKind.commandResult) ?? .unknown
         case "attachment.uploaded": return decode(DSHUploadedAttachment.self, payload).map(DSHEventKind.attachmentUploaded) ?? .unknown
         case "assistant.reasoning": return decode(DSHReasoning.self, payload).map(DSHEventKind.assistantReasoning) ?? .unknown
         case "question.asked": return decode(DSHQuestionRequest.self, payload).map(DSHEventKind.questionAsked) ?? .unknown
         case "question.resolved": return decode(DSHQuestionResolution.self, payload).map(DSHEventKind.questionResolved) ?? .unknown
+        case "protocol.error": return decode(DSHProtocolError.self, payload).map(DSHEventKind.protocolError) ?? .unknown
         default: return .unknown
         }
     }

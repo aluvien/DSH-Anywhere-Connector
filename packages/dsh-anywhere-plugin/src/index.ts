@@ -11,6 +11,7 @@ import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-use
 import { WebSocket, WebSocketServer } from 'ws'
 import {
   AttachmentUploadPayloadSchema,
+  ChatAttachmentSchema,
   CommandExecutePayloadSchema,
   EventEnvelopeSchema,
   ModelCatalogPayloadSchema,
@@ -43,6 +44,11 @@ export const name = 'dsh-anywhere-native-bridge'
  * own event, so a transcript row for them is noise that never clears.
  */
 const COMMAND_RESULT_SUPPRESSED = new Set(['permission', 'permissions', 'model'])
+// A targeted open should make an existing conversation useful immediately,
+// without turning a tap into an unbounded replay on the phone. We still walk
+// the complete durable log to build session-wide usage; only the newest rows
+// are sent over the wire.
+const HISTORY_EVENT_LIMIT = 1_000
 
 export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway']
 
@@ -118,6 +124,8 @@ interface NativeContext extends Context {
   readonly sessionController: {
     list(request: Record<string, never>, signal: AbortSignal): Promise<{ items: unknown[] }>
     create(request: { cwd?: string; workspaceId?: string; agentPreset?: string; model?: { provider: string; model: string; reasoningEffort?: string }}): Promise<{ sessionId: string; agentPreset?: string }>
+    /** Available in current Harness builds; optional for older connectors. */
+    rename?(request: { sessionId: string; title: string }): Promise<unknown>
     selectModel(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<unknown>
     modelCatalog(): Promise<unknown>
     resolveAgent(sessionId: string): Promise<{ agent: unknown } | { error: unknown }>
@@ -133,6 +141,8 @@ interface NativeContext extends Context {
   }
   readonly workspaceRegistry?: {
     list(): readonly { id: string; path: string; title: string; sessionIds: readonly string[] }[]
+    get?(id: string): { id: string; path: string; title: string; sessionIds: readonly string[]; setTitle?(title: string): Promise<void> } | undefined
+    delete?(id: string): Promise<boolean>
     readonly archivedSessionIds: readonly string[]
     archiveSession(sessionId: string): Promise<void>
     unarchiveSession?(sessionId: string): Promise<void>
@@ -152,15 +162,17 @@ interface JsonObject {
 type PermissionMode = 'ask' | 'never' | 'read-only' | 'workspace-write' | 'danger-full-access'
 
 /**
- * UI-only metadata that is intentionally kept outside the Harness session log.
- * The workspace package owns the canonical archive set; this store keeps the
- * connector's per-device presentation choices (and supports unarchive on older
- * Harness builds that only expose archiveSession()).
+ * Small presentation metadata that is intentionally kept outside the Harness
+ * session log. The workspace package owns the canonical archive set; this
+ * store keeps per-session fallbacks for older Harness builds and mobile-only
+ * title/branch choices.
  */
 class SessionMetadataStore {
   private archived = new Set<string>()
   private unarchived = new Set<string>()
   private permissions = new Map<string, PermissionMode>()
+  private titles = new Map<string, string>()
+  private branches = new Map<string, string>()
   readonly ready: Promise<void>
 
   constructor(private readonly path: string) {
@@ -174,6 +186,14 @@ class SessionMetadataStore {
 
   permission(sessionId: string): PermissionMode | undefined {
     return this.permissions.get(sessionId)
+  }
+
+  title(sessionId: string): string | undefined {
+    return this.titles.get(sessionId)
+  }
+
+  branch(sessionId: string): string | undefined {
+    return this.branches.get(sessionId)
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -196,6 +216,20 @@ class SessionMetadataStore {
     await this.persist()
   }
 
+  async setTitle(sessionId: string, title: string): Promise<void> {
+    const trimmed = title.trim().slice(0, 512)
+    if (trimmed.length === 0) return
+    this.titles.set(sessionId, trimmed)
+    await this.persist()
+  }
+
+  async setBranch(sessionId: string, branch: string): Promise<void> {
+    const trimmed = branch.trim().slice(0, 512)
+    if (trimmed.length === 0) return
+    this.branches.set(sessionId, trimmed)
+    await this.persist()
+  }
+
   private async load(): Promise<void> {
     try {
       const parsed = JSON.parse(await readFile(this.path, 'utf8')) as JsonObject
@@ -207,6 +241,18 @@ class SessionMetadataStore {
       if (typeof permissions === 'object' && permissions !== null && !Array.isArray(permissions)) {
         for (const [id, mode] of Object.entries(permissions)) {
           if (isPermissionMode(mode)) this.permissions.set(id, mode)
+        }
+      }
+      const titles = parsed.titles
+      if (typeof titles === 'object' && titles !== null && !Array.isArray(titles)) {
+        for (const [id, title] of Object.entries(titles)) {
+          if (typeof title === 'string' && title.trim().length > 0) this.titles.set(id, title.trim().slice(0, 512))
+        }
+      }
+      const branches = parsed.branches
+      if (typeof branches === 'object' && branches !== null && !Array.isArray(branches)) {
+        for (const [id, branch] of Object.entries(branches)) {
+          if (typeof branch === 'string' && branch.trim().length > 0) this.branches.set(id, branch.trim().slice(0, 512))
         }
       }
     } catch {
@@ -221,6 +267,8 @@ class SessionMetadataStore {
       archived: [...this.archived],
       unarchived: [...this.unarchived],
       permissions: Object.fromEntries(this.permissions),
+      titles: Object.fromEntries(this.titles),
+      branches: Object.fromEntries(this.branches),
     }, null, 2), { mode: 0o600 })
   }
 }
@@ -229,8 +277,8 @@ function isPermissionMode(value: unknown): value is PermissionMode {
   return value === 'ask' || value === 'never' || value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access'
 }
 
-function isPermissionPreset(value: PermissionMode): value is 'workspace-write' | 'danger-full-access' {
-  return value === 'workspace-write' || value === 'danger-full-access'
+function isPermissionPreset(value: PermissionMode): value is 'read-only' | 'workspace-write' | 'danger-full-access' {
+  return value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access'
 }
 
 function metadataPath(): string {
@@ -549,20 +597,60 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           const items = await listSummaries(ctx, metadata, false)
           publish({ deviceId: device.id, type: 'session.snapshot', payload: items }, [client])
           await publishModelCatalog(ctx, publish, device.id)
+          // Seed the live model projection from the authoritative snapshot
+          // before the resume fast-path below. Existing sessions may not emit
+          // a fresh model/selection record until the user changes the model;
+          // without this seed, that first explicit switch looked like initial
+          // setup and never produced the inline conversation notice.
+          for (const item of items) {
+            const summary = normalizeSessionSummary(item, ctx, metadata)
+            if (summary.provider !== undefined && summary.model !== undefined) {
+              modelSelections.set(summary.id, {
+                provider: summary.provider,
+                model: summary.model,
+                ...(summary.reasoningEffort === undefined ? {} : { reasoningEffort: summary.reasoningEffort }),
+              })
+            }
+          }
           if (after !== 0) return
           let remaining = 1_000
           for (const item of items.slice(0, 25)) {
             if (remaining <= 0 || client.readyState !== WebSocket.OPEN) break
             const summary = normalizeSessionSummary(item, ctx, metadata)
             const inspection = await ctx.sessionController.inspect(summary.id, AbortSignal.timeout(15_000))
-            const recent = inspection.events.slice(-Math.min(200, remaining))
+            const allEvents = inspection.events
+            const recentCount = Math.min(200, remaining)
+            const recentStart = Math.max(0, allEvents.length - recentCount)
             const historyToolNames = new Map<string, string>()
-            const historyUsageCounters = new Map<string, { rounds: number; steps: number; contextWindow?: number }>()
-            for (const event of recent) {
-              const normalized = normalizeSessionEvents(summary.id, event, historyToolNames, historyUsageCounters)
-              for (const next of normalized) publish({ ...next, deviceId: device.id }, [client])
+            const historyUsageCounters = new Map<string, UsageCounter>()
+            const historyModelSelections = new Map<string, ModelSelectionProjection>()
+            let publishedUsage = false
+            for (let index = 0; index < allEvents.length; index += 1) {
+              const event = allEvents[index]
+              const normalized = normalizeSessionEvents(summary.id, event, historyToolNames, historyUsageCounters, historyModelSelections)
+              if (index < recentStart) continue
+              for (const next of normalized) {
+                if (next.type === 'usage.updated') publishedUsage = true
+                publish({ ...next, deviceId: device.id }, [client])
+              }
             }
-            remaining -= recent.length
+            // The phone only needs recent message/tool rows, but the footer
+            // must include the complete durable session. Processing all events
+            // above builds that accumulator without flooding a fresh client
+            // with thousands of historical transcript cards.
+            const completeUsage = historyUsageCounters.get(summary.id)
+            if (!publishedUsage && completeUsage !== undefined && hasUsage(completeUsage)) {
+              publish({
+                deviceId: device.id,
+                sessionId: summary.id,
+                type: 'usage.updated',
+                payload: {
+                  sessionId: summary.id,
+                  usage: { ...usageSnapshot(completeUsage), rounds: completeUsage.rounds, steps: completeUsage.steps },
+                },
+              }, [client])
+            }
+            remaining -= recentCount
           }
         })().catch((error: unknown) => {
           publish({
@@ -580,9 +668,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   })
 
   const toolNames = new Map<string, string>()
-  const usageCounters = new Map<string, { rounds: number; steps: number }>()
+  const usageCounters = new Map<string, UsageCounter>()
+  // The Harness emits model/selection records without the previous value. A
+  // small in-memory projection lets the bridge turn a real mid-session switch
+  // into a transcript event while ignoring the initial selection.
+  const modelSelections = new Map<string, ModelSelectionProjection>()
   ctx.on('session/event' as never, ((session: { id: string }, event: unknown) => {
-    const normalized = normalizeSessionEvents(session.id, event, toolNames, usageCounters)
+    const normalized = normalizeSessionEvents(session.id, event, toolNames, usageCounters, modelSelections)
     for (const next of normalized) publish(next)
   }) as never, { global: true })
 
@@ -773,6 +865,17 @@ async function handleHttp(
     json(res, 200, { items: await listSummaries(ctx, metadata, includeArchived) })
     return
   }
+
+  const openMatch = /^\/sessions\/([^/]+)\/open$/.exec(path)
+  if (req.method === 'POST' && openMatch !== null) {
+    const sessionId = decodeURIComponent(openMatch[1]!)
+    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === sessionId)
+    if (summary === undefined) throw new HttpError(404, 'session not found')
+    await publishSessionHistory(ctx, summary, device.id, publish)
+    json(res, 202, { accepted: true, sessionId })
+    return
+  }
+
   if (req.method === 'GET' && path === '/models') {
     json(res, 200, await ctx.sessionController.modelCatalog())
     return
@@ -782,16 +885,46 @@ async function handleHttp(
     const cwd = optionalStringOf(body.cwd)
     const workspaceId = optionalStringOf(body.workspaceId)
     const agentPreset = optionalStringOf(body.agentPreset)
+    const requestedTitle = optionalStringOf(body.title)?.trim().slice(0, 512)
+    const requestedBranch = optionalStringOf(body.branch)?.trim().slice(0, 512)
+    const model = body.model === undefined ? undefined : modelSelectionOf(body.model)
+    const permissionMode = body.permissionMode === undefined
+      ? undefined
+      : permissionModeOf(body.permissionMode)
+    if (permissionMode !== undefined && !isPermissionPreset(permissionMode)) {
+      throw new HttpError(400, 'Harness permission presets are read-only, workspace-write and danger-full-access')
+    }
     const result = await ctx.sessionController.create({
       ...(cwd === undefined ? {} : { cwd }),
       ...(workspaceId === undefined ? {} : { workspaceId }),
       ...(agentPreset === undefined ? {} : { agentPreset }),
+      ...(model === undefined ? {} : { model }),
     })
-    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === result.sessionId)
-    if (body.model !== undefined) {
-      const model = modelSelectionOf(body.model)
-      await ctx.sessionController.selectModel({ sessionId: result.sessionId, ...model })
+    // `SessionCreateRequest` deliberately contains only cwd/workspace/preset;
+    // title is a separate native rename operation and branch is a presentation
+    // hint that older Harness builds do not persist in the header. Keep both in
+    // connector metadata so a newly-created session is immediately useful on
+    // the phone, while still using the native rename API when it is available.
+    await metadata.setTitle(result.sessionId, requestedTitle && requestedTitle.length > 0 ? requestedTitle : '新会话')
+    if (requestedBranch && requestedBranch.length > 0) await metadata.setBranch(result.sessionId, requestedBranch)
+    if (requestedTitle && requestedTitle.length > 0 && ctx.sessionController.rename !== undefined) {
+      try {
+        await ctx.sessionController.rename({ sessionId: result.sessionId, title: requestedTitle })
+      } catch {
+        // The metadata projection remains the fallback for older Harness builds.
+      }
     }
+    // Older Harness versions ignore `model` during create. Repeating the
+    // selection is harmless and keeps those versions aligned with the new
+    // session sheet.
+    if (model !== undefined) await ctx.sessionController.selectModel({ sessionId: result.sessionId, ...model })
+    if (permissionMode !== undefined) {
+      const permissionResult = await executeCommand(ctx, result.sessionId, `/permission ${permissionMode}`, [])
+      const failure = remoteFailureOf(permissionResult)
+      if (failure !== undefined) throw new HttpError(502, failure)
+      await metadata.setPermission(result.sessionId, permissionMode)
+    }
+    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === result.sessionId)
     json(res, 201, { ...result, ...(summary === undefined ? {} : { summary }) })
     return
   }
@@ -814,8 +947,17 @@ async function handleHttp(
     // Attachments have to sit inside `content`: that is where the Harness looks
     // for receipt ids to bind to the message. Sending them in a field of their
     // own is what made the file arrive without the text that accompanied it.
-    const content = parsed.data.content
-      ?? [...(text.length === 0 ? [] : [{ type: 'text' as const, text }]), ...(parsed.data.attachments ?? [])]
+    const declaredContent = parsed.data.content
+    const content = declaredContent === undefined
+      ? [...(text.length === 0 ? [] : [{ type: 'text' as const, text }]), ...(parsed.data.attachments ?? [])]
+      : [
+          // Be tolerant of older clients that put text in `text` and files in
+          // `content`. The Harness only reads the canonical content array.
+          ...(text.length === 0 || declaredContent.some((part) => part.type === 'text' && part.text === text)
+            ? []
+            : [{ type: 'text' as const, text }]),
+          ...declaredContent,
+        ]
     const result = await ctx.sessionController.prompt({
       requestId,
       sessionId: decodeURIComponent(promptMatch[1]!),
@@ -848,6 +990,43 @@ async function handleHttp(
     return
   }
 
+  const workspaceRenameMatch = /^\/workspaces\/([^/]+)\/rename$/.exec(path)
+  if (req.method === 'POST' && workspaceRenameMatch !== null) {
+    const workspaceId = decodeURIComponent(workspaceRenameMatch[1]!)
+    const title = optionalStringOf(objectOf(await readJson(req)).title)?.trim()
+    if (title === undefined || title.length === 0) throw new HttpError(400, 'workspace title is required')
+    const registry = workspaceRegistryOf(ctx)
+    const workspace = registry?.get?.(workspaceId)
+    if (workspace === undefined || workspace.setTitle === undefined) {
+      throw new HttpError(404, 'workspace not found')
+    }
+    await workspace.setTitle(title.slice(0, 512))
+    json(res, 202, { accepted: true, workspaceId, title: title.slice(0, 512) })
+    return
+  }
+
+  const workspaceDeleteMatch = /^\/workspaces\/([^/]+)\/delete$/.exec(path)
+  if (req.method === 'POST' && workspaceDeleteMatch !== null) {
+    const workspaceId = decodeURIComponent(workspaceDeleteMatch[1]!)
+    const registry = workspaceRegistryOf(ctx)
+    const workspace = registry?.get?.(workspaceId)
+    if (workspace === undefined || registry?.delete === undefined) {
+      throw new HttpError(404, 'workspace not found')
+    }
+    // Deleting a registration must not leave its sessions visible under a
+    // phantom project on the next list refresh. Archive the member logs first,
+    // then remove only the durable workspace record; the source directories and
+    // session history remain untouched on disk.
+    for (const sessionId of workspace.sessionIds) {
+      await registry.archiveSession(sessionId)
+      await metadata.setArchived(sessionId, true)
+    }
+    const deleted = await registry.delete(workspaceId)
+    if (!deleted) throw new HttpError(404, 'workspace not found')
+    json(res, 202, { accepted: true, workspaceId })
+    return
+  }
+
   const modelMatch = /^\/sessions\/([^/]+)\/model$/.exec(path)
   if (req.method === 'POST' && modelMatch !== null) {
     const model = modelSelectionOf(await readJson(req))
@@ -863,7 +1042,7 @@ async function handleHttp(
     const mode = permissionModeOf(body.mode)
     const sessionId = decodeURIComponent(permissionMatch[1]!)
     if (!isPermissionPreset(mode)) {
-      throw new HttpError(400, 'Harness permission presets are workspace-write and danger-full-access')
+      throw new HttpError(400, 'Harness permission presets are read-only, workspace-write and danger-full-access')
     }
     // Harness persists a preset as sandbox mode plus approval policy. Calling
     // its native command keeps the actual sandbox aligned with the mobile UI.
@@ -939,6 +1118,63 @@ async function listSummaries(
     // 40 rows were subagents in practice, each titled with its task prompt.
     .filter((item) => !isSubagentSession(item))
   return includeArchived ? summaries : summaries.filter((item) => item.archived !== true)
+}
+
+/**
+ * Inspect one durable Harness session and publish its history as ordinary
+ * transcript events. The Connector receives these on the same bridge socket
+ * as live output, so iOS does not need a second history transport or a local
+ * copy of the Harness storage format.
+ */
+async function publishSessionHistory(
+  ctx: NativeContext,
+  session: ReturnType<typeof normalizeSessionSummary>,
+  deviceId: string,
+  publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
+  recipients?: Iterable<WebSocket>,
+): Promise<number> {
+  const inspection = await ctx.sessionController.inspect(session.id, AbortSignal.timeout(60_000))
+  const allEvents = inspection.events
+  const recentCount = Math.min(HISTORY_EVENT_LIMIT, allEvents.length)
+  const recentStart = Math.max(0, allEvents.length - recentCount)
+  const historyToolNames = new Map<string, string>()
+  const historyUsageCounters = new Map<string, UsageCounter>()
+  const historyModelSelections = new Map<string, ModelSelectionProjection>()
+  let published = 0
+  let publishedUsage = false
+
+  for (let index = 0; index < allEvents.length; index += 1) {
+    const normalized = normalizeSessionEvents(
+      session.id,
+      allEvents[index],
+      historyToolNames,
+      historyUsageCounters,
+      historyModelSelections,
+    )
+    if (index < recentStart) continue
+    for (const next of normalized) {
+      if (next.type === 'usage.updated') publishedUsage = true
+      publish({ ...next, deviceId }, recipients)
+      published += 1
+    }
+  }
+
+  // If the recent window did not contain a usage event, send the complete
+  // session aggregate so the footer remains correct after opening an old log.
+  const completeUsage = historyUsageCounters.get(session.id)
+  if (!publishedUsage && completeUsage !== undefined && hasUsage(completeUsage)) {
+    publish({
+      deviceId,
+      sessionId: session.id,
+      type: 'usage.updated',
+      payload: {
+        sessionId: session.id,
+        usage: { ...usageSnapshot(completeUsage), rounds: completeUsage.rounds, steps: completeUsage.steps },
+      },
+    }, recipients)
+    published += 1
+  }
+  return published
 }
 
 /**
@@ -1095,6 +1331,9 @@ export function normalizeSessionSummary(
   running?: boolean
   blank?: boolean
   parentSessionId?: string
+  agentPreset?: string
+  mode?: string
+  branch?: string
   provider?: string
   model?: string
   reasoningEffort?: string
@@ -1105,11 +1344,12 @@ export function normalizeSessionSummary(
     ? item.sessionId
     : typeof item.id === 'string' ? item.id : 'unknown'
   const cwd = typeof item.cwd === 'string' ? item.cwd : undefined
-  const explicitTitle = sessionTitleOf(item)
+  const explicitTitle = metadata?.title(id) ?? sessionTitleOf(item)
   const workspace = workspaceFor(ctx, id, cwd)
   const selection = selectionFor(item)
   const permissionMode = metadata?.permission(id)
   const archived = item.archived === true || metadata?.isArchived(id, workspaceRegistryOf(ctx))
+  const branch = metadata?.branch(id) ?? (typeof item.branch === 'string' ? item.branch : undefined)
   return {
     id,
     title: explicitTitle ?? (cwd === undefined ? `Session ${id.slice(0, 8)}` : basename(cwd)),
@@ -1120,6 +1360,9 @@ export function normalizeSessionSummary(
     ...(typeof item.running === 'boolean' ? { running: item.running } : {}),
     ...(typeof item.blank === 'boolean' ? { blank: item.blank } : {}),
     ...(typeof item.parentSessionId === 'string' ? { parentSessionId: item.parentSessionId } : {}),
+    ...(typeof item.agentPreset === 'string' ? { agentPreset: item.agentPreset } : {}),
+    ...(typeof item.mode === 'string' ? { mode: item.mode } : {}),
+    ...(branch === undefined ? {} : { branch }),
     ...(item.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
     ...(selection === undefined ? {} : selection),
     ...(permissionMode === undefined ? {} : { permissionMode }),
@@ -1134,11 +1377,23 @@ function normalizeLiveSession(value: unknown, ctx?: NativeContext, metadata?: Se
   const parentSessionId = typeof session.parentSessionId === 'string'
     ? session.parentSessionId
     : typeof header.parentSessionId === 'string' ? header.parentSessionId : undefined
+  const agentPreset = typeof session.agentPreset === 'string'
+    ? session.agentPreset
+    : typeof header.agentPreset === 'string' ? header.agentPreset : undefined
+  const mode = typeof session.mode === 'string'
+    ? session.mode
+    : typeof header.mode === 'string' ? header.mode : undefined
+  const branch = typeof session.branch === 'string'
+    ? session.branch
+    : typeof header.branch === 'string' ? header.branch : undefined
   return normalizeSessionSummary({
     sessionId: typeof session.id === 'string' ? session.id : 'unknown',
     cwd: header.cwd,
     updatedAt: Date.now(),
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
+    ...(agentPreset === undefined ? {} : { agentPreset }),
+    ...(mode === undefined ? {} : { mode }),
+    ...(branch === undefined ? {} : { branch }),
     ...(session.origin === 'subagent' ? { origin: 'subagent' } : {}),
   }, ctx, metadata)
 }
@@ -1204,11 +1459,143 @@ export function normalizeSessionEvent(
   return normalizeSessionEvents(sessionId, value, toolNames)[0]
 }
 
+type ModelSelectionProjection = {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/**
+ * Usage shown in the footer is session-wide, while assistant/message usage is
+ * one turn. Keep the accumulator separate from the wire payload so the phone
+ * can show both without mistaking the latest turn for the whole conversation.
+ */
+type UsageCounter = {
+  rounds: number
+  steps: number
+  contextWindow?: number
+  contextUsed?: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  hasInputTokens: boolean
+  hasOutputTokens: boolean
+  hasTotalTokens: boolean
+  hasCacheReadTokens: boolean
+  hasCacheWriteTokens: boolean
+  seenMessageIds: Set<string>
+  tokensPerSecond?: number
+}
+
+function newUsageCounter(): UsageCounter {
+  return {
+    rounds: 0,
+    steps: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    hasInputTokens: false,
+    hasOutputTokens: false,
+    hasTotalTokens: false,
+    hasCacheReadTokens: false,
+    hasCacheWriteTokens: false,
+    seenMessageIds: new Set<string>(),
+  }
+}
+
+function usageCounterFor(map: Map<string, UsageCounter>, sessionId: string): UsageCounter {
+  const existing = map.get(sessionId)
+  if (existing !== undefined) return existing
+  const created = newUsageCounter()
+  map.set(sessionId, created)
+  return created
+}
+
+function aggregateUsage(counter: UsageCounter, usage: Record<string, number>, messageId: string): Record<string, number> {
+  // A reconnect can replay the same durable assistant event. Do not charge its
+  // tokens twice in the session footer, although the latest throughput/context
+  // hints are still refreshed below.
+  if (!counter.seenMessageIds.has(messageId)) {
+    counter.seenMessageIds.add(messageId)
+    if (typeof usage.inputTokens === 'number') {
+      counter.inputTokens += usage.inputTokens
+      counter.hasInputTokens = true
+    }
+    if (typeof usage.outputTokens === 'number') {
+      counter.outputTokens += usage.outputTokens
+      counter.hasOutputTokens = true
+    }
+    if (typeof usage.totalTokens === 'number') {
+      counter.totalTokens += usage.totalTokens
+      counter.hasTotalTokens = true
+    }
+    if (typeof usage.cacheReadTokens === 'number') {
+      counter.cacheReadTokens += usage.cacheReadTokens
+      counter.hasCacheReadTokens = true
+    }
+    if (typeof usage.cacheWriteTokens === 'number') {
+      counter.cacheWriteTokens += usage.cacheWriteTokens
+      counter.hasCacheWriteTokens = true
+    }
+  }
+  if (typeof usage.contextWindow === 'number') counter.contextWindow = usage.contextWindow
+  if (typeof usage.contextUsed === 'number') counter.contextUsed = usage.contextUsed
+  if (typeof usage.tokensPerSecond === 'number') counter.tokensPerSecond = usage.tokensPerSecond
+
+  return usageSnapshot(counter)
+}
+
+function hasUsage(counter: UsageCounter): boolean {
+  return counter.hasInputTokens || counter.hasOutputTokens || counter.hasTotalTokens
+    || counter.hasCacheReadTokens || counter.hasCacheWriteTokens
+}
+
+function usageSnapshot(counter: UsageCounter): Record<string, number> {
+  const result: Record<string, number> = {}
+  if (counter.hasInputTokens) result.inputTokens = counter.inputTokens
+  if (counter.hasOutputTokens) result.outputTokens = counter.outputTokens
+  if (counter.hasTotalTokens) {
+    result.totalTokens = counter.totalTokens
+  } else if (counter.hasInputTokens || counter.hasOutputTokens) {
+    // Some adapters omit totalTokens. The sum still gives the user a useful,
+    // deterministic whole-session number instead of a blank footer.
+    result.totalTokens = counter.inputTokens + counter.outputTokens
+  }
+  if (counter.hasCacheReadTokens) result.cacheReadTokens = counter.cacheReadTokens
+  if (counter.hasCacheWriteTokens) result.cacheWriteTokens = counter.cacheWriteTokens
+  if (counter.hasInputTokens && counter.hasCacheReadTokens && counter.inputTokens + counter.cacheReadTokens > 0) {
+    result.cacheHitPercent = counter.cacheReadTokens / (counter.inputTokens + counter.cacheReadTokens) * 100
+  }
+  if (counter.contextWindow !== undefined) result.contextWindow = counter.contextWindow
+  if (counter.contextUsed !== undefined) result.contextUsed = counter.contextUsed
+  if (counter.tokensPerSecond !== undefined) result.tokensPerSecond = counter.tokensPerSecond
+  return result
+}
+
+function modelSelectionProjection(data: JsonObject): ModelSelectionProjection | undefined {
+  const provider = typeof data.provider === 'string' ? data.provider : undefined
+  const model = typeof data.model === 'string' ? data.model : undefined
+  if (provider === undefined || model === undefined) return undefined
+  const reasoningEffort = typeof data.reasoningEffort === 'string' ? data.reasoningEffort : undefined
+  return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
+}
+
+function sameModelSelection(left: ModelSelectionProjection, right: ModelSelectionProjection): boolean {
+  return left.provider === right.provider
+    && left.model === right.model
+    && left.reasoningEffort === right.reasoningEffort
+}
+
 export function normalizeSessionEvents(
   sessionId: string,
   value: unknown,
   toolNames: Map<string, string>,
-  usageCounters = new Map<string, { rounds: number; steps: number; contextWindow?: number }>(),
+  usageCounters = new Map<string, UsageCounter>(),
+  modelSelections = new Map<string, ModelSelectionProjection>(),
 ): NativeEventInput[] {
   const event = recordOf(value)
   const type = typeof event.type === 'string' ? event.type : ''
@@ -1217,6 +1604,7 @@ export function normalizeSessionEvents(
   if (type === 'user/message') {
     const source = recordOf(data.source)
     if (source.kind !== 'user') return []
+    const attachments = contentAttachments(data.content)
     return [{
       type: 'user.message.accepted',
       sessionId,
@@ -1224,17 +1612,19 @@ export function normalizeSessionEvents(
         id: stringOr(data.id, randomUUID()),
         role: 'user',
         markdown: contentText(data.content),
+        ...(attachments.length === 0 ? {} : { attachments }),
       },
     }]
   }
   if (type === 'assistant/message') {
     const message = recordOf(data.message)
-    const counters = usageCounters.get(sessionId) ?? { rounds: 0, steps: 0 }
+    const counters = usageCounterFor(usageCounters, sessionId)
     const usage = normalizeUsage(data.usage, counters.contextWindow)
     const tokensPerSecond = outputRate(data.stream, usage?.outputTokens)
     if (usage !== undefined && tokensPerSecond !== undefined) usage.tokensPerSecond = tokensPerSecond
     const source = recordOf(message.source)
     const messageId = stringOr(message.id, randomUUID())
+    const sessionUsage = usage === undefined ? undefined : aggregateUsage(counters, usage, messageId)
     const streamedText = streamText(data.stream)
     const normalized: NativeEventInput[] = [{
       type: 'assistant.message.completed',
@@ -1269,7 +1659,10 @@ export function normalizeSessionEvents(
       normalized.push({
         type: 'usage.updated',
         sessionId,
-        payload: { sessionId, usage: { ...usage, rounds: counters.rounds, steps: counters.steps } },
+        payload: {
+          sessionId,
+          usage: { ...sessionUsage, rounds: counters.rounds, steps: counters.steps },
+        },
       })
     }
     return normalized
@@ -1354,8 +1747,8 @@ export function normalizeSessionEvents(
     ]
   }
   if (type === 'turn/start') {
-    const counters = usageCounters.get(sessionId) ?? { rounds: 0, steps: 0 }
-    usageCounters.set(sessionId, { ...counters, rounds: counters.rounds + 1 })
+    const counters = usageCounterFor(usageCounters, sessionId)
+    counters.rounds += 1
     return [{ type: 'turn.state.changed', sessionId, payload: { sessionId, state: 'running' } }]
   }
   if (type === 'turn/end') {
@@ -1363,16 +1756,17 @@ export function normalizeSessionEvents(
     return [{ type: 'turn.state.changed', sessionId, payload: { sessionId, state: reason } }]
   }
   if (type === 'step/start') {
-    const counters = usageCounters.get(sessionId) ?? { rounds: 0, steps: 0 }
-    usageCounters.set(sessionId, { ...counters, steps: counters.steps + 1 })
+    const counters = usageCounterFor(usageCounters, sessionId)
+    counters.steps += 1
     return []
   }
   if (type === 'request/context') {
     const contextWindow = typeof data.contextWindow === 'number' ? data.contextWindow : undefined
     if (contextWindow !== undefined) {
-      const counters = usageCounters.get(sessionId) ?? { rounds: 0, steps: 0 }
-      usageCounters.set(sessionId, { ...counters, contextWindow })
+      usageCounterFor(usageCounters, sessionId).contextWindow = contextWindow
     }
+    const selection = modelSelectionProjection(data)
+    if (selection !== undefined) modelSelections.set(sessionId, selection)
     return [{
       type: 'session.metadata.updated',
       sessionId,
@@ -1387,6 +1781,8 @@ export function normalizeSessionEvents(
   if (type === 'request/header') {
     const header = recordOf(data.header)
     const config = recordOf(header.config)
+    const selection = modelSelectionProjection(config)
+    if (selection !== undefined) modelSelections.set(sessionId, selection)
     return [{
       type: 'session.metadata.updated',
       sessionId,
@@ -1399,16 +1795,33 @@ export function normalizeSessionEvents(
     }]
   }
   if (type === 'model/selection') {
-    return [{
+    const current = modelSelectionProjection(data)
+    if (current === undefined) return []
+    const previous = modelSelections.get(sessionId)
+    modelSelections.set(sessionId, current)
+    const normalized: NativeEventInput[] = []
+    if (previous !== undefined && !sameModelSelection(previous, current)) {
+      normalized.push({
+        type: 'session.model.changed',
+        sessionId,
+        payload: {
+          sessionId,
+          previous,
+          current,
+        },
+      })
+    }
+    normalized.push({
       type: 'session.metadata.updated',
       sessionId,
       payload: {
         sessionId,
-        ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),
-        ...(typeof data.model === 'string' ? { model: data.model } : {}),
-        ...(typeof data.reasoningEffort === 'string' ? { reasoningEffort: data.reasoningEffort } : {}),
+        provider: current.provider,
+        model: current.model,
+        ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: current.reasoningEffort }),
       },
-    }]
+    })
+    return normalized
   }
   if (type === 'approval/asked') {
     return [{
@@ -1431,7 +1844,7 @@ export function normalizeSessionEvents(
     }]
   }
   const preset = data.preset
-  if (type === 'permission/preset' && (preset === 'workspace-write' || preset === 'danger-full-access')) {
+  if (type === 'permission/preset' && isPermissionMode(preset) && isPermissionPreset(preset)) {
     return [{
       type: 'permission.updated',
       sessionId,
@@ -1507,6 +1920,43 @@ function outputRate(streamValue: unknown, outputTokens: number | undefined): num
  */
 function contentText(value: unknown): string {
   return blockText(value, 'text')
+}
+
+/**
+ * Keep user-message attachment events lightweight. The image/file bytes are
+ * already stored by the Harness; clients only need a receipt to associate
+ * their local thumbnail with the message in the transcript.
+ */
+function contentAttachments(value: unknown): Array<{
+  id: string
+  name: string
+  mediaType?: string | undefined
+  receiptId?: string | undefined
+}> {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    const block = recordOf(entry)
+    if (block.type === 'file' && typeof block.receiptId === 'string') {
+      const receiptId = block.receiptId
+      const parsed = ChatAttachmentSchema.safeParse({
+        id: receiptId,
+        receiptId,
+        name: stringOr(block.name, 'Attachment'),
+        ...(typeof block.mediaType === 'string' ? { mediaType: block.mediaType } : {}),
+      })
+      return parsed.success ? [parsed.data] : []
+    }
+    if (block.type === 'image') {
+      const id = stringOr(block.id, `image-${randomUUID()}`)
+      const parsed = ChatAttachmentSchema.safeParse({
+        id,
+        name: stringOr(block.name, 'Image'),
+        mediaType: stringOr(block.mediaType, 'image/jpeg'),
+      })
+      return parsed.success ? [parsed.data] : []
+    }
+    return []
+  })
 }
 
 function reasoningText(value: unknown): string {

@@ -24,6 +24,30 @@ struct SettingsView: View {
                     )) {
                         Label("Show archived", systemImage: "archivebox")
                     }
+                    Toggle(isOn: Binding(
+                        get: { model.collapseComposerControls },
+                        set: model.setCollapseComposerControls
+                    )) {
+                        Label("Collapse composer controls", systemImage: "rectangle.compress.vertical")
+                    }
+                    Toggle(isOn: Binding(
+                        get: { model.showUsageFooter },
+                        set: model.setShowUsageFooter
+                    )) {
+                        Label("Show session usage", systemImage: "chart.bar.xaxis")
+                    }
+                    Toggle(isOn: Binding(
+                        get: { model.showTurnUsage },
+                        set: model.setShowTurnUsage
+                    )) {
+                        Label("Show turn usage beside Thinking", systemImage: "brain")
+                    }
+                    Toggle(isOn: Binding(
+                        get: { model.showMessageActionsByDefault },
+                        set: model.setShowMessageActionsByDefault
+                    )) {
+                        Label("Show message actions by default", systemImage: "ellipsis.circle")
+                    }
                 }
 
                 Section {
@@ -163,14 +187,14 @@ struct SettingsView: View {
                     }
                 }
             }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemBackground))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color(.secondarySystemBackground))
+            .safeAreaInset(edge: .top, spacing: 0) { settingsHeader }
+            .toolbar(.hidden, for: .navigationBar)
             .task { model.refreshPairedDevices() }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
-            }
             .confirmationDialog("Disconnect this iPhone?",
                                 isPresented: $showForgetConfirmation,
                                 titleVisibility: .visible) {
@@ -184,6 +208,39 @@ struct SettingsView: View {
         }
     }
 
+    /// A stable 44pt glass header keeps Settings in the same visual family as
+    /// the Home and Conversation pages. The native navigation bar is hidden so
+    /// it cannot introduce a second title or differently-sized Done button.
+    private var settingsHeader: some View {
+        HStack(spacing: 8) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close settings")
+
+            Spacer(minLength: 0)
+            Text("Settings")
+                .font(.system(size: 17, weight: .semibold))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+
+            Button("Done") { dismiss() }
+                .font(.system(size: 15, weight: .semibold))
+                .frame(minWidth: 52, minHeight: 44)
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        .background(Color(.systemBackground).opacity(0.96))
+    }
+
     /// The pairing screen saves the address, but nothing surfaced it afterwards.
     private var relayAddress: String? {
         let stored = UserDefaults.standard.string(forKey: "dsh-anywhere.server-address") ?? model.serverAddress
@@ -191,20 +248,20 @@ struct SettingsView: View {
     }
 
     private var statusLabel: String {
-        switch model.connectionState {
-        case .connected: return "Connected"
-        case .connecting: return "Connecting…"
-        case .reconnecting(let attempt): return "Reconnecting (\(attempt))…"
-        case .failed: return "Failed"
-        case .disconnected: return "Disconnected"
+        switch model.deviceStatus {
+        case .online: return DSHLocalization.string("Connected")
+        case .approvalRequired: return DSHLocalization.string("Permission confirmation required")
+        case .error: return DSHLocalization.string("Connection failed")
+        case .offline: return DSHLocalization.string("Disconnected")
         }
     }
 
     private var statusColor: Color {
-        switch model.connectionState {
-        case .connected: return .green
-        case .failed: return .red
-        default: return .orange
+        switch model.deviceStatus {
+        case .online: return .green
+        case .approvalRequired: return .yellow
+        case .error: return .red
+        case .offline: return .gray
         }
     }
 

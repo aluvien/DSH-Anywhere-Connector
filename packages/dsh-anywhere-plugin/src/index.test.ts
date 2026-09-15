@@ -31,6 +31,26 @@ describe('DeepSeek Harness event normalization', () => {
     })
   })
 
+  it('preserves receipt metadata for image/file message history', () => {
+    expect(normalizeSessionEvent('s1', {
+      type: 'user/message',
+      data: {
+        id: 'u2',
+        source: { kind: 'user' },
+        content: [
+          { type: 'text', text: '这是什么？' },
+          { type: 'file', receiptId: 'receipt-1', name: 'photo.jpg', mediaType: 'image/jpeg' },
+        ],
+      },
+    }, new Map())).toEqual({
+      type: 'user.message.accepted', sessionId: 's1',
+      payload: {
+        id: 'u2', role: 'user', markdown: '这是什么？',
+        attachments: [{ id: 'receipt-1', receiptId: 'receipt-1', name: 'photo.jpg', mediaType: 'image/jpeg' }],
+      },
+    })
+  })
+
   it('correlates a tool result with its call', () => {
     const tools = new Map<string, string>()
     normalizeSessionEvent('s1', {
@@ -120,6 +140,35 @@ describe('DeepSeek Harness event normalization', () => {
     expect(usage?.payload).toMatchObject({
       sessionId: 's1',
       usage: { outputTokens: 20, tokensPerSecond: 40 },
+    })
+  })
+
+  it('accumulates usage across assistant turns while keeping the event usage per turn', () => {
+    const tools = new Map<string, string>()
+    const usage = new Map()
+    const first = normalizeSessionEvents('s1', {
+      type: 'assistant/message',
+      data: {
+        message: { id: 'a1', content: [{ type: 'text', text: 'one' }] },
+        usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14, cacheReadTokens: 6 },
+      },
+    }, tools, usage)
+    const second = normalizeSessionEvents('s1', {
+      type: 'assistant/message',
+      data: {
+        message: { id: 'a2', content: [{ type: 'text', text: 'two' }] },
+        usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28, cacheReadTokens: 2 },
+      },
+    }, tools, usage)
+
+    expect(first.find((event) => event.type === 'assistant.message.completed')?.payload).toMatchObject({
+      usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+    })
+    expect(second.find((event) => event.type === 'assistant.message.completed')?.payload).toMatchObject({
+      usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+    })
+    expect(second.find((event) => event.type === 'usage.updated')?.payload).toMatchObject({
+      usage: { inputTokens: 30, outputTokens: 12, totalTokens: 42, cacheReadTokens: 8 },
     })
   })
 })

@@ -2,6 +2,50 @@ import XCTest
 @testable import DSHAnywhere
 
 final class DSHEventStoreTests: XCTestCase {
+    @MainActor
+    func testSessionBecomesUnreadOnlyAfterNewerActivity() {
+        UserDefaults.standard.removeObject(forKey: DSHAppModel.lastReadSessionsKey)
+        UserDefaults.standard.removeObject(forKey: DSHAppModel.unreadBaselineKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: DSHAppModel.lastReadSessionsKey)
+            UserDefaults.standard.removeObject(forKey: DSHAppModel.unreadBaselineKey)
+        }
+
+        let model = DSHAppModel.previewHome()
+        guard let session = model.sessions.first else {
+            return XCTFail("Preview session is missing")
+        }
+        model.markSessionRead(session.id)
+        XCTAssertFalse(model.isSessionUnread(session))
+
+        var updated = session
+        updated.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000) + 1_000
+        XCTAssertTrue(model.isSessionUnread(updated))
+    }
+
+    @MainActor
+    func testConfirmedMessageHideSurvivesAViewModelReload() {
+        UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey)
+        defer { UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey) }
+
+        let model = DSHAppModel.preview()
+        model.hideMessage("preview-user", in: "preview-session")
+
+        let visibleAfterDelete = model.transcriptEntries(for: "preview-session").flatMap { entry -> [String] in
+            guard case .turn(let block) = entry else { return [] }
+            return block.messages.map(\.id)
+        }
+        XCTAssertFalse(visibleAfterDelete.contains("preview-user"))
+
+        let reloaded = DSHAppModel.preview()
+        let visibleAfterReload = reloaded.transcriptEntries(for: "preview-session").flatMap { entry -> [String] in
+            guard case .turn(let block) = entry else { return [] }
+            return block.messages.map(\.id)
+        }
+        XCTAssertFalse(visibleAfterReload.contains("preview-user"))
+        XCTAssertTrue(visibleAfterReload.contains("preview-assistant"))
+    }
+
     func testReducerStreamsAssistantDeltaAndIgnoresDuplicateSequence() {
         var state = DSHStoreState()
         let reducer = DSHEventReducer()
@@ -36,6 +80,66 @@ final class DSHEventStoreTests: XCTestCase {
         DSHEventReducer().reduce(ready, into: &state)
         XCTAssertEqual(state.lastSequence, 1)
         XCTAssertEqual(state.connectionState, .connected)
+    }
+
+    func testRelayControlsUpdateReachabilityOutsideConnectorSequence() {
+        var state = DSHStoreState()
+        state.lastSequence = 42
+        state.transportState = .connected
+        state.machineOnline = true
+        state.connectionState = .connected
+
+        let reconnecting = DSHEvent(envelope: DSHEnvelope(
+            messageId: "transport", deviceId: "d", machineId: "m", sequence: 0,
+            type: "transport.state",
+            payload: .object(["state": .string("reconnecting"), "attempt": .number(1)])
+        ))
+        DSHEventReducer().reduce(reconnecting, into: &state)
+        XCTAssertEqual(state.lastSequence, 42)
+        XCTAssertEqual(state.transportState, .reconnecting(attempt: 1))
+        XCTAssertFalse(state.machineOnline)
+        XCTAssertNil(state.bridgeReachable)
+
+        let relayConnected = DSHEvent(envelope: DSHEnvelope(
+            messageId: "relay", deviceId: "d", machineId: "m", sequence: 0,
+            type: "transport.state", payload: .object(["state": .string("connected")])
+        ))
+        let machineOnline = DSHEvent(envelope: DSHEnvelope(
+            messageId: "presence", deviceId: "d", machineId: "m", sequence: 0,
+            type: "machine.presence", payload: .bool(true)
+        ))
+        DSHEventReducer().reduce(relayConnected, into: &state)
+        DSHEventReducer().reduce(machineOnline, into: &state)
+        XCTAssertEqual(state.lastSequence, 42)
+        XCTAssertEqual(state.transportState, .connected)
+        XCTAssertTrue(state.machineOnline)
+        XCTAssertNil(state.bridgeReachable)
+        XCTAssertEqual(state.connectionState, .connected)
+    }
+
+    func testBridgeFailureOverridesConnectorPresenceUntilBridgeRecovers() {
+        var state = DSHStoreState()
+        state.transportState = .connected
+        state.machineOnline = true
+        let reducer = DSHEventReducer()
+        let failure = DSHEvent(envelope: DSHEnvelope(
+            messageId: "failed", deviceId: "d", machineId: "m", sequence: 1,
+            type: "protocol.error",
+            payload: .object([
+                "code": .string("bridge-request-failed"),
+                "message": .string("Local DSH bridge request failed"),
+                "retryable": .bool(true),
+            ])
+        ))
+        reducer.reduce(failure, into: &state)
+        XCTAssertEqual(state.bridgeReachable, false)
+
+        let ready = DSHEvent(envelope: DSHEnvelope(
+            messageId: "ready-again", deviceId: "d", machineId: "m", sequence: 2,
+            type: "connection.ready", payload: .object([:])
+        ))
+        reducer.reduce(ready, into: &state)
+        XCTAssertEqual(state.bridgeReachable, true)
     }
 
     func testAuthoritativeSnapshotStartsANewSequenceEpochAfterConnectorRestart() {
@@ -198,6 +302,43 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(options.map(\.name), ["Alpha", "beta"])
     }
 
+    func testWorkspaceGroupsUseStableRegistryIDsForMutations() {
+        let sessions = [
+            DSHSessionSummary(id: "a", title: "A", updatedAt: 2,
+                              workspaceId: "workspace-1", workspaceName: "Renamable"),
+            DSHSessionSummary(id: "b", title: "B", updatedAt: 1,
+                              workspaceId: "workspace-1", workspaceName: "Renamable"),
+        ]
+
+        let groups = sessions.groupedForList(.byWorkspace, showArchived: false)
+
+        XCTAssertEqual(groups.map(\.id), ["workspace-1"])
+        XCTAssertEqual(groups.map(\.title), ["Renamable"])
+    }
+
+    func testModelChangeIsStoredAsInlineTranscriptEntry() {
+        var state = DSHStoreState()
+        let event = DSHEvent(envelope: DSHEnvelope(
+            messageId: "model-change", deviceId: "d", machineId: "m", sessionId: "s", sequence: 2,
+            type: "session.model.changed",
+            payload: .object([
+                "sessionId": .string("s"),
+                "previous": .object(["provider": .string("deepseek"), "model": .string("v4.1-flash")]),
+                "current": .object(["provider": .string("deepseek"), "model": .string("v4.1-reasoner")]),
+            ])
+        ))
+
+        DSHEventReducer().reduce(event, into: &state)
+        let notice = try! XCTUnwrap(state.modelChangesBySession["s"]?.first)
+        XCTAssertEqual(notice.sequence, 2)
+        XCTAssertEqual(notice.previous?.model, "v4.1-flash")
+        XCTAssertEqual(notice.current.model, "v4.1-reasoner")
+
+        let entries = [DSHChatMessage(id: "answer", role: .assistant, markdown: "ok", sequence: 3)]
+            .transcriptEntries(with: [], modelChanges: [notice])
+        XCTAssertEqual(entries.map(\.id), ["model-change-s-2-deepseek-v4.1-reasoner", "turn-answer"])
+    }
+
     func testTranscriptInterleavesMessagesAndToolCallsByArrival() {
         // A message, then a call, then another message — the shape of a real
         // turn. Rendering messages and tools as two runs put the call last.
@@ -236,5 +377,31 @@ final class DSHEventStoreTests: XCTestCase {
 
         // 0 < 5, so the unsequenced call sorts before the sequenced message.
         XCTAssertEqual(entries.map(\.id), ["tool-t1", "turn-m1"])
+    }
+
+    func testCommandResultIsStampedAndInterleavedInsteadOfPinnedToBottom() {
+        var state = DSHStoreState()
+        let command = DSHEvent(envelope: DSHEnvelope(
+            messageId: "command-event", deviceId: "d", machineId: "m", sessionId: "s", sequence: 2,
+            type: "command.result",
+            payload: .object([
+                "sessionId": .string("s"),
+                "requestId": .string("command-1"),
+                "matched": .bool(true),
+                "text": .string("done"),
+            ])
+        ))
+        DSHEventReducer().reduce(command, into: &state)
+
+        let result = try! XCTUnwrap(state.commandResultsBySession["s"]?.first)
+        XCTAssertEqual(result.sequence, 2)
+
+        let messages = [
+            DSHChatMessage(id: "before", role: .user, markdown: "before", sequence: 1),
+            DSHChatMessage(id: "after", role: .assistant, markdown: "after", sequence: 3),
+        ]
+        let entries = messages.transcriptEntries(with: [], commandResults: [result])
+
+        XCTAssertEqual(entries.map(\.id), ["turn-before", "command-command-1", "turn-after"])
     }
 }

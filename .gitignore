@@ -16,3 +16,12 @@ artifacts/
 
 # TypeScript 编译输出，由 pnpm build 重新生成
 dist/
+
+# local android toolchain + gradle caches
+.tooling/
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+.relay-local/
+.tmp-classparse/

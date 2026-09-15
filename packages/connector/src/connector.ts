@@ -223,14 +223,20 @@ export class DSHAnywhereConnector {
         return;
       }
       const request = bridgeRequestFor(command);
-      const response = await this.callBridge(request);
+      // A photo can be several megabytes after base64 encoding. Keep normal
+      // commands snappy, but give the local Harness upload service enough time
+      // to download, decode, and persist a large attachment.
+      const response = await this.callBridge(
+        request,
+        command.type === "attachment.upload" || command.type === "session.open" ? 120_000 : 15_000,
+      );
       await this.emitCommandResult(command, response);
     } catch (error) {
       this.sendProtocolError(command, error);
     }
   }
 
-  private async callBridge(request: BridgeRequest): Promise<unknown> {
+  private async callBridge(request: BridgeRequest, timeoutMs = 15_000): Promise<unknown> {
     const response = await this.request(bridgeAPIURL(this.config.bridgeBaseURL, request.path), {
       method: request.method,
       headers: {
@@ -238,7 +244,7 @@ export class DSHAnywhereConnector {
         ...(request.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) throw new BridgeRequestError(response.status);
     const contentType = response.headers.get("content-type") ?? "";
@@ -246,6 +252,12 @@ export class DSHAnywhereConnector {
   }
 
   private async emitCommandResult(command: CommandEnvelope, response: unknown): Promise<void> {
+    if (command.type === "session.open") {
+      // The bridge publishes the requested historical events over its existing
+      // event socket. There is no extra command-result card for opening a
+      // conversation; the phone only needs the transcript events themselves.
+      return;
+    }
     if (command.type === "session.list") {
       const data = asRecord(response);
       const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
@@ -283,7 +295,8 @@ export class DSHAnywhereConnector {
       }
       return;
     }
-    if (command.type === "session.archive" || command.type === "session.model") {
+    if (command.type === "session.archive" || command.type === "session.model"
+        || command.type === "workspace.rename" || command.type === "workspace.delete") {
       // These operations mutate native Harness metadata. Refresh the same
       // filtered list used by the live bridge so archived sessions disappear
       // immediately while model/workspace labels update in place.
@@ -574,15 +587,24 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         method: "GET",
         path: command.payload.includeArchived === true ? "/sessions?includeArchived=true" : "/sessions",
       };
+    case "session.open":
+      return {
+        method: "POST",
+        path: `/sessions/${encodeURIComponent(requireSessionId(command))}/open`,
+        body: {},
+      };
     case "session.create":
       return {
         method: "POST",
         path: "/sessions",
         body: {
+          ...(command.payload.title === undefined ? {} : { title: command.payload.title }),
           ...(command.payload.workingDirectory === undefined ? {} : { cwd: command.payload.workingDirectory }),
           ...(command.payload.workspaceId === undefined ? {} : { workspaceId: command.payload.workspaceId }),
           ...(command.payload.agentPreset === undefined ? {} : { agentPreset: command.payload.agentPreset }),
           ...(command.payload.model === undefined ? {} : { model: command.payload.model }),
+          ...(command.payload.branch === undefined ? {} : { branch: command.payload.branch }),
+          ...(command.payload.permissionMode === undefined ? {} : { permissionMode: command.payload.permissionMode }),
         },
       };
     case "prompt.send":
@@ -623,6 +645,18 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         method: "POST",
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/model`,
         body: command.payload,
+      };
+    case "workspace.rename":
+      return {
+        method: "POST",
+        path: `/workspaces/${encodeURIComponent(command.payload.workspaceId)}/rename`,
+        body: { title: command.payload.title },
+      };
+    case "workspace.delete":
+      return {
+        method: "POST",
+        path: `/workspaces/${encodeURIComponent(command.payload.workspaceId)}/delete`,
+        body: {},
       };
     case "model.catalog":
       return { method: "GET", path: "/models" };

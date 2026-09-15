@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Terminal prompt "❯_" in the connector green, centred in the safe zone. -->
+    <path android:fillColor="#05C856"
+        android:pathData="M36,38 L52,54 L36,70 L42,70 L58,54 L42,38 Z"/>
+    <path android:fillColor="#05C856"
+        android:pathData="M52,68 L74,68 L74,73 L52,73 Z"/>
+</vector>
