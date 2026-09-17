@@ -1476,7 +1476,7 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
-    static func preview() -> DSHAppModel {
+    static func preview(longConversation: Bool = false) -> DSHAppModel {
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         let session = DSHSessionSummary(id: "preview-session", title: "Plan the iOS client",
                                         updatedAt: now,
@@ -1524,6 +1524,15 @@ final class DSHAppModel: ObservableObject {
             DSHChatMessage(id: "preview-user", role: .user, markdown: "Build a native client for my local Harness."),
             DSHChatMessage(id: "preview-assistant", role: .assistant, markdown: "I can help you plan and implement the native client.")
         ]
+        #if DEBUG
+        if longConversation || ProcessInfo.processInfo.arguments.contains("--dsh-preview-long-conversation") {
+            state.messagesBySession[session.id] = (0..<12).flatMap { index in
+                [DSHChatMessage(id: "user-\(index)", role: .user, markdown: "第 \(index + 1) 轮：测试长对话布局"),
+                 DSHChatMessage(id: "assistant-\(index)", role: .assistant,
+                                markdown: "第 \(index + 1) 轮回答。\n\n打开输入框后，这段文字应随可见区域抬起。\n\n最后一行必须完整显示在输入框上方。")]
+            }
+        }
+        #endif
         state.toolsBySession[session.id] = [
             DSHToolActivity(id: "preview-tool", name: "read_project", status: "completed", detail: "Read 12 files")
         ]

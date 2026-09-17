@@ -109,6 +109,39 @@
 ## 32. 中断不断折 + 滚动零时序依赖 + 命令入框
 - 状态：[树]①思考又被放出来（照片实锤新机制）：think 与回答之间隔了用户新消息（中途又发了一轮），用户轮把折叠打断。改为用户轮/命令卡/模型卡全部穿透（原地渲染不断折，pending 挂到下一个可见回答轮；队尾无回答才独立成段；取消轮误挂入下一时间线属罕见且默认折叠）。新增中断穿透单测。②滚动 H4 结构性消除：探针挂载时序不可远程验证，coordinator 加全窗最大 scroll view 回退（转录全屏恒最大，纯公开 API），挂载成败不再影响直驱。③加号 plan/goal 不再裸发空命令：改句首插入 `/plan `/`/goal `（替换行首旧 token，防连点叠加）并聚焦等参数；compact/export/feedback 裸跑有效不动，permission/model 照旧开面板。待发版验证（必须新版号）：思考单行、跳转落底、命令入框。
 
+## 33. 键盘/展开缺重锚定（铬驱动事件）
+- 状态：[✓Build 102]根因：inset 变大不搬 contentOffset；全部旧触发都是内容驱动，键盘/dock/focus 变化零开火——点输入框=旧视口+新高框，必埋末行（公式无罪）。修：keyboardHeight（含 0.35s 落定补钉）+ dockHeight 两个 flag 门控 observer（isDraftFocused 触发可省：无几何变化时无需钉）。Focus 提升（`focus: Binding?` 整套）已回滚：它让 solver 超时，且键盘 bug 不需要它（keyboard/dock observer 足够；compact 下父层仍看不见 focus，记为已知局限）。safeArea 双重避让经反证不存在；不重构成 safeAreaInset Composer（同样缺这三个钉）。构建插曲：ConversationView.body 超 19s solver 预算（83–101 连挂），解法是把 body 拆成 `transcriptScrollView`/`overlayChrome`/`bottomAnchorView`/`transcriptSectionView`/`loadEarlierBanner`/`inlineDecisionCards`/`ConversationModals`/`ConversationObservers` 八个独立预算单元（教训：巨 body + 修饰链是超时的根源，`warn-long-function-bodies` 可量化）。待发版验证（验收十条）。
+
 ## 协作备注（2026-09-16 发现，09-17 已对齐）
 - `Features/Shared/DSHRemoteGlyphs.swift` 已进 Xcode target 并被 `ConversationView` 引用；归属已确认，无需再定。
 - 动 `ConversationView.swift` / `SessionListView.swift` 前仍先对齐，避免互盖。
+
+## 34. 2026-09-17 三张截图：上下遮挡、键盘跟随、模型等级动画
+- 状态：[树]已修，未发布。保留此前 Build 102 的 body 拆分。
+- 布局：header / transcript / composer 改为真实垂直布局；正文视口裁剪在两者之间，删除浮层占位、顶部可滚走 spacer、手算键盘高度和延迟补滚。原生键盘安全区负责抬升整页。
+- 跟随：探针仅绑定正文最近的 UIScrollView；按用户滚动位置判断是否跟随，监听 contentSize / frame / bounds 在排版完成后保持末尾。删除 lazy anchor 出现/消失判定及全窗口最大 scroll view 回退，回看历史时不自动拉回。
+- 等级：触发按钮与弹窗标题、滑块共用当前草稿；切换到不支持等级的模型隐藏滑块并显示中性模型图标。图标采用共享语义等级映射；指针和蓝弧端点共用 135°→330° 角度。拖动时取消反复启动 spring，轨道坐标固定，档位数量变化重新校准索引。
+- 回归：`xcodebuild test -only-testing:DSHAnywhereTests/DSHConversationViewportTests` 6 项通过，`git diff --check` 通过；结果 `/tmp/dsh-viewport-final.xcresult`。新增测试覆盖长对话实际 SwiftUI 布局、输入框展开、320pt 键盘大小安全区变化、流式内容增高、回看历史不抢滚动、短内容 inset、不同 catalog 子集同等级图标一致、指针与弧端同向。截图附件保存在测试 xcresult。无头模拟器未渲染软键盘，因此软键盘跟手收起与真机连续拖动仍需设备复验。
+
+## 35. 2026-09-18 Build 103 缺失 Remote 模式：发布源目录错误
+- 已确认：用户手机 1.0(103) 的设置页没有 Interface/Home layout，且缺少“默认显示消息操作”。Xcode 归档 `/Users/aluvien/Library/Developer/Xcode/Archives/2026-09-17/DSHAnywhere 2026-9-17, 23.48.xcarchive` 的 dSYM 指向 `/Users/aluvien/DSH-ANYWHERE`；该独立旧目录不包含 Remote 路由/首页/设置。不要从该目录打包 iOS。
+- 正确 iOS 源目录：`/Users/aluvien/Develop/App/DSH-ANYWHERE/ios/DSHAnywhere.xcodeproj`。本工作区源码与 102 归档均包含 Remote；不能仅靠源码有按钮就断言用户手机有按钮。
+- 候选：1.0(104)，从当前完整工作树独立 clean archive，包含 §34 对话布局与等级修复。签名 archive/export 均通过；从最终 IPA 解包核对版本104及 Remote/设置相关二进制标记。2026-09-18 00:20（上海时间）上传成功，Apple 已接收，等待处理；Delivery UUID：5e020b69-b018-4cff-80b3-07c6af8fe615。
+- 验证：Release 配置 `DSHHomeLayoutTests/testSettingsCanSwitchBothHomeLayoutsAndPersistSelection` 通过，实际找到设置页 UISegmentedControl 并切至 Remote、检查持久化，再切回经典；设置与两个首页截图均留存。另将既有 unread 测试的 Debug 专用 fixture 改为通用 fixture，使 Release 测试可编译。
+- 交付：`artifacts/ios/remote-restored-build104-20260918/DSHAnywhere.ipa`；同目录 `source-manifest.json` 记录源目录、提交、未提交修改、源码摘要及 IPA SHA256，避免再次混用旧源。
+
+## 36. 2026-09-18 恢复 104 丢失的磨砂与透明风格
+- 状态：[✓Build 105]2026-09-18 00:40 上传成功，Apple 已接收；Delivery UUID：f675b77e-2872-479a-adb7-3af19d181abd。104 用 VStack 分割视口并 clipped，消除了控件背后的正文，导致顶部磨砂和底部透光一并消失；该视觉回归由 §34 的布局修复引入。
+- 修复：用真实 header/composer 的 top/bottom safeAreaInset 替代 VStack 分区，正文 scrollClipDisabled 允许滚动经过浮层背后；顶部使用 ultraThinMaterial，底部保留现有 Liquid Glass，取消平面85%底色。继续由系统处理键盘，不加手动键盘高度。
+- 跟随：监听 adjustedContentInset/contentInset，首尾可见范围与玻璃底层范围分开计算；惯性滚动、手动回看时仍不强制跳底。
+- 验证：7项 DSHConversationViewportTests 通过；实际 SwiftUI host 断言原始滚动表面覆盖上下控件背后，可读视口仍在控件之间；输入框展开与320pt模拟键盘安全区下保持末尾。结果 `/tmp/dsh-glass-verified.xcresult`；截图 `artifacts/ios/glass-restoration-20260918/`。真实软键盘交互收起仍需设备复验。
+
+## 37. 2026-09-18 编辑器统一与模型弹窗稳定性
+- 状态：[✓Build 106]2026-09-18 02:06 上传成功，Apple 已接收；Delivery UUID：711fb8d5-a6be-4ddb-88a0-137790af98d2。
+- 顶部：首页、会话、新建和设置共用轻模糊背景。直接降低模糊效果强度，而非把整层设透明造成锐利文字穿透；浅色去除灰色材质底，深色减轻底色。正文 safeAreaInset 与键盘跟随规则保持。
+- 模型：新建与会话共用 DSHModelConfigurationPicker。移除气泡中的嵌套系统 Menu，列表在固定330×222pt气泡内切换；模型/智能紧凑排列，标签下方增加留白。等级只保留一个选中状态，轨道、填充、圆点、旋钮、标签与拖动命中共用坐标，消除端点多余蓝色突起。移除编辑器对子控件的整体动画；关闭气泡时只提交最终选择。
+- 编辑器：删除另一套 expandedComposer 和旧新建编辑器，统一使用 DSHRemoteComposer；相同外边距、权限/模型选择器、上下文和发送控件。折叠偏好只决定加号菜单或展开附件操作。首页44pt按钮同样使用浮动玻璃样式，蓝色新建按钮为“图标 聊天”（两侧16pt，图文8pt）。
+- 通知：以已接受用户消息为边界，发送前模型多次切换只保留最终一条；保留此前发送批次的选择提示，历史回放避免重复。权限状态不生成会话行，过滤旧版 preset 成功回执，失败仍显示。
+- 设置：各区域采用适配浅/深主题的分组底色；Remote/经典切换保留。
+- 验证：Release 配置11项界面/布局回归及45项事件状态测试通过。涵盖实际原生 popover 的列表/模型/等级切换尺寸不变、两种控件偏好下新建与会话输入框唯一且同宽、滑杆端点命中、键盘安全区、历史回看、通知合并和权限回执。结果 `/tmp/dsh-ui-final-verified.xcresult`、`/tmp/dsh-notice-final.xcresult`；真机连续手势和网络切换手感仍需安装验证。
+- 最终顶部模糊调整后，3项受影响界面回归再次通过，结果 `/tmp/dsh-header-final.xcresult`。截图与日志保存在 `artifacts/ios/ui-refinement-20260918/`。

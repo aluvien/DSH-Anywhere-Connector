@@ -1,5 +1,145 @@
 import XCTest
 @testable import DSHAnywhere
+#if canImport(UIKit)
+import UIKit
+import SwiftUI
+@MainActor
+private final class DSHModelPanelFixture: ObservableObject {
+    @Published var selection = DSHModelSelection(provider: "test", model: "muse", reasoningEffort: "xhigh")
+    @Published var presented = false
+    @Published var showsModels = false
+    let catalog = DSHModelCatalog(
+        default: DSHModelSelection(provider: "test", model: "muse", reasoningEffort: "xhigh"),
+        routableProviders: ["test"],
+        groups: [DSHModelCatalogGroup(id: "test", name: "Test models", models: [
+            DSHModelCatalogModel(id: "muse", name: "muse-spark-1.3-contributor", reasoning: DSHModelReasoning(
+                efforts: ["minimal", "low", "medium", "high", "xhigh"].map {
+                    DSHModelReasoningEffort(id: $0, name: $0.capitalized)
+                }, defaultEffort: "high")),
+            DSHModelCatalogModel(id: "short", name: "Three-level model", reasoning: DSHModelReasoning(
+                efforts: ["low", "medium", "high"].map {
+                    DSHModelReasoningEffort(id: $0, name: $0.capitalized)
+                }, defaultEffort: "medium")),
+            DSHModelCatalogModel(id: "plain", name: "No reasoning model")
+        ])], failures: [])
+}
+
+private struct DSHModelPanelFixtureView: View {
+    @ObservedObject var fixture: DSHModelPanelFixture
+    var body: some View {
+        VStack {
+            Spacer()
+            Text("模型与智能").font(.title3)
+            Spacer()
+            Button("模型") { fixture.presented = true }
+                .padding(16)
+                .popover(isPresented: $fixture.presented, arrowEdge: .bottom) {
+                    DSHModelConfigurationPanel(catalog: fixture.catalog, selection: $fixture.selection,
+                        fallbackName: "muse", showsModels: $fixture.showsModels)
+                        .presentationCompactAdaptation(.popover)
+                        .presentationBackground(.regularMaterial)
+                }
+        }
+        .padding(.bottom, 280)
+    }
+}
+
+@MainActor
+final class DSHModelPanelLayoutTests: XCTestCase {
+    func testNewAndExistingConversationsShareEditorGeometry() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        window.overrideUserInterfaceStyle = .light
+        let model = DSHAppModel.preview()
+        let host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        func descendants(_ view: UIView) -> [UIView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        for collapsed in [true, false] {
+            model.collapseComposerControls = collapsed
+            var widths: [CGFloat] = []
+            for isNew in [true, false] {
+                if isNew {
+                    host.rootView = AnyView(NewSessionSheet().environmentObject(model))
+                } else {
+                    host.rootView = AnyView(NavigationStack {
+                        ConversationView(sessionID: "preview-session").environmentObject(model)
+                    })
+                }
+                try await Task.sleep(for: .milliseconds(500))
+                let editors = descendants(host.view).filter { $0 is UITextField || $0 is UITextView }
+                XCTAssertEqual(editors.count, 1)
+                let editor = try XCTUnwrap(editors.first)
+                XCTAssertTrue(editor.becomeFirstResponder())
+                try await Task.sleep(for: .milliseconds(250))
+                window.layoutIfNeeded()
+                widths.append(editor.bounds.width)
+                let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                    window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                })
+                attachment.name = "shared-editor-\(isNew ? "new" : "conversation")-\(collapsed ? "compact" : "all-actions")"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                editor.resignFirstResponder()
+            }
+            XCTAssertEqual(widths[0], widths[1], accuracy: 1)
+        }
+    }
+
+    func testPopoverBoundsStayStableAcrossListAndModelChanges() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let fixture = DSHModelPanelFixture()
+        let host = UIHostingController(rootView: DSHModelPanelFixtureView(fixture: fixture))
+        window.rootViewController = host
+        window.overrideUserInterfaceStyle = .light
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        try await Task.sleep(for: .milliseconds(300))
+        fixture.presented = true
+        try await Task.sleep(for: .milliseconds(600))
+        let presented = try XCTUnwrap(host.presentedViewController)
+        let original = presented.view.bounds.size
+        XCTAssertGreaterThanOrEqual(original.width, 330)
+        XCTAssertGreaterThanOrEqual(original.height, 222)
+
+        func capture(_ name: String) {
+            window.layoutIfNeeded()
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        capture("model-panel-light-xhigh")
+        fixture.showsModels = true
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(presented.view.bounds.size, original)
+        capture("model-panel-list")
+        fixture.showsModels = false
+        for selection in [
+            DSHModelSelection(provider: "test", model: "muse", reasoningEffort: "minimal"),
+            DSHModelSelection(provider: "test", model: "short", reasoningEffort: "high"),
+            DSHModelSelection(provider: "test", model: "plain"),
+            DSHModelSelection(provider: "test", model: "muse", reasoningEffort: "xhigh")
+        ] {
+            withAnimation(.spring()) { fixture.selection = selection }
+            try await Task.sleep(for: .milliseconds(120))
+            XCTAssertEqual(presented.view.bounds.size, original)
+            capture("model-panel-\(selection.model)-\(selection.reasoningEffort ?? "none")")
+        }
+        window.overrideUserInterfaceStyle = .dark
+        try await Task.sleep(for: .milliseconds(200))
+        capture("model-panel-dark")
+        fixture.presented = false
+        try await Task.sleep(for: .milliseconds(200))
+    }
+}
+#endif
 
 final class DSHProtocolTests: XCTestCase {
     func testEnvelopeRoundTripsUnknownPayload() throws {
@@ -441,3 +581,258 @@ final class DSHStubURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 }
+
+#if canImport(UIKit)
+import UIKit
+import SwiftUI
+
+@MainActor
+final class DSHConversationViewportTests: XCTestCase {
+    private func settle() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    func testKeyboardAndComposerResizeKeepTailVisible() async {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+        scroll.contentSize = CGSize(width: 390, height: 1800)
+        let coordinator = DSHScrollCoordinator()
+        coordinator.attach(scroll)
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1100, accuracy: 0.5)
+        scroll.frame.size.height = 350
+        await settle()
+        XCTAssertTrue(coordinator.isFollowingLatest)
+        XCTAssertEqual(scroll.contentOffset.y, 1450, accuracy: 0.5)
+        scroll.contentSize.height = 2000
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1650, accuracy: 0.5)
+        scroll.frame.size.height = 700
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1300, accuracy: 0.5)
+    }
+
+    func testHistoryReaderIsNotPulledToBottomByResizeOrStreaming() async {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+        scroll.contentSize = CGSize(width: 390, height: 1800)
+        let coordinator = DSHScrollCoordinator()
+        coordinator.attach(scroll)
+        await settle()
+        scroll.contentOffset.y = 400
+        coordinator.userDidScroll()
+        XCTAssertFalse(coordinator.isFollowingLatest)
+        scroll.frame.size.height = 350
+        scroll.contentSize.height = 2200
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 400, accuracy: 0.5)
+        coordinator.resumeFollowing()
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1850, accuracy: 0.5)
+    }
+
+    func testGlassInsetsKeepTailVisibleWithoutChangingScrollFrame() async {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+        scroll.contentSize = CGSize(width: 390, height: 1800)
+        let coordinator = DSHScrollCoordinator()
+        coordinator.attach(scroll)
+        await settle()
+        scroll.contentInset = UIEdgeInsets(top: 58, left: 0, bottom: 76, right: 0)
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1176, accuracy: 0.5)
+        scroll.contentInset.bottom = 420
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 1520, accuracy: 0.5)
+        scroll.contentOffset.y = 400
+        coordinator.userDidScroll()
+        scroll.contentInset.bottom = 76
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, 400, accuracy: 0.5)
+    }
+
+    func testShortTranscriptRespectsTopInset() async {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+        scroll.contentSize = CGSize(width: 390, height: 100)
+        scroll.contentInset.top = 12
+        let coordinator = DSHScrollCoordinator()
+        coordinator.attach(scroll)
+        await settle()
+        XCTAssertEqual(scroll.contentOffset.y, -12, accuracy: 0.5)
+    }
+
+    func testReasoningNeedleTracksArcEndpointInSameDirection() {
+        let intensities = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        let angles = intensities.map { DSHReasoningGlyphMetrics.angle(for: $0) }
+        XCTAssertEqual(angles.first, 135)
+        XCTAssertEqual(angles.last, 330)
+        XCTAssertEqual(angles, angles.sorted())
+        for intensity in intensities {
+            XCTAssertEqual(DSHReasoningGlyphMetrics.angle(for: intensity),
+                           DSHReasoningGlyphMetrics.arcEnd(for: intensity) * 360, accuracy: 0.001)
+        }
+    }
+
+    func testReasoningRailEndpointsAndHitTestingStayAligned() {
+        for width in [CGFloat(250), 302, 360] {
+            let rail = DSHReasoningRailMetrics(width: width)
+            XCTAssertEqual(rail.x(for: 0) - rail.knobDiameter / 2, rail.outerInset)
+            XCTAssertEqual(rail.x(for: 1) + rail.knobDiameter / 2, width - rail.outerInset)
+            for count in 2...7 {
+                for index in 0..<count {
+                    let x = rail.x(for: CGFloat(index) / CGFloat(count - 1))
+                    XCTAssertEqual(rail.index(for: x, lastIndex: count - 1), index)
+                }
+                XCTAssertEqual(rail.index(for: -50, lastIndex: count - 1), 0)
+                XCTAssertEqual(rail.index(for: width + 50, lastIndex: count - 1), count - 1)
+            }
+        }
+    }
+
+    func testReasoningGlyphDoesNotChangeWithCatalogSubset() {
+        let subset = ["low", "medium", "high"].map { DSHModelReasoningEffort(id: $0, name: $0) }
+        let full = ["none", "minimal", "low", "medium", "high", "xhigh"].map { DSHModelReasoningEffort(id: $0, name: $0) }
+        XCTAssertEqual(dshReasoningIntensity(subset, selectedEffortID: "high"),
+                       dshReasoningIntensity(full, selectedEffortID: "high"))
+        XCTAssertEqual(dshReasoningIntensity(full, selectedEffortID: "none"), 0)
+        XCTAssertEqual(dshReasoningIntensity(full, selectedEffortID: "xhigh"), 1)
+        XCTAssertEqual(dshOrderedReasoningEfforts(full.reversed()).map(\.id), full.map(\.id))
+        XCTAssertEqual(dshNearestReasoningEffortIndex(full, to: "ultra"), 5)
+    }
+
+    func testLongConversationViewportStaysBetweenHeaderAndComposer() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        window.overrideUserInterfaceStyle = .dark
+        let model = DSHAppModel.preview(longConversation: true)
+        model.collapseComposerControls = true
+        let host = UIHostingController(rootView: NavigationStack {
+            ConversationView(sessionID: "preview-session").environmentObject(model)
+        })
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        try await Task.sleep(for: .milliseconds(800))
+        window.layoutIfNeeded()
+        func descendants(_ view: UIView) -> [UIView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        let allViews = descendants(host.view)
+        let scroll = try XCTUnwrap(allViews.compactMap { $0 as? UIScrollView }
+            .max { $0.bounds.height < $1.bounds.height })
+        let editor = try XCTUnwrap(allViews.first { $0 is UITextField || $0 is UITextView })
+        func assertViewport(file: StaticString = #filePath, line: UInt = #line) {
+            let viewport = scroll.convert(scroll.bounds.inset(by: scroll.adjustedContentInset), to: window)
+            let underlay = scroll.convert(scroll.bounds, to: window)
+            let editorRect = editor.convert(editor.bounds, to: window)
+            // Preserve the glass backdrop: the raw scroll surface must extend
+            // behind both controls, while the unobscured viewport stays inside.
+            XCTAssertLessThan(underlay.minY, viewport.minY, file: file, line: line)
+            XCTAssertGreaterThan(underlay.maxY, editorRect.minY, file: file, line: line)
+            XCTAssertGreaterThanOrEqual(viewport.minY, window.safeAreaInsets.top + 55, file: file, line: line)
+            XCTAssertLessThanOrEqual(viewport.maxY, editorRect.minY, file: file, line: line)
+            let bottom = max(-scroll.adjustedContentInset.top,
+                             scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+            XCTAssertEqual(scroll.contentOffset.y, bottom, accuracy: 3, file: file, line: line)
+        }
+        func capture(_ name: String) {
+            let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+            let attachment = XCTAttachment(image: renderer.image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        assertViewport()
+        capture("conversation-bottom")
+        let oldHeight = scroll.bounds.inset(by: scroll.adjustedContentInset).height
+        XCTAssertTrue(editor.becomeFirstResponder())
+        try await Task.sleep(for: .milliseconds(800))
+        window.layoutIfNeeded()
+        assertViewport()
+        XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, oldHeight)
+        capture("conversation-composer-expanded")
+        // Headless simulators can have a hardware keyboard attached. Exercise
+        // a full keyboard-sized safe-area change even when no software keyboard
+        // is rendered, independently of the composer's 48-point expansion.
+        let expandedHeight = scroll.bounds.inset(by: scroll.adjustedContentInset).height
+        host.additionalSafeAreaInsets.bottom = 320
+        try await Task.sleep(for: .milliseconds(500))
+        window.layoutIfNeeded()
+        assertViewport()
+        XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, expandedHeight - 250)
+        capture("conversation-keyboard-sized-inset")
+        host.additionalSafeAreaInsets.bottom = 0
+        editor.resignFirstResponder()
+        try await Task.sleep(for: .milliseconds(500))
+        scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
+        window.layoutIfNeeded()
+        capture("conversation-top")
+        scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height / 2), animated: false)
+        window.layoutIfNeeded()
+        capture("conversation-glass-scrolled")
+    }
+}
+#endif
+
+#if canImport(UIKit)
+@MainActor
+final class DSHHomeLayoutTests: XCTestCase {
+    func testSettingsCanSwitchBothHomeLayoutsAndPersistSelection() async throws {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: DSHAppModel.homeLayoutKey)
+        defer {
+            if let previous { defaults.set(previous, forKey: DSHAppModel.homeLayoutKey) }
+            else { defaults.removeObject(forKey: DSHAppModel.homeLayoutKey) }
+        }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        window.overrideUserInterfaceStyle = .dark
+        let model = DSHAppModel.preview()
+        model.selectedSessionID = nil
+        model.useRemoteTaskLayout = false
+        let host = UIHostingController(rootView: SettingsView()
+            .environmentObject(model)
+            .environment(\.locale, Locale(identifier: "zh-Hans")))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        try await Task.sleep(for: .milliseconds(600))
+        func descendants(_ view: UIView) -> [UIView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        let picker = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UISegmentedControl }.first)
+        XCTAssertEqual(picker.numberOfSegments, 2)
+        XCTAssertEqual(picker.selectedSegmentIndex, 1)
+        XCTAssertTrue((picker.titleForSegment(at: 0) ?? "").contains("Remote"))
+        let pickerFrame = picker.convert(picker.bounds, to: window)
+        XCTAssertGreaterThan(pickerFrame.minY, window.safeAreaInsets.top)
+        XCTAssertLessThan(pickerFrame.maxY, window.bounds.midY)
+        func capture(_ name: String) {
+            let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+            let attachment = XCTAttachment(image: renderer.image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        capture("settings-classic-with-remote-switch")
+        picker.selectedSegmentIndex = 0
+        picker.sendActions(for: .valueChanged)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(model.useRemoteTaskLayout)
+        XCTAssertTrue(defaults.bool(forKey: DSHAppModel.homeLayoutKey))
+        capture("settings-remote-selected")
+        let root = UIHostingController(rootView: DSHRootView().environmentObject(model))
+        window.rootViewController = root
+        try await Task.sleep(for: .milliseconds(600))
+        capture("remote-home-restored")
+        model.setUseRemoteTaskLayout(false)
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertFalse(model.useRemoteTaskLayout)
+        XCTAssertFalse(defaults.bool(forKey: DSHAppModel.homeLayoutKey))
+        capture("classic-home-preserved")
+    }
+}
+#endif

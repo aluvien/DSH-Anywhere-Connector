@@ -1,4 +1,54 @@
 import SwiftUI
+import UIKit
+
+/// Tune the blur itself instead of fading a finished material view, which
+/// would expose sharp transcript text behind the title.
+struct DSHHeaderBackdrop: View {
+    var body: some View {
+        DSHHeaderBlur()
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+    }
+}
+
+private struct DSHHeaderBlur: UIViewRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func makeUIView(context: Context) -> DSHHeaderBlurView {
+        DSHHeaderBlurView(effect: nil)
+    }
+
+    func updateUIView(_ view: DSHHeaderBlurView, context: Context) {
+        view.configure(dark: colorScheme == .dark)
+    }
+
+    static func dismantleUIView(_ view: DSHHeaderBlurView, coordinator: ()) {
+        view.stop()
+    }
+}
+
+private final class DSHHeaderBlurView: UIVisualEffectView {
+    private var animator: UIViewPropertyAnimator?
+    private var darkAppearance: Bool?
+
+    func configure(dark: Bool) {
+        guard darkAppearance != dark else { return }
+        stop()
+        darkAppearance = dark
+        effect = nil
+        let animator = UIViewPropertyAnimator(duration: 1, curve: .linear) { [weak self] in
+            self?.effect = UIBlurEffect(style: dark ? .dark : .extraLight)
+        }
+        animator.fractionComplete = dark ? 0.35 : 0.7
+        self.animator = animator
+    }
+
+    func stop() {
+        animator?.stopAnimation(true)
+        animator = nil
+        darkAppearance = nil
+    }
+}
 
 /// Floating glass chrome (Liquid Glass, iOS 26+). Below 26 the same call
 /// site renders the legacy solid card, so one call site serves both.
@@ -214,12 +264,29 @@ struct DSHRemoteContextGlyph: View {
 /// Animated reasoning meter. `intensity` is continuous (0...1), so switching
 /// between model effort presets moves both the blue arc and needle instead of
 /// swapping unrelated static images.
+///
+/// These values are intentionally internal so the visual invariant can be
+/// unit-tested without rendering SwiftUI: the needle's angle is always the
+/// blue arc's terminal angle.
+enum DSHReasoningGlyphMetrics {
+    static let startAngle: Double = 135
+    static let sweepAngle: Double = 195
+
+    static func angle(for intensity: Double) -> Double {
+        startAngle + sweepAngle * min(1, max(0, intensity))
+    }
+
+    static func arcEnd(for intensity: Double) -> Double {
+        angle(for: intensity) / 360
+    }
+}
+
 struct DSHRemoteReasoningGlyph: View {
     var intensity: Double
 
     private var clamped: Double { min(1, max(0, intensity)) }
-    private var arcEnd: Double { 0.375 + 0.18 + (0.32 * clamped) }
-    private var needleAngle: Double { 135 - (195 * clamped) }
+    private var arcEnd: Double { DSHReasoningGlyphMetrics.arcEnd(for: clamped) }
+    private var needleAngle: Double { DSHReasoningGlyphMetrics.angle(for: clamped) }
 
     var body: some View {
         ZStack {
@@ -260,165 +327,432 @@ struct DSHRemoteReasoningSlider: View {
     let count: Int
     let selectedIndex: Int
     let onChanged: (Int) -> Void
-    /// Tick labels under the rail (effort names, already ordered). Empty keeps
-    /// the legacy dot-only rail.
     let labels: [String]
-
-    @State private var liveIndex: Int
 
     init(count: Int, selectedIndex: Int, labels: [String] = [], onChanged: @escaping (Int) -> Void) {
         self.count = max(1, count)
         self.selectedIndex = min(max(0, selectedIndex), max(0, count - 1))
-        // Only as many labels as ticks; extras would have no tick to sit on.
-        self.labels = Array(labels.prefix(self.count))
+        self.labels = Array(labels.prefix(max(1, count)))
         self.onChanged = onChanged
-        _liveIndex = State(initialValue: self.selectedIndex)
     }
 
-    private var lastIndex: Int { max(0, count - 1) }
+    private var lastIndex: Int { count - 1 }
     private var showsLabels: Bool { labels.count == count && count > 1 }
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             GeometryReader { proxy in
                 let metrics = DSHReasoningRailMetrics(width: proxy.size.width)
-                let normalized = lastIndex == 0 ? 0 : CGFloat(liveIndex) / CGFloat(lastIndex)
-                let knobX = metrics.x(for: normalized)
-
-                ZStack(alignment: .leading) {
-                    Capsule(style: .continuous)
-                        .fill(Color(.systemBackground))
-                        .overlay {
-                            Capsule(style: .continuous)
-                                .stroke(Color.primary.opacity(0.18), lineWidth: 1)
-                        }
-
-                    // Fill runs from the rail's left inset to the knob center:
-                    // ending at the knob edge overshoots it at minimum and
-                    // leaves the knob half-uncovered nowhere in between.
-                    Capsule(style: .continuous)
+                let knobX = metrics.x(for: lastIndex == 0 ? 0 : CGFloat(selectedIndex) / CGFloat(lastIndex))
+                ZStack(alignment: .topLeading) {
+                    Capsule()
+                        .fill(Color(.tertiarySystemFill))
+                    // Fill and knob have identical heights and end caps. At the
+                    // minimum the fill sits exactly behind the knob, never beside it.
+                    Capsule()
                         .fill(Color.accentColor)
-                        .frame(width: max(metrics.knobDiameter / 2, knobX - metrics.outerInset),
-                               height: proxy.size.height - metrics.outerInset * 2)
-                        .padding(.leading, metrics.outerInset)
-
+                        .frame(width: knobX + metrics.knobDiameter / 2 - metrics.outerInset,
+                               height: metrics.knobDiameter)
+                        .offset(x: metrics.outerInset, y: metrics.outerInset)
                     ForEach(0..<count, id: \.self) { index in
-                        let fraction = lastIndex == 0 ? 0 : CGFloat(index) / CGFloat(lastIndex)
                         Circle()
-                            .fill(index <= liveIndex ? Color.white.opacity(0.20) : Color(.systemGray4))
-                            .frame(width: 13, height: 13)
-                            .position(x: metrics.x(for: fraction),
-                                      y: proxy.size.height / 2)
+                            .fill(index <= selectedIndex ? Color.white.opacity(0.4) : Color(.systemGray3))
+                            .frame(width: 6, height: 6)
+                            .position(x: metrics.x(for: lastIndex == 0 ? 0 : CGFloat(index) / CGFloat(lastIndex)),
+                                      y: metrics.height / 2)
                     }
-
                     Circle()
-                        .fill(Color.white)
-                        .overlay { Circle().stroke(Color.accentColor, lineWidth: 3) }
+                        .fill(.white)
+                        .overlay { Circle().strokeBorder(Color.accentColor, lineWidth: 2) }
                         .frame(width: metrics.knobDiameter, height: metrics.knobDiameter)
-                        .position(x: knobX, y: proxy.size.height / 2)
+                        .position(x: knobX, y: metrics.height / 2)
                 }
-                .contentShape(Capsule(style: .continuous))
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            let raw = metrics.index(for: value.location.x, lastIndex: lastIndex)
-                            if raw != liveIndex {
-                                liveIndex = raw
-                                onChanged(raw)
-                            }
-                        }
-                )
-                .animation(.spring(response: 0.25, dampingFraction: 0.84), value: liveIndex)
+                .frame(width: proxy.size.width, height: metrics.height)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { value in
+                        let next = metrics.index(for: value.location.x, lastIndex: lastIndex)
+                        if next != selectedIndex { onChanged(next) }
+                    })
             }
-            .frame(height: 64)
+            .frame(height: DSHReasoningRailMetrics.railHeight)
 
             if showsLabels {
                 GeometryReader { proxy in
                     let metrics = DSHReasoningRailMetrics(width: proxy.size.width)
-                    ZStack(alignment: .topLeading) {
-                        ForEach(0..<count, id: \.self) { index in
-                            let fraction = lastIndex == 0 ? 0 : CGFloat(index) / CGFloat(lastIndex)
-                            // Exact tick centers, no edge clamping: clamping
-                            // kept the frame on-rails but moved edge labels
-                            // off their dots. Short effort names never reach
-                            // the frame edges; long ones middle-truncate.
-                            Text(labels[index])
-                                .font(.system(size: 11, weight: index == liveIndex ? .semibold : .regular))
-                                .foregroundStyle(index == liveIndex ? .primary : .secondary)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.7)
-                                .truncationMode(.middle)
-                                .frame(width: metrics.labelWidth(for: count), alignment: .center)
-                                .position(x: metrics.x(for: fraction), y: 9)
-                        }
+                    ForEach(0..<count, id: \.self) { index in
+                        Text(labels[index])
+                            .font(.system(size: 11, weight: index == selectedIndex ? .semibold : .regular))
+                            .foregroundStyle(index == selectedIndex ? .primary : .secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                            .frame(width: metrics.labelWidth(for: count))
+                            .position(x: metrics.x(for: CGFloat(index) / CGFloat(lastIndex)), y: 9)
                     }
                 }
                 .frame(height: 18)
-                .animation(.spring(response: 0.25, dampingFraction: 0.84), value: liveIndex)
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityValue(accessibilityValue)
+        // A parent glass/control animation must not animate the rail's coordinate space.
+        .transaction { $0.animation = nil }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("思考深度")
+        .accessibilityValue(labels.indices.contains(selectedIndex) ? labels[selectedIndex] : "\(selectedIndex + 1) / \(count)")
         .accessibilityAdjustableAction { direction in
-            switch direction {
-            case .increment: step(by: 1)
-            case .decrement: step(by: -1)
-            @unknown default: break
-            }
+            let delta = direction == .increment ? 1 : -1
+            let next = min(max(0, selectedIndex + delta), lastIndex)
+            if next != selectedIndex { onChanged(next) }
         }
-        .onChange(of: selectedIndex) { _, newValue in
-            liveIndex = min(max(0, newValue), lastIndex)
-        }
-    }
-
-    private var accessibilityLabel: String {
-        showsLabels ? "思考深度，\(labels.joined(separator: "、"))" : "思考深度"
-    }
-
-    private var accessibilityValue: String {
-        guard labels.indices.contains(liveIndex) else { return "\(liveIndex + 1) / \(count)" }
-        return labels[liveIndex]
-    }
-
-    private func step(by delta: Int) {
-        let next = min(max(0, liveIndex + delta), lastIndex)
-        guard next != liveIndex else { return }
-        liveIndex = next
-        onChanged(next)
     }
 }
 
-/// Single source of truth for rail geometry, shared by the rail, the dots,
-/// the knob and the tick labels so all three stay centered on one x.
-private struct DSHReasoningRailMetrics {
-    let outerInset: CGFloat = 7
-    let knobDiameter: CGFloat = 42
+/// All geometry, including hit testing, uses rail-local coordinates.
+struct DSHReasoningRailMetrics {
+    static let railHeight: CGFloat = 44
+    let outerInset: CGFloat = 5
+    let knobDiameter: CGFloat = 34
     let railWidth: CGFloat
-    let knobTravel: CGFloat
+    var height: CGFloat { Self.railHeight }
+    var knobTravel: CGFloat { max(0, railWidth - knobDiameter) }
 
     init(width: CGFloat) {
-        self.railWidth = max(1, width - outerInset * 2)
-        self.knobTravel = max(1, railWidth - knobDiameter)
+        railWidth = max(knobDiameter, width - outerInset * 2)
     }
 
-    /// X center for a 0...1 fraction along the rail.
     func x(for fraction: CGFloat) -> CGFloat {
         outerInset + knobDiameter / 2 + knobTravel * min(max(0, fraction), 1)
     }
 
     func index(for locationX: CGFloat, lastIndex: Int) -> Int {
-        let position = min(max(locationX - outerInset - knobDiameter / 2, 0), knobTravel)
-        guard lastIndex > 0 else { return 0 }
-        return Int(round((position / knobTravel) * CGFloat(lastIndex)))
+        guard lastIndex > 0, knobTravel > 0 else { return 0 }
+        let position = min(max(locationX - x(for: 0), 0), knobTravel)
+        return Int(round(position / knobTravel * CGFloat(lastIndex)))
     }
 
-    /// Column width for tick labels. Labels sit on exact tick centers, so
-    /// this only bounds truncation: short names never reach the edges.
     func labelWidth(for count: Int) -> CGFloat {
-        guard count > 0 else { return 0 }
-        return min(64, max(40, (railWidth + outerInset * 2) / CGFloat(count)))
+        min(knobDiameter + outerInset * 2, knobTravel / CGFloat(max(1, count - 1)))
     }
+}
+
+struct DSHComposerPermissionPicker: View {
+    @Binding var mode: String
+    var compact = true
+    @State private var isPresented = false
+
+
+    static func iconStyle(for mode: String) -> DSHRemotePermissionGlyph.Style {
+        .forPermissionMode(mode)
+    }
+
+    var body: some View {
+        Button { isPresented = true } label: {
+            if compact {
+                let style = Self.iconStyle(for: mode)
+                DSHRemotePermissionGlyph(style: style)
+                    .frame(width: 34, height: 34)
+                    .foregroundStyle(style.composerColor)
+            } else {
+                DSHRemotePermissionGlyph(
+                    style: Self.iconStyle(for: mode)
+                )
+                    .foregroundStyle(.primary)
+            }
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("应如何批准 DSH 操作？")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 5)
+
+                ForEach(permissionModes, id: \.mode) { item in
+                    permissionRow(item)
+                }
+            }
+            .padding(10)
+            .frame(width: 340)
+            .presentationCompactAdaptation(.popover)
+        }
+        .accessibilityLabel("Permission: \(permissionLabel(mode))")
+        .accessibilityHint("Changes the sandbox and approval policy for this session")
+    }
+
+    /// The Harness persists a preset as sandbox mode + approval policy, so a
+    /// session can report a raw sandbox mode rather than a preset name.
+    private func permissionLabel(_ value: String) -> String {
+        switch value {
+        case "danger-full-access": return DSHLocalization.string("Full access")
+        case "workspace-write": return DSHLocalization.string("Workspace write")
+        // read-only and ask arrive from sessions configured outside the app.
+        case "read-only": return DSHLocalization.string("Read only")
+        case "ask": return DSHLocalization.string("Ask")
+        default: return DSHLocalization.string("Workspace write")
+        }
+    }
+
+    /// The three user-facing permission presets map directly to Harness
+    /// sandbox choices. Legacy ask/never values remain readable in the store
+    /// but are intentionally not offered as separate modes here. Row icons
+    /// match the composer button glyph.
+    private var permissionModes: [(mode: String, title: String, icon: DSHRemotePermissionGlyph.Style)] {
+        // Titles are localized here rather than left to `Label`, which only
+        // localizes a literal and takes this value as a plain String.
+        [
+            ("read-only", "仅可查看", .hand),
+            ("workspace-write", DSHLocalization.string("Workspace write"), .terminalShield),
+            ("danger-full-access", "完全权限", .warningShield)
+        ]
+    }
+
+    private func permissionRow(
+        _ item: (mode: String, title: String, icon: DSHRemotePermissionGlyph.Style)
+    ) -> some View {
+        Button {
+            mode = item.mode
+            isPresented = false
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                DSHRemotePermissionGlyph(style: item.icon)
+                    .foregroundStyle(item.mode == "danger-full-access" ? .red : .primary)
+                    .frame(width: 28, height: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title).font(.system(size: 17, weight: .medium))
+                    Text(permissionDetail(item.mode))
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+                if mode == item.mode {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func permissionDetail(_ mode: String) -> String {
+        switch mode {
+        case "read-only": return "只读取文件；任何修改前都会询问"
+        case "danger-full-access": return "完全访问计算机（风险较高）"
+        default: return "可编辑当前工作区内的文件"
+        }
+    }
+}
+
+/// One anchored picker for both composers. Model choices stay inside this
+/// surface: presenting a native Menu from a glass popover causes two competing
+/// presentation/morph animations on iOS 26.
+struct DSHModelConfigurationPicker: View {
+    let catalog: DSHModelCatalog?
+    @Binding var selection: DSHModelSelection
+    let fallbackName: String
+    var fallbackEfforts: [DSHModelReasoningEffort] = []
+    var compact = true
+    var onCommit: (DSHModelSelection) -> Void = { _ in }
+    @State private var isPresented = false
+    @State private var draft: DSHModelSelection?
+    @State private var openedSelection: DSHModelSelection?
+    @State private var showsModels = false
+
+    private var displayedSelection: DSHModelSelection { draft ?? selection }
+    private var displayedEfforts: [DSHModelReasoningEffort] {
+        dshModelEfforts(catalog: catalog, selection: displayedSelection, fallback: fallbackEfforts)
+    }
+    private var name: String {
+        dshCatalogModel(catalog: catalog, selection: displayedSelection)?.name ?? fallbackName
+    }
+
+    var body: some View {
+        Button {
+            openedSelection = displayedSelection
+            draft = displayedSelection
+            showsModels = false
+            isPresented = true
+        } label: {
+            if compact {
+                Group {
+                    if displayedEfforts.isEmpty {
+                        Image(systemName: "cpu")
+                    } else {
+                        DSHRemoteReasoningGlyph(intensity: dshReasoningIntensity(displayedEfforts,
+                            selectedEffortID: dshModelEffortID(catalog: catalog, selection: displayedSelection,
+                                                            efforts: displayedEfforts)))
+                    }
+                }
+                .frame(width: 34, height: 34)
+            } else {
+                HStack(spacing: 3) {
+                    Text(name).lineLimit(1).truncationMode(.middle)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                }
+                .font(.system(size: 14))
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel("模型与智能：\(name)")
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            DSHModelConfigurationPanel(
+                catalog: catalog,
+                selection: Binding(get: { displayedSelection }, set: { draft = $0 }),
+                fallbackName: fallbackName, fallbackEfforts: fallbackEfforts,
+                showsModels: $showsModels
+            )
+            .presentationCompactAdaptation(.popover)
+            .presentationBackground(.regularMaterial)
+        }
+        .onChange(of: isPresented) { _, presented in
+            guard !presented, let draft, draft != openedSelection else { return }
+            selection = draft
+            onCommit(draft)
+        }
+        .onChange(of: selection) { _, value in
+            if !isPresented { draft = value }
+        }
+    }
+}
+
+/// Constant outer bounds keep model/effort changes from resizing the system
+/// popover while it is onscreen. Only the inner page changes.
+struct DSHModelConfigurationPanel: View {
+    let catalog: DSHModelCatalog?
+    @Binding var selection: DSHModelSelection
+    let fallbackName: String
+    var fallbackEfforts: [DSHModelReasoningEffort] = []
+    @Binding var showsModels: Bool
+
+    private var item: DSHModelCatalogModel? { dshCatalogModel(catalog: catalog, selection: selection) }
+    private var efforts: [DSHModelReasoningEffort] {
+        dshModelEfforts(catalog: catalog, selection: selection, fallback: fallbackEfforts)
+    }
+    private var selectedIndex: Int {
+        dshNearestReasoningEffortIndex(efforts, to: dshModelEffortID(catalog: catalog,
+                                                                  selection: selection, efforts: efforts))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showsModels {
+                HStack {
+                    Button { showsModels = false } label: {
+                        Label("返回", systemImage: "chevron.left").font(.system(size: 15))
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    Text("模型").font(.system(size: 17, weight: .semibold))
+                    Spacer()
+                    Color.clear.frame(width: 48, height: 1)
+                }
+                .frame(height: 40)
+                Divider()
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(catalog?.groups ?? []) { group in
+                            Text(group.name)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .padding(.top, 8)
+                            ForEach(group.models) { model in
+                                Button {
+                                    if group.id != selection.provider || model.id != selection.model {
+                                        selection = DSHModelSelection(provider: group.id, model: model.id,
+                                            reasoningEffort: model.reasoning?.defaultEffort ?? model.reasoning?.efforts.first?.id)
+                                    }
+                                    showsModels = false
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Text(model.name)
+                                            .font(.system(size: 15))
+                                            .lineLimit(2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        if group.id == selection.provider && model.id == selection.model {
+                                            Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                                        }
+                                    }
+                                    .padding(.vertical, 10)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("model-choice-\(group.id)-\(model.id)")
+                            }
+                        }
+                    }
+                }
+                .scrollBounceBehavior(.basedOnSize)
+            } else {
+                Button { showsModels = true } label: {
+                    HStack(spacing: 8) {
+                        Text("模型").font(.system(size: 17)).fixedSize()
+                        Spacer(minLength: 4)
+                        Text(item?.name ?? fallbackName)
+                            .font(.system(size: 16, weight: .semibold))
+                            .lineLimit(1).truncationMode(.middle)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    }
+                    .frame(height: 40)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("model-list-toggle")
+                .disabled(catalog?.groups.isEmpty ?? true)
+                Divider().padding(.bottom, 10)
+                HStack {
+                    Text("智能").font(.system(size: 17))
+                    Spacer()
+                    Text(efforts.indices.contains(selectedIndex) ? efforts[selectedIndex].name : "不支持")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.bottom, 10)
+                if !efforts.isEmpty {
+                    DSHRemoteReasoningSlider(count: efforts.count, selectedIndex: selectedIndex,
+                                             labels: efforts.map(\.name)) { index in
+                        guard efforts.indices.contains(index) else { return }
+                        selection = DSHModelSelection(provider: selection.provider, model: selection.model,
+                                                      reasoningEffort: efforts[index].id)
+                    }
+                }
+                Spacer(minLength: 16)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 20)
+        .frame(width: 330, height: 222, alignment: .top)
+        .foregroundStyle(.primary)
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
+    }
+}
+
+private func dshCatalogModel(catalog: DSHModelCatalog?, selection: DSHModelSelection) -> DSHModelCatalogModel? {
+    catalog?.groups.first(where: { $0.id == selection.provider })?.models.first {
+        $0.id == selection.model || $0.name == selection.model || selection.model.hasSuffix("/\($0.id)")
+    }
+}
+
+private func dshModelEffortID(catalog: DSHModelCatalog?, selection: DSHModelSelection,
+                             efforts: [DSHModelReasoningEffort]) -> String {
+    selection.reasoningEffort
+        ?? dshCatalogModel(catalog: catalog, selection: selection)?.reasoning?.defaultEffort
+        ?? efforts.first?.id ?? ""
+}
+
+private func dshModelEfforts(catalog: DSHModelCatalog?, selection: DSHModelSelection,
+                             fallback: [DSHModelReasoningEffort]) -> [DSHModelReasoningEffort] {
+    if let item = dshCatalogModel(catalog: catalog, selection: selection) {
+        return dshOrderedReasoningEfforts(item.reasoning?.efforts ?? [])
+    }
+    return dshOrderedReasoningEfforts(fallback)
 }
 
 /// Keeps slider positions tied to the catalog's semantic intelligence fields,
@@ -437,11 +771,28 @@ func dshReasoningRank(_ effort: DSHModelReasoningEffort) -> Int {
 
 func dshReasoningRankOf(id: String, name: String) -> Int {
     let value = "\(id) \(name)".lowercased()
-    if value.contains("max") || value.contains("ultra") || value.contains("xhigh") || value.contains("极高") { return 4 }
-    if value.contains("high") || value.contains("高级") || value.contains("高") { return 3 }
-    if value.contains("medium") || value.contains("中") { return 2 }
-    if value.contains("low") || value.contains("minimal") || value.contains("低") { return 1 }
-    return 2
+    // Match the Harness effort vocabulary from least to most capable. Check
+    // xhigh before high because its id contains "high".
+    if value.contains("none") || value.contains("off") || value.contains("不思考") { return 0 }
+    if value.contains("minimal") || value.contains("最小") { return 1 }
+    if value.contains("low") || value.contains("低") { return 2 }
+    if value.contains("medium") || value.contains("中") { return 3 }
+    if value.contains("max") || value.contains("ultra") || value.contains("xhigh") || value.contains("极高") { return 5 }
+    if value.contains("high") || value.contains("高级") || value.contains("高") { return 4 }
+    // Unknown names should render as a neutral, midrange effort rather than
+    // pretending they are the least capable option.
+    return 3
+}
+
+/// A model's glyph uses the absolute semantic effort rank, rather than its
+/// position in whichever subset the provider happened to expose. For example,
+/// High keeps the same meter position in `[low, medium, high]` and
+/// `[none, minimal, low, medium, high, xhigh]`.
+func dshReasoningIntensity(_ efforts: [DSHModelReasoningEffort], selectedEffortID: String) -> Double {
+    let ordered = dshOrderedReasoningEfforts(efforts)
+    guard !ordered.isEmpty else { return 0.58 }
+    let index = dshNearestReasoningEffortIndex(ordered, to: selectedEffortID)
+    return Double(dshReasoningRank(ordered[index])) / 5
 }
 
 /// Index of the effort that best matches a persisted effort id. Exact id

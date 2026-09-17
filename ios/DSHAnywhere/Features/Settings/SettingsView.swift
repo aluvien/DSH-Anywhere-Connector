@@ -27,6 +27,7 @@ struct SettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                .listRowBackground(settingsSectionBackground(.accentColor))
 
                 Section("Sessions") {
                     Toggle(isOn: Binding(
@@ -66,6 +67,7 @@ struct SettingsView: View {
                         Label("Show message actions by default", systemImage: "ellipsis.circle")
                     }
                 }
+                .listRowBackground(settingsSectionBackground(.indigo))
 
                 Section {
                     if model.machines.isEmpty {
@@ -106,6 +108,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Pairing another Mac adds it here instead of replacing the current one. Tap to switch, swipe to remove.")
                 }
+                .listRowBackground(settingsSectionBackground(.teal))
 
                 Section {
                     if let error = model.devicesError {
@@ -150,6 +153,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Devices paired to this Mac, as reported by the relay. Revoking one signs that device out immediately.")
                 }
+                .listRowBackground(settingsSectionBackground(.purple))
 
                 Section {
                     Picker("Language", selection: Binding(
@@ -163,6 +167,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Follow System uses your device language. The choice applies immediately.")
                 }
+                .listRowBackground(settingsSectionBackground(.orange))
 
                 Section("Connection") {
                     LabeledContent("Machine") {
@@ -186,6 +191,7 @@ struct SettingsView: View {
                         }
                     }
                 }
+                .listRowBackground(settingsSectionBackground(.green))
 
                 Section {
                     Button(role: .destructive) {
@@ -197,18 +203,19 @@ struct SettingsView: View {
                 } footer: {
                     Text("Disconnecting removes the device token from this iPhone's keychain. The Mac keeps running.")
                 }
+                .listRowBackground(settingsSectionBackground(.red))
 
                 Section("About") {
                     LabeledContent("Version") {
                         Text(Self.versionDescription)
                     }
                 }
+                .listRowBackground(settingsSectionBackground(.secondary))
             }
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
             .background(Color(.systemBackground))
             .listRowSeparator(.hidden)
-            .listRowBackground(Color(.secondarySystemBackground))
             .safeAreaInset(edge: .top, spacing: 0) { settingsHeader }
             .toolbar(.hidden, for: .navigationBar)
             .task { model.refreshPairedDevices() }
@@ -234,8 +241,7 @@ struct SettingsView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 16, weight: .semibold))
                     .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
+                    .dshFloatingChrome(Circle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close settings")
@@ -253,9 +259,15 @@ struct SettingsView: View {
                 .foregroundStyle(.tint)
         }
         .padding(.horizontal, 16)
-        .padding(.top, 4)
+        .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground).opacity(0.96))
+        .background(DSHHeaderBackdrop())
+    }
+
+    /// A small tint distinguishes each settings group without taking away the
+    /// system's grouped-list contrast in either light or dark appearance.
+    private func settingsSectionBackground(_ tint: Color) -> Color {
+        tint.opacity(0.10)
     }
 
     /// The pairing screen saves the address, but nothing surfaced it afterwards.

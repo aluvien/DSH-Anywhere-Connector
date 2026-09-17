@@ -280,9 +280,9 @@ struct SessionListView: View {
             }
         }
         .padding(.horizontal, 16)
-        .padding(.top, 4)
+        .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground).opacity(0.96))
+        .background(DSHHeaderBackdrop())
     }
 
     /// Flat mode keeps the compact child-row rhythm used inside a project
@@ -470,7 +470,7 @@ struct SessionListView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground).opacity(0.92))
+        .background(DSHHeaderBackdrop())
     }
 
     @ViewBuilder
@@ -696,6 +696,7 @@ struct NewSessionSheet: View {
     @State private var initialPreviewImage: UIImage?
     @State private var showInitialPreview = false
     @State private var showInitialContextPopover = false
+    @State private var showInitialCommandMenu = false
 
     init(initialWorkspaceID: String? = nil, initialPrompt: String = "") {
         self.initialWorkspaceID = initialWorkspaceID
@@ -720,16 +721,18 @@ struct NewSessionSheet: View {
 
                 VStack(alignment: .leading, spacing: 26) {
                     compactConfiguration
+                        .padding(.horizontal, 6)
 
                     if !initialAttachments.isEmpty {
                         initialAttachmentStrip
+                            .padding(.horizontal, 6)
                     }
 
                     initialPromptEditor
                 }
                 .frame(maxWidth: 560)
-                .padding(.horizontal, 18)
-                .padding(.bottom, 14)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 16)
             }
 
             VStack(spacing: 0) {
@@ -738,9 +741,7 @@ struct NewSessionSheet: View {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 20, weight: .medium))
                                 .frame(width: 44, height: 44)
-                            .background(Color(.systemBackground), in: Circle())
-                            .overlay { Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.75) }
-                            .shadow(color: .black.opacity(0.06), radius: 5, y: 2)
+                                .dshFloatingChrome(Circle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("返回")
@@ -751,13 +752,25 @@ struct NewSessionSheet: View {
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 16)
-                .padding(.top, 8)
+                .padding(.top, 6)
+                .padding(.bottom, 8)
+                .background(DSHHeaderBackdrop())
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .allowsHitTesting(true)
         }
         .presentationBackground(Color(.systemBackground))
+        .sheet(isPresented: $showInitialCommandMenu) {
+            CommandMenuSheet(
+                onCommand: { command in
+                    showInitialCommandMenu = false
+                    initialPrompt = appendCommand(command, to: initialPrompt)
+                },
+                onDismiss: { showInitialCommandMenu = false }
+            )
+            .presentationDetents([.medium])
+        }
         .photosPicker(isPresented: $showInitialPhotoPicker,
                       selection: $selectedInitialPhotos,
                       maxSelectionCount: 10,
@@ -854,6 +867,12 @@ struct NewSessionSheet: View {
             if workspaceID.isEmpty, let first = workspaces.first {
                 selectWorkspace(first)
             }
+        }
+        .onChange(of: model.modelCatalog) { _, catalog in
+            guard selectedModel.isEmpty, let catalog else { return }
+            selectedProvider = catalog.default.provider
+            selectedModel = catalog.default.model
+            selectedReasoningEffort = catalog.default.reasoningEffort
         }
     }
 
@@ -1212,49 +1231,6 @@ struct NewSessionSheet: View {
         }
     }
 
-    private var modelChooser: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("模型")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Menu {
-                if let catalog = model.modelCatalog {
-                    ForEach(catalog.groups) { group in
-                        Section(group.name) {
-                            ForEach(group.models) { item in
-                                Button {
-                                    selectedProvider = group.id
-                                    selectedModel = item.id
-                                    selectedReasoningEffort = item.reasoning?.defaultEffort
-                                } label: {
-                                    Label(item.name, systemImage: selectedModel == item.id ? "checkmark" : "cpu")
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Button("刷新模型列表") { model.sendModelCatalog() }
-                }
-            } label: {
-                HStack {
-                    Image(systemName: "cpu")
-                        .foregroundStyle(.tint)
-                    Text(selectedModel.isEmpty ? "选择模型" : selectedModel)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Spacer()
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 14)
-                .frame(minHeight: 54)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
     /// The first prompt uses the same compact composer as an existing
     /// conversation. Its plus action is the same three-entry native menu;
     /// selecting files only stages them locally until Create/send commits the
@@ -1264,21 +1240,41 @@ struct NewSessionSheet: View {
                           placeholder: "在 \(model.machineName.isEmpty ? "Mac" : model.machineName) 上工作",
                           hasAttachments: !initialAttachments.isEmpty,
                           autofocus: true,
+                          showsMicrophone: false,
                           onSubmit: createSession,
                           slashCommands: DSHSlashCommands,
                           onSlashCommand: { command in
                               initialPrompt = dshCompleteSlashCommand(command, in: initialPrompt)
                           }) {
-            DSHComposerQuickActionsMenu(
-                onCommand: { command in
-                    initialPrompt = appendCommand(command, to: initialPrompt)
-                },
-                onPhoto: { showInitialPhotoPicker = true },
-                onFile: { showInitialFileImporter = true },
-                onCamera: { showInitialCamera = true }
-            )
+            if model.collapseComposerControls {
+                DSHComposerQuickActionsMenu(
+                    onCommand: { command in
+                        initialPrompt = appendCommand(command, to: initialPrompt)
+                    },
+                    onPhoto: { showInitialPhotoPicker = true },
+                    onFile: { showInitialFileImporter = true },
+                    onCamera: { showInitialCamera = true }
+                )
+            } else {
+                HStack(spacing: 0) {
+                    Button { showInitialCommandMenu = true } label: {
+                        Image(systemName: "slash.circle").frame(width: 34, height: 34)
+                    }
+                    .accessibilityLabel("Commands")
+                    Button { showInitialPhotoPicker = true } label: {
+                        Image(systemName: "photo").frame(width: 34, height: 34)
+                    }
+                    .accessibilityLabel("Attach photos")
+                    Button { showInitialFileImporter = true } label: {
+                        Image(systemName: "paperclip").frame(width: 34, height: 34)
+                    }
+                    .accessibilityLabel("Attach file")
+                }
+                .font(.system(size: DSHComposerGlyphHeight))
+                .buttonStyle(.plain)
+            }
         } configuration: {
-            initialPermissionMenu
+            DSHComposerPermissionPicker(mode: $permissionMode)
             Spacer(minLength: 0)
             // Same ring control as the conversation composer. There is no
             // session (and therefore no usage) yet, so it only explains that.
@@ -1296,7 +1292,14 @@ struct NewSessionSheet: View {
                     .padding(16)
                     .presentationCompactAdaptation(.popover)
             }
-            initialModelMenu
+            DSHModelConfigurationPicker(
+                catalog: model.modelCatalog,
+                selection: initialModelSelection,
+                fallbackName: initialModelLabel,
+                fallbackEfforts: selectedModelReasoning?.efforts ?? [],
+                compact: true,
+                onCommit: { _ in }
+            )
         } submit: {
             Button(action: createSession) {
                 Image(systemName: "arrow.up")
@@ -1354,99 +1357,6 @@ struct NewSessionSheet: View {
         }
     }
 
-    private var initialPermissionMenu: some View {
-        Menu {
-            Button { permissionMode = "read-only" } label: {
-                Label("仅可查看", systemImage: permissionMode == "read-only" ? "checkmark" : "eye")
-            }
-            Button { permissionMode = "workspace-write" } label: {
-                Label("工作区内修改", systemImage: permissionMode == "workspace-write" ? "checkmark" : "folder")
-            }
-            Button { permissionMode = "danger-full-access" } label: {
-                Label("完全权限", systemImage: permissionMode == "danger-full-access" ? "checkmark" : "lock.open")
-            }
-        } label: {
-            let style = DSHRemotePermissionGlyph.Style.forPermissionMode(permissionMode)
-            DSHRemotePermissionGlyph(style: style)
-                .frame(width: 34, height: 34)
-                .foregroundStyle(style.composerColor)
-        }
-        .tint(.primary)
-        .accessibilityLabel("Permission: \(initialPermissionLabel)")
-    }
-
-    private var initialPermissionLabel: String {
-        switch permissionMode {
-        case "read-only": return DSHLocalization.string("Read only")
-        case "danger-full-access": return DSHLocalization.string("Full access")
-        default: return DSHLocalization.string("Workspace write")
-        }
-    }
-
-    private var initialModelMenu: some View {
-        Menu {
-            if let catalog = model.modelCatalog {
-                ForEach(catalog.groups) { group in
-                    Section(group.name) {
-                        ForEach(group.models) { item in
-                            Button {
-                                selectedProvider = group.id
-                                selectedModel = item.id
-                                selectedReasoningEffort = item.reasoning?.defaultEffort
-                            } label: {
-                                Label(item.name,
-                                      systemImage: selectedModel == item.id ? "checkmark" : "cpu")
-                            }
-                        }
-                    }
-                }
-            } else {
-                Button("刷新模型列表") { model.sendModelCatalog() }
-            }
-            if let reasoning = selectedModelReasoning, !reasoning.efforts.isEmpty {
-                Section("思考深度") {
-                    ForEach(reasoning.efforts) { effort in
-                        Button {
-                            selectedReasoningEffort = effort.id
-                        } label: {
-                            Label(effort.name,
-                                  systemImage: effort.id == effectiveReasoningEffort
-                                    ? "checkmark" : "brain.head.profile")
-                        }
-                    }
-                }
-            }
-        } label: {
-            DSHRemoteReasoningGlyph(intensity: initialReasoningIntensity)
-                .frame(width: 34, height: 34)
-        }
-        .tint(.primary)
-        .accessibilityLabel("Model: \(initialModelLabel)")
-    }
-
-    @ViewBuilder private var initialReasoningMenu: some View {
-        if let reasoning = selectedModelReasoning, !reasoning.efforts.isEmpty {
-            Menu {
-                ForEach(reasoning.efforts) { effort in
-                    Button {
-                        selectedReasoningEffort = effort.id
-                    } label: {
-                        Label(effort.name,
-                              systemImage: effort.id == effectiveReasoningEffort
-                                ? "checkmark" : "brain.head.profile")
-                    }
-                }
-            } label: {
-                Image(systemName: "brain.head.profile")
-                    .font(.system(size: 17, weight: .medium))
-                    .frame(width: 34, height: 34)
-                    .foregroundStyle(Color.accentColor)
-            }
-            .tint(.primary)
-            .accessibilityLabel("Reasoning effort")
-        }
-    }
-
     private var selectedModelReasoning: DSHModelReasoning? {
         guard let catalog = model.modelCatalog else { return nil }
         if let group = catalog.groups.first(where: { $0.id == selectedProvider }),
@@ -1458,26 +1368,28 @@ struct NewSessionSheet: View {
             .first
     }
 
-    private var effectiveReasoningEffort: String {
-        selectedReasoningEffort
-            ?? selectedModelReasoning?.defaultEffort
-            ?? selectedModelReasoning?.efforts.first?.id
-            ?? ""
-    }
-
-    private var initialReasoningIntensity: Double {
-        guard let reasoning = selectedModelReasoning else { return 0.58 }
-        let efforts = dshOrderedReasoningEfforts(reasoning.efforts)
-        guard let selectedIndex = efforts.firstIndex(where: {
-                  $0.id == effectiveReasoningEffort
-              }) else { return 0.58 }
-        guard efforts.count > 1 else { return 0.58 }
-        return Double(selectedIndex) / Double(efforts.count - 1)
-    }
-
-    private func selectedReasoningName(in reasoning: DSHModelReasoning) -> String {
-        reasoning.efforts.first(where: { $0.id == effectiveReasoningEffort })?.name
-            ?? effectiveReasoningEffort
+    /// The new-session composer keeps the same model picker state shape as a
+    /// live conversation.  The selection stays local until Create is pressed,
+    /// because there is no session to notify yet.
+    private var initialModelSelection: Binding<DSHModelSelection> {
+        Binding(
+            get: {
+                if !selectedModel.isEmpty {
+                    return DSHModelSelection(
+                        provider: selectedProvider.isEmpty ? "deepseek" : selectedProvider,
+                        model: selectedModel,
+                        reasoningEffort: selectedReasoningEffort
+                    )
+                }
+                return model.modelCatalog?.default
+                    ?? DSHModelSelection(provider: "", model: "", reasoningEffort: nil)
+            },
+            set: { selection in
+                selectedProvider = selection.provider
+                selectedModel = selection.model
+                selectedReasoningEffort = selection.reasoningEffort
+            }
+        )
     }
 
     private var initialModelLabel: String {
@@ -1993,9 +1905,7 @@ struct DSHRemoteHomeView: View {
                     Image(systemName: "apple.logo")
                         .font(.system(size: 20, weight: .medium))
                         .frame(width: 44, height: 44)
-                        .background(Color(.systemBackground), in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
-                        .shadow(color: .black.opacity(0.06), radius: 5, y: 2)
+                        .dshFloatingChrome(Circle())
                         .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
@@ -2035,19 +1945,17 @@ struct DSHRemoteHomeView: View {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 18, weight: .semibold))
                         .frame(width: 44, height: 44)
-                        .background(Color(.systemBackground), in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
-                        .shadow(color: .black.opacity(0.06), radius: 5, y: 2)
+                        .dshFloatingChrome(Circle())
                         .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("更多选项")
             }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground))
+        .background(DSHHeaderBackdrop())
     }
 
     @ViewBuilder
@@ -2214,19 +2122,26 @@ struct DSHRemoteHomeView: View {
 
             if !showSearch {
                 Button { openNewTask() } label: {
-                    DSHRemoteComposeGlyph(size: 21)
-                        .frame(width: 48, height: 48)
-                        .background(Color.accentColor, in: Circle())
-                        .foregroundStyle(.white)
+                    HStack(spacing: 8) {
+                        DSHRemoteComposeGlyph(size: 20)
+                        Text("聊天")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                    // 16pt on both sides reads as the requested two-space
+                    // breathing room; the icon-to-label gap is one space.
+                    .padding(.horizontal, 16)
+                    .frame(height: 48)
+                    .background(Color.accentColor, in: Capsule())
+                    .foregroundStyle(.white)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("新建任务")
+                .accessibilityLabel("新建聊天")
             }
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground))
+        .background(DSHHeaderBackdrop())
     }
 
     private var archivedDivider: some View {
@@ -2481,63 +2396,5 @@ private struct DSHRemoteTaskRow: View {
         .padding(.trailing, flatStyle ? 16 : 20)
         .padding(.vertical, flatStyle ? 11 : 9)
         .contentShape(Rectangle())
-    }
-}
-
-/// A real `TextField` keeps the keyboard and interactive dismissal semantics
-/// native. Tapping the arrow hands the current draft to the full-screen New
-/// Task sheet, where device/project/branch/mode/model/permission can be chosen.
-private struct DSHRemoteTaskComposer: View {
-    @Binding var text: String
-    let onNewTask: () -> Void
-
-    private var canSubmit: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Button(action: onNewTask) {
-                DSHRemoteComposeGlyph(size: 20)
-                    .frame(width: 42, height: 42)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("New task")
-
-            Divider()
-                .frame(height: 24)
-                .overlay(Color.primary.opacity(0.14))
-
-            TextField("Plan, ask, build…", text: $text, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 17))
-                .lineLimit(1...3)
-                .onSubmit {
-                    if canSubmit { onNewTask() }
-                }
-
-            Spacer(minLength: 4)
-
-            Button(action: onNewTask) {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 42, height: 42)
-                    .background(Color.accentColor, in: Circle())
-                    .foregroundStyle(Color.white)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Start task")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 25, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 25, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.75)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 7)
-        .padding(.bottom, 8)
-        .background(Color(.systemBackground).opacity(0.94))
     }
 }

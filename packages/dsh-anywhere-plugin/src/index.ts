@@ -81,8 +81,12 @@ export function isSilentSetupEcho(sessionId: string, rawEvent: unknown): boolean
 // A targeted open should make an existing conversation useful immediately,
 // without turning a tap into an unbounded replay on the phone. We still walk
 // the complete durable log to build session-wide usage; only the newest rows
-// are sent over the wire.
-const HISTORY_EVENT_LIMIT = 1_000
+// are sent over the wire. The cap is deliberately generous (10k events):
+// normal sessions are far smaller so they replay in full for free, and only
+// giant sessions pay a heavy one-time replay on open. Past this, sessions
+// stay windowed — true remote paging (fetch older on scroll) is the
+// follow-up, not a bigger cap.
+const HISTORY_EVENT_LIMIT = 10_000
 
 export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway']
 

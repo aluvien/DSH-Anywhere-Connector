@@ -11,7 +11,8 @@ final class DSHEventStoreTests: XCTestCase {
             UserDefaults.standard.removeObject(forKey: DSHAppModel.unreadBaselineKey)
         }
 
-        let model = DSHAppModel.previewHome()
+        let model = DSHAppModel.preview()
+        model.selectedSessionID = nil
         guard let session = model.sessions.first else {
             return XCTFail("Preview session is missing")
         }
@@ -339,6 +340,118 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(entries.map(\.id), ["model-change-s-2-deepseek-v4.1-reasoner", "turn-answer"])
     }
 
+    func testModelChangesBeforeOneSendCollapseToTheFinalChoice() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(modelChangeEvent(model: "draft", sequence: 1), into: &state)
+        reducer.reduce(modelChangeEvent(model: "balanced", sequence: 2), into: &state)
+        reducer.reduce(modelChangeEvent(model: "focused", sequence: 3), into: &state)
+
+        let notices = state.modelChangesBySession["s"] ?? []
+        XCTAssertEqual(notices.map(\.current.model), ["focused"])
+        XCTAssertEqual(notices.map(\.sequence), [3])
+    }
+
+    func testModelChangesAfterAcceptedSendStartANewNoticeBatch() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(modelChangeEvent(model: "draft", sequence: 1), into: &state)
+        reducer.reduce(modelChangeEvent(model: "balanced", sequence: 2), into: &state)
+        reducer.reduce(userMessageEvent(id: "question", text: "send this", sequence: 3), into: &state)
+        reducer.reduce(modelChangeEvent(model: "focused", sequence: 4), into: &state)
+        reducer.reduce(modelChangeEvent(model: "max", sequence: 5), into: &state)
+
+        let notices = state.modelChangesBySession["s"] ?? []
+        XCTAssertEqual(notices.map(\.current.model), ["balanced", "max"])
+        XCTAssertEqual(notices.map(\.sequence), [2, 5])
+
+        let entries = state.messagesBySession["s", default: []]
+            .transcriptEntries(with: [], modelChanges: notices)
+        XCTAssertEqual(entries.map(\.id), [
+            "model-change-s-2-provider-balanced",
+            "turn-question",
+            "model-change-s-5-provider-max",
+        ])
+    }
+
+    func testPermissionUpdateChangesSessionStateWithoutAddingTranscriptNotice() {
+        var state = DSHStoreState()
+        state.sessions = [DSHSessionSummary(id: "s", permissionMode: "read-only")]
+        let event = DSHEvent(envelope: DSHEnvelope(
+            messageId: "permission", deviceId: "d", machineId: "m", sessionId: "s", sequence: 1,
+            type: "permission.updated",
+            payload: .object([
+                "sessionId": .string("s"),
+                "mode": .string("danger-full-access"),
+            ])
+        ))
+
+        DSHEventReducer().reduce(event, into: &state)
+
+        XCTAssertEqual(state.permissionBySession["s"]?.mode, "danger-full-access")
+        XCTAssertEqual(state.sessions.first?.permissionMode, "danger-full-access")
+        XCTAssertTrue(state.messagesBySession["s", default: []].isEmpty)
+        XCTAssertTrue(state.modelChangesBySession["s", default: []].isEmpty)
+        XCTAssertTrue(state.messagesBySession["s", default: []]
+            .transcriptEntries(with: [], modelChanges: state.modelChangesBySession["s", default: []])
+            .isEmpty)
+    }
+
+    func testHistoricalPermissionSetupSuccessDoesNotCreateTranscriptCommand() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(commandResultEvent(kind: "success", text: "preset workspace-write", sequence: 1), into: &state)
+
+        XCTAssertTrue(state.commandResultsBySession["s", default: []].isEmpty)
+    }
+
+    func testHistoricalPermissionSetupFailureRemainsVisible() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(commandResultEvent(kind: "error", text: "preset workspace-write", sequence: 1), into: &state)
+
+        let result = try! XCTUnwrap(state.commandResultsBySession["s"]?.first)
+        XCTAssertEqual(result.kind, "error")
+        XCTAssertEqual(result.text, "preset workspace-write")
+    }
+
+    func testReplayedModelChangeWithSameIdentityDoesNotEraseNewDraft() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(modelChangeEvent(model: "first", sequence: 2), into: &state)
+        reducer.reduce(userMessageEvent(id: "question", text: "send this", sequence: 3), into: &state)
+        reducer.reduce(modelChangeEvent(model: "next", sequence: 4), into: &state)
+        reducer.reduce(sessionSnapshotEvent(sequence: 1), into: &state)
+        reducer.reduce(modelChangeEvent(model: "first", sequence: 2), into: &state)
+
+        let notices = state.modelChangesBySession["s"] ?? []
+        XCTAssertEqual(notices.map(\.current.model), ["first", "next"])
+        XCTAssertEqual(notices.map(\.sequence), [2, 4])
+    }
+
+    func testHistoryReplayModelChangeMergesWithCarryWithoutDuplicate() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+
+        reducer.reduce(modelChangeEvent(model: "first", sequence: 1), into: &state)
+        reducer.reduce(userMessageEvent(id: "question", text: "send this", sequence: 2), into: &state)
+        reducer.reduce(modelChangeEvent(model: "next", sequence: 3), into: &state)
+        reducer.reduce(historyEvent(type: "history.started", sequence: 4), into: &state)
+        // History envelopes are newly sequenced. Its payload nevertheless
+        // represents the first, already rendered model change.
+        reducer.reduce(modelChangeEvent(model: "first", sequence: 5), into: &state)
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 6), into: &state)
+
+        let notices = state.modelChangesBySession["s"] ?? []
+        XCTAssertEqual(notices.map(\.current.model), ["first", "next"])
+        XCTAssertEqual(notices.map(\.sequence), [1, 3])
+    }
+
     func testTranscriptInterleavesMessagesAndToolCallsByArrival() {
         // A message, then a call, then another message — the shape of a real
         // turn. Rendering messages and tools as two runs put the call last.
@@ -429,6 +542,43 @@ final class DSHEventStoreTests: XCTestCase {
                 "role": .string("user"),
                 "markdown": .string(text),
             ])
+        ))
+    }
+
+    private func modelChangeEvent(model: String, sequence: Int64,
+                                  sessionId: String = "s") -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "model-\(sequence)", deviceId: "d", machineId: "m",
+            sessionId: sessionId, sequence: sequence, type: "session.model.changed",
+            payload: .object([
+                "sessionId": .string(sessionId),
+                "current": .object([
+                    "provider": .string("provider"),
+                    "model": .string(model),
+                ]),
+            ])
+        ))
+    }
+
+    private func commandResultEvent(kind: String, text: String, sequence: Int64,
+                                    sessionId: String = "s") -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "command-\(sequence)", deviceId: "d", machineId: "m",
+            sessionId: sessionId, sequence: sequence, type: "command.result",
+            payload: .object([
+                "sessionId": .string(sessionId),
+                "requestId": .string("request-\(sequence)"),
+                "matched": .bool(true),
+                "kind": .string(kind),
+                "text": .string(text),
+            ])
+        ))
+    }
+
+    private func sessionSnapshotEvent(sequence: Int64) -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "snapshot-\(sequence)", deviceId: "d", machineId: "m",
+            sequence: sequence, type: "session.snapshot", payload: .array([])
         ))
     }
 

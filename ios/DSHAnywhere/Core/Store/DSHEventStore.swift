@@ -242,9 +242,28 @@ public struct DSHEventReducer: Sendable {
                 stamped.sequence = event.envelope.sequence
             }
             stamped.timestamp = event.envelope.timestamp
-            // Consecutive switch notices collapse: only the latest one
-            // matters, the rest is noise that buries the transcript.
-            state.modelChangesBySession[change.sessionId] = [stamped]
+            var notices = state.modelChangesBySession[change.sessionId, default: []]
+            // History events receive fresh envelope sequence numbers, while
+            // their payload describes the same old model change. A matching
+            // notice already carried into the replay is therefore the durable
+            // identity here; appending it again would also erase a newer,
+            // unsent draft when the pre-send batch is collapsed below.
+            if notices.contains(where: { $0.id == stamped.id })
+                || state.historyCarryOverBySession[change.sessionId]?.modelChanges
+                    .contains(where: { sameModelChange($0, stamped) }) == true {
+                break
+            }
+            // A user can try several models while composing one message. Keep
+            // only the final choice for that pending send, but preserve older
+            // choices once a user message has been accepted so each later turn
+            // can still explain the model it used.
+            let sendBoundary = state.messagesBySession[change.sessionId, default: []]
+                .filter { $0.role == .user }
+                .compactMap(\.sequence)
+                .max() ?? 0
+            notices.removeAll { $0.sequence > sendBoundary }
+            notices.append(stamped)
+            state.modelChangesBySession[change.sessionId] = notices
         case .commandResult(let result):
             // The command.result payload intentionally stays small and does
             // not carry transport metadata. Stamp the enclosing event's
@@ -258,6 +277,12 @@ public struct DSHEventReducer: Sendable {
             } else if stamped.sequence == nil {
                 stamped.sequence = event.envelope.sequence
             }
+            // A successful app-initiated permission update has a dedicated
+            // `permission.updated` event. Old history batches can still carry
+            // its native `/permission` acknowledgement; omit that known
+            // success marker from the transcript, while keeping failures
+            // visible to the person who made the change.
+            guard !isSilentPermissionSetupSuccess(stamped) else { break }
             var values = state.commandResultsBySession[stamped.sessionId, default: []]
             if let index = values.firstIndex(where: { $0.id == stamped.id }) { values[index] = stamped }
             else { values.append(stamped) }
@@ -328,13 +353,40 @@ public struct DSHEventReducer: Sendable {
         appendMissing(carry.messages, to: &state.messagesBySession[sessionId, default: []])
         appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
         appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
-        appendMissing(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
+        appendMissingModelChanges(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
     }
 
     private func appendMissing<T: Identifiable>(_ values: [T], to store: inout [T]) where T.ID: Equatable {
         for value in values where !store.contains(where: { $0.id == value.id }) {
             store.append(value)
         }
+    }
+
+    private func appendMissingModelChanges(_ values: [DSHModelChangeNotice],
+                                           to store: inout [DSHModelChangeNotice]) {
+        for value in values where !store.contains(where: {
+            $0.id == value.id || sameModelChange($0, value)
+        }) {
+            store.append(value)
+        }
+    }
+
+    private func sameModelChange(_ left: DSHModelChangeNotice,
+                                 _ right: DSHModelChangeNotice) -> Bool {
+        left.previous == right.previous && left.current == right.current
+    }
+
+    private func isSilentPermissionSetupSuccess(_ result: DSHCommandResult) -> Bool {
+        guard result.kind?.lowercased() != "error",
+              let text = result.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() else {
+            return false
+        }
+        return [
+            "preset read-only",
+            "preset workspace-write",
+            "preset danger-full-access",
+        ].contains(text)
     }
 
     private func appendOrReplace<T: Identifiable & Equatable>(_ value: T,
