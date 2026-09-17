@@ -273,4 +273,30 @@ describe("prompt attachments", () => {
     };
     expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
   });
+
+  it("accepts a thumbnail on chat attachments but caps its length", () => {
+    const attachment = {
+      id: "sha256:abc",
+      name: "shot.png",
+      mediaType: "image/png",
+      thumbnail: "data:image/png;base64,iVBORw0KGgo=",
+    };
+    const parsed = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "user.message.accepted",
+      payload: { id: "u1", role: "user", markdown: "see?", attachments: [attachment] },
+    });
+    expect(parsed.type).toBe("user.message.accepted");
+    if (parsed.type === "user.message.accepted") {
+      expect(parsed.payload.attachments?.[0]).toMatchObject({ id: "sha256:abc" });
+    }
+    const oversized = { ...attachment, thumbnail: `data:image/png;base64,${"A".repeat(400_000)}` };
+    expect(EventEnvelopeSchema.safeParse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "user.message.accepted",
+      payload: { id: "u1", role: "user", markdown: "see?", attachments: [oversized] },
+    }).success).toBe(false);
+  });
 });

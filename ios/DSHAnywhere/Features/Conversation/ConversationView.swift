@@ -3175,7 +3175,9 @@ private struct MessageAttachmentPreview: View {
             }
         }
         .task(id: attachment.id) {
-            data = model.attachmentData(for: attachment)
+            // Receipt cache first (phone uploads); embedded thumbnail second
+            // (web uploads, Mac-side and model-returned images).
+            data = model.attachmentData(for: attachment) ?? attachment.thumbnailData
         }
     }
 }

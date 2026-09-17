@@ -103,6 +103,9 @@
 ## 30. 顶栏整片磨砂 + 跳转落点修复
 - 状态：[树]①顶栏改整幅 `ultraThinMaterial`（全版本通用，无需分支；返回圆钮/胶囊玻璃保留；渐隐删除；spacer 与测量保留）；②跳转落点：点箭头落在半路=按旧布局落锚（LazyVStack 尾部未算完），与落定补钉同款修法——点按后 0.35s/1.0s 再各钉一次。待发版验证。
 
+## 31. Mac 侧图片回传（缩略图内嵌）+ 漏数据审计
+- 状态：[树]根因：`{type:image, attachment:{attachmentId: sha256…}}`（网页上传/Mac 文件/模型回图）无 receiptId，手机无字节路径，桥还给随机 id（每次重播 duplicate 叠加）。做法：协议 `ChatAttachment.thumbnail?`（data URL，40 万字符封顶）+ `RELAY_SCHEMA_REVISION` 5→6；桥按 `DSH_HOME/attachments/v1/objects/ab/hex` 同步读盘嵌缩略图（256KB 封顶，超限/读不到降级纯名行；id 改用 attachmentId 保稳定；assistant 消息补发 attachments）；connector 仅重编（透传）；iOS 解 data URL，receipt 优先、缩略图兜底。测试：protocol 17（含封顶拒绝）、plugin 42（含稳定 id+内嵌正向）、relay 12、connector 13 全绿；iOS 单测走 Xcode。**发版顺序**：先重部署 Relay（旧 Relay 拒收新消息！），再发 App（旧 App 严格解码会整条丢消息！），最后 Mac 重编重启服务。审计余项：deliverables/presented（产出文件不可见）、todo/write（清单无展示，ROADMAP §6 已有）、llm/retry（重试中状态缺）、compaction/prune（压缩通知缺）、工具结果图片块（本会话零出现，暂不扩 schema）。待发版验证：网页传图→手机看缩略图。
+
 ## 协作备注（2026-09-16 发现，09-17 已对齐）
 - `Features/Shared/DSHRemoteGlyphs.swift` 已进 Xcode target 并被 `ConversationView` 引用；归属已确认，无需再定。
 - 动 `ConversationView.swift` / `SessionListView.swift` 前仍先对齐，避免互盖。

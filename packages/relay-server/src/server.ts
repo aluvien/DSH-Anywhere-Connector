@@ -23,8 +23,13 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024;
  *    and the `question.answer` command.
  * 4: added `history.started`, `history.completed` events so history replays
  *    can bracket one session batch (older Relays reject them as invalid).
+ * 5: earlier forwarded-type additions (unrecorded at the time).
+ * 6: added optional `thumbnail` to chat attachments so Mac-side images
+ *    (web uploads, model-returned images) reach the phone; older Relays
+ *    reject thumbnail-bearing messages as invalid, so the Relay must be
+ *    redeployed BEFORE any bridge starts sending them.
  */
-const RELAY_SCHEMA_REVISION = 5;
+const RELAY_SCHEMA_REVISION = 6;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day

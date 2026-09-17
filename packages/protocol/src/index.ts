@@ -127,14 +127,17 @@ export type SessionCreatedPayload = z.infer<typeof SessionCreatedPayloadSchema>;
 export const ChatRoleSchema = z.enum(["user", "assistant", "system"]);
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 
-/** Lightweight attachment metadata carried with a user message event. The
- * image bytes stay in the local attachment cache; the event only needs the
- * receipt/name so clients can associate a thumbnail with the message. */
+/** Attachment metadata carried with a message event. Phone-uploaded files
+ * resolve locally by receiptId; anything else (web uploads, Mac-side files,
+ * model-returned images) carries an embedded `thumbnail` data URL instead,
+ * because the phone has no byte path to those. Thumbnails are bridge-capped
+ * small (see THUMBNAIL_MAX_BYTES); full bytes stay on the Mac. */
 export const ChatAttachmentSchema = StrictObject({
   id: IdentifierSchema,
   name: z.string().min(1).max(512),
   mediaType: z.string().min(1).max(256).optional(),
   receiptId: IdentifierSchema.optional(),
+  thumbnail: z.string().min(1).max(400_000).optional(),
 });
 export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 

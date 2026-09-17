@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type { Context } from '@deepseek-ai/cordis'
@@ -1679,6 +1680,9 @@ export function normalizeSessionEvents(
     const messageId = stringOr(message.id, randomUUID())
     const sessionUsage = usage === undefined ? undefined : aggregateUsage(counters, usage, messageId)
     const streamedText = streamText(data.stream)
+    // Assistant-side images (model-returned or read back) travel the same
+    // attachment path as user uploads, thumbnails included.
+    const attachments = contentAttachments(message.content)
     const normalized: NativeEventInput[] = [{
       type: 'assistant.message.completed',
       sessionId,
@@ -1686,6 +1690,7 @@ export function normalizeSessionEvents(
         id: messageId,
         role: 'assistant',
         markdown: contentText(message.content),
+        ...(attachments.length === 0 ? {} : { attachments }),
         ...(usage === undefined ? {} : { usage }),
         ...(typeof source.provider === 'string' ? { provider: source.provider } : {}),
         ...(typeof source.model === 'string' ? { model: source.model } : {}),
@@ -1976,15 +1981,41 @@ function contentText(value: unknown): string {
 }
 
 /**
- * Keep user-message attachment events lightweight. The image/file bytes are
- * already stored by the Harness; clients only need a receipt to associate
- * their local thumbnail with the message in the transcript.
+ * Keep message attachment events lightweight, but complete: phone uploads
+ * resolve locally by receiptId, while anything else (web uploads, Mac-side
+ * files, model-returned images) carries an embedded thumbnail, because the
+ * phone has no byte path to those. Thumbnails are read synchronously from
+ * the Harness attachment store and capped small; anything unreadable or
+ * oversized degrades to a name-only row rather than failing the message.
  */
+const ATTACHMENT_THUMBNAIL_MAX_BYTES = 256 * 1024
+
+/** Resolve `sha256:<hex>` content references to bytes in DSH_HOME. */
+function attachmentObjectPath(attachmentId: string): string | undefined {
+  const hex = attachmentId.startsWith('sha256:') ? attachmentId.slice('sha256:'.length) : attachmentId
+  if (!/^[0-9a-f]{16,128}$/i.test(hex)) return undefined
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'attachments', 'v1', 'objects', hex.slice(0, 2).toLowerCase(), hex.toLowerCase())
+}
+
+function attachmentThumbnail(attachmentId: string, mediaType: string): string | undefined {
+  try {
+    const path = attachmentObjectPath(attachmentId)
+    if (path === undefined) return undefined
+    if (!mediaType.toLowerCase().startsWith('image/')) return undefined
+    if (statSync(path).size > ATTACHMENT_THUMBNAIL_MAX_BYTES) return undefined
+    return `data:${mediaType};base64,${readFileSync(path).toString('base64')}`
+  } catch {
+    return undefined
+  }
+}
+
 function contentAttachments(value: unknown): Array<{
   id: string
   name: string
   mediaType?: string | undefined
   receiptId?: string | undefined
+  thumbnail?: string | undefined
 }> {
   if (!Array.isArray(value)) return []
   return value.flatMap((entry) => {
@@ -2000,11 +2031,23 @@ function contentAttachments(value: unknown): Array<{
       return parsed.success ? [parsed.data] : []
     }
     if (block.type === 'image') {
-      const id = stringOr(block.id, `image-${randomUUID()}`)
+      // Prefer the durable content reference as a stable id (a random id
+      // duplicates the row on every replay) and embed a thumbnail: without
+      // either, the phone renders a permanent empty slot it can never fill.
+      const attachment = recordOf(block.attachment)
+      const attachmentId = typeof attachment.attachmentId === 'string' ? attachment.attachmentId : undefined
+      const mediaType = typeof attachment.mediaType === 'string'
+        ? attachment.mediaType
+        : stringOr(block.mediaType, 'image/jpeg')
+      const id = attachmentId ?? stringOr(block.id, `image-${randomUUID()}`)
+      const thumbnail = attachmentId === undefined
+        ? undefined
+        : attachmentThumbnail(attachmentId, mediaType)
       const parsed = ChatAttachmentSchema.safeParse({
         id,
-        name: stringOr(block.name, 'Image'),
-        mediaType: stringOr(block.mediaType, 'image/jpeg'),
+        name: stringOr(attachment.name, stringOr(block.name, 'Image')),
+        mediaType,
+        ...(thumbnail === undefined ? {} : { thumbnail }),
       })
       return parsed.success ? [parsed.data] : []
     }

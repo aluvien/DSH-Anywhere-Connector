@@ -246,6 +246,17 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(DSHToolPresentation.statusText("cancelled"), "已取消")
     }
 
+    func testThumbnailDataURLDecodes() {
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47])
+        let attachment = DSHMessageAttachment(id: "sha256:abc", name: "shot.png",
+                                              mediaType: "image/png",
+                                              thumbnail: "data:image/png;base64,\(bytes.base64EncodedString())")
+        XCTAssertEqual(attachment.thumbnailData, bytes)
+        XCTAssertNil(dshDataURLBytes("https://example.com/shot.png"))
+        XCTAssertNil(dshDataURLBytes("data:image/png,not-base64!!"))
+        XCTAssertNil(DSHMessageAttachment(id: "x", name: "shot.png").thumbnailData)
+    }
+
     func testNearestEffortIndexSurvivesIdDrift() {
         // The persisted effort id can drift from the catalog's ids; the meter
         // must point at the nearest intelligence, never slam to minimum.

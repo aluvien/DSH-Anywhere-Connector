@@ -867,12 +867,18 @@ public struct DSHMessageAttachment: Codable, Sendable, Equatable, Identifiable {
     public let name: String
     public let mediaType: String?
     public let receiptId: String?
+    /// Embedded thumbnail (`data:<mime>;base64,…`) for images the phone never
+    /// uploaded itself (web uploads, Mac-side files, model-returned images).
+    /// Phone uploads keep resolving through the receipt cache instead.
+    public let thumbnail: String?
 
-    public init(id: String, name: String, mediaType: String? = nil, receiptId: String? = nil) {
+    public init(id: String, name: String, mediaType: String? = nil, receiptId: String? = nil,
+                thumbnail: String? = nil) {
         self.id = id
         self.name = name
         self.mediaType = mediaType
         self.receiptId = receiptId
+        self.thumbnail = thumbnail
     }
 
     public var isImage: Bool {
@@ -880,6 +886,21 @@ public struct DSHMessageAttachment: Codable, Sendable, Equatable, Identifiable {
         let ext = (name as NSString).pathExtension.lowercased()
         return ["png", "jpg", "jpeg", "heic", "webp", "gif"].contains(ext)
     }
+
+    /// Thumbnail bytes when the event carried them inline.
+    public var thumbnailData: Data? {
+        guard let thumbnail else { return nil }
+        return dshDataURLBytes(thumbnail)
+    }
+}
+
+/// Decodes a `data:<mime>;base64,…` URL to bytes. Returns nil for anything
+/// else (plain URLs, garbage), so callers can fall through safely.
+public func dshDataURLBytes(_ value: String) -> Data? {
+    guard let comma = value.firstIndex(of: ",") else { return nil }
+    let head = value[value.startIndex..<comma].lowercased()
+    guard head.hasPrefix("data:") && head.contains(";base64") else { return nil }
+    return Data(base64Encoded: String(value[value.index(after: comma)...]))
 }
 
 public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -49,6 +49,58 @@ describe('DeepSeek Harness event normalization', () => {
         attachments: [{ id: 'receipt-1', receiptId: 'receipt-1', name: 'photo.jpg', mediaType: 'image/jpeg' }],
       },
     })
+  })
+
+  it('embeds thumbnails for Mac-side images with stable ids', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-attach-'))
+    const hex = 'ab'.repeat(32)
+    await mkdir(join(dir, 'attachments', 'v1', 'objects', 'ab'), { recursive: true })
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64')
+    await writeFile(join(dir, 'attachments', 'v1', 'objects', 'ab', hex), png)
+    const previousHome = process.env.DSH_HOME
+    process.env.DSH_HOME = dir
+    try {
+      const input = {
+        type: 'user/message',
+        data: {
+          id: 'u3', source: { kind: 'user' },
+          content: [{ type: 'image', attachment: { attachmentId: `sha256:${hex}`, mediaType: 'image/png', name: 'shot.png' } }],
+        },
+      }
+      const first = normalizeSessionEvent('s1', input, new Map())
+      const second = normalizeSessionEvent('s1', input, new Map())
+      // Same input twice must not mint random ids (or replays duplicate rows).
+      expect(first).toEqual(second)
+      expect(first).toEqual({
+        type: 'user.message.accepted', sessionId: 's1',
+        payload: {
+          id: 'u3', role: 'user', markdown: '',
+          attachments: [{
+            id: `sha256:${hex}`, name: 'shot.png', mediaType: 'image/png',
+            thumbnail: `data:image/png;base64,${png.toString('base64')}`,
+          }],
+        },
+      })
+      // Assistant-side images ride the same path.
+      expect(normalizeSessionEvent('s1', {
+        type: 'assistant/message',
+        data: { message: { id: 'a9', content: [{ type: 'text', text: '' }, input.data.content[0]] } },
+      }, new Map())).toEqual({
+        type: 'assistant.message.completed', sessionId: 's1',
+        payload: {
+          id: 'a9', role: 'assistant', markdown: '',
+          attachments: [{
+            id: `sha256:${hex}`, name: 'shot.png', mediaType: 'image/png',
+            thumbnail: `data:image/png;base64,${png.toString('base64')}`,
+          }],
+        },
+      })
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    }
   })
 
   it('correlates a tool result with its call', () => {
