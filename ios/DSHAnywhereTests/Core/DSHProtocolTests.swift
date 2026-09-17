@@ -142,6 +142,43 @@ final class DSHModelPanelLayoutTests: XCTestCase {
 #endif
 
 final class DSHProtocolTests: XCTestCase {
+    func testMacCatalogWireFixturesKeepEmptyWorkspacesAndCustomModes() throws {
+        func event(_ type: String, _ payload: String) throws -> DSHEvent {
+            let json = """
+            {"version":1,"messageId":"request-1","machineId":"mac","deviceId":"iphone",
+             "sequence":42,"timestamp":1,"type":"\(type)","payload":\(payload)}
+            """
+            return try JSONDecoder().decode(DSHEvent.self, from: Data(json.utf8))
+        }
+        let workspaces = try event("workspace.catalog", #"{"workspaces":[{"id":"empty-project","title":"没有会话的项目","path":"/Users/mac/项目"}]}"#)
+        guard case .workspaceCatalog(let entries) = workspaces.kind else { return XCTFail("Mac workspace catalog was not decoded") }
+        XCTAssertEqual(entries.first?.name, "没有会话的项目")
+        XCTAssertEqual(entries.first?.path, "/Users/mac/项目")
+        let modes = try event("mode.catalog", #"{"defaultMode":"custom-review","modes":[{"id":"custom-review","name":"我的审查模式","description":"来自 Mac 的自定义模式"}]}"#)
+        guard case .modeCatalog(let catalog) = modes.kind else { return XCTFail("Mac mode catalog was not decoded") }
+        XCTAssertEqual(catalog.defaultMode, "custom-review")
+        XCTAssertEqual(catalog.modes.first?.name, "我的审查模式")
+        let directory = try event("directory.list", #"{"path":"/","directories":[{"name":"Users","path":"/Users"}]}"#)
+        guard case .directoryListing(let listing) = directory.kind else { return XCTFail("Mac directory listing was not decoded") }
+        XCTAssertNil(listing.parentPath)
+        XCTAssertEqual(listing.directories.first?.path, "/Users")
+        XCTAssertEqual(directory.envelope.messageId, "request-1")
+    }
+
+    func testRemoteWorkspaceAndRenameCommandsOmitAbsentOptionalFields() throws {
+        let workspace = DSHCommand.createWorkspace(deviceId: "iphone", machineId: "mac", path: "/Users/mac/项目")
+        let data = try JSONEncoder().encode(workspace)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["sessionId"])
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["path"] as? String, "/Users/mac/项目")
+        XCTAssertNil(payload["title"])
+        let rename = DSHCommand.renameSession(deviceId: "iphone", machineId: "mac", sessionId: "conversation", title: "新的名称", requestId: "rename-1")
+        XCTAssertEqual(rename.requestId, "rename-1")
+        XCTAssertEqual(rename.sessionId, "conversation")
+        XCTAssertEqual(rename.payload, .object(["title": .string("新的名称")]))
+    }
+
     func testEnvelopeRoundTripsUnknownPayload() throws {
         let envelope = DSHEnvelope(messageId: "m1", deviceId: "d1", machineId: "mac",
                                    sessionId: "s1", sequence: 4, timestamp: 123,
@@ -778,6 +815,17 @@ final class DSHConversationViewportTests: XCTestCase {
 #if canImport(UIKit)
 @MainActor
 final class DSHHomeLayoutTests: XCTestCase {
+    func testNewTaskRightSwipeDistinguishesReturnFromScrollingAndControlDrags() {
+        XCTAssertTrue(dshShouldDismissNewTaskForRightSwipe(
+            translation: CGSize(width: 150, height: 12), predictedEndTranslation: CGSize(width: 220, height: 16)))
+        XCTAssertFalse(dshShouldDismissNewTaskForRightSwipe(
+            translation: CGSize(width: -150, height: 12), predictedEndTranslation: CGSize(width: -220, height: 16)))
+        XCTAssertFalse(dshShouldDismissNewTaskForRightSwipe(
+            translation: CGSize(width: 110, height: 180), predictedEndTranslation: CGSize(width: 140, height: 220)))
+        XCTAssertFalse(dshShouldDismissNewTaskForRightSwipe(
+            translation: CGSize(width: 30, height: 2), predictedEndTranslation: CGSize(width: 45, height: 2)))
+    }
+
     func testSettingsAndRemoteHomeUseSingleLayout() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)

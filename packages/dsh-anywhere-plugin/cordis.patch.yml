@@ -6,6 +6,7 @@
         - sessionController
         - workspaceRegistry
         - typertGateway
+        - directoryPicker
       config:
         routePrefix: /dsh-anywhere/v1
         approvalTimeoutMs: 120000

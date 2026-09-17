@@ -167,8 +167,9 @@ public struct DSHCommand: Codable, Sendable, Equatable {
     }
 
     public static func listSessions(deviceId: String, machineId: String,
-                                    includeArchived: Bool = false) -> DSHCommand {
-        DSHCommand(deviceId: deviceId, machineId: machineId, type: "session.list",
+                                    includeArchived: Bool = false,
+                                    requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId, type: "session.list",
                    payload: .object(["includeArchived": .bool(includeArchived)]))
     }
 
@@ -188,6 +189,42 @@ public struct DSHCommand: Codable, Sendable, Equatable {
         DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
                    sessionId: sessionId, type: "session.archive",
                    payload: .object(["archived": .bool(archived)]))
+    }
+
+    public static func renameSession(deviceId: String, machineId: String, sessionId: String,
+                                     title: String, requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   sessionId: sessionId, type: "session.rename",
+                   payload: .object(["title": .string(title)]))
+    }
+
+    public static func directoryList(deviceId: String, machineId: String, path: String? = nil,
+                                     requestId: String = UUID().uuidString) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = [:]
+        if let path, !path.isEmpty { payload["path"] = .string(path) }
+        return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                          type: "directory.list", payload: .object(payload))
+    }
+
+    public static func workspaceCatalog(deviceId: String, machineId: String,
+                                        requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   type: "workspace.catalog", payload: .object([:]))
+    }
+
+    public static func createWorkspace(deviceId: String, machineId: String, path: String,
+                                       title: String? = nil,
+                                       requestId: String = UUID().uuidString) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["path": .string(path)]
+        if let title, !title.isEmpty { payload["title"] = .string(title) }
+        return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                          type: "workspace.create", payload: .object(payload))
+    }
+
+    public static func modeCatalog(deviceId: String, machineId: String,
+                                   requestId: String = UUID().uuidString) -> DSHCommand {
+        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                   type: "mode.catalog", payload: .object([:]))
     }
 
     public static func selectModel(deviceId: String, machineId: String, sessionId: String,
@@ -1372,6 +1409,10 @@ public enum DSHEventKind: Sendable, Equatable {
     case approvalResolved(DSHApprovalResolution)
     case turnStateChanged(DSHTurnState)
     case modelCatalog(DSHModelCatalog)
+    case workspaceCatalog([DSHWorkspaceOption])
+    case workspaceCreated(DSHWorkspaceOption)
+    case modeCatalog(DSHModeCatalog)
+    case directoryListing(DSHDirectoryListing)
     case usageUpdated(DSHUsageUpdate)
     case permissionUpdated(DSHPermissionUpdate)
     case sessionMetadataUpdated(DSHSessionMetadataUpdate)
@@ -1390,14 +1431,20 @@ public enum DSHEventKind: Sendable, Equatable {
 public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
     public let envelope: DSHEnvelope
     public let kind: DSHEventKind
+    /// Transport-only provenance: a lower sequence belongs to a session-list
+    /// request made by this client after the Connector restarted. It is never
+    /// encoded on the wire and lets the reducer distinguish it from a stale
+    /// replayed snapshot.
+    public let establishesSequenceEpoch: Bool
 
     public var id: String { envelope.messageId }
     public var sequence: Int64 { envelope.sequence }
     public var type: String { envelope.type }
 
-    public init(envelope: DSHEnvelope) {
+    public init(envelope: DSHEnvelope, establishesSequenceEpoch: Bool = false) {
         self.envelope = envelope
         self.kind = DSHEvent.decodeKind(type: envelope.type, payload: envelope.payload)
+        self.establishesSequenceEpoch = establishesSequenceEpoch
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, _ payload: DSHJSONValue) -> T? {
@@ -1421,6 +1468,12 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "approval.resolved": return decode(DSHApprovalResolution.self, payload).map(DSHEventKind.approvalResolved) ?? .unknown
         case "turn.state.changed": return decode(DSHTurnState.self, payload).map(DSHEventKind.turnStateChanged) ?? .unknown
         case "model.catalog": return decode(DSHModelCatalog.self, payload).map(DSHEventKind.modelCatalog) ?? .unknown
+        case "workspace.catalog":
+            struct Payload: Decodable { let workspaces: [DSHWorkspaceOption] }
+            return decode(Payload.self, payload).map { .workspaceCatalog($0.workspaces) } ?? .unknown
+        case "workspace.created": return decode(DSHWorkspaceOption.self, payload).map(DSHEventKind.workspaceCreated) ?? .unknown
+        case "mode.catalog": return decode(DSHModeCatalog.self, payload).map(DSHEventKind.modeCatalog) ?? .unknown
+        case "directory.list": return decode(DSHDirectoryListing.self, payload).map(DSHEventKind.directoryListing) ?? .unknown
         case "usage.updated": return decode(DSHUsageUpdate.self, payload).map(DSHEventKind.usageUpdated) ?? .unknown
         case "permission.updated": return decode(DSHPermissionUpdate.self, payload).map(DSHEventKind.permissionUpdated) ?? .unknown
         case "session.metadata.updated": return decode(DSHSessionMetadataUpdate.self, payload).map(DSHEventKind.sessionMetadataUpdated) ?? .unknown

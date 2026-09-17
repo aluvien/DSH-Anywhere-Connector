@@ -163,3 +163,12 @@
 - 首页底部搜索恢复占据“聊天”按钮左侧剩余空间的宽框，默认显示放大镜和“搜索聊天”；宽度取当前页面测量值，保留原生工具栏与透明材质。
 - 原生 toolbar 搜索与聊天使用独立项目，搜索标签显式44pt高度，移除与系统工具栏冲突的 bordered 样式。Release 首页测试通过，实际截图确认宽搜索和聊天同时可见：`/tmp/dsh-108-home-native.xcresult`。
 - IPA 与截图：`artifacts/ios/wide-search-build108-20260918/`。IPA SHA256：`5ee7aafc8acb15bca46938f30c2750ba2fb484f9f004e4b8a0f22b5e6990328e`。
+
+
+## 40. 2026-09-18 远端项目、模式与会话同步（Build 109 候选）
+- 状态：签名归档通过，尚未上传 TestFlight；线上 Relay 仍为 schemaRevision 6，需先部署 schemaRevision 7，再同步 Mac Bridge/Connector，最后发布客户端。
+- 新建任务支持页面右滑返回，滑块操作不触发返回；首页保留原生透明宽搜索框。首页菜单新增“新建项目”，浏览配对 Mac 文件夹并通过原生 workspaceRegistry 创建工作区，空工作区也显示。
+- 模式列表、默认模式和名称取自 Mac agentPresets；会话菜单改为远端重命名。空会话显示“新会话”，不持久化占位标题，发送后使用原生语意标题服务，并同步 Mac/网页标题变化。
+- 远端工作区目录和名称为准，移除本地名称与隐藏覆盖。归档过滤按设备保留；请求响应按设备路由，刷新只接受最新请求，移除重复及不完整初始快照，避免旧信息闪现。
+- 新增命令在客户端检查 Relay schemaRevision，旧服务下给出升级提示，保留已有会话通信。升级包：artifacts/server/DSH-ANYWHERE-RELAY-SERVER-20260918-r13-schema7.zip；部署说明：artifacts/server/RELAY-SCHEMA7-UPGRADE.md。保留服务器 .env 和数据卷。
+- 验证：Release 全套104项 iOS测试通过，随后新增3项请求关联/失败状态测试并通过50项 EventStore 定向复验；后端90项测试及全部包类型检查通过。临时 Relay 实例 health 验证 schemaRevision 7。首页和新建任务截图已检查；真实远端联调与真机交互需部署后验证。

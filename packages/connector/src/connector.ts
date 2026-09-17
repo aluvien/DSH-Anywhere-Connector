@@ -5,10 +5,14 @@ import {
   CommandResultPayloadSchema,
   EventEnvelopeSchema,
   ModelCatalogPayloadSchema,
+  ModeCatalogPayloadSchema,
   PROTOCOL_VERSION,
   RelayMessageSchema,
   RelayPayloadMessageSchema,
   SessionSummarySchema,
+  WorkspaceCatalogPayloadSchema,
+  WorkspaceSchema,
+  DirectoryListPayloadSchema,
   type CommandEnvelope,
   type EventEnvelope,
   type SessionSummary,
@@ -85,6 +89,8 @@ export class DSHAnywhereConnector {
   private state: ConnectorState = "stopped";
   private readonly pendingEvents: EventEnvelope[] = [];
   private readonly recentEvents: EventEnvelope[] = [];
+  /** Each device's archive view is a query choice, never a global cache. */
+  private readonly includeArchivedByDevice = new Map<string, boolean>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -180,6 +186,12 @@ export class DSHAnywhereConnector {
       this.log("warn", "Ignored invalid event from local DSH bridge");
       return;
     }
+    // The bridge socket is owned by the connector, not by one phone. Its
+    // connection greeting includes an unfiltered session snapshot which can
+    // race a device's current archive/list query and replace the UI with an
+    // old projection. Lists travel through correlated HTTP commands below;
+    // retain live created/title events but never forward this bridge greeting.
+    if (event.data.type === "session.snapshot") return;
     this.sendEvent(event.data);
   }
 
@@ -221,6 +233,12 @@ export class DSHAnywhereConnector {
         // depend on a separate refresh command or Relay presence timing.
         await this.pushSessionSnapshot(command.deviceId);
         return;
+      }
+      // Record the selected archive view before waiting for the bridge. An
+      // older, slower list response must not overwrite a newer user choice
+      // and make the following archive mutation refresh the wrong projection.
+      if (command.type === "session.list") {
+        this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
       }
       const request = bridgeRequestFor(command);
       // A photo can be several megabytes after base64 encoding. Keep normal
@@ -272,7 +290,9 @@ export class DSHAnywhereConnector {
       const summary = asRecord(data.summary);
       const fallbackSummary = {
         id: sessionId,
-        title: command.payload.title ?? "New session",
+        // A server list projection replaces this immediately. Keep the same
+        // blank-session placeholder in the narrow fallback path.
+        title: command.payload.title ?? "新会话",
         updatedAt: Date.now(),
       };
       this.sendEvent({
@@ -297,7 +317,8 @@ export class DSHAnywhereConnector {
     }
     if (command.type === "session.archive" || command.type === "session.model"
         || command.type === "permission.set"
-        || command.type === "workspace.rename" || command.type === "workspace.delete") {
+        || command.type === "workspace.rename" || command.type === "workspace.delete"
+        || command.type === "session.rename") {
       // These operations mutate native Harness metadata. Refresh the same
       // filtered list used by the live bridge so archived sessions disappear
       // immediately while model/workspace labels update in place.
@@ -305,7 +326,7 @@ export class DSHAnywhereConnector {
       // command.result card) because its effect already arrives as
       // `permission.updated`: a "Command completed" card would be noise, and
       // failures still surface through `protocol.error`.
-      const refreshed = asRecord(await this.callBridge({ method: "GET", path: "/sessions" }));
+      const refreshed = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(command.deviceId) }));
       const items = Array.isArray(refreshed.items)
         ? refreshed.items.map((item) => SessionSummarySchema.parse(item))
         : [];
@@ -332,6 +353,63 @@ export class DSHAnywhereConnector {
         timestamp: Date.now(),
         type: "model.catalog",
         payload: ModelCatalogPayloadSchema.parse(data),
+      });
+      return;
+    }
+    if (command.type === "workspace.catalog") {
+      const data = asRecord(response);
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: command.requestId,
+        machineId: this.config.machineId,
+        deviceId: command.deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "workspace.catalog",
+        payload: WorkspaceCatalogPayloadSchema.parse(data),
+      });
+      return;
+    }
+    if (command.type === "workspace.create") {
+      const data = asRecord(response);
+      const workspace = asRecord(data.workspace);
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: command.requestId,
+        machineId: this.config.machineId,
+        deviceId: command.deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "workspace.created",
+        payload: WorkspaceSchema.parse(workspace),
+      });
+      return;
+    }
+    if (command.type === "mode.catalog") {
+      const data = asRecord(response);
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: command.requestId,
+        machineId: this.config.machineId,
+        deviceId: command.deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "mode.catalog",
+        payload: ModeCatalogPayloadSchema.parse(data),
+      });
+      return;
+    }
+    if (command.type === "directory.list") {
+      const data = asRecord(response);
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: command.requestId,
+        machineId: this.config.machineId,
+        deviceId: command.deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "directory.list",
+        payload: DirectoryListPayloadSchema.parse(data),
       });
       return;
     }
@@ -404,7 +482,7 @@ export class DSHAnywhereConnector {
 
   private async pushSessionSnapshot(deviceId: string): Promise<void> {
     try {
-      const data = asRecord(await this.callBridge({ method: "GET", path: "/sessions" }));
+      const data = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(deviceId) }));
       const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
       this.log("info", `Device ${shortID(deviceId)} online; pushing session snapshot (${items.length} sessions)`);
       this.sendSessionSnapshot(items, deviceId);
@@ -414,21 +492,9 @@ export class DSHAnywhereConnector {
   }
 
   private sendSessionSnapshot(items: SessionSummary[], deviceId: string, messageId: string = randomUUID()): void {
-    // Protocol v1 originally allowed only id/title/updatedAt in a session
-    // summary. Send that compatible snapshot first so an older Relay can
-    // still route the list; a current Relay accepts the following full
-    // snapshot and leaves the richer workspace/model/usage data in place.
-    const compatibleItems = items.map(({ id, title, updatedAt }) => ({ id, title, updatedAt }));
-    this.sendEvent({
-      version: PROTOCOL_VERSION,
-      messageId: randomUUID(),
-      machineId: this.config.machineId,
-      deviceId,
-      sequence: ++this.sequence,
-      timestamp: Date.now(),
-      type: "session.snapshot",
-      payload: compatibleItems,
-    }, deviceId);
+    // One full snapshot is authoritative. The old compatibility pre-snapshot
+    // briefly replaced current rows with stale stripped data, causing the
+    // home screen to flash several times during launch.
     this.sendEvent({
       version: PROTOCOL_VERSION,
       messageId,
@@ -439,6 +505,10 @@ export class DSHAnywhereConnector {
       type: "session.snapshot",
       payload: items,
     }, deviceId);
+  }
+
+  private sessionListPath(deviceId: string): string {
+    return this.includeArchivedByDevice.get(deviceId) === true ? "/sessions?includeArchived=true" : "/sessions";
   }
 
   private sendEvent(event: EventEnvelope, targetDeviceId?: string): void {
@@ -457,7 +527,11 @@ export class DSHAnywhereConnector {
       sequence: ++this.sequence,
     });
     this.rememberEvent(body);
-    this.sendRelayEvent(body, targetDeviceId);
+    // A bridge/command response carries its intended recipient in the event
+    // envelope. Preserve that address through offline queueing too; otherwise
+    // one phone's folder picker or archive snapshot is broadcast to every
+    // paired device when the relay reconnects.
+    this.sendRelayEvent(body, targetDeviceId ?? (body.deviceId === "broadcast" ? undefined : body.deviceId));
   }
 
   private sendRelayEvent(body: EventEnvelope, targetDeviceId?: string): void {
@@ -481,6 +555,14 @@ export class DSHAnywhereConnector {
 
   private replayAfter(lastSequence: number, targetDeviceId: string): void {
     for (const event of this.recentEvents) {
+      // Catalogs and snapshots are request-scoped, not durable live events.
+      // Replaying another device's old result corrupts an in-flight refresh
+      // (and can reintroduce archived rows). The resume path immediately
+      // requests a fresh authoritative snapshot instead.
+      if (event.type === "session.snapshot" || event.type === "workspace.catalog"
+          || event.type === "workspace.created" || event.type === "mode.catalog"
+          || event.type === "directory.list") continue;
+      if (event.deviceId !== "broadcast" && event.deviceId !== targetDeviceId) continue;
       if (event.sequence > lastSequence) this.sendRelayEvent(event, targetDeviceId);
     }
   }
@@ -662,6 +744,22 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         method: "POST",
         path: `/workspaces/${encodeURIComponent(command.payload.workspaceId)}/delete`,
         body: {},
+      };
+    case "workspace.catalog":
+      return { method: "GET", path: "/workspaces" };
+    case "workspace.create":
+      return { method: "POST", path: "/workspaces", body: command.payload };
+    case "directory.list": {
+      const encoded = command.payload.path === undefined ? "" : `?path=${encodeURIComponent(command.payload.path)}`;
+      return { method: "GET", path: `/directories${encoded}` };
+    }
+    case "mode.catalog":
+      return { method: "GET", path: "/modes" };
+    case "session.rename":
+      return {
+        method: "POST",
+        path: `/sessions/${encodeURIComponent(requireSessionId(command))}/rename`,
+        body: command.payload,
       };
     case "model.catalog":
       return { method: "GET", path: "/models" };

@@ -10,10 +10,9 @@ struct NewSessionSheet: View {
     private let initialWorkspaceID: String?
     @State private var workspaceID: String
     @State private var permissionMode = "workspace-write"
-    @State private var sessionTitle = ""
     @State private var workingDirectory = ""
     @State private var branch = "main"
-    @State private var sessionMode = "standard"
+    @State private var sessionMode = ""
     @State private var selectedProvider = ""
     @State private var selectedModel = ""
     @State private var selectedReasoningEffort: String?
@@ -28,6 +27,7 @@ struct NewSessionSheet: View {
     @State private var showInitialPreview = false
     @State private var showInitialContextPopover = false
     @State private var showInitialCommandMenu = false
+    @State private var isModelConfigurationPresented = false
 
     init(initialWorkspaceID: String? = nil, initialPrompt: String = "") {
         self.initialWorkspaceID = initialWorkspaceID
@@ -91,6 +91,17 @@ struct NewSessionSheet: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .allowsHitTesting(true)
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 18, coordinateSpace: .local)
+                .onEnded { value in
+                    guard !isModelConfigurationPresented,
+                          dshShouldDismissNewTaskForRightSwipe(
+                        translation: value.translation,
+                        predictedEndTranslation: value.predictedEndTranslation
+                    ) else { return }
+                    dismiss()
+                }
+        )
         .presentationBackground(Color(.systemBackground))
         .sheet(isPresented: $showInitialCommandMenu) {
             CommandMenuSheet(
@@ -188,6 +199,7 @@ struct NewSessionSheet: View {
                 selectedModel = catalog.default.model
                 selectedReasoningEffort = catalog.default.reasoningEffort
             }
+            selectDefaultModeIfNeeded()
         }
         .onChange(of: model.machineID) { _, _ in
             workspaceID = ""
@@ -205,6 +217,13 @@ struct NewSessionSheet: View {
             selectedModel = catalog.default.model
             selectedReasoningEffort = catalog.default.reasoningEffort
         }
+        .onChange(of: model.modes) { _, _ in
+            selectDefaultModeIfNeeded()
+        }
+        .task {
+            model.requestWorkspaces()
+            model.requestModes()
+        }
     }
 
     /// The two visible selectors mirror the compact information cluster in the
@@ -215,6 +234,7 @@ struct NewSessionSheet: View {
         VStack(alignment: .leading, spacing: 20) {
             machineSelector
             workspaceSelector
+            modeSelector
         }
         .padding(.horizontal, 14)
     }
@@ -273,11 +293,6 @@ struct NewSessionSheet: View {
                     }
                 }
             }
-            Section("模式") {
-                modeButton("standard", title: "标准模式", icon: "sparkles")
-                modeButton("ptc", title: "PTC 模式", icon: "list.clipboard")
-                modeButton("custom", title: "自建模式", icon: "slider.horizontal.3")
-            }
         } label: {
             newSessionInfoRow(icon: "folder",
                               title: selectedWorkspace?.name ?? displayedWorkingDirectory)
@@ -310,20 +325,21 @@ struct NewSessionSheet: View {
 
     private var modeSelector: some View {
         Menu {
-            modeButton("standard", title: "标准模式", icon: "sparkles")
-            modeButton("ptc", title: "PTC 模式", icon: "list.clipboard")
-            modeButton("custom", title: "自建模式", icon: "slider.horizontal.3")
+            if model.modes.isEmpty {
+                Text("尚未读取到 Mac 上的模式")
+                Button("重新加载模式") { model.requestModes() }
+            } else {
+                ForEach(model.modes) { mode in
+                    Button { sessionMode = mode.id } label: {
+                        Label(mode.name, systemImage: sessionMode == mode.id ? "checkmark" : "slider.horizontal.3")
+                    }
+                }
+            }
         } label: {
             newSessionInfoRow(icon: "cpu", title: sessionModeLabel)
         }
         .buttonStyle(.plain)
         .tint(.primary)
-    }
-
-    private func modeButton(_ mode: String, title: String, icon: String) -> some View {
-        Button { sessionMode = mode } label: {
-            Label(title, systemImage: sessionMode == mode ? "checkmark" : icon)
-        }
     }
 
     private func newSessionInfoRow(icon: String, title: String) -> some View {
@@ -370,11 +386,15 @@ struct NewSessionSheet: View {
     }
 
     private var sessionModeLabel: String {
-        switch sessionMode {
-        case "ptc": return "PTC 模式"
-        case "custom": return "自建模式"
-        default: return "标准模式"
-        }
+        model.modes.first(where: { $0.id == sessionMode })?.name ?? "选择模式"
+    }
+
+    private func selectDefaultModeIfNeeded() {
+        guard !model.modes.isEmpty else { return }
+        guard !model.modes.contains(where: { $0.id == sessionMode }) else { return }
+        sessionMode = model.defaultModeID
+            .flatMap { id in model.modes.contains(where: { $0.id == id }) ? id : nil }
+            ?? model.modes[0].id
     }
 
     private func selectWorkspace(_ workspace: DSHWorkspaceOption) {
@@ -479,64 +499,6 @@ struct NewSessionSheet: View {
         }
     }
 
-    private var modeChooser: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("模式与权限")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
-            VStack(spacing: 1) {
-                sessionModeOption(mode: "standard", title: "标准模式", detail: "适合日常问答与代码任务。", icon: "sparkles")
-                sessionModeOption(mode: "ptc", title: "PTC 模式", detail: "先规划，再执行代码任务。", icon: "list.clipboard")
-                sessionModeOption(mode: "custom", title: "自建模式", detail: "使用本机 Harness 的自定义预设。", icon: "slider.horizontal.3")
-                Divider().padding(.horizontal, 16)
-                permissionOption(
-                    mode: "read-only",
-                    title: "仅可查看",
-                    detail: "只能读取工作区内容。",
-                    icon: "eye"
-                )
-                permissionOption(
-                    mode: "workspace-write",
-                    title: "工作区内修改",
-                    detail: "可以读取并修改所选工作区文件。",
-                    icon: "folder"
-                )
-                permissionOption(
-                    mode: "danger-full-access",
-                    title: "完全权限",
-                    detail: "可以读写工作区之外的文件。",
-                    icon: "lock.open"
-                )
-            }
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        }
-    }
-
-    private func sessionModeOption(mode: String, title: String, detail: String, icon: String) -> some View {
-        Button { sessionMode = mode } label: {
-            HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(sessionMode == mode ? Color.accentColor : Color.secondary)
-                    .frame(width: 28)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.system(size: 16, weight: .medium))
-                    Text(detail).font(.system(size: 13)).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: sessionMode == mode ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(sessionMode == mode ? Color.accentColor : Color.secondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
     private var pathAndBranchChooser: some View {
         VStack(alignment: .leading, spacing: 9) {
             Text("项目目录与分支")
@@ -629,7 +591,8 @@ struct NewSessionSheet: View {
                 fallbackName: initialModelLabel,
                 fallbackEfforts: selectedModelReasoning?.efforts ?? [],
                 compact: true,
-                onCommit: { _ in }
+                onCommit: { _ in },
+                onPresentationChanged: { isModelConfigurationPresented = $0 }
             )
         } submit: {
             Button(action: createSession) {
@@ -645,7 +608,9 @@ struct NewSessionSheet: View {
     }
 
     private var canCreateSession: Bool {
-        !initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !initialAttachments.isEmpty
+        !sessionMode.isEmpty
+            && (!initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !initialAttachments.isEmpty)
     }
 
     private var initialAttachmentStrip: some View {
@@ -774,7 +739,6 @@ struct NewSessionSheet: View {
             reasoningEffort: selectedReasoningEffort
         )
         model.createSession(in: selectedWorkspace,
-                            title: sessionTitle.isEmpty ? "新会话" : sessionTitle,
                             workingDirectory: workingDirectory,
                             branch: branch,
                             mode: sessionMode,
@@ -787,6 +751,120 @@ struct NewSessionSheet: View {
 }
 
 // MARK: - ChatGPT Remote task home
+
+/// A picker for directories on the paired Mac. The phone never imports a
+/// local iOS folder: every directory shown here was listed by the remote
+/// Harness and creating the workspace waits for the remote catalog to confirm
+/// it before dismissing.
+struct RemoteWorkspacePickerSheet: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var title = ""
+
+    private var listing: DSHDirectoryListing? { model.directoryListing }
+    private var displayedPath: String { listing?.path ?? "正在连接 Mac…" }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    LabeledContent("Mac", value: model.machineName.isEmpty ? "Mac" : model.machineName)
+                    Text(displayedPath)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+
+                Section("项目名称") {
+                    TextField("使用文件夹名称", text: $title)
+                        .disabled(model.isCreatingWorkspace)
+                }
+
+                Section("选择文件夹") {
+                    if model.isCreatingWorkspace {
+                        HStack {
+                            ProgressView()
+                            Text("正在由 Mac 创建项目…")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let parent = listing?.parentPath {
+                        Button {
+                            model.listDirectory(at: parent)
+                        } label: {
+                            Label("上一级", systemImage: "arrow.up.to.line")
+                        }
+                        .disabled(model.isLoadingDirectory || model.isCreatingWorkspace)
+                    }
+
+                    if model.isLoadingDirectory {
+                        HStack {
+                            ProgressView()
+                            Text("正在读取 Mac 上的文件夹…")
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let listing {
+                        if listing.directories.isEmpty {
+                            ContentUnavailableView("此文件夹没有子文件夹",
+                                                   systemImage: "folder.badge.questionmark")
+                        } else {
+                            ForEach(listing.directories) { entry in
+                                Button {
+                                    model.listDirectory(at: entry.path)
+                                } label: {
+                                    Label(entry.name, systemImage: "folder")
+                                }
+                                .disabled(model.isCreatingWorkspace)
+                            }
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("无法读取 Mac 上的文件夹", systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.secondary)
+                            Button("重新读取") { model.listDirectory() }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("新建项目")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("选择此文件夹") { createWorkspace() }
+                        .disabled(listing == nil || model.isLoadingDirectory || model.isCreatingWorkspace)
+                }
+            }
+            .task { model.listDirectory() }
+            .onChange(of: model.createdWorkspace) { _, workspace in
+                guard workspace != nil else { return }
+                dismiss()
+            }
+        }
+        .presentationDetents([.large])
+    }
+
+    private func createWorkspace() {
+        guard let path = listing?.path else { return }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.createWorkspace(at: path, title: cleanTitle.isEmpty ? nil : cleanTitle)
+    }
+}
+
+/// The full-screen new-task surface accepts an intentional rightward swipe
+/// anywhere on its background.  Short drags, vertical pans and ordinary
+/// control adjustments are not a dismissal gesture.
+func dshShouldDismissNewTaskForRightSwipe(translation: CGSize,
+                                          predictedEndTranslation: CGSize) -> Bool {
+    let horizontalDistance = translation.width
+    let predictedDistance = predictedEndTranslation.width
+    let verticalDistance = abs(translation.height)
+    guard horizontalDistance > 88, predictedDistance > 116 else { return false }
+    return horizontalDistance > verticalDistance * 1.65
+}
 
 private enum DSHRemoteHomeMetrics {
     /// Both project titles and their child conversations resolve against this
@@ -821,6 +899,7 @@ struct DSHRemoteHomeView: View {
     }()
     @State private var newTaskWorkspaceID: String?
     @State private var newTaskPrompt = ""
+    @State private var showNewWorkspace = false
     @State private var didRefresh = false
     @State private var renameWorkspaceID = ""
     @State private var renameWorkspaceText = ""
@@ -829,27 +908,21 @@ struct DSHRemoteHomeView: View {
     @State private var showDeleteWorkspaceConfirmation = false
 
     private var groupedSessions: [DSHSessionGroup] {
-        model.sessions
+        let sessionGroups = model.sessions
             .groupedForList(.byWorkspace, showArchived: model.showArchivedSessions)
-            .filter { !model.hiddenWorkspaceIDs.contains($0.id) }
-            .map { group in
-                let title = group.id == DSHSessionGroup.flatGroupID
-                    ? group.title
-                    : model.workspaceDisplayName(for: group.id, fallback: group.title)
-                return DSHSessionGroup(id: group.id, title: title,
-                                       sessions: group.sessions,
-                                       isUnfiled: group.isUnfiled)
-            }
+        let groupsByID = Dictionary(uniqueKeysWithValues: sessionGroups.map { ($0.id, $0) })
+        let catalogGroups = model.workspaces.map { workspace in
+            DSHSessionGroup(id: workspace.id, title: workspace.name,
+                            sessions: groupsByID[workspace.id]?.sessions ?? [])
+        }
+        let catalogIDs = Set(model.workspaces.map(\.id))
+        return catalogGroups + sessionGroups.filter { !catalogIDs.contains($0.id) }
     }
 
     private var flatSessions: [DSHSessionSummary] {
         model.sessions
             .groupedForList(.flat, showArchived: model.showArchivedSessions)
             .flatMap(\.sessions)
-            .filter { session in
-                guard let workspaceID = session.workspaceId else { return true }
-                return !model.hiddenWorkspaceIDs.contains(workspaceID)
-            }
     }
 
     private var hasArchivedSessions: Bool {
@@ -967,6 +1040,7 @@ struct DSHRemoteHomeView: View {
             .scrollDismissesKeyboard(.interactively)
             .refreshable {
                 model.refreshSessions(includeArchived: model.showArchivedSessions)
+                model.requestWorkspaces()
                 model.sendModelCatalog()
             }
             .background(Color(.systemBackground))
@@ -1006,6 +1080,10 @@ struct DSHRemoteHomeView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(model)
+            }
+            .sheet(isPresented: $showNewWorkspace) {
+                RemoteWorkspacePickerSheet()
+                    .environmentObject(model)
             }
             .alert("重命名项目", isPresented: $showRenameWorkspace) {
                 TextField("项目名称", text: $renameWorkspaceText)
@@ -1103,6 +1181,9 @@ struct DSHRemoteHomeView: View {
                     Button { refreshTasks() } label: {
                         Label("刷新", systemImage: "arrow.clockwise")
                     }
+                    Button { showNewWorkspace = true } label: {
+                        Label("新建项目", systemImage: "folder.badge.plus")
+                    }
                     Divider()
                     Section("排序") {
                         Button { model.setGroupsSessionsByWorkspace(true) } label: {
@@ -1114,8 +1195,9 @@ struct DSHRemoteHomeView: View {
                     }
                     Divider()
                     Section("管理") {
-                        Button { model.setShowArchived(true) } label: {
-                            Label("已归档任务", systemImage: "archivebox")
+                        Button { model.setShowArchived(!model.showArchivedSessions) } label: {
+                            Label(model.showArchivedSessions ? "隐藏已归档任务" : "已归档任务",
+                                  systemImage: model.showArchivedSessions ? "archivebox.fill" : "archivebox")
                         }
                         Button { showSettings = true } label: {
                             Label("设置", systemImage: "gearshape")

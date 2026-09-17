@@ -235,6 +235,40 @@ describe("DSH Anywhere wire protocol", () => {
       payload: { workspaceId: "workspace-1" },
     }).type).toBe("workspace.delete");
   });
+
+  it("accepts remote workspace, directory, mode and session-title commands", () => {
+    const fields = {
+      version: PROTOCOL_VERSION,
+      machineId: "mac-1",
+      deviceId: "iphone-1",
+      timestamp: 1_735_000_000_000,
+    };
+    expect(parseCommand({ ...fields, requestId: "workspace-create", type: "workspace.create",
+      payload: { path: "/Users/me/Code", title: "Code" } }).type).toBe("workspace.create");
+    expect(parseCommand({ ...fields, requestId: "workspace-list", type: "workspace.catalog", payload: {} }).type).toBe("workspace.catalog");
+    expect(parseCommand({ ...fields, requestId: "directory-list", type: "directory.list", payload: { path: "/Users/me" } }).type).toBe("directory.list");
+    expect(parseCommand({ ...fields, requestId: "mode-list", type: "mode.catalog", payload: {} }).type).toBe("mode.catalog");
+    expect(parseCommand({ ...fields, requestId: "session-rename", sessionId: "session-1", type: "session.rename",
+      payload: { title: "Remote title" } }).type).toBe("session.rename");
+  });
+
+  it("carries request-correlated remote catalogs with only host-issued paths", () => {
+    const workspace = EventEnvelopeSchema.parse({
+      ...envelopeFields, type: "workspace.catalog",
+      payload: { workspaces: [{ id: "workspace-1", title: "Code", path: "/Users/me/Code" }] },
+    });
+    const directory = EventEnvelopeSchema.parse({
+      ...envelopeFields, sequence: 2, type: "directory.list",
+      payload: { path: "/Users/me", parentPath: "/Users", directories: [{ name: "Code", path: "/Users/me/Code" }] },
+    });
+    const modes = EventEnvelopeSchema.parse({
+      ...envelopeFields, sequence: 3, type: "mode.catalog",
+      payload: { defaultMode: "standard", modes: [{ id: "standard", name: "标准模式", description: "Mac preset" }] },
+    });
+    expect(workspace.type).toBe("workspace.catalog");
+    expect(directory.type).toBe("directory.list");
+    expect(modes.type).toBe("mode.catalog");
+  });
 });
 
 describe("prompt attachments", () => {

@@ -11,6 +11,11 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var pendingQuestions: [DSHQuestionRequest] = []
     public var turnStateBySession: [String: String] = [:]
     public var modelCatalog: DSHModelCatalog?
+    /// Workspace and mode catalogs are complete, remote-owned lists. They are
+    /// separate from session snapshots so empty workspaces still render.
+    public var workspaceCatalog: [DSHWorkspaceOption] = []
+    public var modeCatalog: DSHModeCatalog?
+    public var directoryListing: DSHDirectoryListing?
     public var usageBySession: [String: DSHSessionUsage] = [:]
     public var permissionBySession: [String: DSHPermissionUpdate] = [:]
     public var metadataBySession: [String: DSHSessionMetadataUpdate] = [:]
@@ -214,6 +219,17 @@ public struct DSHEventReducer: Sendable {
             state.turnStateBySession[turn.sessionId] = turn.state
         case .modelCatalog(let catalog):
             state.modelCatalog = catalog
+        case .workspaceCatalog(let workspaces):
+            state.workspaceCatalog = workspaces
+        case .workspaceCreated:
+            // The create acknowledgement is not a local source of truth. The
+            // Connector follows it with workspace.catalog, which replaces the
+            // list atomically and includes any server-side normalization.
+            break
+        case .modeCatalog(let catalog):
+            state.modeCatalog = catalog
+        case .directoryListing(let listing):
+            state.directoryListing = listing
         case .usageUpdated(let update):
             state.usageBySession[update.sessionId] = update.usage
             if let index = state.sessions.firstIndex(where: { $0.id == update.sessionId }) {
@@ -403,8 +419,13 @@ public struct DSHEventReducer: Sendable {
 private extension DSHEvent {
     func startsNewSequenceEpoch(comparedTo lastSequence: Int64) -> Bool {
         guard sequence <= lastSequence else { return false }
+        if establishesSequenceEpoch { return true }
         switch kind {
-        case .connectionReady, .sessionSnapshot:
+        // A replayed snapshot may arrive after a reconnect with an older
+        // sequence. It is not proof the Connector restarted and resetting on
+        // it lets stale rows replace a newer authoritative list. Only the
+        // Connector's explicit epoch marker is allowed to roll the sequence.
+        case .connectionReady:
             return true
         default:
             return false
@@ -441,11 +462,69 @@ public struct DSHSessionGroup: Identifiable, Sendable, Equatable {
 }
 
 /// A workspace the user can start a session in.
-public struct DSHWorkspaceOption: Identifiable, Sendable, Equatable {
+public struct DSHWorkspaceOption: Codable, Identifiable, Sendable, Equatable {
     public let id: String
     public let name: String
+    /// Absolute path from the paired Mac's workspace registry. Older
+    /// Connectors omit it in session snapshots, hence optional.
+    public let path: String?
 
-    public init(id: String, name: String) { self.id = id; self.name = name }
+    public init(id: String, name: String, path: String? = nil) {
+        self.id = id; self.name = name; self.path = path
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, title, path }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decodeIfPresent(String.self, forKey: .title)
+            ?? container.decode(String.self, forKey: .name)
+        path = try container.decodeIfPresent(String.self, forKey: .path)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .title)
+        try container.encodeIfPresent(path, forKey: .path)
+    }
+}
+
+/// A directory returned by the paired Mac. iOS renders this catalog rather
+/// than attempting to inspect the Mac filesystem itself.
+public struct DSHDirectoryEntry: Codable, Identifiable, Sendable, Equatable {
+    public let name: String
+    public let path: String
+    public var id: String { path }
+    public init(name: String, path: String) { self.name = name; self.path = path }
+}
+
+public struct DSHDirectoryListing: Codable, Sendable, Equatable {
+    public let path: String
+    public let parentPath: String?
+    public let directories: [DSHDirectoryEntry]
+    public init(path: String, parentPath: String? = nil, directories: [DSHDirectoryEntry]) {
+        self.path = path; self.parentPath = parentPath; self.directories = directories
+    }
+}
+
+/// Modes advertised by the paired Mac; their ids pass through to
+/// `session.create` so mobile never hard-codes an out-of-date mode list.
+public struct DSHModeOption: Codable, Identifiable, Sendable, Equatable {
+    public let id: String
+    public let name: String
+    public let description: String?
+    public init(id: String, name: String, description: String? = nil) {
+        self.id = id; self.name = name; self.description = description
+    }
+}
+
+public struct DSHModeCatalog: Codable, Sendable, Equatable {
+    public let defaultMode: String?
+    public let modes: [DSHModeOption]
+    public init(defaultMode: String? = nil, modes: [DSHModeOption]) {
+        self.defaultMode = defaultMode; self.modes = modes
+    }
 }
 
 public extension Array where Element == DSHSessionSummary {

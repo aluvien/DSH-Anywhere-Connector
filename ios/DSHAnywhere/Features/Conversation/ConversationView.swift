@@ -654,6 +654,8 @@ struct ConversationView: View {
     @State private var showFilesPanel = false
     @State private var showUsagePanel = false
     @State private var showContextPopover = false
+    @State private var showRenameSession = false
+    @State private var renameSessionText = ""
     /// UIKit fallback for viewport moves; never observed, only driven.
     @State private var scrollCoordinator = DSHScrollCoordinator()
     /// Render-window size (see windowedTranscriptSections). A fresh view per
@@ -979,6 +981,13 @@ struct ConversationView: View {
             .fileImporter(isPresented: $showFileImporter,
                           allowedContentTypes: [.data], allowsMultipleSelection: true,
                           onCompletion: handleFileImporterResult)
+            .alert("重命名会话", isPresented: $showRenameSession) {
+                TextField("会话名称", text: $renameSessionText)
+                Button("取消", role: .cancel) { }
+                Button("保存") { renameSession() }
+            } message: {
+                Text("名称会在 Mac 确认后同步到所有设备。")
+            }
         }
     }
 
@@ -1036,8 +1045,8 @@ struct ConversationView: View {
                         Label("归档", systemImage: "archivebox")
                     }
                     Divider()
-                    Button { showModelPicker = true } label: {
-                        Label("更换模型", systemImage: "cpu")
+                    Button { beginRenameSession() } label: {
+                        Label("重命名", systemImage: "pencil")
                     }
                     Button { showFilesPanel = true } label: {
                         Label("文件", systemImage: "folder")
@@ -1866,6 +1875,17 @@ struct ConversationView: View {
     private func archiveSession() {
         model.archive(session ?? emptySession, archived: true)
         dismiss()
+    }
+
+    private func beginRenameSession() {
+        renameSessionText = conversationTitle
+        showRenameSession = true
+    }
+
+    private func renameSession() {
+        let title = renameSessionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, let session else { return }
+        model.renameSession(session, to: title)
     }
 
     /// Prior dialogue carried into a branch as plain text (newest 40

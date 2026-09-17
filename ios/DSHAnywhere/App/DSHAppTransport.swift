@@ -19,10 +19,15 @@ protocol DSHAppTransport: Sendable {
     func revokeDevice(_ deviceId: String) async throws
 }
 
+private struct DSHRelayUpgradeRequired: LocalizedError {
+    var errorDescription: String? { "请先升级 Relay 服务后再使用项目、模式或重命名功能。已有会话仍可正常使用。" }
+}
+
 actor DSHRemoteTransport: DSHAppTransport {
     private let tokenStore: any DSHTokenStore
     private let store: DSHProfileStore
     private var connection: DSHWebSocketConnection?
+    private var verifiedCatalogRelay: URL?
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -66,12 +71,33 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func send(_ command: DSHCommand) async throws {
         guard let connection else { throw DSHWebSocketError.notConnected }
+        if ["workspace.catalog", "workspace.create", "mode.catalog", "directory.list", "session.rename"].contains(command.type) {
+            try await verifyCatalogRelay()
+        }
         try await connection.send(command)
+    }
+
+    /// New routed commands require schema 7. A staged rollout must not send
+    /// unknown messages to an older Relay and tear down existing chat traffic.
+    private func verifyCatalogRelay() async throws {
+        guard let profile = store.activeProfile else { throw DSHAPIError.missingCredentials }
+        let baseURL = profile.relayBaseURL
+        guard verifiedCatalogRelay != baseURL else { return }
+        var request = URLRequest(url: baseURL.appending(path: "health"))
+        request.timeoutInterval = 10
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await URLSession.shared.data(for: request)
+        struct Health: Decodable { let schemaRevision: Int? }
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let health = try? JSONDecoder().decode(Health.self, from: data),
+              (health.schemaRevision ?? 0) >= 7 else { throw DSHRelayUpgradeRequired() }
+        verifiedCatalogRelay = baseURL
     }
 
     func disconnect() async {
         await connection?.disconnect()
         connection = nil
+        verifiedCatalogRelay = nil
     }
 
     func forgetPairing() async throws {

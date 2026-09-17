@@ -124,6 +124,43 @@ export type SessionSnapshotPayload = z.infer<typeof SessionSnapshotPayloadSchema
 export const SessionCreatedPayloadSchema = SessionSummarySchema;
 export type SessionCreatedPayload = z.infer<typeof SessionCreatedPayloadSchema>;
 
+/** A durable Harness workspace. The registry is authoritative even while it
+ * has no sessions, so callers must not infer this list from session rows. */
+export const WorkspaceSchema = StrictObject({
+  id: IdentifierSchema,
+  title: z.string().min(1).max(512),
+  path: z.string().min(1).max(8_192),
+});
+export type Workspace = z.infer<typeof WorkspaceSchema>;
+
+export const WorkspaceCatalogPayloadSchema = StrictObject({
+  workspaces: z.array(WorkspaceSchema).max(10_000),
+});
+export type WorkspaceCatalogPayload = z.infer<typeof WorkspaceCatalogPayloadSchema>;
+
+/** A mode is a native Harness agent preset, never a client-maintained list. */
+export const ModeCatalogPayloadSchema = StrictObject({
+  defaultMode: IdentifierSchema.optional(),
+  modes: z.array(StrictObject({
+    id: IdentifierSchema,
+    name: z.string().min(1).max(512),
+    description: z.string().max(4_000).optional(),
+  })).max(1_000),
+});
+export type ModeCatalogPayload = z.infer<typeof ModeCatalogPayloadSchema>;
+
+/** One browsable level of the host filesystem. The client must use supplied
+ * absolute paths rather than assembling them itself. */
+export const DirectoryListPayloadSchema = StrictObject({
+  path: z.string().min(1).max(8_192),
+  parentPath: z.string().min(1).max(8_192).optional(),
+  directories: z.array(StrictObject({
+    name: z.string().min(1).max(512),
+    path: z.string().min(1).max(8_192),
+  })).max(1_000),
+});
+export type DirectoryListPayload = z.infer<typeof DirectoryListPayloadSchema>;
+
 export const ChatRoleSchema = z.enum(["user", "assistant", "system"]);
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 
@@ -336,6 +373,10 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("connection.ready", ConnectionReadyPayloadSchema),
   EventEnvelope("session.snapshot", SessionSnapshotPayloadSchema),
   EventEnvelope("session.created", SessionCreatedPayloadSchema),
+  EventEnvelope("workspace.catalog", WorkspaceCatalogPayloadSchema),
+  EventEnvelope("workspace.created", WorkspaceSchema),
+  EventEnvelope("mode.catalog", ModeCatalogPayloadSchema),
+  EventEnvelope("directory.list", DirectoryListPayloadSchema),
   EventEnvelope("user.message.accepted", ChatMessagePayloadSchema),
   EventEnvelope("assistant.message.delta", AssistantMessageDeltaPayloadSchema),
   EventEnvelope("assistant.message.completed", ChatMessagePayloadSchema),
@@ -447,6 +488,18 @@ export const WorkspaceRenamePayloadSchema = StrictObject({
 export const WorkspaceDeletePayloadSchema = StrictObject({
   workspaceId: IdentifierSchema,
 });
+export const WorkspaceCreatePayloadSchema = StrictObject({
+  path: z.string().min(1).max(8_192),
+  title: z.string().min(1).max(512).optional(),
+});
+export const WorkspaceCatalogCommandPayloadSchema = StrictObject({});
+export const DirectoryListCommandPayloadSchema = StrictObject({
+  path: z.string().min(1).max(8_192).optional(),
+});
+export const ModeCatalogCommandPayloadSchema = StrictObject({});
+export const SessionRenamePayloadSchema = StrictObject({
+  title: z.string().min(1).max(512),
+});
 export const CommandExecutePayloadSchema = StrictObject({
   line: z.string().min(1).max(20_000),
   attachments: PromptSendPayloadSchema.shape.content.optional(),
@@ -482,6 +535,11 @@ export type SessionArchivePayload = z.infer<typeof SessionArchivePayloadSchema>;
 export type SessionModelPayload = z.infer<typeof SessionModelPayloadSchema>;
 export type WorkspaceRenamePayload = z.infer<typeof WorkspaceRenamePayloadSchema>;
 export type WorkspaceDeletePayload = z.infer<typeof WorkspaceDeletePayloadSchema>;
+export type WorkspaceCreatePayload = z.infer<typeof WorkspaceCreatePayloadSchema>;
+export type WorkspaceCatalogCommandPayload = z.infer<typeof WorkspaceCatalogCommandPayloadSchema>;
+export type DirectoryListCommandPayload = z.infer<typeof DirectoryListCommandPayloadSchema>;
+export type ModeCatalogCommandPayload = z.infer<typeof ModeCatalogCommandPayloadSchema>;
+export type SessionRenamePayload = z.infer<typeof SessionRenamePayloadSchema>;
 export type CommandExecutePayload = z.infer<typeof CommandExecutePayloadSchema>;
 export type PermissionSetPayload = z.infer<typeof PermissionSetPayloadSchema>;
 export type AttachmentUploadPayload = z.infer<typeof AttachmentUploadPayloadSchema>;
@@ -499,6 +557,11 @@ export const CommandEnvelopeSchema = z.discriminatedUnion("type", [
   CommandEnvelope("session.model", SessionModelPayloadSchema),
   CommandEnvelope("workspace.rename", WorkspaceRenamePayloadSchema),
   CommandEnvelope("workspace.delete", WorkspaceDeletePayloadSchema),
+  CommandEnvelope("workspace.create", WorkspaceCreatePayloadSchema),
+  CommandEnvelope("workspace.catalog", WorkspaceCatalogCommandPayloadSchema),
+  CommandEnvelope("directory.list", DirectoryListCommandPayloadSchema),
+  CommandEnvelope("mode.catalog", ModeCatalogCommandPayloadSchema),
+  CommandEnvelope("session.rename", SessionRenamePayloadSchema),
   CommandEnvelope("model.catalog", StrictObject({})),
   CommandEnvelope("command.execute", CommandExecutePayloadSchema),
   CommandEnvelope("permission.set", PermissionSetPayloadSchema),

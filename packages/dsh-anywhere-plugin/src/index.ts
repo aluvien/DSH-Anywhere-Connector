@@ -88,7 +88,7 @@ export function isSilentSetupEcho(sessionId: string, rawEvent: unknown): boolean
 // follow-up, not a bigger cap.
 const HISTORY_EVENT_LIMIT = 10_000
 
-export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway']
+export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway', 'directoryPicker']
 
 export interface Config {
   readonly routePrefix?: string
@@ -179,6 +179,7 @@ interface NativeContext extends Context {
   }
   readonly workspaceRegistry?: {
     list(): readonly { id: string; path: string; title: string; sessionIds: readonly string[] }[]
+    create?(path: string, title?: string): Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     get?(id: string): { id: string; path: string; title: string; sessionIds: readonly string[]; setTitle?(title: string): Promise<void> } | undefined
     delete?(id: string): Promise<boolean>
     readonly archivedSessionIds: readonly string[]
@@ -190,6 +191,15 @@ interface NativeContext extends Context {
   }
   readonly typertGateway?: {
     invoke(request: { namespace: string; method: string; args: Record<string, unknown>; signal?: AbortSignal }): Promise<unknown>
+  }
+  readonly directoryPicker?: {
+    capability(): {
+      kind: string
+      list?(path?: string, signal?: AbortSignal): Promise<{
+        path: string
+        entries: readonly { name: string; path: string }[]
+      }>
+    }
   }
 }
 
@@ -723,6 +733,18 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     if (isSilentSetupEcho(session.id, event)) return
     const normalized = normalizeSessionEvents(session.id, event, toolNames, usageCounters, modelSelections)
     for (const next of normalized) publish(next)
+    // The native title service writes a durable `session/title` event after
+    // the first actual user message. Project that fresh authoritative summary
+    // immediately so a new phone session stops saying “新会话” without waiting
+    // for the next manual list refresh. The same path covers web/Mac renames.
+    if (isSessionTitleEvent(event)) {
+      void listSummaries(ctx, metadata, true).then((items) => {
+        const summary = items.find((item) => item.id === session.id)
+        if (summary !== undefined) publish({ type: 'session.created', payload: summary })
+      }).catch((error: unknown) => {
+        publish({ type: 'protocol.error', payload: { code: 'session-title-refresh-failed', message: String(error), retryable: true } })
+      })
+    }
   }) as never, { global: true })
 
   ctx.on('session/created' as never, ((session: unknown) => {
@@ -927,6 +949,50 @@ async function handleHttp(
     json(res, 200, await ctx.sessionController.modelCatalog())
     return
   }
+  if (req.method === 'GET' && path === '/workspaces') {
+    json(res, 200, { workspaces: workspaceCatalog(ctx) })
+    return
+  }
+  if (req.method === 'POST' && path === '/workspaces') {
+    const body = objectOf(await readJson(req))
+    const pathValue = stringOf(body.path)
+    const title = optionalStringOf(body.title)?.trim().slice(0, 512)
+    const registry = workspaceRegistryOf(ctx)
+    if (registry?.create === undefined) throw new HttpError(501, 'Harness workspace creation is unavailable')
+    try {
+      const workspace = await registry.create(pathValue, title && title.length > 0 ? title : undefined)
+      json(res, 201, { workspace: workspaceProjection(workspace) })
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error))
+    }
+    return
+  }
+  if (req.method === 'GET' && path === '/directories') {
+    const picker = directoryPickerOf(ctx)
+    const capability = picker?.capability()
+    if (capability?.kind !== 'browse' || capability.list === undefined) {
+      throw new HttpError(501, 'Harness directory browsing is unavailable')
+    }
+    try {
+      const listing = await capability.list(url.searchParams.get('path') ?? undefined, AbortSignal.timeout(15_000))
+      json(res, 200, {
+        path: listing.path,
+        ...(dirname(listing.path) === listing.path ? {} : { parentPath: dirname(listing.path) }),
+        directories: listing.entries.map((entry) => ({ name: entry.name, path: entry.path })),
+      })
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error))
+    }
+    return
+  }
+  if (req.method === 'GET' && path === '/modes') {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness mode catalog is unavailable')
+    const result = await ctx.typertGateway.invoke({ namespace: 'agentPresets', method: 'list', args: {}, signal: AbortSignal.timeout(15_000) })
+    const failure = remoteFailureOf(result)
+    if (failure !== undefined) throw new HttpError(502, failure)
+    json(res, 200, modeCatalogFromRemote(result))
+    return
+  }
   if (req.method === 'POST' && path === '/sessions') {
     const body = objectOf(await readJson(req))
     const cwd = optionalStringOf(body.cwd)
@@ -947,18 +1013,18 @@ async function handleHttp(
       ...(agentPreset === undefined ? {} : { agentPreset }),
       ...(model === undefined ? {} : { model }),
     })
-    // `SessionCreateRequest` deliberately contains only cwd/workspace/preset;
-    // title is a separate native rename operation and branch is a presentation
-    // hint that older Harness builds do not persist in the header. Keep both in
-    // connector metadata so a newly-created session is immediately useful on
-    // the phone, while still using the native rename API when it is available.
-    await metadata.setTitle(result.sessionId, requestedTitle && requestedTitle.length > 0 ? requestedTitle : '新会话')
+    // A blank session is represented as “新会话” by the projection below. Do
+    // not persist that placeholder: it used to override the native title
+    // service forever, so the first real user message could never receive its
+    // semantic Harness-generated title.
     if (requestedBranch && requestedBranch.length > 0) await metadata.setBranch(result.sessionId, requestedBranch)
     if (requestedTitle && requestedTitle.length > 0 && ctx.sessionController.rename !== undefined) {
       try {
         await ctx.sessionController.rename({ sessionId: result.sessionId, title: requestedTitle })
       } catch {
-        // The metadata projection remains the fallback for older Harness builds.
+        // The metadata projection is an old-Harness fallback only for an
+        // explicitly supplied title, never for the blank-session placeholder.
+        await metadata.setTitle(result.sessionId, requestedTitle)
       }
     }
     // Older Harness versions ignore `model` during create. Repeating the
@@ -1035,6 +1101,19 @@ async function handleHttp(
     await metadata.setArchived(sessionId, archived)
     const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === sessionId)
     json(res, 202, { accepted: true, ...(summary === undefined ? {} : { summary }) })
+    return
+  }
+
+  const renameMatch = /^\/sessions\/([^/]+)\/rename$/.exec(path)
+  if (req.method === 'POST' && renameMatch !== null) {
+    const sessionId = decodeURIComponent(renameMatch[1]!)
+    const title = optionalStringOf(objectOf(await readJson(req)).title)?.trim()
+    if (title === undefined || title.length === 0) throw new HttpError(400, 'session title is required')
+    if (ctx.sessionController.rename === undefined) throw new HttpError(501, 'Harness session renaming is unavailable')
+    await ctx.sessionController.rename({ sessionId, title: title.slice(0, 512) })
+    // The connector follows this acknowledgement with a fresh authoritative
+    // snapshot; a local cache must never outlive the native title projection.
+    json(res, 202, { accepted: true, sessionId })
     return
   }
 
@@ -1243,6 +1322,10 @@ export function isSubagentSession(item: { origin?: string; parentSessionId?: str
   return item.origin === 'subagent' || item.parentSessionId !== undefined
 }
 
+function isSessionTitleEvent(value: unknown): boolean {
+  return recordOf(value).type === 'session/title'
+}
+
 async function publishModelCatalog(
   ctx: NativeContext,
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
@@ -1357,6 +1440,14 @@ function remoteFailureOf(value: unknown): string | undefined {
     : 'Harness permission command failed'
 }
 
+/** Typert wraps the native return value in `{ ok, value }`; direct local
+ * adapters sometimes return the value itself, so accept both shapes. */
+function remoteValueOf(value: unknown): JsonObject {
+  const remote = recordOf(value)
+  const nested = recordOf(remote.value)
+  return Object.keys(nested).length > 0 ? nested : remote
+}
+
 function approvalDecisionOf(value: unknown): ApprovalDecision {
   if (value === 'allowed-once' || value === 'rejected') return value
   throw new HttpError(400, 'decision must be allowed-once or rejected')
@@ -1402,7 +1493,10 @@ export function normalizeSessionSummary(
     ? item.sessionId
     : typeof item.id === 'string' ? item.id : 'unknown'
   const cwd = typeof item.cwd === 'string' ? item.cwd : undefined
-  const explicitTitle = metadata?.title(id) ?? sessionTitleOf(item)
+  // A title projection is written by the Harness auto-title service and by
+  // native/web renames. It must always beat our legacy metadata fallback so
+  // a mobile rename cannot permanently shadow a later native change.
+  const explicitTitle = sessionTitleOf(item) ?? metadata?.title(id)
   const workspace = workspaceFor(ctx, id, cwd)
   const selection = selectionFor(item)
   const permissionMode = metadata?.permission(id)
@@ -1410,7 +1504,7 @@ export function normalizeSessionSummary(
   const branch = metadata?.branch(id) ?? (typeof item.branch === 'string' ? item.branch : undefined)
   return {
     id,
-    title: explicitTitle ?? (cwd === undefined ? `Session ${id.slice(0, 8)}` : basename(cwd)),
+    title: explicitTitle ?? (item.blank === true ? '新会话' : (cwd === undefined ? `Session ${id.slice(0, 8)}` : basename(cwd))),
     updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
     ...(cwd === undefined ? {} : { cwd }),
     ...(workspace === undefined ? {} : workspace),
@@ -1495,12 +1589,47 @@ function workspaceFor(ctx: NativeContext | undefined, sessionId: string, cwd: st
   return undefined
 }
 
+function workspaceProjection(workspace: { id: string; path: string; title: string }): { id: string; path: string; title: string } {
+  return { id: workspace.id, path: workspace.path, title: workspace.title }
+}
+
+/** The registry includes empty workspaces; session rows cannot reconstruct it. */
+export function workspaceCatalog(ctx: Pick<NativeContext, 'workspaceRegistry'>): { id: string; path: string; title: string }[] {
+  return workspaceRegistryOf(ctx)?.list().map(workspaceProjection) ?? []
+}
+
+export function modeCatalogFromRemote(result: unknown): {
+  defaultMode?: string
+  modes: { id: string; name: string; description?: string }[]
+} {
+  const remote = remoteValueOf(result)
+  const presets: unknown[] = Array.isArray(remote.presets) ? remote.presets : []
+  const modes = presets.map((preset) => recordOf(preset))
+    .filter((preset) => typeof preset.id === 'string' && typeof preset.broken !== 'string')
+    .map((preset) => ({
+      id: preset.id as string,
+      name: typeof preset.name === 'string' && preset.name.trim().length > 0 ? preset.name : preset.id as string,
+      ...(typeof preset.description === 'string' && preset.description.trim().length > 0 ? { description: preset.description } : {}),
+      ...(preset.isDefault === true ? { isDefault: true } : {}),
+    }))
+  const defaultMode = modes.find((mode) => mode.isDefault === true)?.id
+  return { ...(defaultMode === undefined ? {} : { defaultMode }), modes: modes.map(({ isDefault: _isDefault, ...mode }) => mode) }
+}
+
+function directoryPickerOf(ctx: NativeContext): NonNullable<NativeContext['directoryPicker']> | undefined {
+  try {
+    return ctx.directoryPicker
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Cordis optional injections are exposed as throwing getters. Optional
  * chaining cannot catch that getter failure, so a profile without the
  * workspace service previously turned a valid GET /sessions into HTTP 500.
  */
-function workspaceRegistryOf(ctx: NativeContext | undefined): NonNullable<NativeContext['workspaceRegistry']> | undefined {
+function workspaceRegistryOf(ctx: Pick<NativeContext, 'workspaceRegistry'> | undefined): NonNullable<NativeContext['workspaceRegistry']> | undefined {
   if (ctx === undefined) return undefined
   try {
     return ctx.workspaceRegistry

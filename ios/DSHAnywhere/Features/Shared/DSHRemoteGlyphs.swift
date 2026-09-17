@@ -521,6 +521,9 @@ struct DSHModelConfigurationPicker: View {
     var fallbackEfforts: [DSHModelReasoningEffort] = []
     var compact = true
     var onCommit: (DSHModelSelection) -> Void = { _ in }
+    /// Lets a hosting full-screen surface suspend broad navigation gestures
+    /// while this picker owns a horizontal reasoning-slider interaction.
+    var onPresentationChanged: (Bool) -> Void = { _ in }
     @State private var isPresented = false
     @State private var draft: DSHModelSelection?
     @State private var openedSelection: DSHModelSelection?
@@ -574,6 +577,7 @@ struct DSHModelConfigurationPicker: View {
             .presentationBackground(.regularMaterial)
         }
         .onChange(of: isPresented) { _, presented in
+            onPresentationChanged(presented)
             guard !presented, let draft, draft != openedSelection else { return }
             selection = draft
             onCommit(draft)

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PROTOCOL_VERSION } from "@dsh-anywhere/protocol";
+import { PROTOCOL_VERSION, type CommandEnvelope } from "@dsh-anywhere/protocol";
 import { DSHAnywhereConnector, backoffDelay, bridgeRequestFor } from "../src/connector.js";
 import { requestPairingCode } from "../src/setup.js";
 import type { ConnectorConfig } from "../src/config.js";
@@ -13,7 +13,8 @@ const config: ConnectorConfig = {
 };
 
 function command(type: "session.list" | "session.open" | "session.create" | "prompt.send" | "turn.cancel" | "approval.decide"
-  | "workspace.rename" | "workspace.delete") {
+  | "workspace.rename" | "workspace.delete" | "workspace.catalog" | "workspace.create"
+  | "directory.list" | "mode.catalog" | "session.rename") {
   const base = { version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1 };
   if (type === "session.list") return { ...base, type, payload: {} } as const;
   if (type === "session.open") return { ...base, type, sessionId: "session-1", payload: { sessionId: "session-1" } } as const;
@@ -22,18 +23,26 @@ function command(type: "session.list" | "session.open" | "session.create" | "pro
   if (type === "turn.cancel") return { ...base, type, sessionId: "session-1", payload: {} } as const;
   if (type === "workspace.rename") return { ...base, type, payload: { workspaceId: "workspace-1", title: "Renamed" } } as const;
   if (type === "workspace.delete") return { ...base, type, payload: { workspaceId: "workspace-1" } } as const;
+  if (type === "workspace.catalog" || type === "mode.catalog") return { ...base, type, payload: {} } as const;
+  if (type === "workspace.create") return { ...base, type, payload: { path: "/tmp/workspace", title: "Workspace" } } as const;
+  if (type === "directory.list") return { ...base, type, payload: { path: "/tmp" } } as const;
+  if (type === "session.rename") return { ...base, type, sessionId: "session-1", payload: { title: "Renamed session" } } as const;
   return { ...base, type, payload: { approvalId: "approval-1", allow: true } } as const;
 }
 
 describe("bridge command mapping", () => {
   it("preserves prompt requestId and maps every supported endpoint", () => {
     expect(bridgeRequestFor(command("session.list"))).toEqual({ method: "GET", path: "/sessions" });
+    expect(bridgeRequestFor({
+      version: PROTOCOL_VERSION, requestId: "archives", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      type: "session.list", payload: { includeArchived: true },
+    } satisfies CommandEnvelope)).toEqual({ method: "GET", path: "/sessions?includeArchived=true" });
     expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: {} });
     expect(bridgeRequestFor(command("session.create"))).toEqual({ method: "POST", path: "/sessions", body: { cwd: "/tmp" } });
     expect(bridgeRequestFor({
-      ...command("session.create"),
-      payload: { workingDirectory: "/tmp", initialPrompt: "hello", permissionMode: "danger-full-access" },
-    })).toEqual({
+      version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      type: "session.create", payload: { workingDirectory: "/tmp", initialPrompt: "hello", permissionMode: "danger-full-access" },
+    } satisfies CommandEnvelope)).toEqual({
       method: "POST", path: "/sessions", body: { cwd: "/tmp", permissionMode: "danger-full-access" },
     });
     expect(bridgeRequestFor(command("prompt.send"))).toEqual({
@@ -49,6 +58,15 @@ describe("bridge command mapping", () => {
     expect(bridgeRequestFor(command("workspace.delete"))).toEqual({
       method: "POST", path: "/workspaces/workspace-1/delete", body: {},
     });
+    expect(bridgeRequestFor(command("workspace.catalog"))).toEqual({ method: "GET", path: "/workspaces" });
+    expect(bridgeRequestFor(command("workspace.create"))).toEqual({
+      method: "POST", path: "/workspaces", body: { path: "/tmp/workspace", title: "Workspace" },
+    });
+    expect(bridgeRequestFor(command("directory.list"))).toEqual({ method: "GET", path: "/directories?path=%2Ftmp" });
+    expect(bridgeRequestFor(command("mode.catalog"))).toEqual({ method: "GET", path: "/modes" });
+    expect(bridgeRequestFor(command("session.rename"))).toEqual({
+      method: "POST", path: "/sessions/session-1/rename", body: { title: "Renamed session" },
+    });
   });
 
   it("uses capped exponential backoff", () => {
@@ -59,6 +77,91 @@ describe("bridge command mapping", () => {
 });
 
 describe("Relay and bridge forwarding", () => {
+  it("drops the connector-only bridge snapshot so it cannot overwrite a phone refresh", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    bridge.emit("message", JSON.stringify({
+      version: PROTOCOL_VERSION, messageId: "bridge-snapshot", machineId: "mac", deviceId: "dsh-anywhere-connector", sequence: 1, timestamp: 1,
+      type: "session.snapshot", payload: [{ id: "stale", title: "Stale", updatedAt: 1 }],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(relay.sent).toEqual([]);
+    await connector.stop();
+  });
+
+  it("publishes one rich snapshot for a refresh instead of a stripped pre-snapshot", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: (async () => new Response(JSON.stringify({ items: [{
+        id: "session-1", title: "Authoritative", updatedAt: 1, workspaceId: "workspace-1", workspaceName: "Code",
+      }] }), { headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "list-relay", sender: "device", body: command("session.list") }));
+    await vi.waitFor(() => expect(relay.sent).toHaveLength(1));
+    expect(JSON.parse(relay.sent[0]!).body).toMatchObject({
+      type: "session.snapshot", messageId: "request-1",
+      payload: [{ id: "session-1", workspaceId: "workspace-1", workspaceName: "Code" }],
+    });
+    await connector.stop();
+  });
+
+  it("keeps an archive-view refresh authoritative after an archive mutation", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const urls: string[] = [];
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: (async (input: RequestInfo | URL) => {
+        urls.push(String(input));
+        return new Response(JSON.stringify({ items: [] }), { headers: { "content-type": "application/json" } });
+      }) as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const archiveList = { ...command("session.list"), requestId: "archives", payload: { includeArchived: true } };
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archives-relay", sender: "device", body: archiveList }));
+    await vi.waitFor(() => expect(urls).toContain("http://127.0.0.1:3080/dsh-anywhere/v1/sessions?includeArchived=true"));
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archive-relay", sender: "device", body: {
+      version: PROTOCOL_VERSION, requestId: "archive", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      sessionId: "session-1", type: "session.archive", payload: { archived: true },
+    } }));
+    await vi.waitFor(() => expect(urls.filter((url) => url.endsWith("/sessions?includeArchived=true")).length).toBeGreaterThanOrEqual(2));
+    await connector.stop();
+  });
+
+  it("routes one phone's directory listing only to that phone", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: (async () => new Response(JSON.stringify({
+        path: "/Users/me", parentPath: "/Users", directories: [{ name: "Code", path: "/Users/me/Code" }],
+      }), { headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const listing = { ...command("directory.list"), deviceId: "phone-folder", requestId: "folder-list" };
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "folder-relay", sender: "device", body: listing }));
+    await vi.waitFor(() => expect(relay.sent).toHaveLength(1));
+    expect(JSON.parse(relay.sent[0]!)).toMatchObject({ targetDeviceId: "phone-folder", body: {
+      type: "directory.list", messageId: "folder-list", payload: { path: "/Users/me" },
+    } });
+    await connector.stop();
+  });
+
   it("replays buffered bridge events after a device resume", async () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();

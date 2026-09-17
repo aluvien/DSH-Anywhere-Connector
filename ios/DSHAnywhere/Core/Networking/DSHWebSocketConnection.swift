@@ -130,6 +130,12 @@ public actor DSHWebSocketConnection {
     private var stopped = false
     private var _state: DSHConnectionState = .disconnected
     private var _lastSequence: Int64
+    /// A restart resets Connector sequence numbers. Only a snapshot that
+    /// answers one of this device's own session-list requests may establish a
+    /// new epoch without a preceding connection.ready; arbitrary replayed
+    /// snapshots are deliberately ignored when they are older.
+    private var pendingSessionSnapshotRequestGenerations: [String: Int] = [:]
+    private var latestSessionSnapshotRequestGeneration = 0
 
     public init(configuration: DSHWebSocketConfiguration,
                 lastSequence: Int64 = 0,
@@ -184,7 +190,9 @@ public actor DSHWebSocketConnection {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         guard !stopped, let socket else { throw DSHWebSocketError.notConnected }
-        try await sendRelay(normalized(command), over: socket)
+        let normalized = normalized(command)
+        try await sendRelay(normalized, over: socket)
+        rememberSessionSnapshotRequestIfNeeded(normalized)
     }
 
     private func run() async {
@@ -251,6 +259,9 @@ public actor DSHWebSocketConnection {
                 throw DSHWebSocketError.unauthorizedRelayRole
             }
             _state = .connected
+            // Requests from a dead socket can never receive a useful reply.
+            // The fresh handshake list below becomes the only list authority.
+            pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
             yieldControl(type: "transport.state", value: _state)
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
                                         lastSequence: _lastSequence), over: task)
@@ -258,8 +269,10 @@ public actor DSHWebSocketConnection {
             // every connection. Request the authoritative session list here,
             // rather than relying on SwiftUI onAppear or on a replayed local
             // connection.ready event that may no longer be buffered.
-            try await sendRelay(.listSessions(deviceId: configuration.deviceId,
-                                              machineId: configuration.machineId), over: task)
+            let list = DSHCommand.listSessions(deviceId: configuration.deviceId,
+                                               machineId: configuration.machineId)
+            try await sendRelay(list, over: task)
+            rememberSessionSnapshotRequestIfNeeded(list)
             return true
         case .presence(let presence):
             if presence.machineId == configuration.machineId, presence.role == .machine {
@@ -276,7 +289,40 @@ public actor DSHWebSocketConnection {
             guard event.envelope.version == 1 else {
                 throw DSHWebSocketError.unsupportedProtocolVersion(event.envelope.version)
             }
-            if event.startsNewSequenceEpoch(comparedTo: _lastSequence) {
+            let snapshotGeneration = event.isSessionSnapshot
+                ? pendingSessionSnapshotRequestGenerations.removeValue(forKey: event.envelope.messageId)
+                : nil
+            // Two refreshes can cross on the wire (for example, opening
+            // Archives while the initial list is still in flight). The older
+            // result is still valid server data, but it is not the answer to
+            // the current screen state and must not overwrite it.
+            if let snapshotGeneration,
+               snapshotGeneration < latestSessionSnapshotRequestGeneration {
+                return false
+            }
+            // During a current list request, a replay/presence snapshot has no
+            // request correlation. Wait for the current answer instead of
+            // briefly painting whatever old list happened to arrive first.
+            if event.isSessionSnapshot, snapshotGeneration == nil,
+               !pendingSessionSnapshotRequestGenerations.isEmpty {
+                return false
+            }
+            let isCorrelatedSnapshot = snapshotGeneration == latestSessionSnapshotRequestGeneration
+            if isCorrelatedSnapshot {
+                // Once the newest response wins, older requests are obsolete;
+                // retaining them would block later unsolicited live snapshots
+                // forever when an old response never arrives.
+                pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
+            }
+            if case .protocolError = event.kind,
+               let failedGeneration = pendingSessionSnapshotRequestGenerations
+                .removeValue(forKey: event.envelope.messageId),
+               failedGeneration == latestSessionSnapshotRequestGeneration {
+                pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
+            }
+            let establishesEpoch = event.startsNewSequenceEpoch(comparedTo: _lastSequence,
+                                                                  matchingSessionListRequest: isCorrelatedSnapshot)
+            if establishesEpoch {
                 // A Connector restart resets its in-memory replay sequence.  A
                 // full session snapshot is also authoritative: it is sent in
                 // direct response to a user refresh, and may be the first
@@ -285,7 +331,8 @@ public actor DSHWebSocketConnection {
                 _lastSequence = 0
             }
             if event.sequence > _lastSequence { _lastSequence = event.sequence }
-            continuation?.yield(event)
+            continuation?.yield(DSHEvent(envelope: event.envelope,
+                                         establishesSequenceEpoch: establishesEpoch))
             return false
         }
     }
@@ -301,6 +348,19 @@ public actor DSHWebSocketConnection {
         let payload = try DSHRelayPayloadMessage.wrapping(machineId: configuration.machineId,
                                                            sender: .device, body: command)
         try await task.send(.data(try JSONEncoder().encode(payload)))
+    }
+
+    private func rememberSessionSnapshotRequestIfNeeded(_ command: DSHCommand) {
+        guard command.type == "session.list" else { return }
+        latestSessionSnapshotRequestGeneration += 1
+        pendingSessionSnapshotRequestGenerations[command.requestId] = latestSessionSnapshotRequestGeneration
+        // A timed-out response must not turn an unrelated future event into a
+        // reset. The bounded set also preserves the most recent refreshes when
+        // several pull-to-refresh gestures race.
+        if pendingSessionSnapshotRequestGenerations.count > 12 {
+            pendingSessionSnapshotRequestGenerations = pendingSessionSnapshotRequestGenerations
+                .filter { $0.value >= latestSessionSnapshotRequestGeneration - 6 }
+        }
     }
 
     /// Feeds Relay control-plane state through the same batched UI stream as
@@ -320,10 +380,20 @@ public actor DSHWebSocketConnection {
 }
 
 private extension DSHEvent {
-    func startsNewSequenceEpoch(comparedTo lastSequence: Int64) -> Bool {
+    var isSessionSnapshot: Bool {
+        if case .sessionSnapshot = kind { return true }
+        return false
+    }
+
+    func startsNewSequenceEpoch(comparedTo lastSequence: Int64,
+                                matchingSessionListRequest: Bool) -> Bool {
         guard sequence <= lastSequence else { return false }
+        if matchingSessionListRequest { return true }
         switch kind {
-        case .connectionReady, .sessionSnapshot:
+        // A delayed/replayed list can otherwise reset the transport cursor and
+        // republish stale home rows during launch. A real restart either emits
+        // connection.ready or answers our just-sent list request above.
+        case .connectionReady:
             return true
         default:
             return false

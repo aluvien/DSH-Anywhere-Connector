@@ -83,6 +83,41 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.connectionState, .connected)
     }
 
+    func testStaleLowerSnapshotCannotReplaceNewerAuthoritativeSessions() {
+        var state = DSHStoreState()
+        state.lastSequence = 42
+        state.sessions = [DSHSessionSummary(id: "fresh", title: "Fresh", updatedAt: 42)]
+        let stale = DSHEvent(envelope: DSHEnvelope(
+            messageId: "replayed", deviceId: "d", machineId: "m", sequence: 3,
+            type: "session.snapshot", payload: .array([
+                .object(["id": .string("stale"), "title": .string("Stale"), "updatedAt": .number(3)]),
+            ])
+        ))
+
+        DSHEventReducer().reduce(stale, into: &state)
+
+        XCTAssertEqual(state.lastSequence, 42)
+        XCTAssertEqual(state.sessions.map(\.id), ["fresh"])
+    }
+
+    func testCorrelatedLowerSnapshotStartsNewEpochAfterConnectorRestart() {
+        var state = DSHStoreState()
+        state.lastSequence = 42
+        state.sessions = [DSHSessionSummary(id: "old", title: "Old", updatedAt: 42)]
+        let fresh = DSHEvent(envelope: DSHEnvelope(
+            messageId: "requested", deviceId: "d", machineId: "m", sequence: 1,
+            type: "session.snapshot", payload: .array([
+                .object(["id": .string("new"), "title": .string("New"), "updatedAt": .number(1)]),
+            ])
+        ), establishesSequenceEpoch: true)
+
+        DSHEventReducer().reduce(fresh, into: &state)
+
+        XCTAssertEqual(state.lastSequence, 1)
+        XCTAssertEqual(state.sessions.map(\.id), ["new"])
+        XCTAssertTrue(state.hasLoadedSessions)
+    }
+
     func testRelayControlsUpdateReachabilityOutsideConnectorSequence() {
         var state = DSHStoreState()
         state.lastSequence = 42
@@ -152,7 +187,7 @@ final class DSHEventStoreTests: XCTestCase {
             type: "session.snapshot", payload: .array([
                 .object(["id": .string("current"), "title": .string("Current"), "updatedAt": .number(2)]),
             ])
-        ))
+        ), establishesSequenceEpoch: true)
         DSHEventReducer().reduce(snapshot, into: &state)
         XCTAssertEqual(state.lastSequence, 1)
         XCTAssertEqual(state.sessions.map(\.id), ["current"])
@@ -941,4 +976,131 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(model.sessionDot(for: waiting), .yellow)
         XCTAssertEqual(model.sessionDot(for: active), .green)
     }
+
+    @MainActor
+    func testLocalTransportFailureClearsWorkspaceAndDirectoryLoading() async {
+        let transport = CorrelationTransport(failingTypes: ["workspace.create", "directory.list"])
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+
+        model.createWorkspace(at: "/Users/me/Project")
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(model.isCreatingWorkspace)
+
+        model.listDirectory(at: "/Users/me")
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(model.isLoadingDirectory)
+    }
+
+    @MainActor
+    func testWorkspaceCreationDismissesOnlyForMatchingRemoteAcknowledgement() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        model.createWorkspace(at: "/Users/me/Existing")
+        try? await Task.sleep(for: .milliseconds(80))
+        let pendingCommand = await transport.lastCommand(ofType: "workspace.create")
+        let requestID = try XCTUnwrap(pendingCommand?.requestId)
+
+        await transport.emit(event(type: "workspace.created", messageID: "another-device", sequence: 1,
+                                   payload: .object([
+                                    "id": .string("existing"), "path": .string("/Users/me/Existing"),
+                                    "title": .string("Existing"),
+                                   ])))
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(model.isCreatingWorkspace)
+        XCTAssertNil(model.createdWorkspace)
+
+        await transport.emit(event(type: "workspace.created", messageID: requestID, sequence: 2,
+                                   payload: .object([
+                                    "id": .string("existing"), "path": .string("/Users/me/Existing"),
+                                    "title": .string("Existing"),
+                                   ])))
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(model.isCreatingWorkspace)
+        XCTAssertEqual(model.createdWorkspace?.id, "existing")
+        XCTAssertEqual(model.createdWorkspace?.name, "Existing")
+        model.disconnect()
+    }
+
+    @MainActor
+    func testOnlyLatestDirectoryReplyUpdatesFolderBrowser() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        model.listDirectory(at: "/Users/me")
+        try? await Task.sleep(for: .milliseconds(50))
+        let firstCommand = await transport.lastCommand(ofType: "directory.list")
+        let firstID = try XCTUnwrap(firstCommand?.requestId)
+        model.listDirectory(at: "/Users/me/New")
+        try? await Task.sleep(for: .milliseconds(50))
+        let secondCommand = await transport.lastCommand(ofType: "directory.list")
+        let secondID = try XCTUnwrap(secondCommand?.requestId)
+        XCTAssertNotEqual(firstID, secondID)
+
+        await transport.emit(event(type: "directory.list", messageID: firstID, sequence: 1,
+                                   payload: directoryPayload(path: "/Users/me", directory: "Old")))
+        await transport.emit(event(type: "directory.list", messageID: secondID, sequence: 2,
+                                   payload: directoryPayload(path: "/Users/me/New", directory: "Current")))
+        try? await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(model.directoryListing?.path, "/Users/me/New")
+        XCTAssertEqual(model.directoryListing?.directories.map(\.name), ["Current"])
+        XCTAssertFalse(model.isLoadingDirectory)
+        model.disconnect()
+    }
+
+    private func directoryPayload(path: String, directory: String) -> DSHJSONValue {
+        .object([
+            "path": .string(path),
+            "directories": .array([
+                .object(["name": .string(directory), "path": .string("\(path)/\(directory)")]),
+            ]),
+        ])
+    }
+
+    private func event(type: String, messageID: String, sequence: Int64,
+                       payload: DSHJSONValue) -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(messageId: messageID, deviceId: "device", machineId: "machine",
+                                        sequence: sequence, type: type, payload: payload))
+    }
+}
+
+private actor CorrelationTransport: DSHAppTransport {
+    private var continuation: AsyncThrowingStream<DSHEvent, Error>.Continuation?
+    private var commands: [DSHCommand] = []
+    private let failingTypes: Set<String>
+
+    init(failingTypes: Set<String> = []) { self.failingTypes = failingTypes }
+
+    func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential,
+              deviceName: String) async throws -> DSHRemoteProfile {
+        DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!,
+                         deviceId: "device", machineId: "machine", machineName: "Mac")
+    }
+
+    func connect() async -> AsyncThrowingStream<DSHEvent, Error> {
+        let stream = AsyncThrowingStream<DSHEvent, Error>.makeStream()
+        continuation = stream.continuation
+        return stream.stream
+    }
+
+    func send(_ command: DSHCommand) async throws {
+        commands.append(command)
+        if failingTypes.contains(command.type) {
+            throw DSHWebSocketError.notConnected
+        }
+    }
+
+    func disconnect() async { continuation?.finish(); continuation = nil }
+    func forgetPairing() async throws { await disconnect() }
+    func setActiveMachine(_ machineId: String) async {}
+    func removeMachine(_ machineId: String) async throws {}
+    func pairedDevices() async throws -> [DSHRelayDevice] { [] }
+    func revokeDevice(_ deviceId: String) async throws {}
+
+    func lastCommand(ofType type: String) -> DSHCommand? {
+        commands.last(where: { $0.type == type })
+    }
+
+    func emit(_ event: DSHEvent) { continuation?.yield(event) }
 }

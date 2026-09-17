@@ -29,7 +29,7 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024;
  *    reject thumbnail-bearing messages as invalid, so the Relay must be
  *    redeployed BEFORE any bridge starts sending them.
  */
-const RELAY_SCHEMA_REVISION = 6;
+const RELAY_SCHEMA_REVISION = 7;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day

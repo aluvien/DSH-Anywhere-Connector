@@ -80,6 +80,52 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertTrue(sawOfflinePresence)
         await connection.disconnect()
     }
+
+    func testOnlyLatestCorrelatedListSnapshotCanResetAConnectorEpoch() async throws {
+        let fake = RecordingWebSocketTask()
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1),
+                                                maximumReconnectAttempts: 0)
+        let connection = DSHWebSocketConnection(configuration: config, lastSequence: 42,
+                                                taskFactory: { _ in fake })
+        let stream = await connection.connect()
+        var iterator = stream.makeAsyncIterator()
+        let requestID = "fresh-list"
+        try await connection.send(DSHCommand(requestId: requestID, deviceId: "device", machineId: "machine",
+                                             type: "session.list",
+                                             payload: .object(["includeArchived": .bool(true)])))
+
+        // A replay can have a lower sequence but no current request id. It
+        // must not restart the cursor or paint an obsolete home list.
+        fake.enqueue(try relaySnapshot(messageID: "old-replay", sequence: 3, title: "Old"))
+        fake.enqueue(try relaySnapshot(messageID: requestID, sequence: 1, title: "Fresh"))
+
+        var receivedSnapshot: DSHEvent?
+        for _ in 0..<4 {
+            guard let event = try await iterator.next() else { break }
+            if case .sessionSnapshot = event.kind {
+                receivedSnapshot = event
+                break
+            }
+        }
+        XCTAssertEqual(receivedSnapshot?.envelope.messageId, requestID)
+        XCTAssertTrue(receivedSnapshot?.establishesSequenceEpoch == true)
+        let finalSequence = await connection.lastSequence
+        XCTAssertEqual(finalSequence, 1)
+        await connection.disconnect()
+    }
+
+    private func relaySnapshot(messageID: String, sequence: Int64, title: String) throws -> URLSessionWebSocketTask.Message {
+        let event = DSHEvent(envelope: DSHEnvelope(
+            messageId: messageID, deviceId: "device", machineId: "machine", sequence: sequence,
+            type: "session.snapshot", payload: .array([
+                .object(["id": .string(title.lowercased()), "title": .string(title), "updatedAt": .number(Double(sequence))]),
+            ])
+        ))
+        let relay = try DSHRelayPayloadMessage.wrapping(machineId: "machine", sender: .machine, body: event)
+        return .data(try JSONEncoder().encode(relay))
+    }
 }
 
 private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Sendable {
@@ -115,5 +161,14 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
         }
         if !additionalMessages.isEmpty { return additionalMessages.removeFirst() }
         return try await withCheckedThrowingContinuation { continuation in receiveContinuation = continuation }
+    }
+
+    func enqueue(_ message: URLSessionWebSocketTask.Message) {
+        if let continuation = receiveContinuation {
+            receiveContinuation = nil
+            continuation.resume(returning: message)
+        } else {
+            additionalMessages.append(message)
+        }
     }
 }

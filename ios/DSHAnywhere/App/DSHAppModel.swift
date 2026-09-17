@@ -85,10 +85,6 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.object(forKey: DSHAppModel.groupingKey) as? Bool ?? true
     @Published var collapsedSessionGroups: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.collapsedGroupsKey) ?? [])
-    @Published private(set) var workspaceAliases: [String: String] =
-        (UserDefaults.standard.dictionary(forKey: DSHAppModel.workspaceAliasesKey) as? [String: String]) ?? [:]
-    @Published private(set) var hiddenWorkspaceIDs: Set<String> =
-        Set(UserDefaults.standard.stringArray(forKey: DSHAppModel.hiddenWorkspacesKey) ?? [])
     /// The Harness bridge has no command for deleting one historical message.
     /// Keep a persistent, device-local suppression list so a confirmed delete
     /// does not reappear on refresh while the authoritative Mac transcript is
@@ -113,6 +109,11 @@ final class DSHAppModel: ObservableObject {
     /// Kept apart from `errorMessage` so a device-list failure does not pop an
     /// alert over whatever the user is doing in Settings.
     @Published var devicesError: String?
+    /// The folder picker dismisses only after this request receives the Mac's
+    /// `workspace.created` acknowledgement. `nil` means no confirmed result.
+    @Published private(set) var createdWorkspace: DSHWorkspaceOption?
+    @Published private(set) var isCreatingWorkspace = false
+    @Published private(set) var isLoadingDirectory = false
 
     private let transport: any DSHAppTransport
     private let reducer = DSHEventReducer()
@@ -141,12 +142,15 @@ final class DSHAppModel: ObservableObject {
     /// Nonisolated: the eviction sweep runs on a detached background task.
     nonisolated static let attachmentDiskBudgetBytes = 200 * 1024 * 1024
     private let deviceID = "ios-device"
-    /// Every in-flight `session.create` request keeps the snapshot it was
-    /// created against. The Connector echoes that request id in
-    /// `session.created`; keeping this as a map (rather than one global slot)
-    /// means two quick taps cannot make the first task lose its initial prompt
-    /// or navigate to the wrong session.
-    private var pendingSessionCreationKnownIDs: [String: Set<String>] = [:]
+    /// Creation acknowledgements are correlated by the Connector request id;
+    /// never infer the created session from a later list snapshot.
+    private var pendingSessionCreationRequestIDs: Set<String> = []
+    private var pendingWorkspaceCreationRequestID: String?
+    /// The picker issues one navigation request at a time. Keeping its latest
+    /// id prevents a slower parent-folder response from replacing a newer
+    /// child-folder listing.
+    private var pendingDirectoryRequestID: String?
+    private var requestedCatalogsForConnection = false
     /// Attachments selected in the shared new-session composer stay local until
     /// the session exists. They are uploaded and sent as one initial prompt
     /// immediately after the matching `session.created` event arrives.
@@ -170,11 +174,16 @@ final class DSHAppModel: ObservableObject {
     /// state reset already drops any carried-over rows).
     private func resetTransientRequestState() {
         pendingEvents.removeAll(keepingCapacity: false)
-        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
         pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
         lastOpenSessionAt.removeAll(keepingCapacity: false)
+        pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
+        pendingWorkspaceCreationRequestID = nil
+        pendingDirectoryRequestID = nil
+        isCreatingWorkspace = false
+        isLoadingDirectory = false
+        requestedCatalogsForConnection = false
         // Queued prompts belong to one machine: swap the in-memory set for
         // the newly active machine's persisted one (disk already holds both).
         queuedPromptsBySession.removeAll(keepingCapacity: false)
@@ -188,8 +197,6 @@ final class DSHAppModel: ObservableObject {
     static let usageFooterKey = "dsh-anywhere.show-session-usage"
     static let messageActionsKey = "dsh-anywhere.show-message-actions-by-default"
     static let composerCollapsedKey = "dsh-anywhere.collapse-composer-controls"
-    static let workspaceAliasesKey = "dsh-anywhere.workspace-aliases"
-    static let hiddenWorkspacesKey = "dsh-anywhere.hidden-workspaces"
     static let hiddenMessagesKey = "dsh-anywhere.hidden-messages"
     static let lastReadSessionsKey = "dsh-anywhere.last-read-session-timestamps"
     static let unreadBaselineKey = "dsh-anywhere.unread-baseline"
@@ -550,25 +557,18 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
-    /// Workspaces available when starting a session. Apply the local alias
-    /// immediately after a rename while the authoritative snapshot is in
-    /// flight, so the new-session picker never briefly shows the old title.
-    var workspaces: [DSHWorkspaceOption] {
-        sessions.workspaceOptions()
-            .filter { !hiddenWorkspaceIDs.contains($0.id) }
-            .map { workspace in
-                DSHWorkspaceOption(id: workspace.id,
-                                   name: workspaceAliases[workspace.id] ?? workspace.name)
-            }
-    }
+    /// The paired Mac owns the workspace registry. It includes empty projects,
+    /// so deriving this from sessions would make a newly-created project vanish
+    /// until its first task exists.
+    var workspaces: [DSHWorkspaceOption] { state.workspaceCatalog }
+    var modes: [DSHModeOption] { state.modeCatalog?.modes ?? [] }
+    var defaultModeID: String? { state.modeCatalog?.defaultMode }
+    var directoryListing: DSHDirectoryListing? { state.directoryListing }
 
     /// Starts a session, optionally inside a workspace.
     ///
-    /// Choosing a workspace matters because a session created without one does
-    /// not appear in the list at all: the list only shows registered
-    /// workspaces, so an unfiled session was reachable once and then lost.
     func createSession(in workspace: DSHWorkspaceOption? = nil,
-                       title: String = "新会话",
+                       title: String? = nil,
                        workingDirectory: String? = nil,
                        branch: String? = nil,
                        mode: String = "standard",
@@ -576,15 +576,13 @@ final class DSHAppModel: ObservableObject {
                        permissionMode: String = "workspace-write",
                        initialPrompt: String? = nil,
                        initialAttachments: [DSHStagedAttachment] = []) {
-        let known = Set(sessions.map(\.id))
-        // Remember which request asked for this session. The connector echoes it
-        // back as the created event's messageId, which is what lets the reply be
-        // matched to this tap instead of guessed at. Multiple entries are
-        // allowed, so rapid new-task taps remain independent.
         let requestId = UUID().uuidString
-        pendingSessionCreationKnownIDs[requestId] = known
-        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        var payload: [String: DSHJSONValue] = ["title": .string(cleanTitle.isEmpty ? "新会话" : cleanTitle)]
+        pendingSessionCreationRequestIDs.insert(requestId)
+        var payload: [String: DSHJSONValue] = [:]
+        if let title {
+            let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanTitle.isEmpty { payload["title"] = .string(cleanTitle) }
+        }
         // The bridge accepts workspaceId OR cwd, never both: the workspace
         // registry already resolves the directory, so sending both is a 400.
         if workspace == nil, let workingDirectory {
@@ -623,34 +621,41 @@ final class DSHAppModel: ObservableObject {
                                   type: "session.create",
                                   payload: .object(payload))
         send(command)
-        // Fallback for when `session.created` never arrives (dropped event, older
-        // connector): re-request the list and open a session we did not know
-        // about. Either path makes the tap do something visible.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: .seconds(1.5))
-            guard self.pendingSessionCreationKnownIDs[requestId] != nil else { return }
-            self.refreshSessions()
-            try? await Task.sleep(for: .seconds(1.5))
-            guard let known = self.pendingSessionCreationKnownIDs[requestId] else { return }
-            let candidates = self.sessions.filter { !known.contains($0.id) }
-            // A list snapshot has no request id. Only use it as a fallback
-            // when exactly one new session exists; guessing among several
-            // tasks would open the wrong conversation, which is worse than
-            // leaving the user on the task browser where all of them are
-            // visible.
-            if candidates.count == 1, let created = candidates.first {
-                self.completeCreatedSession(created, requestID: requestId)
-            } else {
-                self.pendingSessionCreationKnownIDs.removeValue(forKey: requestId)
-                self.pendingInitialMessagesByRequestID.removeValue(forKey: requestId)
-            }
-        }
     }
 
     func refreshSessions(includeArchived: Bool? = nil) {
         let include = includeArchived ?? showArchivedSessions
         send(DSHCommand.listSessions(deviceId: deviceID, machineId: machineID, includeArchived: include))
+    }
+
+    func requestWorkspaces() {
+        send(DSHCommand.workspaceCatalog(deviceId: deviceID, machineId: machineID))
+    }
+
+    func requestModes() {
+        send(DSHCommand.modeCatalog(deviceId: deviceID, machineId: machineID))
+    }
+
+    func listDirectory(at path: String? = nil) {
+        let requestId = UUID().uuidString
+        pendingDirectoryRequestID = requestId
+        isLoadingDirectory = true
+        send(DSHCommand.directoryList(deviceId: deviceID, machineId: machineID,
+                                      path: path, requestId: requestId))
+    }
+
+    func createWorkspace(at path: String, title: String? = nil) {
+        let cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPath.isEmpty, !isCreatingWorkspace else { return }
+        let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestId = UUID().uuidString
+        createdWorkspace = nil
+        isCreatingWorkspace = true
+        pendingWorkspaceCreationRequestID = requestId
+        send(DSHCommand.createWorkspace(deviceId: deviceID, machineId: machineID,
+                                        path: cleanPath,
+                                        title: cleanTitle?.isEmpty == false ? cleanTitle : nil,
+                                        requestId: requestId))
     }
 
     /// Loads the durable transcript for an existing session. Session snapshots
@@ -716,28 +721,30 @@ final class DSHAppModel: ObservableObject {
     }
 
     func workspaceDisplayName(for id: String, fallback: String) -> String {
-        workspaceAliases[id] ?? fallback
+        workspaces.first(where: { $0.id == id })?.name ?? fallback
     }
 
-    /// Project mutations are sent to the Harness workspace registry and also
-    /// applied optimistically to this device's presentation cache. The local
-    /// cache keeps the list responsive while the Relay round-trip refreshes the
-    /// authoritative workspace/session snapshot.
+    /// Mutations intentionally wait for the Connector's following catalog or
+    /// snapshot. Local aliases and hidden-project sets used to make failed
+    /// mutations look successful and could outlive the remote truth.
     func renameWorkspace(id: String, to name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        workspaceAliases[id] = trimmed
-        UserDefaults.standard.set(workspaceAliases, forKey: Self.workspaceAliasesKey)
         send(DSHCommand.renameWorkspace(deviceId: deviceID, machineId: machineID,
                                         workspaceId: id, title: trimmed))
     }
 
     func deleteWorkspace(_ group: DSHSessionGroup) {
         guard !group.isUnfiled, group.id != DSHSessionGroup.flatGroupID else { return }
-        hiddenWorkspaceIDs.insert(group.id)
-        UserDefaults.standard.set(Array(hiddenWorkspaceIDs), forKey: Self.hiddenWorkspacesKey)
         send(DSHCommand.deleteWorkspace(deviceId: deviceID, machineId: machineID,
                                         workspaceId: group.id))
+    }
+
+    func renameSession(_ session: DSHSessionSummary, to title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        send(DSHCommand.renameSession(deviceId: deviceID, machineId: machineID,
+                                      sessionId: session.id, title: trimmed))
     }
 
     func archive(_ session: DSHSessionSummary, archived: Bool = true) {
@@ -1186,13 +1193,16 @@ final class DSHAppModel: ObservableObject {
     }
 
     func modeLabel(for sessionID: String) -> String {
-        let value = sessions.first(where: { $0.id == sessionID })?.mode
-            ?? sessions.first(where: { $0.id == sessionID })?.agentPreset
-            ?? "standard"
+        guard let value = sessions.first(where: { $0.id == sessionID })?.mode
+            ?? sessions.first(where: { $0.id == sessionID })?.agentPreset else {
+            return modes.first(where: { $0.id == defaultModeID })?.name ?? "标准模式"
+        }
+        if let remoteName = modes.first(where: { $0.id == value })?.name { return remoteName }
         switch value.lowercased() {
         case "ptc", "plan-to-code", "plan_to_code": return "PTC 模式"
         case "custom", "self", "自建", "自建模式": return "自建模式"
-        default: return "标准模式"
+        case "standard": return "标准模式"
+        default: return value
         }
     }
 
@@ -1217,6 +1227,7 @@ final class DSHAppModel: ObservableObject {
             do { try await self?.transport.send(command) }
             catch {
                 guard let self else { return }
+                self.clearFailedRemoteRequest(command.requestId)
                 // A prompt that never left the phone parks for retry (with
                 // its text intact) instead of only flashing an alert while
                 // the draft is already gone.
@@ -1227,6 +1238,31 @@ final class DSHAppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// A local transport rejection (offline socket or an older Relay schema)
+    /// has no protocol.error envelope. Clear only the request state owned by
+    /// that command so folder-picker controls never remain disabled forever.
+    private func clearFailedRemoteRequest(_ requestID: String) {
+        if requestID == pendingWorkspaceCreationRequestID {
+            pendingWorkspaceCreationRequestID = nil
+            isCreatingWorkspace = false
+        }
+        if requestID == pendingDirectoryRequestID {
+            pendingDirectoryRequestID = nil
+            isLoadingDirectory = false
+        }
+        if pendingSessionCreationRequestIDs.remove(requestID) != nil {
+            pendingInitialMessagesByRequestID.removeValue(forKey: requestID)
+        }
+    }
+
+    /// Directory listings are request/response data, never broadcast state.
+    /// Ignore an old or another device's reply before it reaches the reducer;
+    /// otherwise a late response can visibly jump the folder browser back.
+    private func shouldReduce(_ event: DSHEvent) -> Bool {
+        guard case .directoryListing = event.kind else { return true }
+        return event.envelope.messageId == pendingDirectoryRequestID
     }
 
     private func enqueue(_ event: DSHEvent) {
@@ -1247,19 +1283,22 @@ final class DSHAppModel: ObservableObject {
 
         // Mutate a local copy and assign once. `state` is @Published, so this
         // turns a burst of assistant deltas/tool events into one UI update.
+        let acceptedEvents = events.filter(shouldReduce)
         var next = state
-        for event in events {
+        for event in acceptedEvents {
             reducer.reduce(event, into: &next)
         }
-        attachPendingMessageThumbnails(to: &next, events: events)
+        attachPendingMessageThumbnails(to: &next, events: acceptedEvents)
         // Do not compare the entire transcript here: that equality check would
         // walk every message/tool on every frame and cost more than the
         // notification we are trying to avoid. A batch always represents one
         // transport tick, so one assignment is the bounded publication point.
         state = next
 
-        for event in events {
+        for event in acceptedEvents {
             handleSessionCreated(event)
+            handleRemoteRequestCompletion(event)
+            requestRemoteCatalogsWhenConnected(event)
             retireQueuedPrompt(event)
             confirmSendAccepted(event)
             flushQueueOnSettle(event)
@@ -1418,17 +1457,64 @@ final class DSHAppModel: ObservableObject {
         // so an unrelated one could steal the screen. Matching the request id
         // removes both.
         let requestID = event.envelope.messageId
-        guard pendingSessionCreationKnownIDs[requestID] != nil else { return }
+        guard pendingSessionCreationRequestIDs.contains(requestID) else { return }
         completeCreatedSession(session, requestID: requestID)
     }
 
     private func completeCreatedSession(_ session: DSHSessionSummary, requestID: String) {
-        pendingSessionCreationKnownIDs.removeValue(forKey: requestID)
+        pendingSessionCreationRequestIDs.remove(requestID)
         selectedSessionID = session.id
         guard let pending = pendingInitialMessagesByRequestID.removeValue(forKey: requestID) else { return }
         Task { @MainActor [weak self] in
             await self?.sendInitialMessage(pending, to: session.id)
         }
+    }
+
+    /// Only a correlated remote acknowledgement changes picker completion
+    /// state. This prevents a workspace created on another device from
+    /// dismissing the local folder picker, and clears spinners on errors.
+    private func handleRemoteRequestCompletion(_ event: DSHEvent) {
+        let requestID = event.envelope.messageId
+        switch event.kind {
+        case .workspaceCreated(let workspace)
+            where requestID == pendingWorkspaceCreationRequestID:
+            pendingWorkspaceCreationRequestID = nil
+            isCreatingWorkspace = false
+            createdWorkspace = workspace
+            requestWorkspaces()
+        case .directoryListing where requestID == pendingDirectoryRequestID:
+            pendingDirectoryRequestID = nil
+            isLoadingDirectory = false
+        case .protocolError(let error):
+            if requestID == pendingWorkspaceCreationRequestID {
+                pendingWorkspaceCreationRequestID = nil
+                isCreatingWorkspace = false
+                errorMessage = error.message
+            }
+            if requestID == pendingDirectoryRequestID {
+                pendingDirectoryRequestID = nil
+                isLoadingDirectory = false
+                errorMessage = error.message
+            }
+            if pendingSessionCreationRequestIDs.remove(requestID) != nil {
+                pendingInitialMessagesByRequestID.removeValue(forKey: requestID)
+                errorMessage = error.message
+            }
+        default:
+            break
+        }
+    }
+
+    /// The home view may appear before its socket handshake completes. Ask for
+    /// the server-owned workspace and mode catalogs at the actual connection
+    /// boundary as well, so empty projects do not depend on a SwiftUI timing
+    /// race. The transport's schema gate keeps this harmless on older Relays.
+    private func requestRemoteCatalogsWhenConnected(_ event: DSHEvent) {
+        guard case .transportState(.connected) = event.kind,
+              !requestedCatalogsForConnection else { return }
+        requestedCatalogsForConnection = true
+        requestWorkspaces()
+        requestModes()
     }
 
     private func sendInitialMessage(_ pending: DSHPendingInitialMessage, to sessionID: String) async {
@@ -1478,6 +1564,21 @@ final class DSHAppModel: ObservableObject {
                                       model: "deepseek-v4.1-flash", branch: "main")
         var state = DSHStoreState()
         state.sessions = [session, second, third]
+        // The remote catalog intentionally has a project with no sessions;
+        // previews exercise the same source of truth as the production home.
+        state.workspaceCatalog = [
+            DSHWorkspaceOption(id: "preview-dsh", name: "DSH-ANYWHERE",
+                               path: "/Users/aluvien/Documents/Develop/App/DSH-ANYWHERE"),
+            DSHWorkspaceOption(id: "preview-lab", name: "tihu-test",
+                               path: "/Users/aluvien/Documents/Develop/App/tihu-test"),
+            DSHWorkspaceOption(id: "preview-empty", name: "未开始项目",
+                               path: "/Users/aluvien/Documents/Develop/App/empty-project"),
+        ]
+        state.modeCatalog = DSHModeCatalog(defaultMode: "standard", modes: [
+            DSHModeOption(id: "standard", name: "标准模式", description: "通用任务执行"),
+            DSHModeOption(id: "plan", name: "规划模式", description: "先制定方案再执行"),
+            DSHModeOption(id: "review", name: "审查模式", description: "检查已有工作"),
+        ])
         state.hasLoadedSessions = true
         state.transportState = .connected
         state.machineOnline = true

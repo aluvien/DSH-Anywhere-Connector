@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { PairingRateLimiter, apply, inject, isSubagentSession, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial } from './index.js'
+import { PairingRateLimiter, apply, inject, isSubagentSession, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -332,6 +332,123 @@ describe('session list rows', () => {
       title: 'Flat title',
       projections: { asOfSeq: 1, values: { title: '   ' } },
     }).title).toBe('Flat title')
+  })
+
+  it('keeps the Chinese blank-session placeholder until the native title projection arrives', () => {
+    expect(normalizeSessionSummary({
+      sessionId: 'session-new', cwd: '/Users/me/Code', updatedAt: 1, blank: true,
+      projections: { asOfSeq: 1, values: { title: null } },
+    }).title).toBe('新会话')
+    expect(normalizeSessionSummary({
+      sessionId: 'session-new', cwd: '/Users/me/Code', updatedAt: 2, blank: false,
+      projections: { asOfSeq: 4, values: { title: '修复首页刷新闪烁' } },
+    }).title).toBe('修复首页刷新闪烁')
+  })
+})
+
+describe('native remote catalogs', () => {
+  it('lists even an empty native workspace without deriving one from sessions', () => {
+    const workspaces = workspaceCatalog({ workspaceRegistry: {
+      list: () => [{ id: 'workspace-empty', title: 'Empty project', path: '/Users/me/Empty', sessionIds: [] }],
+      archivedSessionIds: [],
+      archiveSession: async () => undefined,
+    } })
+    expect(workspaces).toEqual([{ id: 'workspace-empty', title: 'Empty project', path: '/Users/me/Empty' }])
+  })
+
+  it('uses the actual Harness preset roster and rejects broken presets', () => {
+    expect(modeCatalogFromRemote({ ok: true, value: { presets: [
+      { id: 'standard', name: '标准', description: 'Mac preset', isDefault: true },
+      { id: 'broken', name: 'Broken', broken: 'missing provider', isDefault: false },
+      { id: 'raw', isDefault: false },
+    ] } })).toEqual({
+      defaultMode: 'standard',
+      modes: [{ id: 'standard', name: '标准', description: 'Mac preset' }, { id: 'raw', name: 'raw' }],
+    })
+  })
+})
+
+describe('native bridge mutations', () => {
+  const connectorToken = 'test-connector-token-that-is-long-enough'
+
+  function mount(options: {
+    create?: (request: { cwd?: string; workspaceId?: string; agentPreset?: string }) => Promise<{ sessionId: string }>
+    rename?: (request: { sessionId: string; title: string }) => Promise<unknown>
+    createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
+    directoryPicker?: unknown
+  } = {}) {
+    let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
+    const context = {
+      logger: { info: () => undefined, warn: () => undefined },
+      webServer: {
+        register: (route: { handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }) => {
+          handler = route.handler
+          return () => undefined
+        },
+        registerUpgrade: () => () => undefined,
+      },
+      sessionController: {
+        list: async () => ({ items: [] }),
+        create: options.create ?? (async () => ({ sessionId: 'session-new' })),
+        ...(options.rename === undefined ? {} : { rename: options.rename }),
+        selectModel: async () => undefined,
+        modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, routableProviders: [], groups: [], failures: [] }),
+        resolveAgent: async () => ({ error: 'none' }),
+        prompt: async () => ({ accepted: true }),
+        cancel: () => ({ accepted: true }),
+        inspect: async () => ({ events: [] }),
+      },
+      workspaceRegistry: {
+        list: () => [],
+        ...(options.createWorkspace === undefined ? {} : { create: options.createWorkspace }),
+        archivedSessionIds: [],
+        archiveSession: async () => undefined,
+      },
+      typertGateway: {
+        invoke: async () => ({ ok: true, value: { presets: [] } }),
+      },
+      ...(options.directoryPicker === undefined ? {} : { directoryPicker: options.directoryPicker }),
+      on: () => undefined,
+      effect: () => undefined,
+    } as unknown as Context
+    apply(context, { connectorToken })
+    return async (method: string, url: string, body?: unknown): Promise<{ status: number; body: unknown }> => {
+      const request = Readable.from([body === undefined ? '' : JSON.stringify(body)]) as unknown as IncomingMessage
+      Object.assign(request, {
+        method, url, headers: { authorization: `Bearer ${connectorToken}` }, socket: { remoteAddress: '127.0.0.1' },
+      })
+      let status = 0
+      let response = ''
+      const reply = {
+        writeHead: (value: number) => { status = value },
+        end: (value?: string) => { response = value ?? '' },
+      } as unknown as ServerResponse
+      await handler!(request, reply)
+      return { status, body: response.length === 0 ? undefined : JSON.parse(response) }
+    }
+  }
+
+  it('creates a durable native workspace from the selected absolute host folder', async () => {
+    const createWorkspace = async (path: string, title?: string) => ({ id: 'workspace-1', path, title: title ?? 'Code', sessionIds: [] })
+    const request = mount({ createWorkspace })
+    await expect(request('POST', '/dsh-anywhere/v1/workspaces', { path: '/Users/me/Code', title: 'Phone project' }))
+      .resolves.toEqual({ status: 201, body: { workspace: { id: 'workspace-1', path: '/Users/me/Code', title: 'Phone project' } } })
+  })
+
+  it('does not rename a blank session, but routes an explicit rename to Harness', async () => {
+    const renameCalls: { sessionId: string; title: string }[] = []
+    const request = mount({ rename: async (value) => { renameCalls.push(value) } })
+    expect((await request('POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' })).status).toBe(201)
+    expect(renameCalls).toEqual([])
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/session-new/rename', { title: '重命名后标题' }))
+      .resolves.toMatchObject({ status: 202 })
+    expect(renameCalls).toEqual([{ sessionId: 'session-new', title: '重命名后标题' }])
+  })
+
+  it('reports an unavailable directory browser instead of fabricating local paths', async () => {
+    const request = mount({ directoryPicker: { capability: () => ({ kind: 'native' }) } })
+    await expect(request('GET', '/dsh-anywhere/v1/directories?path=%2FUsers%2Fme'))
+      .resolves.toMatchObject({ status: 501, body: { error: 'Harness directory browsing is unavailable' } })
   })
 })
 
