@@ -794,6 +794,14 @@ private enum DSHRemoteHomeMetrics {
     static let projectTextInset: CGFloat = 47
 }
 
+private struct DSHRemoteHomeWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// The production home for DSH Anywhere: project cards, task rows, one stable
 /// header, and native controls for search and starting work.
 struct DSHRemoteHomeView: View {
@@ -803,6 +811,7 @@ struct DSHRemoteHomeView: View {
     @State private var showSearch = false
     @State private var searchText = ""
     @FocusState private var searchFieldFocused: Bool
+    @State private var homeContentWidth: CGFloat = 0
     @State private var showNewTask = {
         #if DEBUG
         return ProcessInfo.processInfo.arguments.contains("--dsh-preview-new-session")
@@ -961,6 +970,12 @@ struct DSHRemoteHomeView: View {
                 model.sendModelCatalog()
             }
             .background(Color(.systemBackground))
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: DSHRemoteHomeWidthPreferenceKey.self,
+                                           value: proxy.size.width)
+                }
+            }
             .safeAreaInset(edge: .top, spacing: 0) {
                 if !showSearch { remoteHeader }
             }
@@ -1020,6 +1035,10 @@ struct DSHRemoteHomeView: View {
                 if !model.hasLoadedSessions {
                     model.refreshSessions()
                 }
+            }
+            .onPreferenceChange(DSHRemoteHomeWidthPreferenceKey.self) { width in
+                guard width > 0, abs(homeContentWidth - width) > 0.5 else { return }
+                homeContentWidth = width
             }
         }
     }
@@ -1225,34 +1244,50 @@ struct DSHRemoteHomeView: View {
     /// system glass and keyboard inset on every supported iOS version.
     @ToolbarContentBuilder
     private var remoteHomeToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .bottomBar) {
-            if showSearch {
-                TextField("搜索聊天", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($searchFieldFocused)
-                    .submitLabel(.search)
-                    .frame(maxWidth: .infinity)
-                    .task { searchFieldFocused = true }
+        if showSearch {
+            ToolbarItem(placement: .bottomBar) {
+                HStack(spacing: 8) {
+                    TextField("搜索聊天", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($searchFieldFocused)
+                        .submitLabel(.search)
+                        .frame(width: homeSearchWidth)
+                        .accessibilityIdentifier("home-search-field")
+                        .task { searchFieldFocused = true }
 
-                Button {
-                    searchText = ""
-                    showSearch = false
-                    searchFieldFocused = false
-                } label: {
-                    Image(systemName: "xmark")
+                    Button {
+                        searchText = ""
+                        showSearch = false
+                        searchFieldFocused = false
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .accessibilityLabel("关闭搜索")
                 }
-                .accessibilityLabel("关闭搜索")
-            } else {
+                .layoutPriority(1)
+            }
+        } else {
+            // Keep the two actions as separate native toolbar items. A wide
+            // custom group can be treated as one overflowing item by iOS and
+            // the system then drops the leading search control altogether.
+            ToolbarItem(placement: .bottomBar) {
                 Button {
                     showSearch = true
                     searchFieldFocused = true
                 } label: {
-                    Label("搜索聊天", systemImage: "magnifyingglass")
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 17, weight: .medium))
+                        Text("搜索聊天")
+                            .lineLimit(1)
+                    }
+                    .frame(width: homeSearchWidth, height: 44, alignment: .leading)
                 }
                 .accessibilityLabel("搜索聊天")
+                .accessibilityIdentifier("home-search-button")
+            }
 
-                Spacer()
-
+            ToolbarItem(placement: .bottomBar) {
                 Button { openNewTask() } label: {
                     HStack(spacing: 8) {
                         DSHRemoteComposeGlyph(size: 17)
@@ -1263,8 +1298,21 @@ struct DSHRemoteHomeView: View {
                 .labelStyle(.titleAndIcon)
                 .buttonStyle(.borderedProminent)
                 .accessibilityLabel("新建聊天")
+                .accessibilityIdentifier("home-new-chat-button")
             }
         }
+    }
+
+    /// Reserve the trailing chat action and toolbar margins while allowing
+    /// the search control to fill the remaining width on each device.
+    private var homeSearchWidth: CGFloat {
+        let reservedWidth: CGFloat = showSearch ? 56 : 184
+        let fallbackWidth: CGFloat = showSearch ? 220 : 224
+        let available = homeContentWidth > 0 ? homeContentWidth : 402
+        // The system bottom bar adds its own margins around each item. Keep
+        // enough room for the trailing action so iOS does not hide this item,
+        // while retaining the broad search field from the original home.
+        return min(236, max(190, min(available - reservedWidth, fallbackWidth)))
     }
 
     private var archivedDivider: some View {
