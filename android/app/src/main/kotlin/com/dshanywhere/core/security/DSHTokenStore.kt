@@ -30,10 +30,15 @@ class DSHKeystoreTokenStore(context: Context) : DSHTokenStore {
     private val lock = Any()
 
     override fun save(token: String, account: String) = synchronized(lock) {
-        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        // AndroidKeyStore keys are created with `setRandomizedEncryptionRequired`
+        // (the platform default) so the *keystore* must choose the IV: passing
+        // our own throws "Caller-provided IV not permitted". Encrypt with no IV,
+        // then persist the one the keystore generated (90 bits for AES-GCM).
         val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-            init(Cipher.ENCRYPT_MODE, secretKey(), GCMParameterSpec(TAG_BITS, iv))
+            init(Cipher.ENCRYPT_MODE, secretKey())
         }
+        val iv = cipher.iv
+        require(iv != null && iv.isNotEmpty()) { "keystore did not provide an IV" }
         val ciphertext = cipher.doFinal(token.toByteArray(Charsets.UTF_8))
         val record = encode(iv + ciphertext)
         val records = readAll().toMutableMap()
@@ -45,8 +50,12 @@ class DSHKeystoreTokenStore(context: Context) : DSHTokenStore {
         val record = readAll()[account] ?: return null
         runCatching {
             val raw = decode(record)
-            val iv = raw.copyOfRange(0, 12)
-            val ciphertext = raw.copyOfRange(12, raw.size)
+            // AES-GCM IVs are 12 bytes in practice; slice defensively so a
+            // different keystore length cannot silently corrupt the token.
+            val ivLength = 12
+            if (raw.size <= ivLength) return@runCatching null
+            val iv = raw.copyOfRange(0, ivLength)
+            val ciphertext = raw.copyOfRange(ivLength, raw.size)
             val cipher = Cipher.getInstance(TRANSFORMATION).apply {
                 init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(TAG_BITS, iv))
             }

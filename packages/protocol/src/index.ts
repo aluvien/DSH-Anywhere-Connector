@@ -283,6 +283,20 @@ export const AssistantReasoningPayloadSchema = StrictObject({
 });
 export type AssistantReasoningPayload = z.infer<typeof AssistantReasoningPayloadSchema>;
 
+/**
+ * Brackets for one history replay batch of a single session. The bridge
+ * publishes `history.started`, then the replayed transcript events in stored
+ * order, then `history.completed` with the same batch id. Clients atomically
+ * replace the session transcript on completion, so a replay can never
+ * interleave with (or renumber) live output. `batchId` pairs one completion
+ * with its start when two replays of the same session overlap.
+ */
+export const HistoryBatchPayloadSchema = StrictObject({
+  sessionId: IdentifierSchema,
+  batchId: IdentifierSchema,
+});
+export type HistoryBatchPayload = z.infer<typeof HistoryBatchPayloadSchema>;
+
 /** One selectable answer offered for a user question. */
 export const AskUserQuestionOptionSchema = StrictObject({
   label: z.string().min(1).max(512),
@@ -335,6 +349,8 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("command.result", CommandResultPayloadSchema),
   EventEnvelope("attachment.uploaded", AttachmentUploadedPayloadSchema),
   EventEnvelope("assistant.reasoning", AssistantReasoningPayloadSchema),
+  EventEnvelope("history.started", HistoryBatchPayloadSchema),
+  EventEnvelope("history.completed", HistoryBatchPayloadSchema),
   EventEnvelope("question.asked", QuestionAskedPayloadSchema),
   EventEnvelope("question.resolved", QuestionResolvedPayloadSchema),
   EventEnvelope("protocol.error", ProtocolErrorPayloadSchema),

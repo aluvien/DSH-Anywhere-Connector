@@ -82,3 +82,43 @@ features/       pairing · settings · sessions · conversation
 ```
 
 移植契约见 `docs/PORTING-SPEC.md`。
+
+## 在模拟器里查看界面（已验证可用）
+
+本机没有 Android Studio，但 SDK 里有模拟器。你的原 AVD（`Pixel_8_Pro`）带陈旧快照锁，
+所以项目内单独维护了一套可写 AVD 副本（`.tooling/avd/`，已 gitignore）：
+
+```sh
+cd <repo-root>
+export SDK=$HOME/Library/Android/sdk
+export ANDROID_AVD_HOME=$PWD/.tooling/avd
+export ANDROID_EMULATOR_HOME=$PWD/.tooling/emu-home
+export HOME=$ANDROID_EMULATOR_HOME          # adb key 与模拟器共用同一份
+
+# 1) 启动模拟器（首次或状态坏了就加 -wipe-data）
+"$SDK/emulator/emulator" -avd Pixel_8_Pro -no-snapshot -no-boot-anim -gpu auto &
+
+# 2) 等开机（sys.boot_completed=1）
+"$SDK/platform-tools/adb" wait-for-device
+"$SDK/platform-tools/adb" shell getprop sys.boot_completed
+
+# 3) 把手机侧 :8787 反向映射到本机 relay，装包并启动
+"$SDK/platform-tools/adb" reverse tcp:8787 tcp:8787
+"$SDK/platform-tools/adb" install -r android/app/build/outputs/apk/debug/app-debug.apk
+"$SDK/platform-tools/adb" shell am start -n com.dshanywhere/.MainActivity
+```
+
+配对信息（本地测试床）：relay 填 `http://localhost:8787`（走 adb reverse），machine ID 与
+一次性配对码取自 `.relay-local/`：
+
+```sh
+MACHINE=$(cat .relay-local/machine.txt)
+MTOKEN=$(cat .relay-local/machine-token.txt)
+curl -s -X POST "http://127.0.0.1:8787/v1/machines/$MACHINE/pairing-codes" \
+  -H "Authorization: Bearer $MTOKEN"      # 返回 8 位码，配对码是一次性的
+```
+
+界面截图见 `artifacts/android-ui/`（配对页 / 会话列表 / 对话流式与工具卡）。
+
+> 注意：模拟器首次使用手写笔会弹 "Try out your stylus" 向导，会抢走 adb 的输入事件，
+> 用 `adb shell settings put secure stylus_handwriting_tutorial_shown 1` 关掉即可。

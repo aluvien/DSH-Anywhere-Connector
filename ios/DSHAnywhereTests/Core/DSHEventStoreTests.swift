@@ -404,4 +404,363 @@ final class DSHEventStoreTests: XCTestCase {
 
         XCTAssertEqual(entries.map(\.id), ["turn-before", "command-command-1", "turn-after"])
     }
+
+    // MARK: - History replay brackets
+
+    private func historyEvent(type: String, sessionId: String = "s",
+                              sequence: Int64, batchId: String = "b1") -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "evt-\(sequence)", deviceId: "d", machineId: "m",
+            sessionId: sessionId, sequence: sequence, type: type,
+            payload: .object([
+                "sessionId": .string(sessionId),
+                "batchId": .string(batchId),
+            ])
+        ))
+    }
+
+    private func userMessageEvent(id: String, text: String, sequence: Int64,
+                                  sessionId: String = "s") -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "evt-\(sequence)", deviceId: "d", machineId: "m",
+            sessionId: sessionId, sequence: sequence, type: "user.message.accepted",
+            payload: .object([
+                "id": .string(id),
+                "role": .string("user"),
+                "markdown": .string(text),
+            ])
+        ))
+    }
+
+    private func toolStartedEvent(id: String, sequence: Int64,
+                                  sessionId: String = "s") -> DSHEvent {
+        DSHEvent(envelope: DSHEnvelope(
+            messageId: "evt-\(sequence)", deviceId: "d", machineId: "m",
+            sessionId: sessionId, sequence: sequence, type: "tool.started",
+            payload: .object([
+                "id": .string(id),
+                "name": .string("bash"),
+                "status": .string("running"),
+            ])
+        ))
+    }
+
+    func testHistoryReplayMergesWithoutClearing() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        // Live rows seen before the replay: unpersisted output.
+        reducer.reduce(userMessageEvent(id: "live-q", text: "live?", sequence: 1), into: &state)
+        reducer.reduce(toolStartedEvent(id: "live-t", sequence: 2), into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["live-q"])
+
+        // The replay must NOT blank the arrays: replayed rows merge by id
+        // (dupes are no-ops), so the screen never flashes empty mid-replay.
+        reducer.reduce(historyEvent(type: "history.started", sequence: 3), into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["live-q"])
+        XCTAssertEqual(state.historyCarryOverBySession["s"]?.batchId, "b1")
+        XCTAssertEqual(state.historyCarryOverBySession["s"]?.messages.map(\.id), ["live-q"])
+        XCTAssertEqual(state.historyCarryOverBySession["s"]?.tools.map(\.id), ["live-t"])
+
+        reducer.reduce(userMessageEvent(id: "h-q", text: "old?", sequence: 4), into: &state)
+        reducer.reduce(toolStartedEvent(id: "h-t", sequence: 5), into: &state)
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 6), into: &state)
+
+        // Live rows keep their place; replayed rows append; carry (already
+        // present) merges as a no-op. Render order comes from the sequence
+        // sort, not array order.
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["live-q", "h-q"])
+        XCTAssertEqual(state.toolsBySession["s"]?.map(\.id), ["live-t", "h-t"])
+        XCTAssertNil(state.historyCarryOverBySession["s"])
+        // The replay must not renumber the live rows.
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.sequence, 1)
+    }
+
+    func testHistoryCompletionWithStaleBatchIdIsIgnored() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        reducer.reduce(historyEvent(type: "history.started", sequence: 1, batchId: "b1"),
+                       into: &state)
+        // A completion from an overlapping older batch must not merge.
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 2, batchId: "b0"),
+                       into: &state)
+        XCTAssertNotNil(state.historyCarryOverBySession["s"])
+    }
+
+    func testHistoryForceMergeIgnoresBatchId() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        reducer.reduce(userMessageEvent(id: "live-q", text: "live?", sequence: 1), into: &state)
+        reducer.reduce(historyEvent(type: "history.started", sequence: 2, batchId: "b1"), into: &state)
+        reducer.reduce(userMessageEvent(id: "h-q", text: "old?", sequence: 3), into: &state)
+        // Timeout path: merge whatever is open (carry rows already present
+        // merge as no-ops).
+        reducer.completeHistory(sessionId: "s", batchId: nil, into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["live-q", "h-q"])
+        XCTAssertNil(state.historyCarryOverBySession["s"])
+    }
+
+    func testOverlappingReplaysDoNotLoseRows() {
+        // A second open while the first replay still streams must fold into
+        // the open carry, not replace it: replacing discards rows outside
+        // the replay window, and the first completion then drops them for
+        // good (transcript goes blank except for freshly streamed rows).
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        reducer.reduce(userMessageEvent(id: "old", text: "old?", sequence: 1), into: &state)
+        reducer.reduce(historyEvent(type: "history.started", sequence: 2, batchId: "b1"), into: &state)
+        reducer.reduce(userMessageEvent(id: "r1", text: "replayed?", sequence: 3), into: &state)
+        reducer.reduce(historyEvent(type: "history.started", sequence: 4, batchId: "b2"), into: &state)
+        reducer.reduce(userMessageEvent(id: "r2", text: "replayed?", sequence: 5), into: &state)
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 6, batchId: "b1"), into: &state)
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 7, batchId: "b2"), into: &state)
+        // Render order comes from the sequence sort, so compare as a set.
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id).sorted(), ["old", "r1", "r2"])
+        XCTAssertNil(state.historyCarryOverBySession["s"])
+    }
+
+    func testAttachmentCacheEvictsOldestFirst() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func write(_ name: String, bytes: Int, age: TimeInterval) throws {
+            let url = dir.appendingPathComponent(name)
+            try Data(repeating: 0x41, count: bytes).write(to: url)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(-age)],
+                ofItemAtPath: url.path)
+        }
+        try write("old.bin", bytes: 100, age: 100)
+        try write("new.bin", bytes: 100, age: 0)
+        DSHAppModel.evictAttachmentCache(directory: dir, keepingBytesUnder: 150)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("old.bin").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("new.bin").path))
+        // Under budget: nothing is touched.
+        DSHAppModel.evictAttachmentCache(directory: dir, keepingBytesUnder: 10_000)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("new.bin").path))
+    }
+
+    @MainActor
+    func testQueuedPromptHoldEditCancelTake() {
+        // Unique session id: the queue persists to UserDefaults per machine,
+        // so a fixed id would leak entries across test runs.
+        let sid = "q-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        model.holdQueuedPrompt(text: "  first  ", for: sid)
+        model.holdQueuedPrompt(text: "second", for: sid)
+        XCTAssertEqual(model.queuedPrompts(for: sid).map(\.text), ["first", "second"])
+        let first = model.queuedPrompts(for: sid)[0]
+        XCTAssertFalse(first.sent)
+        model.updateQueuedPrompt(id: first.id, text: "first-edited", sessionID: sid)
+        XCTAssertEqual(model.queuedPrompts(for: sid).first?.text, "first-edited")
+        XCTAssertTrue(model.cancelQueuedPrompt(id: first.id, sessionID: sid))
+        XCTAssertEqual(model.queuedPrompts(for: sid).map(\.text), ["second"])
+        // Server-sent mirrors refuse local cancel; acceptance still retires.
+        model.noteQueuedPrompt(text: "server", mode: "queue", for: sid)
+        let server = model.queuedPrompts(for: sid).first(where: { $0.text == "server" })!
+        XCTAssertTrue(server.sent)
+        XCTAssertFalse(model.cancelQueuedPrompt(id: server.id, sessionID: sid))
+        model.matchQueuedPrompt(text: "server", sessionID: sid)
+        let second = model.queuedPrompts(for: sid).first(where: { $0.text == "second" })!
+        XCTAssertEqual(model.takeQueuedPrompt(id: second.id, sessionID: sid)?.text, "second")
+        XCTAssertTrue(model.queuedPrompts(for: sid).isEmpty)
+    }
+
+    @MainActor
+    func testPendingSendMatchParkAndRetry() {
+        let sid = "send-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        // Sending records a pending ack; acceptance retires it.
+        model.sendPrompt("hello", to: sid)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 1)
+        model.confirmPendingSend(text: "hello", sessionID: sid)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 0)
+        XCTAssertNil(model.failedSend)
+        // A transport throw parks the prompt with its text for retry.
+        let command = DSHCommand(
+            requestId: "req-1", deviceId: "d", machineId: "m", sessionId: sid,
+            type: "prompt.send",
+            payload: .object(["text": .string("retry me"),
+                              "attachments": .array([])]))
+        model.parkFailedPromptSend(command, error: NSError(domain: "test", code: 1))
+        XCTAssertEqual(model.failedSend?.text, "retry me")
+        XCTAssertEqual(model.failedSend?.sessionID, sid)
+        // Retry clears the banner and re-records a fresh pending send.
+        model.retryFailedSend()
+        XCTAssertNil(model.failedSend)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 1)
+        model.dismissFailedSend()
+    }
+
+    func testToolsFoldIntoPrecedingAssistantTurn() {
+        let entries: [DSHTranscriptEntry] = [
+            .turn(DSHTranscriptBlock(id: "q", messages: [
+                DSHChatMessage(id: "q", role: .user, markdown: "q?", sequence: 1),
+            ])),
+            .turn(DSHTranscriptBlock(id: "a1", messages: [
+                DSHChatMessage(id: "a1", role: .assistant, markdown: "ans", sequence: 2),
+            ])),
+            .tool(DSHToolActivity(id: "t", name: "bash", status: "succeeded", sequence: 3)),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 2)
+        guard case .turn(let block, let tools) = sections[1] else {
+            return XCTFail("Assistant turn should carry its tools")
+        }
+        XCTAssertEqual(block.id, "a1")
+        XCTAssertEqual(tools.map(\.id), ["t"])
+    }
+
+    func testOrphanToolWithoutAssistantTurnStaysStandalone() {
+        let entries: [DSHTranscriptEntry] = [
+            .tool(DSHToolActivity(id: "t", name: "bash", status: "running", sequence: 1)),
+            .turn(DSHTranscriptBlock(id: "q", messages: [
+                DSHChatMessage(id: "q", role: .user, markdown: "q?", sequence: 2),
+            ])),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 2)
+        guard case .row(let entry) = sections[0] else {
+            return XCTFail("Orphan tool should stand alone")
+        }
+        XCTAssertEqual(entry.id, "tool-t")
+    }
+
+    func testReasoningOnlyTurnsFoldIntoFollowingAnswer() {
+        // One agentic turn arrives as think → tool → think → tool → answer.
+        // Rendering one "思考" row per think step buries the conversation;
+        // they must fold into a single timeline row with the final answer.
+        let entries: [DSHTranscriptEntry] = [
+            .turn(DSHTranscriptBlock(id: "r1", messages: [
+                DSHChatMessage(id: "r1", role: .assistant, markdown: "",
+                               reasoning: "first thought", sequence: 1),
+            ])),
+            .tool(DSHToolActivity(id: "t1", name: "bash", status: "succeeded", sequence: 2)),
+            .turn(DSHTranscriptBlock(id: "r2", messages: [
+                DSHChatMessage(id: "r2", role: .assistant, markdown: "",
+                               reasoning: "second thought", sequence: 3),
+            ])),
+            .tool(DSHToolActivity(id: "t2", name: "bash", status: "succeeded", sequence: 4)),
+            .turn(DSHTranscriptBlock(id: "a", messages: [
+                DSHChatMessage(id: "a", role: .assistant, markdown: "done", sequence: 5),
+            ])),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 1)
+        guard case .turn(let block, let tools) = sections[0] else {
+            return XCTFail("Think steps should fold into the answer turn")
+        }
+        XCTAssertEqual(block.messages.map(\.id), ["r1", "r2", "a"])
+        XCTAssertEqual(block.visibleMessages.map(\.id), ["a"])
+        XCTAssertTrue(block.reasoning.contains("first thought"))
+        XCTAssertTrue(block.reasoning.contains("second thought"))
+        XCTAssertEqual(tools.map(\.id), ["t1", "t2"])
+    }
+
+    func testTrailingReasoningOnlyTurnStaysStandalone() {
+        // Live streaming: reasoning arrived but the answer text has not yet.
+        // It must stay visible (with its running tools) rather than vanish.
+        let entries: [DSHTranscriptEntry] = [
+            .turn(DSHTranscriptBlock(id: "a", messages: [
+                DSHChatMessage(id: "a", role: .assistant, markdown: "done", sequence: 1),
+            ])),
+            .turn(DSHTranscriptBlock(id: "r", messages: [
+                DSHChatMessage(id: "r", role: .assistant, markdown: "",
+                               reasoning: "thinking…", sequence: 2),
+            ])),
+            .tool(DSHToolActivity(id: "t", name: "bash", status: "running", sequence: 3)),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 2)
+        guard case .turn(let block, let tools) = sections[1] else {
+            return XCTFail("Live think step should stay its own section")
+        }
+        XCTAssertEqual(block.messages.map(\.id), ["r"])
+        XCTAssertEqual(tools.map(\.id), ["t"])
+    }
+
+    func testModelChangeDoesNotSplitReasoningFold() {
+        // think → model notice → answer must render one timeline row, not a
+        // stranded "思考" row above the duration row.
+        let notice = DSHModelChangeNotice(
+            sessionId: "s",
+            current: DSHModelSelection(provider: "p", model: "m"),
+            sequence: 2, timestamp: 2)
+        let entries: [DSHTranscriptEntry] = [
+            .turn(DSHTranscriptBlock(id: "r", messages: [
+                DSHChatMessage(id: "r", role: .assistant, markdown: "",
+                               reasoning: "thinking…", sequence: 1),
+            ])),
+            .modelChange(notice),
+            .turn(DSHTranscriptBlock(id: "a", messages: [
+                DSHChatMessage(id: "a", role: .assistant, markdown: "done", sequence: 3),
+            ])),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 2)
+        guard case .turn(let block, _) = sections[1] else {
+            return XCTFail("Think step should fold into the answer turn")
+        }
+        XCTAssertEqual(block.messages.map(\.id), ["r", "a"])
+        XCTAssertEqual(block.visibleMessages.map(\.id), ["a"])
+    }
+
+    func testReplayedRowsKeepFirstSequenceInsteadOfRenumbering() {        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        // Live rows first.
+        reducer.reduce(userMessageEvent(id: "q", text: "q?", sequence: 1), into: &state)
+        reducer.reduce(toolStartedEvent(id: "t", sequence: 2), into: &state)
+        // The same rows replayed later (re-open, refresh, backfill) update
+        // content in place but must not move ahead of live rows that
+        // followed the first sighting.
+        reducer.reduce(userMessageEvent(id: "q", text: "q?", sequence: 10), into: &state)
+        reducer.reduce(toolStartedEvent(id: "t", sequence: 11), into: &state)
+
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.sequence, 1)
+        XCTAssertEqual(state.toolsBySession["s"]?.first?.sequence, 2)
+
+        let messages = state.messagesBySession["s"] ?? []
+        let tools = state.toolsBySession["s"] ?? []
+        let entries = messages.transcriptEntries(with: tools)
+        XCTAssertEqual(entries.map(\.id), ["turn-q", "tool-t"])
+    }
+
+    func testMessageTimestampIsStampedOnceAndSurvivesReplay() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func accepted(sequence: Int64, timestamp: Int64) -> DSHEvent {
+            DSHEvent(envelope: DSHEnvelope(
+                messageId: "evt-\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", sequence: sequence, timestamp: timestamp,
+                type: "user.message.accepted",
+                payload: .object([
+                    "id": .string("q"),
+                    "role": .string("user"),
+                    "markdown": .string("q?"),
+                ])
+            ))
+        }
+        reducer.reduce(accepted(sequence: 1, timestamp: 1_000), into: &state)
+        reducer.reduce(accepted(sequence: 10, timestamp: 2_000), into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.timestamp, 1_000)
+    }
+
+    @MainActor
+    func testSessionDotPrioritizesErrorOverApprovalOverActivity() {
+        var state = DSHStoreState()
+        let quiet = DSHSessionSummary(id: "quiet", title: "q", updatedAt: 0)
+        let failed = DSHSessionSummary(id: "failed", title: "f", updatedAt: 0)
+        let waiting = DSHSessionSummary(id: "waiting", title: "w", updatedAt: 0)
+        let active = DSHSessionSummary(id: "active", title: "a", updatedAt: 0, running: true)
+        state.sessions = [quiet, failed, waiting, active]
+        state.turnStateBySession["failed"] = "failed"
+        state.pendingApprovals = [
+            DSHApprovalRequest(id: "ap", sessionId: "waiting", toolName: "bash", reason: "run?"),
+        ]
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+        XCTAssertEqual(model.sessionDot(for: quiet), .none)
+        XCTAssertEqual(model.sessionDot(for: failed), .red)
+        XCTAssertEqual(model.sessionDot(for: waiting), .yellow)
+        XCTAssertEqual(model.sessionDot(for: active), .green)
+    }
 }

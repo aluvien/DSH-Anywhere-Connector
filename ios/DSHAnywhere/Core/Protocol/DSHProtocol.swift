@@ -526,6 +526,108 @@ public extension Array where Element == DSHChatMessage {
     }
 }
 
+/// One rendered unit: an assistant turn with the tool calls it made folded
+/// in, or any other entry standing alone.
+public enum DSHTranscriptSection: Identifiable, Sendable, Equatable {
+    case turn(block: DSHTranscriptBlock, tools: [DSHToolActivity])
+    case row(DSHTranscriptEntry)
+
+    public var id: String {
+        switch self {
+        case .turn(let block, _): return "section-turn-\(block.id)"
+        case .row(let entry): return "section-\(entry.id)"
+        }
+    }
+}
+
+public extension Array where Element == DSHTranscriptEntry {
+    /// Folds each tool call into the most recent assistant turn, so one reply
+    /// reads as one unit: the thinking row on top expands to the reasoning
+    /// plus everything the turn ran, and only final text stays outside.
+    /// User turns, commands and model notices always stand alone; a tool with
+    /// no preceding assistant turn (history edge) does too.
+    func groupedTurns() -> [DSHTranscriptSection] {
+        var sections: [DSHTranscriptSection] = []
+        var openBlock: DSHTranscriptBlock?
+        var openTools: [DSHToolActivity] = []
+        func flushOpen() {
+            guard let block = openBlock else { return }
+            sections.append(.turn(block: block, tools: openTools))
+            openBlock = nil
+            openTools = []
+        }
+        for entry in self {
+            switch entry {
+            case .turn(let block) where !block.isUserTurn:
+                flushOpen()
+                openBlock = block
+            case .tool(let tool) where openBlock != nil:
+                openTools.append(tool)
+            default:
+                flushOpen()
+                sections.append(.row(entry))
+            }
+        }
+        flushOpen()
+        return sections.mergingReasoningOnlyTurns()
+    }
+}
+
+public extension Array where Element == DSHTranscriptSection {
+    /// Folds reasoning-only turns (think steps that produced no answer text of
+    /// their own) into the turn that follows them. A long agentic turn arrives
+    /// as think → tool → think → tool …, which the entry ordering keeps as
+    /// separate turns so tools stay at their true positions — but rendering
+    /// one "思考" row per think step buries the conversation. After the fold,
+    /// one logical turn renders one timeline row holding all of its reasoning
+    /// and tools, with only the final answers outside.
+    /// A trailing reasoning-only turn (live streaming, tools still running)
+    /// is kept as its own section so live progress is never hidden, and so is
+    /// one interrupted by a user turn or a command. Model-change notices and
+    /// orphan tools do NOT break the fold: a notice is metadata, not
+    /// conversation, and an orphan tool belongs to the pending think —
+    /// otherwise a mid-turn model switch strands a lone "思考" row above the
+    /// duration row it belongs to.
+    func mergingReasoningOnlyTurns() -> [DSHTranscriptSection] {
+        var merged: [DSHTranscriptSection] = []
+        var pendingMessages: [DSHChatMessage] = []
+        var pendingTools: [DSHToolActivity] = []
+        func flushPendingAsOwnSection() {
+            guard !pendingMessages.isEmpty || !pendingTools.isEmpty else { return }
+            merged.append(.turn(
+                block: DSHTranscriptBlock(
+                    id: pendingMessages.first?.id ?? UUID().uuidString,
+                    messages: pendingMessages),
+                tools: pendingTools))
+            pendingMessages = []
+            pendingTools = []
+        }
+        for section in self {
+            switch section {
+            case .turn(let block, let tools) where block.visibleMessages.isEmpty:
+                pendingMessages += block.messages
+                pendingTools += tools
+            case .turn(let block, let tools):
+                merged.append(.turn(
+                    block: DSHTranscriptBlock(id: block.id,
+                                              messages: pendingMessages + block.messages),
+                    tools: pendingTools + tools))
+                pendingMessages = []
+                pendingTools = []
+            case .row(.modelChange):
+                merged.append(section)
+            case .row(.tool(let tool)) where !pendingMessages.isEmpty || !pendingTools.isEmpty:
+                pendingTools.append(tool)
+            default:
+                flushPendingAsOwnSection()
+                merged.append(section)
+            }
+        }
+        flushPendingAsOwnSection()
+        return merged
+    }
+}
+
 /// Relay messages deliberately wrap the existing Harness protocol. Keeping the
 /// wrapper separate means a Relay acknowledgement can never be mistaken for a
 /// Harness event by the store.
@@ -795,21 +897,25 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public var reasoning: String?
     /// Sequence of the event that produced this message. Client-side only.
     public var sequence: Int64?
+    /// Wall-clock time the message arrived, in milliseconds since the epoch.
+    /// Stamped from the envelope (first sighting wins, like `sequence`) so
+    /// the reply timestamp survives replays. Client-side only.
+    public var timestamp: Int64?
 
     public init(id: String, role: DSHMessageRole, markdown: String,
                 attachments: [DSHMessageAttachment] = [],
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, contextWindow: Double? = nil,
-                reasoning: String? = nil, sequence: Int64? = nil) {
-        self.id = id; self.role = role; self.markdown = markdown; self.attachments = attachments; self.usage = usage
-        self.provider = provider; self.model = model; self.reasoningEffort = reasoningEffort
-        self.contextWindow = contextWindow; self.reasoning = reasoning
-        self.sequence = sequence
+                reasoning: String? = nil, sequence: Int64? = nil, timestamp: Int64? = nil) {
+        self.id = id; self.role = role; self.markdown = markdown; self.attachments = attachments
+        self.usage = usage; self.provider = provider; self.model = model
+        self.reasoningEffort = reasoningEffort; self.contextWindow = contextWindow
+        self.reasoning = reasoning; self.sequence = sequence; self.timestamp = timestamp
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, role, markdown, attachments, usage, provider, model,
-             reasoningEffort, contextWindow, reasoning, sequence
+             reasoningEffort, contextWindow, reasoning, sequence, timestamp
     }
 
     public init(from decoder: Decoder) throws {
@@ -827,6 +933,7 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
         contextWindow = try container.decodeIfPresent(Double.self, forKey: .contextWindow)
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         sequence = try container.decodeIfPresent(Int64.self, forKey: .sequence)
+        timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
     }
 }
 
@@ -987,14 +1094,130 @@ public struct DSHToolActivity: Codable, Sendable, Equatable, Identifiable {
     public let name: String
     public var status: String
     public var detail: String?
+    /// The call arguments as they arrived on `tool.started`. A completion
+    /// replaces `detail` with the result text, so without this the row title
+    /// ("读取 · path") would lose its path the moment the call settles.
+    /// Client-side only, optional so older payloads still decode.
+    public var arguments: String?
     /// Sequence of the event that produced this call. Client-side only, and
     /// optional so decoding a payload that omits it still works.
     public var sequence: Int64?
 
     public init(id: String, name: String, status: String = "running", detail: String? = nil,
-                sequence: Int64? = nil) {
+                arguments: String? = nil, sequence: Int64? = nil) {
         self.id = id; self.name = name; self.status = status; self.detail = detail
+        self.arguments = arguments
         self.sequence = sequence
+    }
+}
+
+/// Web-parity tool row presentation, mirrored from the Harness web client's
+/// tool-call row model (`dsh-client-ui-tool`: variant classification, title
+/// keys, summary keys). One line — "{verb} · {target}" — keeps the transcript
+/// readable while still saying what the model is doing.
+public enum DSHToolPresentation {
+    /// Row variant per wire tool name; unknown names fall to "others".
+    public static func variant(for toolName: String) -> String {
+        switch toolName {
+        case "bash", "pwsh": return "bash"
+        case "read", "read_image", "web_fetch",
+             "cordis_package_inspect", "cordis_runtime_inspect": return "read"
+        case "web_search", "grep", "glob": return "search"
+        case "write": return "write"
+        case "edit": return "edit"
+        case "run_code": return "code"
+        default: return "others"
+        }
+    }
+
+    /// Chinese verb per tool, exact-name overrides first (as on web).
+    public static func title(for toolName: String) -> String {
+        switch toolName {
+        case "cordis_package_inspect", "cordis_runtime_inspect": return "查看"
+        case "cordis_run": return "运行 Cordis 插件"
+        case "cordis_stop": return "停止 Cordis 插件"
+        case "cordis_undefine": return "移除 Cordis 插件"
+        case "pwsh": return "Pwsh"
+        case "read_image": return "读取图片"
+        default:
+            switch variant(for: toolName) {
+            case "search": return "搜索"
+            case "read": return "读取"
+            case "bash": return "Bash"
+            case "write": return "写入"
+            case "edit": return "编辑"
+            case "code": return "代码"
+            default: return "工具调用"
+            }
+        }
+    }
+
+    /// First-line target of the call ("docs/IOS-PENDING.md"), picked from the
+    /// call arguments per variant, mirroring the web summary keys.
+    public static func summary(for toolName: String, arguments: String?) -> String? {
+        guard let raw = arguments?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+        let variant = variant(for: toolName)
+        if let object = Self.jsonObject(raw) {
+            if variant == "search", let queries = object["queries"] as? [String] {
+                let heads = queries.compactMap { Self.firstLine($0) }.filter { !$0.isEmpty }
+                if !heads.isEmpty { return heads.joined(separator: ", ") }
+            }
+            for key in summaryKeys(for: variant) {
+                if let value = object[key] as? String,
+                   let head = Self.firstLine(value), !head.isEmpty { return head }
+            }
+            for (_, value) in object {
+                if let text = value as? String,
+                   let head = Self.firstLine(text), !head.isEmpty { return head }
+            }
+        }
+        return firstLine(raw)
+    }
+
+    /// One-line row headline: "读取 · docs/IOS-PENDING.md", verb alone when
+    /// the call carries no usable target.
+    public static func headline(for tool: DSHToolActivity) -> String {
+        let verb = title(for: tool.name)
+        if let target = summary(for: tool.name, arguments: tool.arguments ?? tool.detail) {
+            return "\(verb) · \(target)"
+        }
+        return verb
+    }
+
+    /// Web status words: 运行中 / 已完成 / 失败 / 已取消.
+    public static func statusText(_ status: String) -> String {
+        switch status.lowercased() {
+        case "running": return "运行中"
+        case "succeeded", "success", "completed", "complete": return "已完成"
+        case "failed", "error": return "失败"
+        case "cancelled", "canceled": return "已取消"
+        default: return status
+        }
+    }
+
+    private static func summaryKeys(for variant: String) -> [String] {
+        switch variant {
+        case "bash": return ["description", "command"]
+        case "read": return ["path", "file_path", "url"]
+        case "search": return ["query", "pattern", "url"]
+        case "write", "edit": return ["path", "file_path"]
+        case "code": return ["description"]
+        default: return []
+        }
+    }
+
+    private static func jsonObject(_ raw: String) -> [String: Any]? {
+        guard let data = raw.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data),
+              let object = value as? [String: Any] else { return nil }
+        return object
+    }
+
+    private static func firstLine(_ value: String) -> String? {
+        let head = value.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+            .first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        return head.isEmpty ? nil : head
     }
 }
 
@@ -1088,6 +1311,18 @@ public struct DSHProtocolError: Codable, Sendable, Equatable {
     }
 }
 
+/// Brackets for one history replay batch of a single session, pairing one
+/// `history.completed` with its `history.started` when replays overlap.
+public struct DSHHistoryBatch: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let batchId: String
+
+    public init(sessionId: String, batchId: String) {
+        self.sessionId = sessionId
+        self.batchId = batchId
+    }
+}
+
 public struct DSHTurnState: Codable, Sendable, Equatable {
     public let sessionId: String
     public let state: String
@@ -1123,6 +1358,8 @@ public enum DSHEventKind: Sendable, Equatable {
     case questionAsked(DSHQuestionRequest)
     case questionResolved(DSHQuestionResolution)
     case protocolError(DSHProtocolError)
+    case historyStarted(DSHHistoryBatch)
+    case historyCompleted(DSHHistoryBatch)
     case unknown
 }
 
@@ -1170,6 +1407,8 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "question.asked": return decode(DSHQuestionRequest.self, payload).map(DSHEventKind.questionAsked) ?? .unknown
         case "question.resolved": return decode(DSHQuestionResolution.self, payload).map(DSHEventKind.questionResolved) ?? .unknown
         case "protocol.error": return decode(DSHProtocolError.self, payload).map(DSHEventKind.protocolError) ?? .unknown
+        case "history.started": return decode(DSHHistoryBatch.self, payload).map(DSHEventKind.historyStarted) ?? .unknown
+        case "history.completed": return decode(DSHHistoryBatch.self, payload).map(DSHEventKind.historyCompleted) ?? .unknown
         default: return .unknown
         }
     }

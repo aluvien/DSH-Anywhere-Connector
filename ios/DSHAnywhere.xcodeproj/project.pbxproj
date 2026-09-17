@@ -19,6 +19,7 @@
 		B00000000000000000000009 /* Features/Pairing/PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000009 /* Features/Pairing/PairingView.swift */; };
 		B0000000000000000000000A /* Features/Sessions/SessionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000A /* Features/Sessions/SessionListView.swift */; };
 		B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000B /* Features/Conversation/ConversationView.swift */; };
+		B00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */; };
 		B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */; };
 		B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */; };
 		B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */; };
@@ -55,6 +56,7 @@
 		F00000000000000000000009 /* Features/Pairing/PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Pairing/PairingView.swift; sourceTree = "<group>"; };
 		F0000000000000000000000A /* Features/Sessions/SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Sessions/SessionListView.swift; sourceTree = "<group>"; };
 		F0000000000000000000000B /* Features/Conversation/ConversationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ConversationView.swift; sourceTree = "<group>"; };
+		F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Shared/DSHRemoteGlyphs.swift; sourceTree = "<group>"; };
 		F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ToolActivityCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ApprovalCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/QuestionCard.swift; sourceTree = "<group>"; };
@@ -112,6 +114,7 @@
 				F00000000000000000000009 /* Features/Pairing/PairingView.swift */,
 				F0000000000000000000000A /* Features/Sessions/SessionListView.swift */,
 				F0000000000000000000000B /* Features/Conversation/ConversationView.swift */,
+				F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */,
 				F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */,
 				F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */,
 				F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */,
@@ -255,6 +258,7 @@
 				B00000000000000000000009 /* Features/Pairing/PairingView.swift in Sources */,
 				B0000000000000000000000A /* Features/Sessions/SessionListView.swift in Sources */,
 				B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */,
+				B00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift in Sources */,
 				B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */,
 				B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */,
 				B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */,
@@ -313,12 +317,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 78;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSCameraUsageDescription = "DSH Anywhere uses the camera only to scan the pairing QR code shown by DSH Anywhere Connector on your Mac.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "DSH Anywhere uses the camera to scan the pairing QR code shown by DSH Anywhere Connector on your Mac, and to take photos you attach to a conversation.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -338,12 +342,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 78;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSCameraUsageDescription = "DSH Anywhere uses the camera only to scan the pairing QR code shown by DSH Anywhere Connector on your Mac.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "DSH Anywhere uses the camera to scan the pairing QR code shown by DSH Anywhere Connector on your Mac, and to take photos you attach to a conversation.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;

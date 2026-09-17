@@ -210,6 +210,56 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(block.visibleMessages.map(\.id), ["u1"])
     }
 
+    // MARK: - Web-parity tool presentation
+
+    func testToolVerbsMirrorTheWebClient() {
+        // Mirrors dsh-client-ui-tool's variant/title tables verbatim.
+        XCTAssertEqual(DSHToolPresentation.title(for: "read"), "读取")
+        XCTAssertEqual(DSHToolPresentation.title(for: "read_image"), "读取图片")
+        XCTAssertEqual(DSHToolPresentation.title(for: "web_search"), "搜索")
+        XCTAssertEqual(DSHToolPresentation.title(for: "web_fetch"), "读取")
+        XCTAssertEqual(DSHToolPresentation.title(for: "grep"), "搜索")
+        XCTAssertEqual(DSHToolPresentation.title(for: "write"), "写入")
+        XCTAssertEqual(DSHToolPresentation.title(for: "edit"), "编辑")
+        XCTAssertEqual(DSHToolPresentation.title(for: "bash"), "Bash")
+        XCTAssertEqual(DSHToolPresentation.title(for: "run_code"), "代码")
+        XCTAssertEqual(DSHToolPresentation.title(for: "job_output"), "工具调用")
+    }
+
+    func testToolHeadlinePicksTheCallTarget() {
+        let read = DSHToolActivity(id: "t", name: "read", status: "running",
+                                   detail: #"{"file_path":"docs/IOS-PENDING.md"}"#,
+                                   arguments: #"{"file_path":"docs/IOS-PENDING.md"}"#)
+        XCTAssertEqual(DSHToolPresentation.headline(for: read), "读取 · docs/IOS-PENDING.md")
+        let bash = DSHToolActivity(id: "t", name: "bash", status: "succeeded",
+                                   detail: "done",
+                                   arguments: #"{"command":"ls -la","description":"list files"}"#)
+        XCTAssertEqual(DSHToolPresentation.headline(for: bash), "Bash · list files")
+        let bare = DSHToolActivity(id: "t", name: "job_output", status: "running")
+        XCTAssertEqual(DSHToolPresentation.headline(for: bare), "工具调用")
+    }
+
+    func testToolStatusWordsMirrorTheWebClient() {
+        XCTAssertEqual(DSHToolPresentation.statusText("running"), "运行中")
+        XCTAssertEqual(DSHToolPresentation.statusText("succeeded"), "已完成")
+        XCTAssertEqual(DSHToolPresentation.statusText("failed"), "失败")
+        XCTAssertEqual(DSHToolPresentation.statusText("cancelled"), "已取消")
+    }
+
+    func testNearestEffortIndexSurvivesIdDrift() {
+        // The persisted effort id can drift from the catalog's ids; the meter
+        // must point at the nearest intelligence, never slam to minimum.
+        let efforts = [
+            DSHModelReasoningEffort(id: "low", name: "低"),
+            DSHModelReasoningEffort(id: "medium", name: "中"),
+            DSHModelReasoningEffort(id: "high", name: "高"),
+        ]
+        XCTAssertEqual(dshNearestReasoningEffortIndex(efforts, to: "high"), 2)
+        XCTAssertEqual(dshNearestReasoningEffortIndex(efforts, to: "xhigh"), 2)
+        XCTAssertEqual(dshNearestReasoningEffortIndex(efforts, to: "minimal"), 0)
+        XCTAssertEqual(dshNearestReasoningEffortIndex([], to: "high"), 0)
+    }
+
     // MARK: - Relay device management
 
     private func stubbedSession() -> URLSession {

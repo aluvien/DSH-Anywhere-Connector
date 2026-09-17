@@ -351,3 +351,17 @@ describe('subagent sessions stay out of the user list', () => {
     expect(isSubagentSession(summary)).toBe(true)
   })
 });
+
+describe('silent setup echoes', () => {
+  it('drops the preset acknowledgement inside an armed window', async () => {
+    const { armSilentSetupWindow, isSilentSetupEcho } = await import('./index.js')
+    const echo = { type: 'command/done', data: { commandId: 'cmd-1', kind: 'success', text: 'preset workspace-write' } }
+    expect(isSilentSetupEcho('s', echo)).toBe(false)
+    armSilentSetupWindow('s')
+    expect(isSilentSetupEcho('s', echo)).toBe(true)
+    // Other sessions, other commands and other texts pass through.
+    expect(isSilentSetupEcho('other', echo)).toBe(false)
+    expect(isSilentSetupEcho('s', { type: 'command/done', data: { text: 'something else' } })).toBe(false)
+    expect(isSilentSetupEcho('s', { type: 'tool/call', data: {} })).toBe(false)
+  })
+});

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
@@ -20,8 +21,26 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024;
  *
  * 3: added `assistant.reasoning`, `question.asked`, `question.resolved` events
  *    and the `question.answer` command.
+ * 4: added `history.started`, `history.completed` events so history replays
+ *    can bracket one session batch (older Relays reject them as invalid).
  */
-const RELAY_SCHEMA_REVISION = 4;
+const RELAY_SCHEMA_REVISION = 5;
+
+/**
+ * Deployment date shown on /health. The docker image bakes the build day
+ * into /app/BUILD_DATE (see deploy/relay/Dockerfile), so every rebuild
+ * stamps itself and nobody has to hand-edit a date string ever again.
+ * Outside docker (local dev, tests) it falls back to this constant.
+ */
+function relayBuildStamp(): string {
+  try {
+    const stamped = readFileSync("/app/BUILD_DATE", "utf8").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(stamped)) return stamped;
+  } catch {
+    // No stamp file: running from source. Fall through to the constant.
+  }
+  return "2026-09-16";
+}
 
 export interface RelayServerOptions {
   readonly bootstrapToken: string;
@@ -206,7 +225,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         ok: true,
         version: PROTOCOL_VERSION,
         schemaRevision: RELAY_SCHEMA_REVISION,
-        build: "2026-09-13",
+        build: relayBuildStamp(),
         // Neither device management nor one-time pairing codes changed the
         // routed wire schema, so the revision stays put; these flags are how a
         // caller tells whether the deployed Relay serves those routes yet.

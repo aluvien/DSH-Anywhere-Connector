@@ -13,6 +13,12 @@ struct ToolActivityCard: View {
         ["completed", "complete", "success", "succeeded"].contains(tool.status.lowercased())
     }
 
+    /// Pulse only while actually running: a failed tool is settled, and a
+    /// forever-pulsing gear reads as "still working".
+    private var isRunning: Bool {
+        tool.status.lowercased() == "running"
+    }
+
     private var hasDetail: Bool {
         !(tool.detail?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
@@ -26,12 +32,17 @@ struct ToolActivityCard: View {
                 HStack(alignment: .center, spacing: 10) {
                     Image(systemName: isComplete ? "checkmark.circle.fill" : "gearshape.2.fill")
                         .foregroundStyle(isComplete ? .green : .orange)
-                        .symbolEffect(.pulse, isActive: !isComplete)
-                    Text(tool.name)
+                        .symbolEffect(.pulse, isActive: isRunning)
+                    // Web-style one-liner ("读取 · docs/x.md"): the Chinese
+                    // verb plus the call target, so the row says what the
+                    // model is doing without opening it.
+                    Text(DSHToolPresentation.headline(for: tool))
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer()
-                    Text(tool.status.capitalized)
+                    Text(DSHToolPresentation.statusText(tool.status))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if hasDetail {
@@ -59,7 +70,7 @@ struct ToolActivityCard: View {
         .padding(12)
         .background(Color.orange.opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .accessibilityLabel("Tool \(tool.name), \(tool.status)")
+        .accessibilityLabel("\(DSHToolPresentation.headline(for: tool))，\(DSHToolPresentation.statusText(tool.status))")
     }
 
     private static func isShellTool(_ name: String) -> Bool {

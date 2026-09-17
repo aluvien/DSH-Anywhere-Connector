@@ -28,5 +28,8 @@ COPY --from=build /app/packages/relay-server/dist ./packages/relay-server/dist
 COPY --from=build /app/packages/relay-server/node_modules ./packages/relay-server/node_modules
 
 RUN mkdir -p /data && chown -R node:node /data
+# Bake the image build day where /health reads it from. Every rebuild
+# re-stamps itself, so the deployment date is always current.
+RUN date -u +%F > /app/BUILD_DATE
 USER node
 CMD ["node", "packages/relay-server/dist/index.js"]

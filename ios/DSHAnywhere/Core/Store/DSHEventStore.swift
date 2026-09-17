@@ -20,6 +20,11 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     /// Errors are keyed by the request id carried as the error envelope's
     /// message id.  Commands that wait for a correlated reply can fail fast.
     public var protocolErrorsByRequestID: [String: String] = [:]
+    /// Transcript rows set aside when a history replay starts.  The replay
+    /// rebuilds the session arrays in stored order; on completion the
+    /// carried-over rows that the replay did not contain (unpersisted live
+    /// output) are appended back.  Keyed by session id.
+    public var historyCarryOverBySession: [String: DSHHistoryCarryOver] = [:]
     public var unknownEvents: [DSHEnvelope] = []
     public var lastSequence: Int64 = 0
     /// The socket to the public Relay and the presence of the Mac Connector
@@ -33,6 +38,19 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var connectionState: DSHConnectionState = .disconnected
 
     public init() {}
+}
+
+/// Transcript rows held aside while one history replay batch streams.  The
+/// replay rebuilds the session arrays in stored order; rows the replay did
+/// not contain are unpersisted live output and belong after it.
+public struct DSHHistoryCarryOver: Codable, Sendable, Equatable {
+    public var batchId: String
+    public var messages: [DSHChatMessage] = []
+    public var tools: [DSHToolActivity] = []
+    public var commandResults: [DSHCommandResult] = []
+    public var modelChanges: [DSHModelChangeNotice] = []
+
+    public init(batchId: String) { self.batchId = batchId }
 }
 
 /// Pure, deterministic event reducer.  Keeping this separate from the
@@ -92,7 +110,23 @@ public struct DSHEventReducer: Sendable {
             upsert(session, into: &state.sessions)
         case .userMessageAccepted(let message):
             var stamped = message
-            stamped.sequence = event.envelope.sequence
+            // First sighting wins: replays (re-open, refresh, reconnect
+            // backfill) update content in place but must not renumber the
+            // row ahead of live output that followed it.
+            if let sessionId = event.envelope.sessionId,
+               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }),
+               let existingSequence = existing.sequence {
+                stamped.sequence = existingSequence
+            } else if stamped.sequence == nil {
+                stamped.sequence = event.envelope.sequence
+            }
+            if let sessionId = event.envelope.sessionId,
+               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }),
+               let existingTimestamp = existing.timestamp {
+                stamped.timestamp = existingTimestamp
+            } else if stamped.timestamp == nil {
+                stamped.timestamp = event.envelope.timestamp
+            }
             appendOrReplace(stamped, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
         case .assistantMessageCompleted(let message):
             // A completion replaces the streaming partial, so carry the
@@ -104,8 +138,10 @@ public struct DSHEventReducer: Sendable {
                 // Keep where the message started rather than where it finished,
                 // so interleaving with tool calls stays chronological.
                 completed.sequence = existing.sequence
+                completed.timestamp = existing.timestamp
             } else {
                 completed.sequence = event.envelope.sequence
+                completed.timestamp = event.envelope.timestamp
             }
             appendOrReplace(completed, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
         case .assistantReasoning(let reasoning):
@@ -116,7 +152,8 @@ public struct DSHEventReducer: Sendable {
             } else {
                 messages.append(DSHChatMessage(id: reasoning.messageId, role: .assistant,
                                                markdown: "", reasoning: reasoning.text,
-                                               sequence: event.envelope.sequence))
+                                               sequence: event.envelope.sequence,
+                                               timestamp: event.envelope.timestamp))
             }
             state.messagesBySession[sessionId] = messages
         case .assistantMessageDelta(let delta):
@@ -126,12 +163,25 @@ public struct DSHEventReducer: Sendable {
                 messages[index].markdown += delta.text
             } else {
                 messages.append(DSHChatMessage(id: delta.messageId, role: .assistant, markdown: delta.text,
-                                               sequence: event.envelope.sequence))
+                                                sequence: event.envelope.sequence,
+                                                timestamp: event.envelope.timestamp))
             }
             state.messagesBySession[sessionId] = messages
         case .toolStarted(let tool):
             var stamped = tool
-            stamped.sequence = event.envelope.sequence
+            // The start payload's detail carries the call arguments: keep a
+            // copy so the row title ("读取 · path") survives the completion,
+            // which replaces detail with the result text.
+            if stamped.arguments == nil { stamped.arguments = stamped.detail }
+            // Same first-sighting rule as messages: a replayed start must not
+            // push its call below live rows that arrived after the first sighting.
+            if let sessionId = event.envelope.sessionId,
+               let existing = state.toolsBySession[sessionId]?.first(where: { $0.id == tool.id }),
+               let existingSequence = existing.sequence {
+                stamped.sequence = existingSequence
+            } else if stamped.sequence == nil {
+                stamped.sequence = event.envelope.sequence
+            }
             appendOrReplace(stamped, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
         case .toolCompleted(let tool):
             var stamped = tool
@@ -141,6 +191,9 @@ public struct DSHEventReducer: Sendable {
                 .first { $0.id == tool.id }
             if let existing {
                 stamped.sequence = existing.sequence
+                // The completion replaces detail with the result text; carry
+                // the call arguments forward for the row title.
+                if stamped.arguments == nil { stamped.arguments = existing.arguments }
             } else {
                 stamped.sequence = event.envelope.sequence
             }
@@ -180,22 +233,31 @@ public struct DSHEventReducer: Sendable {
             }
         case .modelChanged(let change):
             var stamped = change
-            stamped.sequence = event.envelope.sequence
-            stamped.timestamp = event.envelope.timestamp
-            var values = state.modelChangesBySession[change.sessionId, default: []]
-            if let index = values.firstIndex(where: { $0.id == stamped.id }) {
-                values[index] = stamped
-            } else {
-                values.append(stamped)
+            // 0 means "no sequence yet" for this non-optional field; same
+            // first-sighting rule as everything else.
+            if let existing = state.modelChangesBySession[change.sessionId]?.first(where: { $0.id == change.id }),
+               existing.sequence != 0 {
+                stamped.sequence = existing.sequence
+            } else if stamped.sequence == 0 {
+                stamped.sequence = event.envelope.sequence
             }
-            state.modelChangesBySession[change.sessionId] = values
+            stamped.timestamp = event.envelope.timestamp
+            // Consecutive switch notices collapse: only the latest one
+            // matters, the rest is noise that buries the transcript.
+            state.modelChangesBySession[change.sessionId] = [stamped]
         case .commandResult(let result):
             // The command.result payload intentionally stays small and does
             // not carry transport metadata. Stamp the enclosing event's
             // sequence here so the transcript can place the acknowledgement
             // where it happened instead of appending it after every message.
+            // Replays keep the first stamp (see userMessageAccepted).
             var stamped = result
-            stamped.sequence = event.envelope.sequence
+            if let existing = state.commandResultsBySession[stamped.sessionId]?.first(where: { $0.id == result.id }),
+               let existingSequence = existing.sequence {
+                stamped.sequence = existingSequence
+            } else if stamped.sequence == nil {
+                stamped.sequence = event.envelope.sequence
+            }
             var values = state.commandResultsBySession[stamped.sessionId, default: []]
             if let index = values.firstIndex(where: { $0.id == stamped.id }) { values[index] = stamped }
             else { values.append(stamped) }
@@ -207,6 +269,39 @@ public struct DSHEventReducer: Sendable {
         case .protocolError(let error):
             state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
             if error.code == "bridge-request-failed" { state.bridgeReachable = false }
+        case .historyStarted(let batch):
+            // A replay rebuilds this session's transcript in stored order.
+            // Set the rows seen so far aside (unpersisted live output) and
+            // start from empty so replayed rows cannot renumber them.
+            // Overlapping replays (a second open while the first still
+            // streams) FOLD into the open carry instead of replacing it:
+            // replacing discards rows the replay window does not cover, and
+            // the first completion then drops them forever. The carry keeps
+            // the first batch id, so the first completion merges and later
+            // ones become harmless no-ops.
+            // The arrays are deliberately NOT cleared: replayed rows merge by
+            // id (dupes are no-ops), first-sighting keeps their order, and the
+            // render sorts by sequence — so a replay paints over identical
+            // rows instead of blanking the screen and popping rows in one by
+            // one (the enter-page flicker). The carry remains purely a safety
+            // net for rows outside the replay window.
+            let sessionId = batch.sessionId
+            if var carry = state.historyCarryOverBySession[sessionId] {
+                appendMissing(state.messagesBySession[sessionId, default: []], to: &carry.messages)
+                appendMissing(state.toolsBySession[sessionId, default: []], to: &carry.tools)
+                appendMissing(state.commandResultsBySession[sessionId, default: []], to: &carry.commandResults)
+                appendMissing(state.modelChangesBySession[sessionId, default: []], to: &carry.modelChanges)
+                state.historyCarryOverBySession[sessionId] = carry
+            } else {
+                var carry = DSHHistoryCarryOver(batchId: batch.batchId)
+                carry.messages = state.messagesBySession[sessionId, default: []]
+                carry.tools = state.toolsBySession[sessionId, default: []]
+                carry.commandResults = state.commandResultsBySession[sessionId, default: []]
+                carry.modelChanges = state.modelChangesBySession[sessionId, default: []]
+                state.historyCarryOverBySession[sessionId] = carry
+            }
+        case .historyCompleted(let batch):
+            completeHistory(sessionId: batch.sessionId, batchId: batch.batchId, into: &state)
         case .transportState, .machinePresence:
             break
         case .unknown:
@@ -217,6 +312,29 @@ public struct DSHEventReducer: Sendable {
     private func upsert(_ session: DSHSessionSummary, into sessions: inout [DSHSessionSummary]) {
         if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = session }
         else { sessions.append(session) }
+    }
+
+    /// Atomically finishes one history replay batch: the live arrays now hold
+    /// exactly the replayed rows in stream (stored) order.  Rows the replay
+    /// did not contain are unpersisted live output seen before the batch and
+    /// belong after it.  A completion for a batch that is no longer open
+    /// (overlapping replays) is ignored; pass `batchId: nil` to force-merge
+    /// whatever is open, which is what the app-level timeout does when the
+    /// closing bracket never arrives.
+    public func completeHistory(sessionId: String, batchId: String?, into state: inout DSHStoreState) {
+        guard let carry = state.historyCarryOverBySession[sessionId] else { return }
+        if let batchId, carry.batchId != batchId { return }
+        state.historyCarryOverBySession.removeValue(forKey: sessionId)
+        appendMissing(carry.messages, to: &state.messagesBySession[sessionId, default: []])
+        appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
+        appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
+        appendMissing(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
+    }
+
+    private func appendMissing<T: Identifiable>(_ values: [T], to store: inout [T]) where T.ID: Equatable {
+        for value in values where !store.contains(where: { $0.id == value.id }) {
+            store.append(value)
+        }
     }
 
     private func appendOrReplace<T: Identifiable & Equatable>(_ value: T,

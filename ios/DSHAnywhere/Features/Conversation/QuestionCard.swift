@@ -83,18 +83,11 @@ struct QuestionCard: View {
                 }
             }
 
-            HStack(spacing: 8) {
-                TextField(options.isEmpty ? "Type your answer" : "Other answer",
-                          text: customBinding(question.id))
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-                    .onSubmit { submitCompleteAnswers() }
-                if isMulti || options.isEmpty {
-                    Button("Send") { submitCompleteAnswers() }
-                        .buttonStyle(.bordered)
-                        .disabled(isSubmitting || !hasAnswer(question))
-                }
-            }
+            TextField(options.isEmpty ? "Type your answer" : "Other answer",
+                      text: customBinding(question.id))
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .onSubmit { submitCompleteAnswers() }
         }
     }
 

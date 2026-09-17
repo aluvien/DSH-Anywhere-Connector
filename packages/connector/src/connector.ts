@@ -296,10 +296,15 @@ export class DSHAnywhereConnector {
       return;
     }
     if (command.type === "session.archive" || command.type === "session.model"
+        || command.type === "permission.set"
         || command.type === "workspace.rename" || command.type === "workspace.delete") {
       // These operations mutate native Harness metadata. Refresh the same
       // filtered list used by the live bridge so archived sessions disappear
       // immediately while model/workspace labels update in place.
+      // permission.set joins this branch (instead of the generic
+      // command.result card) because its effect already arrives as
+      // `permission.updated`: a "Command completed" card would be noise, and
+      // failures still surface through `protocol.error`.
       const refreshed = asRecord(await this.callBridge({ method: "GET", path: "/sessions" }));
       const items = Array.isArray(refreshed.items)
         ? refreshed.items.map((item) => SessionSummarySchema.parse(item))

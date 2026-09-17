@@ -23,6 +23,78 @@
         }
       }
     },
+    "%@ · %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ · %2$@"
+          }
+        }
+      }
+    },
+    "%@ → %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ → %2$@"
+          }
+        }
+      }
+    },
+    "%@ is unreachable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 无法连接"
+          }
+        }
+      }
+    },
+    "%@, %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, %2$@"
+          }
+        }
+      }
+    },
+    "%@，%@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@，%2$@"
+          }
+        }
+      }
+    },
+    "%@不可用：%@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@不可用：%2$@"
+          }
+        }
+      }
+    },
+    "%lld operations" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个操作"
+          }
+        }
+      }
+    },
     "%lld." : {
 
     },
@@ -36,6 +108,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "关于"
+          }
+        }
+      }
+    },
+    "Active session" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "活跃会话"
           }
         }
       }
@@ -128,6 +211,42 @@
         }
       }
     },
+    "Attach photos" : {
+
+    },
+    "Attachments" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "附件"
+          }
+        }
+      }
+    },
+    "Back" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "返回"
+          }
+        }
+      }
+    },
+    "Bring a machine online to start a session." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先让设备上线，再开始会话。"
+          }
+        }
+      }
+    },
     "By workspace" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -172,6 +291,61 @@
         }
       }
     },
+    "Choose model in new task" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在新任务中选择模型"
+          }
+        }
+      }
+    },
+    "Classic" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "经典"
+          }
+        }
+      }
+    },
+    "Classic keeps the previous Happy-inspired session list." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "经典布局保留之前的 Happy 风格会话列表。"
+          }
+        }
+      }
+    },
+    "Close" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        }
+      }
+    },
+    "Close settings" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭设置"
+          }
+        }
+      }
+    },
     "Code copied" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -179,6 +353,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "代码已复制"
+          }
+        }
+      }
+    },
+    "Collapse composer controls" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "折叠编辑框操作"
           }
         }
       }
@@ -271,6 +456,17 @@
         }
       }
     },
+    "Connection error" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接错误"
+          }
+        }
+      }
+    },
     "Connection failed" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -348,6 +544,9 @@
         }
       }
     },
+    "Create session" : {
+
+    },
     "Create your first Harness session." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -359,6 +558,17 @@
         }
       }
     },
+    "Created just now" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "刚刚创建"
+          }
+        }
+      }
+    },
     "Delete" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -366,6 +576,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "删除"
+          }
+        }
+      }
+    },
+    "Delete project" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除项目"
           }
         }
       }
@@ -458,17 +679,6 @@
         }
       }
     },
-    "This removes the message from this iPhone only. The original Harness history on your Mac is unchanged." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "只会从这台 iPhone 的会话视图中移除；Mac 上的 Harness 原始历史不会改变。"
-          }
-        }
-      }
-    },
     "Done" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -491,9 +701,6 @@
         }
       }
     },
-    "DSH-ANYWHERE" : {
-
-    },
     "English" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -501,6 +708,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "English"
+          }
+        }
+      }
+    },
+    "Enter message…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输入消息…"
           }
         }
       }
@@ -538,6 +756,17 @@
         }
       }
     },
+    "File" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文件"
+          }
+        }
+      }
+    },
     "Filter and sort sessions" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -545,6 +774,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "筛选与排序会话"
+          }
+        }
+      }
+    },
+    "Filter sessions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "筛选会话"
           }
         }
       }
@@ -637,6 +877,17 @@
         }
       }
     },
+    "Hide archived" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隐藏已归档"
+          }
+        }
+      }
+    },
     "Hide reasoning" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -648,8 +899,41 @@
         }
       }
     },
+    "Home layout" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "首页布局"
+          }
+        }
+      }
+    },
     "https://dsh.example.com" : {
 
+    },
+    "Interface" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "界面"
+          }
+        }
+      }
+    },
+    "is unreachable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法访问"
+          }
+        }
+      }
     },
     "Jump to latest output" : {
       "extractionState" : "manual",
@@ -669,6 +953,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "语言"
+          }
+        }
+      }
+    },
+    "Loading tasks…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在加载任务…"
           }
         }
       }
@@ -728,6 +1023,20 @@
         }
       }
     },
+    "Model: %@" : {
+
+    },
+    "More actions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更多操作"
+          }
+        }
+      }
+    },
     "My Mac" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -761,6 +1070,17 @@
         }
       }
     },
+    "New session in" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在工作区中新建会话"
+          }
+        }
+      }
+    },
     "New session in %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -768,6 +1088,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在 %@ 中新建会话"
+          }
+        }
+      }
+    },
+    "New task" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建任务"
+          }
+        }
+      }
+    },
+    "New task in %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 %@ 中新建任务"
           }
         }
       }
@@ -790,6 +1132,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "暂无设备。"
+          }
+        }
+      }
+    },
+    "No messages yet" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂无消息"
           }
         }
       }
@@ -827,6 +1180,28 @@
         }
       }
     },
+    "No sessions yet" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂无会话"
+          }
+        }
+      }
+    },
+    "No tasks yet" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂无任务"
+          }
+        }
+      }
+    },
     "No workspace" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -849,6 +1224,17 @@
         }
       }
     },
+    "Offline" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "离线"
+          }
+        }
+      }
+    },
     "OK" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -856,6 +1242,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "好"
+          }
+        }
+      }
+    },
+    "Online" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在线"
+          }
+        }
+      }
+    },
+    "Or enter manually" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "或手动输入"
           }
         }
       }
@@ -926,6 +1334,17 @@
         }
       }
     },
+    "Permission confirmation required" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要确认权限"
+          }
+        }
+      }
+    },
     "Permission mode" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -959,6 +1378,28 @@
         }
       }
     },
+    "Photo" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "图片"
+          }
+        }
+      }
+    },
+    "Plan, ask, build…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "规划、提问、构建…"
+          }
+        }
+      }
+    },
     "Project options" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -977,17 +1418,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "只读"
-          }
-        }
-      }
-    },
-    "Reasoning effort" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "思考深度"
           }
         }
       }
@@ -1014,6 +1444,17 @@
         }
       }
     },
+    "Reasoning effort" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "思考深度"
+          }
+        }
+      }
+    },
     "Reconnect to load available models." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1021,6 +1462,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重新连接以加载可用模型。"
+          }
+        }
+      }
+    },
+    "Reconnecting (%lld)…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在重新连接（%lld）…"
           }
         }
       }
@@ -1091,6 +1543,39 @@
         }
       }
     },
+    "Remote" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "远程"
+          }
+        }
+      }
+    },
+    "Remote shows projects and tasks in a native task browser." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote 布局以原生任务浏览器显示项目和任务。"
+          }
+        }
+      }
+    },
+    "Remote tasks" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote 任务"
+          }
+        }
+      }
+    },
     "Remove" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1109,6 +1594,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "移除附件"
+          }
+        }
+      }
+    },
+    "Rename project" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重命名项目"
           }
         }
       }
@@ -1245,6 +1741,31 @@
         }
       }
     },
+    "Session" : {
+
+    },
+    "Session icon" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "会话图标"
+          }
+        }
+      }
+    },
+    "Session settings" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "会话设置"
+          }
+        }
+      }
+    },
     "Sessions" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1278,6 +1799,17 @@
         }
       }
     },
+    "Show message actions by default" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认显示消息操作"
+          }
+        }
+      }
+    },
     "Show reasoning" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1285,6 +1817,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "查看思考过程"
+          }
+        }
+      }
+    },
+    "Show session usage" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示会话用量"
+          }
+        }
+      }
+    },
+    "Show turn usage beside Thinking" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在“思考”旁显示本轮用量"
           }
         }
       }
@@ -1311,6 +1865,31 @@
         }
       }
     },
+    "Start New Session" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建会话"
+          }
+        }
+      }
+    },
+    "Start one on a connected machine." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在已连接的设备上开始一个会话。"
+          }
+        }
+      }
+    },
+    "Start task" : {
+
+    },
     "Status" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1333,6 +1912,17 @@
         }
       }
     },
+    "Task title (optional)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "任务标题（可选）"
+          }
+        }
+      }
+    },
     "That is not a DSH Anywhere pairing code." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1340,6 +1930,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "这不是 DSH Anywhere 的配对码。"
+          }
+        }
+      }
+    },
+    "Thinking" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "思考"
           }
         }
       }
@@ -1355,6 +1956,61 @@
         }
       }
     },
+    "This removes the message from this iPhone only. The original Harness history on your Mac is unchanged." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只会从这台 iPhone 的会话视图中移除；Mac 上的 Harness 原始历史不会改变。"
+          }
+        }
+      }
+    },
+    "Took %lld hr %lld min" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用时 %lld时%lld分"
+          }
+        }
+      }
+    },
+    "Took %lld min" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用时 %lld分钟"
+          }
+        }
+      }
+    },
+    "Took %lld min %lld sec" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用时 %lld分钟%lld秒"
+          }
+        }
+      }
+    },
+    "Took %lld sec" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用时 %lld秒"
+          }
+        }
+      }
+    },
     "Tool %@, %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1362,6 +2018,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "工具 %@，%@"
+          }
+        }
+      }
+    },
+    "Troubleshoot" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排查连接"
           }
         }
       }
@@ -1388,6 +2055,9 @@
         }
       }
     },
+    "Unread" : {
+
+    },
     "Unrecognised code %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1395,6 +2065,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无法识别的码 %@"
+          }
+        }
+      }
+    },
+    "Untitled session" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未命名会话"
           }
         }
       }
@@ -1432,6 +2113,17 @@
         }
       }
     },
+    "Workspace menu" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工作区菜单"
+          }
+        }
+      }
+    },
     "Workspace write" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1465,577 +2157,209 @@
         }
       }
     },
-    "Active session" : {
-      "extractionState" : "manual",
+    "上下文窗口" : {
+
+    },
+    "上下文窗口已使用 %lld%%" : {
+
+    },
+    "不使用工作树" : {
+
+    },
+    "不可用" : {
+
+    },
+    "仅可查看" : {
+
+    },
+    "从此分支新建会话" : {
+
+    },
+    "会话图标" : {
+
+    },
+    "会话文件" : {
+
+    },
+    "会话统计" : {
+
+    },
+    "会话选项" : {
+
+    },
+    "保存" : {
+
+    },
+    "共 %lld 个" : {
+
+    },
+    "关闭" : {
+
+    },
+    "关闭搜索" : {
+
+    },
+    "关闭预览" : {
+
+    },
+    "出错" : {
+
+    },
+    "分支" : {
+
+    },
+    "删除并归档会话" : {
+
+    },
+    "删除附件" : {
+
+    },
+    "删除项目" : {
+
+    },
+    "删除项目？" : {
+
+    },
+    "刷新" : {
+
+    },
+    "刷新会话列表" : {
+
+    },
+    "刷新模型列表" : {
+
+    },
+    "刷新项目" : {
+
+    },
+    "剩余 %lld%%（已用 %@ / %@）" : {
       "localizations" : {
-        "zh-Hans" : {
+        "en" : {
           "stringUnit" : {
-            "state" : "translated",
-            "value" : "活跃会话"
+            "state" : "new",
+            "value" : "剩余 %1$lld%%（已用 %2$@ / %3$@）"
           }
         }
       }
     },
-    "Attachments" : {
-      "extractionState" : "manual",
+    "取消" : {
+
+    },
+    "在项目中新建任务" : {
+
+    },
+    "复制" : {
+
+    },
+    "复制对话串 ID" : {
+
+    },
+    "完全权限" : {
+
+    },
+    "将删除项目“%@”并归档其中的 %lld 个会话。项目目录和历史记录仍保留在 Mac 上。" : {
       "localizations" : {
-        "zh-Hans" : {
+        "en" : {
           "stringUnit" : {
-            "state" : "translated",
-            "value" : "附件"
+            "state" : "new",
+            "value" : "将删除项目“%1$@”并归档其中的 %2$lld 个会话。项目目录和历史记录仍保留在 Mac 上。"
           }
         }
       }
     },
-    "Back" : {
-      "extractionState" : "manual",
+    "展开项目" : {
+
+    },
+    "工作区内修改" : {
+
+    },
+    "已归档任务" : {
+
+    },
+    "应如何批准 DSH 操作？" : {
+
+    },
+    "归档" : {
+
+    },
+    "思考深度" : {
+
+    },
+    "按时间倒序排列" : {
+
+    },
+    "按项目" : {
+
+    },
+    "排序" : {
+
+    },
+    "搜索聊天" : {
+
+    },
+    "收起项目" : {
+
+    },
+    "文件" : {
+
+    },
+    "新建任务" : {
+
+    },
+    "新建会话暂无上下文用量数据" : {
+
+    },
+    "智能" : {
+
+    },
+    "暂无上下文用量数据" : {
+
+    },
+    "暂无可用工作区" : {
+
+    },
+    "暂无文件" : {
+
+    },
+    "更多选项" : {
+
+    },
+    "更换模型" : {
+
+    },
+    "本会话" : {
+
+    },
+    "查看本会话统计" : {
+
+    },
+    "模型" : {
+
+    },
+    "模型已切换" : {
+
+    },
+    "模型已切换：%@ 到 %@" : {
       "localizations" : {
-        "zh-Hans" : {
+        "en" : {
           "stringUnit" : {
-            "state" : "translated",
-            "value" : "返回"
+            "state" : "new",
+            "value" : "模型已切换：%1$@ 到 %2$@"
           }
         }
       }
     },
-    "Close" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "关闭"
-          }
-        }
-      }
+    "模式" : {
+
     },
-    "Close settings" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "关闭设置"
-          }
-        }
-      }
+    "模式与权限" : {
+
     },
-    "Collapse composer controls" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "折叠编辑框操作"
-          }
-        }
-      }
+    "深度求索中… %@" : {
+
     },
-    "Created just now" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "刚刚创建"
-          }
-        }
-      }
-    },
-    "Delete project" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "删除项目"
-          }
-        }
-      }
-    },
-    "Enter message…" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "输入消息…"
-          }
-        }
-      }
-    },
-    "File" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "文件"
-          }
-        }
-      }
-    },
-    "Filter sessions" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "筛选会话"
-          }
-        }
-      }
-    },
-    "Hide archived" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "隐藏已归档"
-          }
-        }
-      }
-    },
-    "More actions" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "更多操作"
-          }
-        }
-      }
-    },
-    "New session in" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在工作区中新建会话"
-          }
-        }
-      }
-    },
-    "No messages yet" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "暂无消息"
-          }
-        }
-      }
-    },
-    "Offline" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "离线"
-          }
-        }
-      }
-    },
-    "Online" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在线"
-          }
-        }
-      }
-    },
-    "Or enter manually" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "或手动输入"
-          }
-        }
-      }
-    },
-    "Photo" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "图片"
-          }
-        }
-      }
-    },
-    "Plan, ask, build…" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "规划、提问、构建…"
-          }
-        }
-      }
-    },
-    "Rename project" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "重命名项目"
-          }
-        }
-      }
-    },
-    "Session icon" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "会话图标"
-          }
-        }
-      }
-    },
-    "Session settings" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "会话设置"
-          }
-        }
-      }
-    },
-    "Show session usage" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "显示会话用量"
-          }
-        }
-      }
-    },
-    "Show turn usage beside Thinking" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在“思考”旁显示本轮用量"
-          }
-        }
-      }
-    },
-    "Show message actions by default" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "默认显示消息操作"
-          }
-        }
-      }
-    },
-    "Workspace menu" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "工作区菜单"
-          }
-        }
-      }
-    },
-    "%@ is unreachable" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ 无法连接"
-          }
-        }
-      }
-    },
-    "Bring a machine online to start a session." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "请先让设备上线，再开始会话。"
-          }
-        }
-      }
-    },
-    "No sessions yet" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "暂无会话"
-          }
-        }
-      }
-    },
-    "Start New Session" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "新建会话"
-          }
-        }
-      }
-    },
-    "Start one on a connected machine." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在已连接的设备上开始一个会话。"
-          }
-        }
-      }
-    },
-    "Troubleshoot" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "排查连接"
-          }
-        }
-      }
-    },
-    "Untitled session" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "未命名会话"
-          }
-        }
-      }
-    },
-    "Remote" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "远程"
-          }
-        }
-      }
-    },
-    "Remote tasks" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Remote 任务"
-          }
-        }
-      }
-    },
-    "Classic" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "经典"
-          }
-        }
-      }
-    },
-    "Home layout" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "首页布局"
-          }
-        }
-      }
-    },
-    "Interface" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "界面"
-          }
-        }
-      }
-    },
-    "No tasks yet" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "暂无任务"
-          }
-        }
-      }
-    },
-    "Loading tasks…" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "正在加载任务…"
-          }
-        }
-      }
-    },
-    "Connection error" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "连接错误"
-          }
-        }
-      }
-    },
-    "Connected" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "已连接"
-          }
-        }
-      }
-    },
-    "Permission confirmation required" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "需要确认权限"
-          }
-        }
-      }
-    },
-    "is unreachable" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无法访问"
-          }
-        }
-      }
-    },
-    "Choose model in new task" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在新任务中选择模型"
-          }
-        }
-      }
-    },
-    "New task" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "新建任务"
-          }
-        }
-      }
-    },
-    "New task in %@" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在 %@ 中新建任务"
-          }
-        }
-      }
-    },
-    "Task title (optional)" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "任务标题（可选）"
-          }
-        }
-      }
-    },
-    "Remote shows projects and tasks in a native task browser." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Remote 布局以原生任务浏览器显示项目和任务。"
-          }
-        }
-      }
-    },
-    "Classic keeps the previous Happy-inspired session list." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "经典布局保留之前的 Happy 风格会话列表。"
-          }
-        }
-      }
-    },
-    "Reconnecting (%lld)…" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "正在重新连接（%lld）…"
-          }
-        }
-      }
+    "用输入框的加号上传文件后，会显示在这里。" : {
+
     },
     "简体中文" : {
       "extractionState" : "manual",
@@ -2047,6 +2371,45 @@
           }
         }
       }
+    },
+    "管理" : {
+
+    },
+    "缓存与上下文" : {
+
+    },
+    "设置" : {
+
+    },
+    "语音输入" : {
+
+    },
+    "返回" : {
+
+    },
+    "还没有上传文件" : {
+
+    },
+    "远程" : {
+
+    },
+    "重命名项目" : {
+
+    },
+    "需要确认" : {
+
+    },
+    "项目" : {
+
+    },
+    "项目名称" : {
+
+    },
+    "项目目录（可选）" : {
+
+    },
+    "项目目录与分支" : {
+
     }
   },
   "version" : "1.0"

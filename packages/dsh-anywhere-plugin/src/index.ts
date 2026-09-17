@@ -44,6 +44,39 @@ export const name = 'dsh-anywhere-native-bridge'
  * own event, so a transcript row for them is noise that never clears.
  */
 const COMMAND_RESULT_SUPPRESSED = new Set(['permission', 'permissions', 'model'])
+
+/**
+ * Setup executions the bridge runs itself (`/permission` during permission
+ * changes and session creation) surface as ordinary native `command/done`
+ * events, which would render as tool/result cards the user never asked for.
+ * The phone already learns the outcome from `permission.updated` (and from
+ * `protocol.error` on failure). Each setup call arms a short per-session
+ * window; native echoes whose text is the preset acknowledgement are
+ * dropped inside it. User-typed commands never match both conditions.
+ */
+const silentSetupUntil = new Map<string, number>()
+const SILENT_SETUP_WINDOW_MS = 10_000
+const SILENT_SETUP_TEXT = /^preset (read-only|workspace-write|danger-full-access)$/
+
+export function armSilentSetupWindow(sessionId: string): void {
+  silentSetupUntil.set(sessionId, Date.now() + SILENT_SETUP_WINDOW_MS)
+}
+
+export function isSilentSetupEcho(sessionId: string, rawEvent: unknown): boolean {
+  const expiry = silentSetupUntil.get(sessionId)
+  if (expiry === undefined) return false
+  if (expiry <= Date.now()) {
+    silentSetupUntil.delete(sessionId)
+    return false
+  }
+  if (typeof rawEvent !== 'object' || rawEvent === null) return false
+  const record = rawEvent as Record<string, unknown>
+  if (record['type'] !== 'command/done') return false
+  const data = record['data']
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return false
+  const text = (data as Record<string, unknown>)['text']
+  return typeof text === 'string' && SILENT_SETUP_TEXT.test(text)
+}
 // A targeted open should make an existing conversation useful immediately,
 // without turning a tap into an unbounded replay on the phone. We still walk
 // the complete durable log to build session-wide usage; only the newest rows
@@ -624,7 +657,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             const historyToolNames = new Map<string, string>()
             const historyUsageCounters = new Map<string, UsageCounter>()
             const historyModelSelections = new Map<string, ModelSelectionProjection>()
+            const batchId = randomUUID()
             let publishedUsage = false
+            // Same brackets as publishSessionHistory: the fresh client must
+            // be able to replace each session transcript atomically even
+            // though 25 sessions backfill over one socket.
+            publish({ deviceId: device.id, sessionId: summary.id, type: 'history.started',
+              payload: { sessionId: summary.id, batchId } }, [client])
             for (let index = 0; index < allEvents.length; index += 1) {
               const event = allEvents[index]
               const normalized = normalizeSessionEvents(summary.id, event, historyToolNames, historyUsageCounters, historyModelSelections)
@@ -650,6 +689,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
                 },
               }, [client])
             }
+            publish({ deviceId: device.id, sessionId: summary.id, type: 'history.completed',
+              payload: { sessionId: summary.id, batchId } }, [client])
             remaining -= recentCount
           }
         })().catch((error: unknown) => {
@@ -674,6 +715,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   // into a transcript event while ignoring the initial selection.
   const modelSelections = new Map<string, ModelSelectionProjection>()
   ctx.on('session/event' as never, ((session: { id: string }, event: unknown) => {
+    if (isSilentSetupEcho(session.id, event)) return
     const normalized = normalizeSessionEvents(session.id, event, toolNames, usageCounters, modelSelections)
     for (const next of normalized) publish(next)
   }) as never, { global: true })
@@ -919,6 +961,7 @@ async function handleHttp(
     // session sheet.
     if (model !== undefined) await ctx.sessionController.selectModel({ sessionId: result.sessionId, ...model })
     if (permissionMode !== undefined) {
+      armSilentSetupWindow(result.sessionId)
       const permissionResult = await executeCommand(ctx, result.sessionId, `/permission ${permissionMode}`, [])
       const failure = remoteFailureOf(permissionResult)
       if (failure !== undefined) throw new HttpError(502, failure)
@@ -1046,6 +1089,7 @@ async function handleHttp(
     }
     // Harness persists a preset as sandbox mode plus approval policy. Calling
     // its native command keeps the actual sandbox aligned with the mobile UI.
+    armSilentSetupWindow(sessionId)
     const result = await executeCommand(ctx, sessionId, `/permission ${mode}`, [])
     const failure = remoteFailureOf(result)
     if (failure !== undefined) throw new HttpError(502, failure)
@@ -1122,9 +1166,12 @@ async function listSummaries(
 
 /**
  * Inspect one durable Harness session and publish its history as ordinary
- * transcript events. The Connector receives these on the same bridge socket
- * as live output, so iOS does not need a second history transport or a local
- * copy of the Harness storage format.
+ * transcript events bracketed by `history.started` / `history.completed`
+ * carrying one batch id. The Connector receives these on the same bridge
+ * socket as live output, so iOS does not need a second history transport or
+ * a local copy of the Harness storage format; the brackets let it replace
+ * the session transcript atomically instead of interleaving the replay with
+ * (and renumbering) live output.
  */
 async function publishSessionHistory(
   ctx: NativeContext,
@@ -1140,9 +1187,12 @@ async function publishSessionHistory(
   const historyToolNames = new Map<string, string>()
   const historyUsageCounters = new Map<string, UsageCounter>()
   const historyModelSelections = new Map<string, ModelSelectionProjection>()
+  const batchId = randomUUID()
   let published = 0
   let publishedUsage = false
 
+  publish({ deviceId, sessionId: session.id, type: 'history.started',
+    payload: { sessionId: session.id, batchId } }, recipients)
   for (let index = 0; index < allEvents.length; index += 1) {
     const normalized = normalizeSessionEvents(
       session.id,
@@ -1161,6 +1211,7 @@ async function publishSessionHistory(
 
   // If the recent window did not contain a usage event, send the complete
   // session aggregate so the footer remains correct after opening an old log.
+  // It travels inside the brackets so the atomic replace keeps it.
   const completeUsage = historyUsageCounters.get(session.id)
   if (!publishedUsage && completeUsage !== undefined && hasUsage(completeUsage)) {
     publish({
@@ -1174,6 +1225,8 @@ async function publishSessionHistory(
     }, recipients)
     published += 1
   }
+  publish({ deviceId, sessionId: session.id, type: 'history.completed',
+    payload: { sessionId: session.id, batchId } }, recipients)
   return published
 }
 

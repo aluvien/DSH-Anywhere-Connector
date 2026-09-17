@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import PhotosUI
 import UniformTypeIdentifiers
 import ImageIO
@@ -11,6 +12,13 @@ struct DSHStagedAttachment: Identifiable, Sendable {
     let isImage: Bool
 }
 
+private extension URL {
+    /// Image extensions the composer treats as previewable photos.
+    var isImageFile: Bool {
+        ["png", "jpg", "jpeg", "heic"].contains(pathExtension.lowercased())
+    }
+}
+
 /// Shared compact composer chrome used by both an existing conversation and
 /// the new-session screen. The caller owns the whole control row so collapsing
 /// it can replace *only* command/photo/file with a plus menu. Permission,
@@ -21,6 +29,7 @@ struct DSHCompactComposer<Controls: View>: View {
     let placeholder: String
     let hasAttachments: Bool
     let onSubmit: () -> Void
+    let autofocus: Bool
     let controls: Controls
     @FocusState private var isFocused: Bool
 
@@ -28,11 +37,13 @@ struct DSHCompactComposer<Controls: View>: View {
          placeholder: String,
          hasAttachments: Bool = false,
          onSubmit: @escaping () -> Void,
+         autofocus: Bool = false,
          @ViewBuilder controls: () -> Controls) {
         _text = text
         self.placeholder = placeholder
         self.hasAttachments = hasAttachments
         self.onSubmit = onSubmit
+        self.autofocus = autofocus
         self.controls = controls()
     }
 
@@ -43,7 +54,7 @@ struct DSHCompactComposer<Controls: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             TextField(placeholder, text: $text, axis: .vertical)
-                .lineLimit(1...5)
+                .lineLimit(1...3)
                 .textFieldStyle(.plain)
                 .font(.system(size: 17))
                 .focused($isFocused)
@@ -51,39 +62,400 @@ struct DSHCompactComposer<Controls: View>: View {
                     if canSubmit { onSubmit() }
                 }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 7) {
                 controls
             }
         }
+        .onAppear {
+            if autofocus { isFocused = true }
+        }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        .background(Color(.systemBackground), in: .rect(cornerRadius: 20))
+        .overlay { RoundedRectangle(cornerRadius: 20).stroke(Color.primary.opacity(0.09), lineWidth: 0.75) }
+        .shadow(color: .black.opacity(0.06), radius: 6, y: 2)
     }
 }
 
-/// A native anchored menu, deliberately not a sheet/card. These are the only
-/// three controls hidden by the compact-editor preference.
-struct DSHComposerQuickActionsMenu: View {
-    let onCommand: () -> Void
-    let onPhoto: () -> Void
-    let onFile: () -> Void
+/// Remote's editor has two native-looking states: a quiet single-line capsule
+/// while resting, and a taller two-row editor while the field is active.  The
+/// same component is shared by conversations and the new-task screen so their
+/// geometry and icon order cannot drift apart.
+struct DSHRemoteComposer<Leading: View, Configuration: View, Submit: View>: View {
+    @Binding var text: String
+    let placeholder: String
+    let hasAttachments: Bool
+    let autofocus: Bool
+    let showsMicrophone: Bool
+    let onSubmit: () -> Void
+    let slashCommands: [(id: String, gloss: String, icon: String)]
+    let onSlashCommand: ((String) -> Void)?
+    let leading: Leading
+    let configuration: Configuration
+    let submit: Submit
+    @FocusState private var isFocused: Bool
+
+    init(text: Binding<String>,
+         placeholder: String,
+         hasAttachments: Bool = false,
+         autofocus: Bool = false,
+         showsMicrophone: Bool = true,
+         onSubmit: @escaping () -> Void,
+         slashCommands: [(id: String, gloss: String, icon: String)] = [],
+         onSlashCommand: ((String) -> Void)? = nil,
+         @ViewBuilder leading: () -> Leading,
+         @ViewBuilder configuration: () -> Configuration,
+         @ViewBuilder submit: () -> Submit) {
+        _text = text
+        self.placeholder = placeholder
+        self.hasAttachments = hasAttachments
+        self.autofocus = autofocus
+        self.showsMicrophone = showsMicrophone
+        self.onSubmit = onSubmit
+        self.slashCommands = slashCommands
+        self.onSlashCommand = onSlashCommand
+        self.leading = leading()
+        self.configuration = configuration()
+        self.submit = submit()
+    }
+
+    private var isExpanded: Bool {
+        isFocused || autofocus || hasAttachments || !text.isEmpty
+    }
+
+    /// Active slash token, if the caret sits right behind one: a `/` at the
+    /// start or after whitespace, with no whitespace following it.
+    private var slashQuery: String? {
+        guard onSlashCommand != nil, !slashCommands.isEmpty,
+              let last = text.last, !last.isWhitespace,
+              let slashIndex = text.lastIndex(of: "/") else { return nil }
+        if slashIndex != text.startIndex {
+            guard text[text.index(before: slashIndex)].isWhitespace else { return nil }
+        }
+        let query = String(text[text.index(after: slashIndex)...])
+        guard !query.contains(where: \.isWhitespace) else { return nil }
+        return query
+    }
+
+    private var slashSuggestions: [(id: String, gloss: String, icon: String)]? {
+        guard let query = slashQuery else { return nil }
+        let needle = query.lowercased()
+        let matches = slashCommands.filter { needle.isEmpty || $0.id.lowercased().hasPrefix(needle) }
+        return matches.isEmpty ? nil : Array(matches.prefix(6))
+    }
 
     var body: some View {
-        Menu {
-            Button(action: onCommand) {
-                Label("Commands", systemImage: "slash.circle")
+        // The editor stays in the same hierarchy slot in both states.
+        // It used to move between a VStack branch and an HStack branch when
+        // `isFocused` flipped `isExpanded`, which destroyed the focused
+        // TextField on every tap and looped focus loss -> collapse -> focus.
+        VStack(alignment: .leading, spacing: 7) {
+            if let suggestions = slashSuggestions {
+                slashCard(suggestions)
             }
-            Button(action: onPhoto) {
-                Label("Attach photo", systemImage: "photo")
+            HStack(spacing: 7) {
+                if !isExpanded {
+                    leading
+                }
+                editor
+                    .lineLimit(isExpanded ? 4 : 1)
+                if !isExpanded {
+                    Spacer(minLength: 0)
+                    if showsMicrophone { microphone }
+                    submit
+                }
             }
-            Button(action: onFile) {
-                Label("Attach file", systemImage: "paperclip")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // The control row is the last row of the card, so it always sits
+            // at the inner bottom edge no matter how tall the editor grows.
+            if isExpanded {
+                HStack(spacing: 7) {
+                    leading
+                    configuration
+                    if showsMicrophone { microphone }
+                    submit
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-        } label: {
-            Image(systemName: "plus")
-                .font(.title3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, isExpanded ? 12 : 10)
+        .padding(.top, isExpanded ? 10 : 8)
+        // The control row sits close to the card's bottom edge by design.
+        .padding(.bottom, isExpanded ? 5 : 8)
+        .frame(minHeight: isExpanded ? 100 : 52)
+        .dshFloatingChrome(RoundedRectangle(cornerRadius: isExpanded ? 22 : 28, style: .continuous))
+        .animation(.easeOut(duration: 0.16), value: isExpanded)
+        .onAppear { if autofocus { isFocused = true } }
+    }
+
+    private var editor: some View {
+        TextField(placeholder, text: $text, axis: .vertical)
+            .textFieldStyle(.plain)
+            .font(.system(size: 17))
+            .focused($isFocused)
+            .onSubmit(onSubmit)
+    }
+
+    private var microphone: some View {
+        Button { isFocused = true } label: {
+            DSHRemoteMicrophoneGlyph()
+                .frame(width: 34, height: 34)
+                .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("语音输入")
+    }
+
+    private func slashCard(_ suggestions: [(id: String, gloss: String, icon: String)]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(suggestions, id: \.id) { item in
+                Button {
+                    onSlashCommand?(item.id)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 30, height: 30)
+                            .background(Color.accentColor.opacity(0.1), in: Circle())
+                        Text("/\(item.id)")
+                            .font(.system(size: 15).monospaced())
+                            .foregroundStyle(Color.accentColor)
+                        Text(item.gloss)
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("/\(item.id) \(item.gloss)")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+/// Completes the trailing `/query` token with the chosen command, keeping
+/// everything typed before it. Shared by both composers.
+func dshCompleteSlashCommand(_ command: String, in text: String) -> String {
+    guard let slashIndex = text.lastIndex(of: "/") else { return text }
+    return String(text[..<slashIndex]) + "/\(command) "
+}
+
+/// A native anchored menu, deliberately not a sheet/card. These are the only
+/// three controls hidden by the compact-editor preference. The two command
+/// entries are real slash-command shortcuts; choosing one sends it through
+/// the same command path as the expanded editor.
+struct DSHComposerQuickActionsMenu: View {
+    let onCommand: (String) -> Void
+    let onPhoto: () -> Void
+    let onFile: () -> Void
+    var onCamera: (() -> Void)? = nil
+    @State private var isPresented = false
+
+    var body: some View {
+        Button { isPresented = true } label: {
+            DSHRemotePlusGlyph()
+                .frame(width: 34, height: 34)
+                .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 2) {
+                menuSectionHeader("快捷指令")
+                menuRow(title: "方案模式", subtitle: "/plan · 先规划再执行",
+                        icon: .plan) { onCommand("plan") }
+                menuRow(title: "追求目标", subtitle: "/goal · 设置长期目标",
+                        icon: .goal) { onCommand("goal") }
+                Divider()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                menuSectionHeader("添加附件")
+                menuRow(title: "文件", subtitle: "从文件 App 选取",
+                        icon: .file, action: onFile)
+                if onCamera != nil && DSHCameraPicker.isAvailable {
+                    menuRow(title: "相机", subtitle: "拍摄一张照片",
+                            icon: .camera, action: { onCamera?() })
+                }
+                menuRow(title: "照片", subtitle: "从相簿选取",
+                        icon: .photos, action: onPhoto)
+            }
+            .padding(.vertical, 8)
+            .frame(width: 280)
+            .presentationCompactAdaptation(.popover)
         }
         .accessibilityLabel("More actions")
+        .tint(.primary)
+    }
+
+    private func menuSectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+    }
+
+    private func menuRow(title: String, subtitle: String, icon: DSHRemoteActionGlyph.Kind,
+                         action: @escaping () -> Void) -> some View {
+        Button {
+            isPresented = false
+            action()
+        } label: {
+            HStack(spacing: 12) {
+                DSHRemoteActionGlyph(kind: icon)
+                    .foregroundStyle(.primary)
+                    .frame(width: 34, height: 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title)，\(subtitle)")
+    }
+}
+
+/// System camera capture for composer attachments. The quick-actions menu
+/// only offers the camera row when this reports available, so the entry
+/// never degrades into a second photo picker.
+struct DSHCameraPicker: UIViewControllerRepresentable {
+    @Binding var image: UIImage?
+
+    static var isAvailable: Bool {
+        UIImagePickerController.isSourceTypeAvailable(.camera)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: DSHCameraPicker
+
+        init(parent: DSHCameraPicker) { self.parent = parent }
+
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            parent.image = info[.originalImage] as? UIImage
+            picker.dismiss(animated: true)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
+        }
+    }
+}
+
+/// Context usage ring: track plus an arc whose length follows the usage
+/// ratio. One monochrome color like every other composer control; only the
+/// arc length carries information. The exact percent lives in the
+/// accessibility label and the popover.
+/// Shared by the conversation and new-session composers.
+struct DSHContextRing: View {
+    let ratio: Double
+
+    var body: some View {
+        DSHRemoteContextGlyph(progress: ratio)
+        .frame(width: 34, height: 34)
+    }
+}
+
+/// Resting heights of the floating chrome, so the transcript reserves
+/// headroom above the first row and below the last one.
+private struct DSHHeaderHeightKey: PreferenceKey {
+    nonisolated(unsafe) static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct DSHDockHeightKey: PreferenceKey {
+    nonisolated(unsafe) static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// Direct handle to the transcript's UIScrollView. If SwiftUI's ScrollViewReader
+/// silently fails to move the viewport (observed on-device as a dead jump
+/// button and unwatched tail output), this drives the same destination
+/// through public UIKit traversal — no private API.
+final class DSHScrollCoordinator: NSObject {
+    weak var scrollView: UIScrollView?
+
+    func scrollToBottom(animated: Bool) {
+        guard let scrollView else { return }
+        let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height
+            + scrollView.adjustedContentInset.bottom)
+        scrollView.setContentOffset(CGPoint(x: 0, y: maxY), animated: animated)
+    }
+}
+
+/// Probe view that reports the enclosing scroll view on mount. Mount-based
+/// (not update-based): SwiftUI skips updateUIView when the representable's
+/// inputs never change, so an update-only walk can stay nil forever when its
+/// first call races attachment.
+private final class DSHScrollProbeView: UIView {
+    weak var coordinator: DSHScrollCoordinator?
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        guard superview != nil else { return }
+        var current = superview
+        while let candidate = current {
+            if let scrollView = candidate as? UIScrollView {
+                coordinator?.scrollView = scrollView
+                return
+            }
+            current = candidate.superview
+        }
+    }
+}
+
+private struct DSHScrollFinder: UIViewRepresentable {
+    let coordinator: DSHScrollCoordinator
+
+    func makeUIView(context: Context) -> UIView {
+        let view = DSHScrollProbeView()
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        view.coordinator = coordinator
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        var current = uiView.superview
+        while let candidate = current {
+            if let scrollView = candidate as? UIScrollView {
+                coordinator.scrollView = scrollView
+                return
+            }
+            current = candidate.superview
+        }
     }
 }
 
@@ -92,12 +464,41 @@ struct ConversationView: View {
     @Environment(\.dismiss) private var dismiss
     let sessionID: String
 
+    /// Measured chrome heights for the overlay layout's resting headroom.
+    @State private var headerHeight: CGFloat = 0
+    /// Measured dock height for the overlay layout's resting headroom, plus
+    /// the keyboard overlap while typing so rows are never left behind the
+    /// raised dock.
+    @State private var dockHeight: CGFloat = 0
+    /// Manual keyboard avoidance: the dock floats in an overlay now, so the
+    /// free ride from the bottom safe-area inset is gone.
+    @State private var keyboardHeight: CGFloat = 0
+    /// Last time the bottom anchor was seen. Disambiguates layout churn
+    /// (reappears in milliseconds) from a genuine scroll-away (never comes
+    /// back) while a turn runs.
+    @State private var anchorVisibleAt = Date.distantPast
+
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
-    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var showCamera = false
+    @State private var capturedPhoto: UIImage?
+    @State private var draftPreviewImage: UIImage?
+    @State private var showDraftPreview = false
     @State private var showCommandMenu = false
     @State private var showModelPicker = false
     @State private var showPermissionPicker = false
+    @State private var showNewSession = false
+    @State private var showQueuedList = false
+    @State private var showFilesPanel = false
+    @State private var showUsagePanel = false
+    @State private var showContextPopover = false
+    /// UIKit fallback for viewport moves; never observed, only driven.
+    @State private var scrollCoordinator = DSHScrollCoordinator()
+    /// Render-window size (see windowedTranscriptSections). A fresh view per
+    /// pushed session starts at the initial limit; the onChange below covers
+    /// the reused-view edge.
+    @State private var visibleSectionLimit = transcriptInitialLimit
     /// Attachments stay entirely local while the composer is being edited.
     /// They are uploaded only from `send()`, after the user has confirmed the
     /// whole prompt, so cancelling/removing a chip never leaves a remote file.
@@ -109,10 +510,19 @@ struct ConversationView: View {
     /// False once the reader scrolls away from the newest output, so auto-follow
     /// never fights a manual scroll.
     @State private var isFollowingLatest = true
+    /// When this device first saw the current turn run. Drives the live
+    /// elapsed clock above the composer; cleared when the turn settles.
+    @State private var turnStartedAt: Date?
     private static let bottomAnchor = "conversation-bottom"
 
     private var session: DSHSessionSummary? { model.sessions.first { $0.id == sessionID } }
     private var isRunning: Bool { model.turnState(for: sessionID).lowercased() == "running" }
+    /// Any tool literally running right now. The live trail keys off this —
+    /// not the turn flag alone — so tools in flight always surface above the
+    /// composer even when the turn state arrives late or goes stale.
+    private var hasLiveToolActivity: Bool {
+        model.tools(for: sessionID).contains { $0.status.lowercased() == "running" }
+    }
     private var hasDraftAttachments: Bool { !draftAttachments.isEmpty }
     private var hasRenderedContent: Bool {
         !transcriptEntries.isEmpty
@@ -148,36 +558,126 @@ struct ConversationView: View {
     }
 
     private var conversationSubtitle: String {
+        let machine = model.machineName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let machineLabel = machine.isEmpty ? "Mac" : machine
+        let mode = model.modeLabel(for: sessionID)
         if let workspace = session?.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines), !workspace.isEmpty {
-            return workspace
+            return "\(mode) · \(workspace) · \(machineLabel)"
         }
         if let cwd = session?.cwd, let last = cwd.split(separator: "/").last, !last.isEmpty {
-            return String(last)
+            return "\(mode) · \(last) · \(machineLabel)"
         }
-        return "DSH Anywhere"
+        return "\(mode) · DSH Anywhere · \(machineLabel)"
+    }
+
+    /// Sections actually rendered. While the turn runs, reasoning-only turns
+    /// (think steps with no answer text yet) are withheld: all thinking
+    /// progress lives in the live trail above the composer, so the transcript
+    /// never sprouts "思考" rows mid-output. They reappear folded into the
+    /// finished turn the moment it settles.
+    private var visibleTranscriptSections: [DSHTranscriptSection] {
+        let sections = model.transcriptSections(for: sessionID)
+        guard isRunning else { return sections }
+        return sections.filter {
+            guard case .turn(let block, _) = $0 else { return true }
+            return block.isUserTurn || !block.visibleMessages.isEmpty
+        }
+    }
+
+    /// Render-window sizing: first paint shows the newest slice only.
+    private static let transcriptInitialLimit = 50
+    private static let transcriptPageSize = 100
+
+    private var windowedTranscriptSections: [DSHTranscriptSection] {
+        let sections = visibleTranscriptSections
+        guard sections.count > visibleSectionLimit else { return sections }
+        return Array(sections.suffix(visibleSectionLimit))
+    }
+
+    private var hiddenSectionCount: Int {
+        max(0, visibleTranscriptSections.count - visibleSectionLimit)
+    }
+
+    /// Pages the render window back by one page, keeping the old top row
+    /// pinned under the header so the viewport does not jump. Called by the
+    /// tap button and by the top sentinel (scroll-to-top auto-loads).
+    private func loadEarlierSections(proxy: ScrollViewProxy) {
+        guard hiddenSectionCount > 0 else { return }
+        let anchorID = windowedTranscriptSections.first?.id
+        visibleSectionLimit += Self.transcriptPageSize
+        if let anchorID {
+            DispatchQueue.main.async {
+                proxy.scrollTo(anchorID, anchor: .top)
+            }
+        }
     }
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(transcriptEntries) { entry in
-                        switch entry {
-                        case .turn(let block):
-                            if block.isUserTurn {
-                                MessageBubble(sessionID: sessionID, message: block.messages[0]).id(entry.id)
-                            } else {
-                                AssistantTurnView(sessionID: sessionID, block: block).id(entry.id)
+            GeometryReader { outer in
+                ZStack {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            // Headroom so the first row rests below the
+                            // floating header instead of underneath it.
+                            Color.clear.frame(height: headerHeight)
+                            // Render window: only the newest sections mount,
+                            // so a long session never pays full-list diffing
+                            // on every token. Older rows stay in the local
+                            // store and page in on demand (no protocol round
+                            // trip); thinking still expands in place on tap.
+                            if hiddenSectionCount > 0 {
+                                // Scrolling to the very top pages automatically;
+                                // appearing without a disappear cycle does not
+                                // refire, so this cannot loop.
+                                Color.clear
+                                    .frame(height: 1)
+                                    .onAppear { loadEarlierSections(proxy: proxy) }
+                                HStack {
+                                    Spacer(minLength: 0)
+                                    Button {
+                                        loadEarlierSections(proxy: proxy)
+                                    } label: {
+                                        Text("↑ 加载更早 \(hiddenSectionCount) 段")
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundStyle(Color.accentColor)
+                                            .padding(.vertical, 8)
+                                    }
+                                    .accessibilityLabel("加载更早的对话内容")
+                                    Spacer(minLength: 0)
+                                }
                             }
-                        case .tool(let tool):
-                            // Kept in place rather than hidden until a turn runs:
-                            // popping them in and out is what made a new message
-                            // look like it "suddenly" produced a wall of calls.
-                            ToolActivityCard(tool: tool).id(entry.id)
-                        case .command(let result):
-                            CommandResultCard(result: result).id(entry.id)
-                        case .modelChange(let notice):
-                            ModelChangeCard(notice: notice).id(entry.id)
+                            ForEach(windowedTranscriptSections) { section in
+                        switch section {
+                        case .turn(let block, let tools):
+                            if block.isUserTurn {
+                                MessageBubble(sessionID: sessionID, message: block.messages[0]).id(section.id)
+                            } else {
+                                AssistantTurnView(sessionID: sessionID,
+                                                  block: block,
+                                                  tools: tools,
+                                                  onBranch: createBranchSession).id(section.id)
+                            }
+                        case .row(let entry):
+                            switch entry {
+                            case .turn(let block):
+                                if block.isUserTurn {
+                                    MessageBubble(sessionID: sessionID, message: block.messages[0]).id(section.id)
+                                } else {
+                                    AssistantTurnView(sessionID: sessionID,
+                                                      block: block,
+                                                      tools: [],
+                                                      onBranch: createBranchSession).id(section.id)
+                                }
+                            case .tool(let tool):
+                                // A tool with no preceding assistant turn
+                                // (history edge): keep it visible standalone.
+                                ToolActivityCard(tool: tool).id(section.id)
+                            case .command(let result):
+                                CommandResultCard(result: result).id(section.id)
+                            case .modelChange(let notice):
+                                ModelChangeCard(notice: notice).id(section.id)
+                            }
                         }
                     }
                     ForEach(model.pendingApprovals.filter { $0.sessionId == sessionID }) { approval in
@@ -193,18 +693,47 @@ struct ConversationView: View {
                     if !hasRenderedContent {
                         emptyConversationState
                     }
+                    // Headroom so the last row clears the floating dock: the
+                    // spacer must cover the dock's bottom lift PLUS its full
+                    // height (the anchor lands at the viewport bottom, so
+                    // anything less leaves the last line clipped behind the
+                    // dock). Includes the keyboard lift while typing.
+                    Color.clear.frame(height: dockHeight + dockBottomPadding(outer: outer) + 4)
                     // Tracks whether the viewport is at the newest output. It
                     // vanishes as soon as the reader scrolls back, which is what
                     // stops auto-follow from fighting a manual scroll.
                     Color.clear
                         .frame(height: 1)
                         .id(Self.bottomAnchor)
-                        .onAppear { isFollowingLatest = true }
-                        .onDisappear { isFollowingLatest = false }
+                        .background(DSHScrollFinder(coordinator: scrollCoordinator))
+                        .onAppear {
+                            isFollowingLatest = true
+                            anchorVisibleAt = .now
+                        }
+                        .onDisappear {
+                            // Tell churn apart from a real scroll-away: layout
+                            // churn (filter/merge/spacer resizing mid-turn)
+                            // re-shows the anchor within milliseconds, while a
+                            // genuine scroll-away never comes back. Clearing
+                            // the flag on churn strands the view mid-list with
+                            // the last line behind the dock and no recovery.
+                            if !isRunning {
+                                isFollowingLatest = false
+                                return
+                            }
+                            let leftAt = Date.now
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                if anchorVisibleAt <= leftAt { isFollowingLatest = false }
+                            }
+                        }
                 }
-                .padding()
+                .padding(.horizontal)
+                .padding(.top, 12)
             }
-            .defaultScrollAnchor(.bottom)
+            // No `.defaultScrollAnchor`: it fights the programmatic scrollTo
+            // below (system anchor vs manual pinning cancel each other and the
+            // jump button goes dead). Pinning is fully owned by scrollToLatest
+            // on every content change instead.
             .background(Color(.systemBackground))
             .refreshable {
                 // Remote's pull-to-refresh rehydrates both the task metadata
@@ -214,33 +743,30 @@ struct ConversationView: View {
                 model.sendModelCatalog()
                 model.openSession(sessionID)
             }
-            // Dragging the transcript puts the keyboard away. `.always` keeps
-            // the bounce gesture available even when a short conversation has
-            // nothing to scroll, which is what the removed keyboard "Done" bar
-            // was working around.
+            // Dragging the transcript puts the keyboard away with the finger
+            // following it (`.interactively` is the only system-supported
+            // finger-tracked dismissal). `.always` keeps the bounce gesture
+            // available even when a short conversation has nothing to scroll,
+            // which is what the removed keyboard "Done" bar was working
+            // around. Back-swipe is the system's full-screen interactive pop
+            // (see DSHInteractivePopGestureEnabler), not a custom gesture, so
+            // it tracks force/velocity and can be cancelled mid-swipe.
             .scrollDismissesKeyboard(.interactively)
             .scrollBounceBehavior(.always)
-            .safeAreaInset(edge: .bottom) { composer }
-            // Only while the reader is away from the newest output: the whole
-            // point is to not need this button when already at the bottom.
-            .overlay(alignment: .bottomTrailing) {
-                if !isFollowingLatest {
-                    Button {
-                        isFollowingLatest = true
-                        withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
-                    } label: {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.title2)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, Color.accentColor)
-                            .shadow(radius: 3, y: 1)
+                    // Floating chrome hovers over the transcript so content
+                    // blurs inside the floating controls (Liquid Glass). The
+                    // header itself is transparent — no full-width bar — with
+                    // frosted glass kept on its back button and capsule only.
+                    // The spacer above reserves the dock's resting room; the
+                    // keyboard lifts the dock via dockBottomPadding.
+                    VStack(spacing: 0) {
+                        happyConversationHeader
+                        Spacer(minLength: 0)
+                        composer(proxy: proxy)
                     }
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 12)
-                    .accessibilityLabel("Jump to latest output")
+                    .frame(maxWidth: .infinity)
+                    .padding(.bottom, dockBottomPadding(outer: outer))
                 }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) { happyConversationHeader }
             .toolbar(.hidden, for: .navigationBar)
             // The custom Happy header intentionally hides SwiftUI's navigation
             // bar. Re-enable UIKit's native edge-swipe pop gesture so the
@@ -270,41 +796,60 @@ struct ConversationView: View {
                 // respects the manual-scroll guard above.
                 scrollToLatest(proxy)
             }
-            .onChange(of: isRunning) { _, _ in
+            .onChange(of: isRunning) { _, running in
+                if running {
+                    if turnStartedAt == nil { turnStartedAt = .now }
+                } else {
+                    turnStartedAt = nil
+                }
                 scrollToLatest(proxy)
+                // Turn boundaries reshuffle rows (running filter lifts, merges
+                // fold, sections settle): an immediate pin can land on
+                // pre-layout geometry and strand the viewport mid-list with
+                // nothing left to re-pin once idle. Re-pin after layout
+                // settles. Gated on following at schedule time: scrolling away
+                // inside the window eats one pin at most, then stays free.
+                if !running, isFollowingLatest {
+                    for delay in [0.4, 1.2] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            scrollToLatest(proxy)
+                        }
+                    }
+                }
             }
-            .onChange(of: selectedPhoto) { _, item in
-                guard let item else { return }
+            .onChange(of: sessionID) {
+                visibleSectionLimit = Self.transcriptInitialLimit
+            }
+            .onChange(of: selectedPhotos) { _, items in
+                guard !items.isEmpty else { return }
+                selectedPhotos = []
                 // Both the expanded photo button and compact plus menu use the
                 // same staging path, so selection never uploads immediately.
                 Task { @MainActor in
-                    defer { selectedPhoto = nil }
-                    do {
-                        guard let data = try await item.loadTransferable(type: Data.self) else {
-                            reportPhotoFailure()
-                            return
+                    var staged = 0
+                    for item in items.prefix(10) {
+                        do {
+                            guard let data = try await item.loadTransferable(type: Data.self) else { continue }
+                            // JPEG/downsampling is CPU work. Keep it off the main
+                            // actor so choosing large iCloud photos does not make
+                            // the composer freeze before the user can press Send.
+                            let optimized = await optimizedPhotoDataOffMain(data)
+                            draftAttachments.append(DSHStagedAttachment(name: "photo.jpg",
+                                                                        data: optimized,
+                                                                        isImage: true))
+                            staged += 1
+                        } catch {
+                            // One bad asset must not sink the other nine.
+                            continue
                         }
-                        // JPEG/downsampling is CPU work. Keep it off the main
-                        // actor so choosing a large iCloud photo does not make
-                        // the composer freeze before the user can press Send.
-                        let optimized = await optimizedPhotoDataOffMain(data)
-                        draftAttachments.append(DSHStagedAttachment(name: "photo.jpg",
-                                                                    data: optimized,
-                                                                    isImage: true))
-                    } catch {
-                        // `try?` used to swallow this, so a failure looked like
-                        // the button doing nothing at all.
-                        reportPhotoFailure()
                     }
+                    // `try?` used to swallow this, so a failure looked like
+                    // the button doing nothing at all.
+                    if staged == 0 { reportPhotoFailure() }
                 }
             }
             .sheet(isPresented: $showCommandMenu) {
                 CommandMenuSheet(
-                    selectedPhoto: $selectedPhoto,
-                    onFile: {
-                        showCommandMenu = false
-                        showFileImporter = true
-                    },
                     onCommand: { command in
                         showCommandMenu = false
                         if command == "permission" { showPermissionPicker = true }
@@ -325,9 +870,55 @@ struct ConversationView: View {
                     .environmentObject(model)
                     .presentationDetents([.medium])
             }
+            .sheet(isPresented: $showFilesPanel) {
+                RemoteFilesPanel(sessionID: sessionID)
+                    .environmentObject(model)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.hidden)
+            }
+            .sheet(isPresented: $showUsagePanel) {
+                RemoteUsagePanel(sessionID: sessionID)
+                    .environmentObject(model)
+                    .presentationDetents([.medium, .large])
+            }
             .photosPicker(isPresented: $showPhotoPicker,
-                          selection: $selectedPhoto,
+                          selection: $selectedPhotos,
+                          maxSelectionCount: 10,
                           matching: .images)
+            .fullScreenCover(isPresented: $showDraftPreview) {
+                if let draftPreviewImage {
+                    DSHImageViewer(image: draftPreviewImage, name: "预览")
+                }
+            }
+            .fullScreenCover(isPresented: $showNewSession) {
+                NewSessionSheet(initialWorkspaceID: session?.workspaceId)
+                    .environmentObject(model)
+            }
+            .sheet(isPresented: $showQueuedList) {
+                QueuedPromptsSheet(sessionID: sessionID)
+                    .environmentObject(model)
+                    .presentationDetents([.medium])
+            }
+            .fullScreenCover(isPresented: $showCamera) {
+                DSHCameraPicker(image: $capturedPhoto)
+                    .ignoresSafeArea()
+            }
+            .onChange(of: capturedPhoto) { _, photo in
+                guard let photo else { return }
+                capturedPhoto = nil
+                // JPEG encoding a 12MP capture blocks briefly; keep it off
+                // the main actor like the photo-library path below.
+                Task { @MainActor in
+                    let raw = await Task.detached(priority: .userInitiated) {
+                        photo.jpegData(compressionQuality: 0.9)
+                    }.value
+                    guard let raw else { return }
+                    let optimized = await optimizedPhotoDataOffMain(raw)
+                    draftAttachments.append(DSHStagedAttachment(name: "camera.jpg",
+                                                                data: optimized,
+                                                                isImage: true))
+                }
+            }
             .fileImporter(isPresented: $showFileImporter,
                           allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
                 guard case .success(let urls) = result else { return }
@@ -336,27 +927,63 @@ struct ConversationView: View {
                     defer { if accessed { url.stopAccessingSecurityScopedResource() } }
                     if let data = try? Data(contentsOf: url) {
                         draftAttachments.append(DSHStagedAttachment(name: url.lastPathComponent,
-                                                                   data: data,
-                                                                   isImage: url.pathExtension.lowercased() == "png"
-                                                                    || url.pathExtension.lowercased() == "jpg"
-                                                                    || url.pathExtension.lowercased() == "jpeg"
-                                                                    || url.pathExtension.lowercased() == "heic"))
+                                                                    data: data,
+                                                                    isImage: url.isImageFile))
                     }
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+                setKeyboardHeight(from: note)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                withAnimation(.easeOut(duration: 0.25)) { keyboardHeight = 0 }
+            }
+            .onPreferenceChange(DSHHeaderHeightKey.self) { headerHeight = $0 }
+            .onPreferenceChange(DSHDockHeightKey.self) { dockHeight = $0 }
         }
     }
+}
 
-    /// Remote's task header is intentionally quiet: the title and project are
-    /// presented as one centred capsule, with the back control on the left and
-    /// the project mark/options control on the right. This is the same visual
-    /// hierarchy as the Remote task detail screen; connection status remains
-    /// in the composer status row below the transcript.
+    /// Bottom lift for the floating dock. The overlay layout gave up the free
+    /// keyboard ride from the bottom safe-area inset, so it is manual now:
+    /// keyboard overlap minus the home-indicator strip, plus thumb room.
+    private func dockBottomPadding(outer: GeometryProxy) -> CGFloat {
+        guard keyboardHeight > 0 else { return 8 }
+        return max(8, keyboardHeight - outer.safeAreaInsets.bottom + 8)
+    }
+
+    private func setKeyboardHeight(from note: Notification) {
+        let height = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)?.height ?? 0
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        withAnimation(.easeOut(duration: duration)) { keyboardHeight = max(0, height) }
+    }
+
+    /// Remote's task header is intentionally quiet: title and project/device
+    /// subtitle are centered on the white surface, with a back button on the
+    /// left and a compact edit/menu capsule on the right.
     private var happyConversationHeader: some View {
-        ZStack {
-            VStack(spacing: 1) {
+        HStack(spacing: 10) {
+            Button { dismiss() } label: {
+                if #available(iOS 26, *) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .glassEffect(.regular, in: Circle())
+                } else {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(Color(.systemBackground), in: Circle())
+                        .overlay { Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.75) }
+                        .shadow(color: .black.opacity(0.06), radius: 5, y: 2)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("返回")
+
+            VStack(alignment: .leading, spacing: 1) {
                 Text(conversationTitle)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(conversationSubtitle)
@@ -365,51 +992,54 @@ struct ConversationView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay { Capsule().stroke(Color.primary.opacity(0.10), lineWidth: 0.75) }
-            .allowsHitTesting(false)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 10) {
-                Button { dismiss() } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 20, weight: .medium))
+            HStack(spacing: 0) {
+                Button { showNewSession = true } label: {
+                    DSHRemoteComposeGlyph(size: 20)
                         .frame(width: 44, height: 44)
-                        .background(.ultraThinMaterial, in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.75) }
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Back")
-
-                Spacer(minLength: 0)
+                .accessibilityLabel("新建会话")
 
                 Menu {
-                    Button { showModelPicker = true } label: {
-                        Label("Select model", systemImage: "cpu")
+                    Button {
+                        UIPasteboard.general.string = sessionID
+                    } label: {
+                        Label("复制对话串 ID", systemImage: "doc.on.doc")
                     }
-                    Button { showPermissionPicker = true } label: {
-                        Label("Permission", systemImage: "checkmark.shield")
-                    }
-                    Button { refreshSession() } label: {
-                        Label("Refresh session info", systemImage: "arrow.clockwise")
+                    Button(role: .destructive) { archiveSession() } label: {
+                        Label("归档", systemImage: "archivebox")
                     }
                     Divider()
-                    Button(role: .destructive) { archiveSession() } label: {
-                        Label("Archive session", systemImage: "archivebox")
+                    Button { showModelPicker = true } label: {
+                        Label("更换模型", systemImage: "cpu")
+                    }
+                    Button { showFilesPanel = true } label: {
+                        Label("文件", systemImage: "folder")
                     }
                 } label: {
-                    DSHHappyAvatar(size: 44)
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 20, weight: .semibold))
                         .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Session settings")
+                .accessibilityLabel("会话选项")
             }
+            .frame(width: 88, height: 44)
+            .dshFloatingChrome(Capsule())
         }
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 16)
-        .padding(.top, 4)
+        .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground).opacity(0.96))
+        // Full-width frosted bar: transcript blurs behind the whole header.
+        // frosted glass also lives on the back button and the capsule above.
+        // ultraThinMaterial works back to iOS 17, so no version branch here.
+        .background(.ultraThinMaterial)
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: DSHHeaderHeightKey.self, value: proxy.size.height)
+        })
     }
 
     /// Happy's empty conversation state is intentionally sparse: a laptop,
@@ -468,17 +1098,112 @@ struct ConversationView: View {
     /// Happy's quiet two-line card; once the user types or attaches something,
     /// the controls expand to expose commands, attachments, permissions and
     /// model selection without changing the send path.
-    private var composer: some View {
+    private func composer(proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Jump-to-latest lives at the very top of the dock, so its bottom
+            // edge always clears the composer's top edge by the stack spacing
+            // plus its own bottom padding. It used to float in an overlay
+            // positioned from a measured composer height, which drifted and
+            // let it cover the input card.
+            // Only while the reader is away from the newest output: the whole
+            // point is to not need this button when already at the bottom.
+            if !isFollowingLatest {
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        isFollowingLatest = true
+                        scrollToLatest(proxy, animated: true)
+                        // LazyVStack may not have laid out the tail yet: a
+                        // pin computed on stale geometry lands mid-list.
+                        // Re-pin after layout settles (same pattern as the
+                        // turn-end pins).
+                        for delay in [0.35, 1.0] {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                                scrollToLatest(proxy, animated: true)
+                            }
+                        }
+                    } label: {
+                        // Glass disc on iOS 26+ (transcript shows through it);
+                        // below that, the ghost arrow: no disc background so
+                        // the button never masks the transcript underneath.
+                        if #available(iOS 26, *) {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                                .frame(width: 48, height: 48)
+                                .glassEffect(.regular, in: Circle())
+                        } else {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+                                .frame(width: 48, height: 40)
+                                .opacity(0.5)
+                        }
+                    }
+                    .accessibilityLabel("Jump to latest output")
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.bottom, 4)
+            }
+
             if !draftAttachments.isEmpty {
                 draftAttachmentStrip
             }
 
-            // Keep reachability and branch visible while reading a running
-            // conversation too.  The original implementation hid this row
-            // as soon as the first transcript entry arrived, which made the
-            // status jump above the composer and left no persistent context.
-            sessionStatusBar
+            // Live turn status rides above the input card while work happens,
+            // so a reader who scrolled away still sees that work is happening
+            // (and what it is doing) instead of a frozen screen. Gated on
+            // actual tool activity — not only the turn state — so a stale
+            // turn flag can never hide a running 读取/编辑/Bash.
+            if isRunning || hasLiveToolActivity {
+                liveTurnStatus
+            }
+
+            // Queued prompts bubble: prompts this device queued behind the
+            // run, newest last. One shows its text, several show the count;
+            // tapping opens the detail list. Entries retire when accepted.
+            if !model.queuedPrompts(for: sessionID).isEmpty {
+                queuedPromptBubble
+            }
+
+            // Failed send: the prompt never got its acceptance. Says whether
+            // it died locally or on the Mac side, and offers a retry with the
+            // original text (and receipts) intact.
+            if let failed = model.failedSend, failed.sessionID == sessionID {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(failedSendTitle(failed))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(failed.text)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    Button("重试") { model.retryFailedSend() }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Button {
+                        model.dismissFailedSend()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
+                    }
+                    .accessibilityLabel("关闭发送失败提示")
+                }
+                .padding(10)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(failedSendTitle(failed))：\(failed.text)")
+            }
 
             if model.collapseComposerControls {
                 compactComposer
@@ -486,12 +1211,39 @@ struct ConversationView: View {
                 expandedComposer
             }
 
-            if hasRenderedContent && model.showUsageFooter {
-                UsageFooter(usage: model.usage(for: sessionID))
+            if hasRenderedContent && model.showUsageFooter && hasSessionUsageData {
+                Button { showUsagePanel = true } label: {
+                    UsageFooter(usage: model.usage(for: sessionID))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("查看本会话统计")
             }
         }
+        // Overlay content shrink-wraps: pin full width or the dock collapses.
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.top, 7)
+        .padding(.bottom, 8)
+        // Transparent: the transcript shows through around the floating
+        // card, and this measurement reserves the resting headroom for it.
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: DSHDockHeightKey.self, value: proxy.size.height)
+        })
+    }
+
+    private var hasSessionUsageData: Bool {
+        guard let usage = model.usage(for: sessionID) else { return false }
+        return usage.rounds != nil
+            || usage.steps != nil
+            || usage.inputTokens != nil
+            || usage.outputTokens != nil
+            || usage.totalTokens != nil
+            || usage.cacheReadTokens != nil
+            || usage.cacheWriteTokens != nil
+            || usage.cacheHitPercent != nil
+            || usage.tokensPerSecond != nil
+            || usage.contextUsed != nil
+            || usage.contextWindow != nil
     }
 
     private var draftAttachmentStrip: some View {
@@ -505,6 +1257,11 @@ struct ConversationView: View {
                                 .scaledToFill()
                                 .frame(width: 28, height: 28)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    draftPreviewImage = image
+                                    showDraftPreview = true
+                                }
                         }
                         Label(attachment.name, systemImage: attachment.isImage ? "photo" : "paperclip")
                             .font(.caption)
@@ -584,30 +1341,40 @@ struct ConversationView: View {
     /// extra usage line.  The plus button exposes only command/photo/file;
     /// the permission, model and send controls remain in this same editor.
     private var compactComposer: some View {
-        DSHCompactComposer(text: $model.draft,
-                           placeholder: DSHLocalization.string("Send a message, / command, @ file or conversation"),
-                           hasAttachments: hasDraftAttachments,
-                           onSubmit: send) {
+        DSHRemoteComposer(text: $model.draft,
+                          placeholder: composerPlaceholder,
+                          hasAttachments: hasDraftAttachments,
+                          autofocus: previewComposerFocused,
+                          showsMicrophone: false,
+                          onSubmit: { send() },
+                          slashCommands: DSHSlashCommands,
+                          onSlashCommand: { command in
+                              model.draft = dshCompleteSlashCommand(command, in: model.draft)
+                          }) {
             DSHComposerQuickActionsMenu(
-                onCommand: { showCommandMenu = true },
+                onCommand: { command in
+                    model.executeCommand("/\(command)", for: sessionID)
+                },
                 onPhoto: { showPhotoPicker = true },
-                onFile: { showFileImporter = true }
+                onFile: { showFileImporter = true },
+                onCamera: { showCamera = true }
             )
-
+        } configuration: {
             PermissionMenu(sessionID: sessionID, compact: true)
-
-            Spacer(minLength: 4)
-
-            ModelMenu(sessionID: sessionID)
-
-            ReasoningEffortMenu(sessionID: sessionID)
-
-            if let ratio = contextRatio {
-                ContextRing(ratio: ratio)
-            }
-
+            Spacer(minLength: 0)
+            contextUsageControl
+            ReasoningEffortMenu(sessionID: sessionID, compact: true)
+        } submit: {
             composerSendControl
         }
+    }
+
+    private var previewComposerFocused: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--dsh-preview-composer-focused")
+        #else
+        false
+        #endif
     }
 
     private var expandedComposer: some View {
@@ -618,65 +1385,273 @@ struct ConversationView: View {
                 .textFieldStyle(.plain)
                 .focused($isDraftFocused)
                 .onSubmit { send() }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 10) {
                 Button { showCommandMenu = true } label: {
-                    Image(systemName: "slash.circle").font(.title3)
+                    Image(systemName: "slash.circle")
+                        .font(.title3)
+                        .foregroundStyle(.primary)
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Commands")
 
-                PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                    Image(systemName: "photo").font(.title3)
+                PhotosPicker(selection: $selectedPhotos,
+                             maxSelectionCount: 10,
+                             matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.title3)
+                        .foregroundStyle(.primary)
                 }
-                .accessibilityLabel("Attach photo")
+                .buttonStyle(.plain)
+                .accessibilityLabel("Attach photos")
 
                 Button { showFileImporter = true } label: {
-                    Image(systemName: "paperclip").font(.title3)
+                    Image(systemName: "paperclip")
+                        .font(.title3)
+                        .foregroundStyle(.primary)
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Attach file")
 
                 PermissionMenu(sessionID: sessionID)
 
-                Spacer(minLength: 4)
-
-                ModelMenu(sessionID: sessionID)
+                Spacer(minLength: 0)
+                    .layoutPriority(-1)
 
                 ReasoningEffortMenu(sessionID: sessionID)
 
-                if let ratio = contextRatio {
-                    ContextRing(ratio: ratio)
-                }
+                contextUsageControl
 
                 composerSendControl
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        .dshFloatingChrome(RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private var composerPlaceholder: String {
+        let machine = model.machineName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = machine.isEmpty ? "Mac" : machine
+        return "在 \(name) 上工作"
+    }
+
+    /// Two live lines above the input card while the turn runs:
+    /// "深度求索中… {elapsed}" ticking every second, plus the newest activity
+    /// (running tool → streaming answer → thinking → waiting). The elapsed
+    /// clock spans dispatch to completion: it starts at the newest accepted
+    /// user message (the moment the Mac takes the task — uploads and local
+    /// queue holds excluded), so the live count flows straight into the
+    /// turn's final 用时 row. Falls back to first-running-seen, then now.
+    @ViewBuilder
+    private var liveTurnStatus: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                Text("深度求索中… \(liveElapsedText(now: context.date))")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            Text(liveTrailText)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 4)
+        .onAppear {
+            if turnStartedAt == nil { turnStartedAt = .now }
+        }
+    }
+
+    private func liveElapsedText(now: Date) -> String {
+        let total = max(0, Int(now.timeIntervalSince(liveElapsedStart ?? now)))
+        if total < 60 { return "\(total)秒" }
+        if total < 3600 { return "\(total / 60)分\(total % 60)秒" }
+        return "\(total / 3600)小时\((total % 3600) / 60)分"
+    }
+
+    /// Dispatch moment of the newest accepted user message (Mac clock), i.e.
+    /// when the task actually started. Falls back to first-running-seen.
+    private var liveElapsedStart: Date? {
+        if let ms = model.messages(for: sessionID).last(where: { $0.role == .user })?.timestamp,
+           ms > 0 {
+            return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
+        }
+        return turnStartedAt
+    }
+
+    private func failedSendTitle(_ failed: DSHAppModel.DSHFailedSend) -> String {
+        switch failed.failure {
+        case .local:
+            return "发送失败，本地连接不可用"
+        case .server(let detail):
+            return detail.isEmpty ? "发送失败，Mac 未响应" : "发送失败：\(detail)"
+        }
+    }
+
+    /// Newest activity first: a running tool call beats streaming text, which
+    /// beats a growing reasoning trace. The line carries live content (not
+    /// just counts), so its motion itself proves the task is moving. Tool
+    /// phrasing mirrors the web client ("读取 · path").
+    private var liveTrailText: String {
+        let tools = model.tools(for: sessionID)
+        if let running = tools.last(where: { $0.status.lowercased() == "running" }) {
+            return DSHToolPresentation.headline(for: running)
+        }
+        if let last = model.messages(for: sessionID).last, last.role == .assistant {
+            if !last.markdown.isEmpty {
+                let preview = Self.previewLine(last.markdown)
+                return preview.isEmpty ? "正在输出…" : "正在输出 · \(preview)"
+            }
+            if let reasoning = last.reasoning, !reasoning.isEmpty {
+                let preview = Self.previewLine(reasoning)
+                return preview.isEmpty ? "思考中…" : "思考中 · \(preview)"
+            }
+        }
+        return "等待响应…"
+    }
+
+    /// Newest non-empty line, flattened for the one-line trail. The tail —
+    /// not the head — is what is being typed right now.
+    private static func previewLine(_ text: String, limit: Int = 40) -> String {
+        let line = text.split(separator: "\n", omittingEmptySubsequences: true).last
+            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        guard !line.isEmpty else { return "" }
+        return line.count > limit ? "…" + String(line.suffix(limit)) : String(line)
+    }
+
+    /// Queue bubble above the input card, pinned right. One queued prompt
+    /// shows its text, several collapse to a count; tapping opens the detail
+    /// list. Edit/cancel of server-side queued items needs a protocol
+    /// addition (`session/updateQueue`); until then this mirrors what this
+    /// device sent and retires entries on acceptance.
+    @ViewBuilder
+    private var queuedPromptBubble: some View {
+        let queued = model.queuedPrompts(for: sessionID)
+        if !queued.isEmpty {
+            HStack {
+                Spacer(minLength: 0)
+                Button { showQueuedList = true } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "hourglass")
+                            .font(.system(size: 12, weight: .medium))
+                        if queued.count == 1, let first = queued.first {
+                            Text(first.text)
+                                .font(.system(size: 13))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        } else {
+                            Text("\(queued.count)条排队")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.thinMaterial, in: .capsule)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    queued.count == 1 ? "排队中的消息" : "\(queued.count)条排队消息，查看详情")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var contextUsageControl: some View {
+        let ratio = contextRatio ?? 0
+        Button { showContextPopover = true } label: {
+            ContextRing(ratio: ratio)
+                .frame(width: 34, height: 34)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("上下文窗口已使用 \(Int(ratio * 100))%")
+        .popover(isPresented: $showContextPopover, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("上下文窗口")
+                    .font(.headline)
+                if let usage = model.usage(for: sessionID),
+                   let used = usage.contextUsed,
+                   let window = usage.contextWindow {
+                    let remaining = max(0, window - used)
+                    let percent = window > 0 ? Int((remaining / window) * 100) : 0
+                    Text("剩余 \(percent)%（已用 \(chineseTokenCount(used)) / \(chineseTokenCount(window))）")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("暂无上下文用量数据")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(16)
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private func compactTokenCount(_ value: Double) -> String {
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+        return "\(Int(value))"
+    }
+
+    private func chineseTokenCount(_ value: Double) -> String {
+        if value >= 10_000 {
+            let amount = value / 10_000
+            return amount.rounded() == amount ? "\(Int(amount))万" : String(format: "%.1f万", amount)
+        }
+        return "\(Int(value))"
     }
 
     @ViewBuilder private var composerSendControl: some View {
         if isSending {
             ProgressView()
-                .controlSize(.small)
+                .tint(.white)
+                .frame(width: 34, height: 34)
+                .background(Color.accentColor, in: Circle())
                 .accessibilityLabel("Sending")
+        } else if isRunning, composerCanSend {
+            // Staged text while a turn runs: sending never pauses the run.
+            // The prompt joins behind it (queue) or redirects it (steer).
+            Menu {
+                Button("排队发送") { send(mode: "queue") }
+                Button("插话发送") { send(mode: "steer") }
+            } label: {
+                sendCircle(enabled: true)
+            }
+            .accessibilityLabel("发送：排队或插话")
         } else if isRunning {
             Button(action: { model.cancelTurn(for: sessionID) }) {
-                Image(systemName: "stop.circle.fill")
-                    .font(.title)
-                    .foregroundStyle(.red)
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor, in: Circle())
+                    .foregroundStyle(.white)
             }
             .accessibilityLabel("Stop turn")
         } else {
-            Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title)
-                    .foregroundStyle(.tint)
+            Button(action: { send() }) {
+                sendCircle(enabled: composerCanSend)
             }
-            .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && !hasDraftAttachments)
+            .disabled(!composerCanSend)
             .accessibilityLabel("Send message")
         }
+    }
+
+    private func sendCircle(enabled: Bool) -> some View {
+        Image(systemName: "arrow.up")
+            .font(.system(size: 17, weight: .semibold))
+            .frame(width: 34, height: 34)
+            .background(enabled ? Color.accentColor : Color(.systemGray5), in: Circle())
+            .foregroundStyle(enabled ? .white : .white.opacity(0.85))
+    }
+
+    private var composerCanSend: Bool {
+        !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasDraftAttachments
     }
 
     /// Context window usage, shown as a ring beside the model.
@@ -687,30 +1662,63 @@ struct ConversationView: View {
     }
 
     /// Keeps the newest output on screen, unless the reader has scrolled away.
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+    private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = false) {
         guard isFollowingLatest else { return }
         // Streaming deltas are intentionally not animated. The old
         // `withAnimation` ran once per token and kept Core Animation busy even
         // when the reader was already at the bottom, which made the phone warm
         // and caused visible stutter. The explicit jump button below still uses
         // an animation when the user asks for one.
-        var transaction = Transaction()
-        transaction.animation = nil
-        withTransaction(transaction) {
-            proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+        if animated {
+            withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
+        } else {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
         }
+        // Belt and suspenders: drive the real scroll view too. If SwiftUI's
+        // scrollTo silently no-ops, the content offset still lands at the
+        // same place. Same destination, so the two never fight.
+        scrollCoordinator.scrollToBottom(animated: animated)
     }
 
-    private func send() {
+    /// Sends the draft without pausing the run: `queue` appends behind the
+    /// current turn, `steer` redirects it (web parity). Queue-mode sends
+    /// while busy are mirrored into the queue bubble until accepted.
+    private func send(mode: String = "queue") {
         guard !isSending else { return }
         let text = model.draft
         let staged = draftAttachments
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !staged.isEmpty else { return }
+        let wasRunning = isRunning
+        // Text-only queue while busy stays on the device (editable,
+        // cancellable, auto-fired when the turn settles). Anything with
+        // attachments — and every steer — goes to the server immediately.
+        if wasRunning && mode == "queue" && staged.isEmpty {
+            model.holdQueuedPrompt(text: trimmed, for: sessionID)
+            isDraftFocused = false
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                            to: nil, from: nil, for: nil)
+            model.draft = ""
+            return
+        }
+        if wasRunning && mode == "queue" {
+            model.noteQueuedPrompt(text: trimmed, mode: mode, for: sessionID)
+        }
 
         // Clear the editor immediately so a double tap cannot send the same
         // draft twice. If an upload fails, restore the not-yet-uploaded chips
         // below so the user can retry without selecting the files again.
+        // The keyboard goes away with the send so the fresh answer is
+        // visible. Both paths are needed: the expanded editor binds the
+        // parent focus state, while the compact editor owns its focus
+        // inside DSHRemoteComposer.
+        isDraftFocused = false
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
         model.draft = ""
         draftAttachments = []
         isSending = true
@@ -734,7 +1742,8 @@ struct ConversationView: View {
                     uploadedCount += 1
                 }
                 model.sendPrompt(text, attachments: receipts,
-                                 messageAttachments: messageAttachments, to: sessionID)
+                                 messageAttachments: messageAttachments, to: sessionID,
+                                 mode: mode)
             } catch {
                 model.draft = text
                 draftAttachments = Array(staged.dropFirst(uploadedCount))
@@ -762,9 +1771,64 @@ struct ConversationView: View {
         }
     }
 
+    /// Starts a sibling task with the same machine/workspace/branch/model
+    /// context. The Harness exposes no fork API, so the prior dialogue
+    /// travels as the new session's first prompt (best effort, text only);
+    /// the parent transcript remains untouched.
+    private func createBranchSession() {
+        guard let session else { return }
+        let workspace: DSHWorkspaceOption?
+        if let workspaceID = session.workspaceId {
+            workspace = DSHWorkspaceOption(
+                id: workspaceID,
+                name: model.workspaceDisplayName(for: workspaceID,
+                                                  fallback: session.workspaceName ?? ""))
+        } else {
+            workspace = nil
+        }
+        let selectedModel: DSHModelSelection?
+        if let modelID = session.model, !modelID.isEmpty {
+            selectedModel = DSHModelSelection(provider: session.provider ?? "deepseek",
+                                               model: modelID,
+                                               reasoningEffort: session.reasoningEffort)
+        } else {
+            selectedModel = nil
+        }
+        let parentTitle = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.createSession(in: workspace,
+                            title: parentTitle.isEmpty ? "新会话" : "\(parentTitle) 分支",
+                            workingDirectory: session.cwd,
+                            branch: session.branch,
+                            mode: session.mode ?? session.agentPreset ?? "standard",
+                            model: selectedModel,
+                            permissionMode: session.permissionMode ?? "workspace-write",
+                            initialPrompt: branchTranscriptText())
+    }
+
     private func archiveSession() {
         model.archive(session ?? emptySession, archived: true)
         dismiss()
+    }
+
+    /// Prior dialogue carried into a branch as plain text (newest 40
+    /// messages, hard-capped). Reasoning and tool detail stay behind;
+    /// the new session continues from the readable Q&A.
+    private func branchTranscriptText() -> String? {
+        let messages = transcriptEntries.flatMap { entry -> [DSHChatMessage] in
+            guard case .turn(let block) = entry else { return [] }
+            return block.messages
+        }
+        .filter { !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        .suffix(40)
+        guard !messages.isEmpty else { return nil }
+        var text = "以下是之前会话中的对话记录，请基于这些上下文继续协助我：\n\n" + messages.map { message in
+            let body = message.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            return message.role == .user ? "用户：\(body)" : "助手：\(body)"
+        }.joined(separator: "\n\n")
+        if text.count > 12_000 {
+            text = "…（更早记录已省略）\n\n" + String(text.suffix(12_000))
+        }
+        return text
     }
 }
 
@@ -791,10 +1855,13 @@ private struct DSHInteractivePopGestureEnabler: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         weak var navigationController: UINavigationController?
         weak var previousDelegate: UIGestureRecognizerDelegate?
+        private var fullscreenPop: UIPanGestureRecognizer?
 
         func attach(to navigationController: UINavigationController) {
             guard self.navigationController !== navigationController else {
                 navigationController.interactivePopGestureRecognizer?.isEnabled = true
+                Self.enableContentPopIfAvailable(on: navigationController)
+                installFullscreenPopIfNeeded(on: navigationController)
                 return
             }
             restore()
@@ -803,6 +1870,49 @@ private struct DSHInteractivePopGestureEnabler: UIViewControllerRepresentable {
             previousDelegate = gesture?.delegate
             gesture?.delegate = self
             gesture?.isEnabled = true
+            Self.enableContentPopIfAvailable(on: navigationController)
+            installFullscreenPopIfNeeded(on: navigationController)
+        }
+
+        /// The system full-screen (anywhere-origin) interactive pop gesture.
+        /// It tracks the finger with velocity and cancellation like the edge
+        /// gesture, which the old decide-on-release custom DragGesture never
+        /// could.
+        /// Resolved at runtime (not `if #available`) so the iOS 17 deployment
+        /// target keeps working: where the API is absent this is a no-op and
+        /// the edge gesture above remains the way back.
+        private static func enableContentPopIfAvailable(on navigationController: UINavigationController) {
+            // Built at runtime (not as a literal): Swift 6 validates
+            // `Selector("…")` literals at compile time, and this API is newer
+            // than the iOS 17 deployment target, so a literal is a build
+            // error even though the responds(to:) guard would be safe.
+            let key = "interactiveContentPop" + "GestureRecognizer"
+            guard navigationController.responds(to: NSSelectorFromString(key)),
+                  let gesture = navigationController.value(forKey: key)
+                    as? UIGestureRecognizer else { return }
+            gesture.isEnabled = true
+        }
+
+        /// Full-screen fallback for the native content pop above. The native
+        /// gesture stays disabled in our configuration (custom header, hidden
+        /// navigation bar), so this reuses the edge gesture's own interactive
+        /// transition driver for a pan that may start anywhere: same
+        /// finger-tracking, velocity and cancellation as the system gesture.
+        /// Private targets/action, resolved at runtime like above; the
+        /// long-standing fullscreen-pop technique, kept as a fallback behind
+        /// the native API.
+        private func installFullscreenPopIfNeeded(on navigationController: UINavigationController) {
+            if fullscreenPop != nil { return }
+            guard let edge = navigationController.interactivePopGestureRecognizer,
+                  let targets = edge.value(forKey: "targets") as? [NSObject],
+                  let target = targets.first?.value(forKey: "target") as? NSObject else { return }
+            let action = NSSelectorFromString("handleNavigationTransition:")
+            guard target.responds(to: action) else { return }
+            let pan = UIPanGestureRecognizer(target: target, action: action)
+            pan.maximumNumberOfTouches = 1
+            pan.delegate = self
+            navigationController.view.addGestureRecognizer(pan)
+            fullscreenPop = pan
         }
 
         func restore() {
@@ -811,6 +1921,10 @@ private struct DSHInteractivePopGestureEnabler: UIViewControllerRepresentable {
                   gesture.delegate === self else { return }
             gesture.delegate = previousDelegate
             gesture.isEnabled = true
+            if let pan = fullscreenPop {
+                navigationController.view.removeGestureRecognizer(pan)
+                fullscreenPop = nil
+            }
             self.navigationController = nil
             previousDelegate = nil
         }
@@ -818,7 +1932,17 @@ private struct DSHInteractivePopGestureEnabler: UIViewControllerRepresentable {
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let navigationController,
                   navigationController.viewControllers.count > 1,
-                  navigationController.presentedViewController == nil else { return false }
+                  navigationController.presentedViewController == nil,
+                  navigationController.transitionCoordinator == nil else { return false }
+            // The fullscreen pan has no screen edge to anchor it: only begin
+            // on a clearly rightward velocity, so vertical scrolls (and
+            // leftward code-block pans) never become a back navigation.
+            if gestureRecognizer === fullscreenPop,
+               let pan = gestureRecognizer as? UIPanGestureRecognizer,
+               let view = gestureRecognizer.view {
+                let velocity = pan.velocity(in: view)
+                return velocity.x > 0 && abs(velocity.x) > abs(velocity.y)
+            }
             return true
         }
     }
@@ -881,16 +2005,7 @@ private struct ContextRing: View {
     let ratio: Double
 
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.secondary.opacity(0.22), lineWidth: 2.5)
-            Circle()
-                .trim(from: 0, to: ratio)
-                .stroke(ratio > 0.9 ? Color.orange : Color.accentColor,
-                        style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 20, height: 20)
+        DSHContextRing(ratio: ratio)
         .accessibilityLabel("Context \(Int(ratio * 100)) percent used")
     }
 }
@@ -925,27 +2040,33 @@ private struct ModelMenu: View {
                 Button("Refresh models") { model.sendModelCatalog() }
             }
         } label: {
-            HStack(spacing: compact ? 5 : 4) {
-                if !compact { Image(systemName: "cpu") }
-                Text(displayName)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .minimumScaleFactor(0.78)
-                if !compact {
+            Group {
+                if compact {
+                    DSHRemoteReasoningGlyph(intensity: 0.58)
+                        .frame(width: 34, height: 34)
+                } else {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu")
+                        Text(displayName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .minimumScaleFactor(0.65)
                     Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                    }
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(.primary)
                 }
             }
-            .font(.system(size: compact ? 15 : 14, weight: .regular))
         }
+        .tint(.primary)
         .accessibilityLabel("Model")
     }
 
     private var displayName: String {
-        let base = model.shortModelName(for: sessionID)
-        guard compact,
-              let effort = model.sessions.first(where: { $0.id == sessionID })?.reasoningEffort,
-              !effort.isEmpty else { return base }
-        return "\(base) · \(effort.capitalized)"
+        // Reasoning is rendered by the adjacent selector. Keeping it out of
+        // the model label avoids a duplicated “· Medium” and leaves room for
+        // the permission name and microphone on a phone-width editor.
+        model.shortModelName(for: sessionID)
     }
 }
 
@@ -954,44 +2075,9 @@ private struct ModelMenu: View {
 private struct ReasoningEffortMenu: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
-
-    var body: some View {
-        if let configuration = model.reasoningConfiguration(for: sessionID) {
-            Menu {
-                ForEach(configuration.efforts) { effort in
-                    Button {
-                        model.selectModel(
-                            DSHModelSelection(provider: configuration.provider,
-                                              model: configuration.model,
-                                              reasoningEffort: effort.id),
-                            for: sessionID
-                        )
-                    } label: {
-                        Label(effort.name,
-                              systemImage: effort.id == configuration.selectedEffortID
-                                ? "checkmark" : "brain.head.profile")
-                    }
-                }
-            } label: {
-                HStack(spacing: 3) {
-                    Text(configuration.selectedEffort?.name ?? configuration.selectedEffortID)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption2)
-                }
-                .font(.system(size: 14, weight: .regular))
-                .frame(maxWidth: 70)
-            }
-            .accessibilityLabel("Reasoning effort")
-        }
-    }
-}
-
-private struct PermissionMenu: View {
-    @EnvironmentObject private var model: DSHAppModel
-    let sessionID: String
     let compact: Bool
+    @State private var isPresented = false
+    @State private var pendingSelection: DSHModelSelection?
 
     init(sessionID: String, compact: Bool = false) {
         self.sessionID = sessionID
@@ -999,29 +2085,227 @@ private struct PermissionMenu: View {
     }
 
     var body: some View {
-        Menu {
-            ForEach(permissionModes, id: \.mode) { item in
-                Button { model.setPermission(item.mode, for: sessionID) } label: {
-                    Label(item.title, systemImage: model.permissionMode(for: sessionID) == item.mode ? "checkmark" : item.icon)
-                }
-            }
-        } label: {
-            if compact {
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.shield")
-                        .font(.title3)
-                    Text(permissionLabel(model.permissionMode(for: sessionID)))
+        if let configuration = model.reasoningConfiguration(for: sessionID) {
+            let efforts = dshOrderedReasoningEfforts(configuration.efforts)
+            // Nearest-rank, not exact-or-zero: the persisted effort id can
+            // drift from the catalog's ids, and slamming to minimum then
+            // points the meter away from the model's real intelligence.
+            let selectedIndex = dshNearestReasoningEffortIndex(efforts, to: configuration.selectedEffortID)
+            let intensity = efforts.count > 1
+                ? Double(selectedIndex) / Double(efforts.count - 1)
+                : 0.58
+            Button {
+                pendingSelection = nil
+                isPresented = true
+            } label: {
+                Group {
+                    if compact {
+                        DSHRemoteReasoningGlyph(intensity: intensity)
+                            .frame(width: 34, height: 34)
+                    } else {
+                        // Single model control: name and effort together, so
+                        // the row needs no second model button next to it.
+                        HStack(spacing: 3) {
+                            Text("\(model.shortModelName(for: sessionID)) · \(configuration.selectedEffort?.name ?? configuration.selectedEffortID)")
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .minimumScaleFactor(0.65)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                        }
                         .font(.system(size: 14, weight: .regular))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
+                        .foregroundStyle(.primary)
+                    }
                 }
-            } else {
-                // Icon only: the label cost ~80pt of a row that also holds
-                // three attachments, the model and send. The mode is still
-                // announced.
-                Image(systemName: "checkmark.shield")
-                    .font(.title3)
             }
+            .buttonStyle(.plain)
+            .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+                // Draft-aware: the slider/header follow pendingSelection while
+                // dragging or after picking another model; commit happens once
+                // on dismiss via applyPendingSelection().
+                let visibleEfforts = self.visibleEfforts(
+                    serverEfforts: efforts,
+                    configuration: configuration
+                )
+                let draftIndex = dshNearestReasoningEffortIndex(
+                    visibleEfforts,
+                    to: pendingSelection?.reasoningEffort ?? configuration.selectedEffortID
+                )
+                VStack(spacing: 12) {
+                    Menu {
+                        if let catalog = model.modelCatalog {
+                            ForEach(catalog.groups) { group in
+                                Section(group.name) {
+                                    ForEach(group.models) { item in
+                                        Button(item.name) {
+                                            pendingSelection = DSHModelSelection(
+                                                provider: group.id,
+                                                model: item.id,
+                                                reasoningEffort: item.reasoning?.defaultEffort
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Text("模型")
+                                .font(.system(size: 17))
+                            Spacer(minLength: 12)
+                            Text(displayedModelName(configuration: configuration))
+                                .font(.system(size: 17, weight: .semibold))
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 14)
+                        .frame(height: 46)
+                    }
+                    .tint(.primary)
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("智能")
+                                .font(.system(size: 17))
+                            Spacer(minLength: 12)
+                            // Live-syncs to the draft while dragging; the
+                            // server value returns on reopen.
+                            Text(displayedEffortName(efforts: visibleEfforts, configuration: configuration))
+                                .font(.system(size: 17, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        DSHRemoteReasoningSlider(
+                            count: visibleEfforts.count,
+                            selectedIndex: draftIndex,
+                            labels: visibleEfforts.map(\.name)
+                        ) { index in
+                            guard visibleEfforts.indices.contains(index) else { return }
+                            // Keep the (possibly newly picked) model, only move
+                            // the effort; provider/model come from the draft
+                            // when one exists so a model switch + slide composes
+                            // into a single commit on close.
+                            let base = pendingSelection ?? DSHModelSelection(
+                                provider: configuration.provider,
+                                model: configuration.model,
+                                reasoningEffort: configuration.selectedEffortID
+                            )
+                            pendingSelection = DSHModelSelection(
+                                provider: base.provider,
+                                model: base.model,
+                                reasoningEffort: visibleEfforts[index].id
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+                .padding(.vertical, 10)
+                .frame(width: 330)
+                .presentationCompactAdaptation(.popover)
+            }
+            .tint(.primary)
+            .accessibilityLabel("Reasoning effort")
+            .onChange(of: isPresented) { _, presented in
+                if !presented { applyPendingSelection() }
+            }
+        } else {
+            ModelMenu(sessionID: sessionID, compact: compact)
+        }
+    }
+
+    private func applyPendingSelection() {
+        guard let pendingSelection else { return }
+        self.pendingSelection = nil
+        // Let the popover dismiss animation finish first: the send triggers
+        // a snapshot refresh that re-renders the whole conversation on the
+        // main thread, which stutters if it lands mid-dismiss.
+        let selection = pendingSelection
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            model.selectModel(selection, for: sessionID)
+        }
+    }
+
+    private func displayedEffortName(efforts: [DSHModelReasoningEffort],
+                                     configuration: DSHReasoningConfiguration) -> String {
+        if let draft = pendingSelection?.reasoningEffort,
+           let match = efforts.first(where: { $0.id == draft }) {
+            return match.name
+        }
+        return configuration.selectedEffort?.name ?? configuration.selectedEffortID
+    }
+
+    private func displayedModelName(configuration: DSHReasoningConfiguration) -> String {
+        guard let draft = pendingSelection,
+              draft.provider != configuration.provider || draft.model != configuration.model else {
+            return model.shortModelName(for: sessionID)
+        }
+        return model.modelLabel(for: draft)
+    }
+
+    /// Efforts for the draft model when the user picked another model inside
+    /// the popover; otherwise the live server efforts. Keeps the slider,
+    /// its labels and the header on the same draft.
+    private func visibleEfforts(serverEfforts: [DSHModelReasoningEffort],
+                                configuration: DSHReasoningConfiguration) -> [DSHModelReasoningEffort] {
+        guard let draft = pendingSelection,
+              draft.provider != configuration.provider || draft.model != configuration.model,
+              let catalog = model.modelCatalog,
+              let item = catalog.groups.first(where: { $0.id == draft.provider })?.models.first(where: { $0.id == draft.model }),
+              let reasoning = item.reasoning, !reasoning.efforts.isEmpty else {
+            return serverEfforts
+        }
+        return dshOrderedReasoningEfforts(reasoning.efforts)
+    }
+}
+
+private struct PermissionMenu: View {
+    @EnvironmentObject private var model: DSHAppModel
+    let sessionID: String
+    let compact: Bool
+    @State private var isPresented = false
+
+    init(sessionID: String, compact: Bool = false) {
+        self.sessionID = sessionID
+        self.compact = compact
+    }
+
+    static func iconStyle(for mode: String) -> DSHRemotePermissionGlyph.Style {
+        .forPermissionMode(mode)
+    }
+
+    var body: some View {
+        Button { isPresented = true } label: {
+            if compact {
+                let style = Self.iconStyle(for: model.permissionMode(for: sessionID))
+                DSHRemotePermissionGlyph(style: style)
+                    .frame(width: 34, height: 34)
+                    .foregroundStyle(style.composerColor)
+            } else {
+                DSHRemotePermissionGlyph(
+                    style: Self.iconStyle(for: model.permissionMode(for: sessionID))
+                )
+                    .foregroundStyle(.primary)
+            }
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("应如何批准 DSH 操作？")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 5)
+
+                ForEach(permissionModes, id: \.mode) { item in
+                    permissionRow(item)
+                }
+            }
+            .padding(10)
+            .frame(width: 340)
+            .presentationCompactAdaptation(.popover)
         }
         .accessibilityLabel("Permission: \(permissionLabel(model.permissionMode(for: sessionID)))")
         .accessibilityHint("Changes the sandbox and approval policy for this session")
@@ -1042,15 +2326,55 @@ private struct PermissionMenu: View {
 
     /// The three user-facing permission presets map directly to Harness
     /// sandbox choices. Legacy ask/never values remain readable in the store
-    /// but are intentionally not offered as separate modes here.
-    private var permissionModes: [(mode: String, title: String, icon: String)] {
+    /// but are intentionally not offered as separate modes here. Row icons
+    /// match the composer button glyph.
+    private var permissionModes: [(mode: String, title: String, icon: DSHRemotePermissionGlyph.Style)] {
         // Titles are localized here rather than left to `Label`, which only
         // localizes a literal and takes this value as a plain String.
         [
-            ("read-only", "仅可查看", "eye"),
-            ("workspace-write", DSHLocalization.string("Workspace write"), "folder"),
-            ("danger-full-access", "完全权限", "exclamationmark.triangle")
+            ("read-only", "仅可查看", .hand),
+            ("workspace-write", DSHLocalization.string("Workspace write"), .terminalShield),
+            ("danger-full-access", "完全权限", .warningShield)
         ]
+    }
+
+    private func permissionRow(
+        _ item: (mode: String, title: String, icon: DSHRemotePermissionGlyph.Style)
+    ) -> some View {
+        Button {
+            model.setPermission(item.mode, for: sessionID)
+            isPresented = false
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                DSHRemotePermissionGlyph(style: item.icon)
+                    .foregroundStyle(item.mode == "danger-full-access" ? .red : .primary)
+                    .frame(width: 28, height: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title).font(.system(size: 17, weight: .medium))
+                    Text(permissionDetail(item.mode))
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+                if model.permissionMode(for: sessionID) == item.mode {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func permissionDetail(_ mode: String) -> String {
+        switch mode {
+        case "read-only": return "只读取文件；任何修改前都会询问"
+        case "danger-full-access": return "完全访问计算机（风险较高）"
+        default: return "可编辑当前工作区内的文件"
+        }
     }
 }
 
@@ -1126,52 +2450,185 @@ private struct UsageFooter: View {
     }
 }
 
-struct CommandMenuSheet: View {
-    @Binding var selectedPhoto: PhotosPickerItem?
-    let onFile: () -> Void
-    let onCommand: (String) -> Void
-    let onDismiss: () -> Void
+private struct RemoteFilesPanel: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
 
-    private let commands: [(String, String, String)] = [
-        ("compact", "压缩以上对话内容", "rectangle.compress.vertical"),
-        ("export", "将当前会话导出为 ZIP", "square.and.arrow.up"),
-        ("feedback", "发送关于当前会话的反馈", "bubble.left.and.exclamationmark.bubble.right"),
-        ("goal", "设置或查看长期任务目标", "target"),
-        ("permission", "切换权限预设（沙箱模式与审批策略）", "checkmark.shield"),
-        ("plan", "进入或退出计划模式", "list.clipboard"),
-        ("model", "选择本会话使用的模型", "cpu")
-    ]
+    private var attachments: [DSHUploadedAttachment] {
+        model.attachments(for: sessionID)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("会话文件")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text(attachments.isEmpty ? "还没有上传文件" : "共 \(attachments.count) 个")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 18, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .background(.thinMaterial, in: Circle())
+                        .overlay { Circle().stroke(Color.primary.opacity(0.10), lineWidth: 0.75) }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            ScrollView {
+                if attachments.isEmpty {
+                    ContentUnavailableView("暂无文件", systemImage: "doc.on.doc",
+                                           description: Text("用输入框的加号上传文件后，会显示在这里。"))
+                        .padding(.top, 80)
+                } else {
+                    LazyVStack(spacing: 10) {
+                        ForEach(attachments) { file in
+                            HStack(spacing: 12) {
+                                Image(systemName: file.mediaType?.hasPrefix("image/") == true ? "photo" : "doc")
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 36, height: 36)
+                                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(file.name)
+                                        .font(.system(size: 15, weight: .medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(fileSubtitle(file))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+        }
+        .background(Color(.systemBackground))
+    }
+
+    private func fileSubtitle(_ file: DSHUploadedAttachment) -> String {
+        var parts: [String] = []
+        if let mediaType = file.mediaType, !mediaType.isEmpty { parts.append(mediaType) }
+        if let size = file.size, size > 0 { parts.append(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) }
+        return parts.isEmpty ? "已上传" : parts.joined(separator: " · ")
+    }
+}
+
+/// Full session usage is kept behind the compact footer so the composer never
+/// loses width. Tapping the footer opens the same native sheet treatment as
+/// the Files pill and makes it clear these numbers cover the whole
+/// conversation, not just the most recent turn.
+private struct RemoteUsagePanel: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
+
+    private var usage: DSHSessionUsage? { model.usage(for: sessionID) }
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Attachments") {
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                        Label("Photo", systemImage: "photo")
-                    }
-                    Button(action: onFile) {
-                        Label("File", systemImage: "paperclip")
+                Section("本会话") {
+                    metric("轮次", usage?.rounds.map(String.init) ?? "—")
+                    metric("步骤", usage?.steps.map(String.init) ?? "—")
+                    metric("输入 Token", compact(usage?.inputTokens))
+                    metric("输出 Token", compact(usage?.outputTokens))
+                    metric("总 Token", compact(usage?.totalTokens))
+                }
+                Section("缓存与上下文") {
+                    metric("缓存命中", usage?.cacheHitPercent.map { String(format: "%.2f%%", $0) } ?? "—")
+                    metric("读取缓存", compact(usage?.cacheReadTokens))
+                    metric("写入缓存", compact(usage?.cacheWriteTokens))
+                    metric("平均速度", usage?.tokensPerSecond.map { String(format: "%.0f tok/s", $0) } ?? "—")
+                    if let used = usage?.contextUsed, let window = usage?.contextWindow, window > 0 {
+                        metric("上下文窗口", "剩余 " + compact(window - used) + " / " + compact(window))
                     }
                 }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("会话统计")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer(minLength: 12)
+            Text(value)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+
+    private func compact(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+        return "\(Int(value))"
+    }
+}
+
+/// Slash commands shared by the command sheet and the composer `/`
+/// autocomplete. Attachments deliberately live outside this list: they have
+/// their own photo/file buttons and must not resurface here.
+let DSHSlashCommands: [(id: String, gloss: String, icon: String)] = [
+    ("compact", "压缩以上对话内容", "rectangle.compress.vertical"),
+    ("export", "将当前会话导出为 ZIP", "square.and.arrow.up"),
+    ("feedback", "发送关于当前会话的反馈", "bubble.left.and.exclamationmark.bubble.right"),
+    ("goal", "设置或查看长期任务目标", "target"),
+    ("permission", "切换权限预设（沙箱模式与审批策略）", "checkmark.shield"),
+    ("plan", "进入或退出计划模式", "list.clipboard"),
+    ("model", "选择本会话使用的模型", "cpu"),
+]
+
+struct CommandMenuSheet: View {
+    let onCommand: (String) -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
                 Section("Commands") {
-                    ForEach(commands, id: \.0) { item in
-                        Button { onCommand(item.0) } label: {
+                    ForEach(DSHSlashCommands, id: \.id) { item in
+                        Button { onCommand(item.id) } label: {
                             Label {
                                 // Show the literal command the row runs, so the sheet
                                 // teaches the slash syntax instead of only describing it:
                                 // icon, "/command", a space, then the Chinese gloss.
                                 HStack(spacing: 0) {
-                                    Text("/\(item.0)")
+                                    Text("/\(item.id)")
                                         .font(.body.monospaced())
                                         .foregroundStyle(.tint)
-                                    Text(" \(item.1)")
+                                    Text(" \(item.gloss)")
                                         .foregroundStyle(.primary)
                                 }
                             } icon: {
-                                Image(systemName: item.2).foregroundStyle(.tint)
+                                Image(systemName: item.icon).foregroundStyle(.tint)
                             }
                         }
-                        .accessibilityLabel("/\(item.0) \(item.1)")
+                        .accessibilityLabel("/\(item.id) \(item.gloss)")
                     }
                 }
             }
@@ -1183,9 +2640,6 @@ struct CommandMenuSheet: View {
                                  trailingTitle: "Done", trailingAction: onDismiss)
             }
             .toolbar(.hidden, for: .navigationBar)
-            .onChange(of: selectedPhoto) { _, item in
-                if item != nil { onDismiss() }
-            }
         }
     }
 }
@@ -1203,9 +2657,15 @@ private struct ModelPickerSheet: View {
                         Section(group.name) {
                             ForEach(group.models) { item in
                                 Button {
-                                    model.selectModel(DSHModelSelection(provider: group.id, model: item.id,
-                                                                         reasoningEffort: item.reasoning?.defaultEffort), for: sessionID)
+                                    let selection = DSHModelSelection(provider: group.id, model: item.id,
+                                                                      reasoningEffort: item.reasoning?.defaultEffort)
                                     dismiss()
+                                    // Same dismiss-first sequencing as the
+                                    // effort popover: the refresh behind the
+                                    // send stutters the sheet animation.
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                        model.selectModel(selection, for: sessionID)
+                                    }
                                 } label: {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(item.name).foregroundStyle(.primary)
@@ -1214,6 +2674,23 @@ private struct ModelPickerSheet: View {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // Providers the Harness failed to load used to vanish
+                    // silently, leaving the user wondering where their models
+                    // went. List them with the reported reason instead.
+                    if !catalog.failures.isEmpty {
+                        Section("不可用") {
+                            ForEach(catalog.failures) { failure in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(failure.name).foregroundStyle(.secondary)
+                                    Text(failure.message)
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityLabel("\(failure.name)不可用：\(failure.message)")
                             }
                         }
                     }
@@ -1230,6 +2707,94 @@ private struct ModelPickerSheet: View {
             }
             .toolbar(.hidden, for: .navigationBar)
         }
+    }
+}
+
+private struct QueuedPromptsSheet: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
+    @State private var editingItem: DSHAppModel.DSHQueuedPrompt?
+    @State private var editingText = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                let queued = model.queuedPrompts(for: sessionID)
+                if queued.isEmpty {
+                    Text("暂无排队消息")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(queued) { item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(item.mode == "steer" ? "插话" : "排队")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(Color.accentColor)
+                                if item.sent {
+                                    Text("已发送·等待执行")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Text(item.sentAt, style: .time)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Text(item.text)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 4)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            if !item.sent {
+                                Button("立即发送") {
+                                    sendNow(item)
+                                }
+                                .tint(.accentColor)
+                                Button("编辑") {
+                                    editingItem = item
+                                    editingText = item.text
+                                }
+                                Button("取消", role: .destructive) {
+                                    model.cancelQueuedPrompt(id: item.id, sessionID: sessionID)
+                                }
+                            }
+                        }
+                    }
+                    Section {
+                        Text("本机暂存的排队上轮结束自动发出，可编辑/取消/立即发送；已发送的由服务端执行，不可改删，接收后自动消失。")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("排队消息")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+            .alert("编辑排队消息", isPresented: Binding(
+                get: { editingItem != nil },
+                set: { if !$0 { editingItem = nil } }
+            )) {
+                TextField("消息内容", text: $editingText, axis: .vertical)
+                Button("取消", role: .cancel) { editingItem = nil }
+                Button("保存") {
+                    if let item = editingItem {
+                        model.updateQueuedPrompt(id: item.id, text: editingText, sessionID: sessionID)
+                    }
+                    editingItem = nil
+                }
+            }
+        }
+    }
+
+    private func sendNow(_ item: DSHAppModel.DSHQueuedPrompt) {
+        guard model.takeQueuedPrompt(id: item.id, sessionID: sessionID) != nil else { return }
+        model.sendPrompt(item.text, to: sessionID)
     }
 }
 
@@ -1394,73 +2959,144 @@ private struct ModelChangeCard: View {
     }()
 }
 
+private struct MessageInteractionModifier: ViewModifier {
+    let isUser: Bool
+    let onCopy: () -> Void
+    let onTapAssistant: () -> Void
+
+    func body(content: Content) -> some View {
+        if isUser {
+            content.contextMenu {
+                Button(action: onCopy) {
+                    Label("复制", systemImage: "doc.on.doc")
+                }
+            }
+        } else {
+            content.onTapGesture(perform: onTapAssistant)
+        }
+    }
+}
+
 private struct MessageBubble: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
     let message: DSHChatMessage
+    let onBranch: (() -> Void)?
     @State private var showActions = false
-    @State private var showDeleteConfirmation = false
     @State private var didCopy = false
+
+    init(sessionID: String, message: DSHChatMessage, onBranch: (() -> Void)? = nil) {
+        self.sessionID = sessionID
+        self.message = message
+        self.onBranch = onBranch
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                if message.role == .user { Spacer(minLength: 36) }
-                messageContent
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.12))
-                    .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .contentShape(RoundedRectangle(cornerRadius: 16))
-                    .onTapGesture {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            showActions = true
-                        }
+            // Media lives outside the tinted bubble so photos are never
+            // squeezed into (or masked by) its rounded shape.
+            if !message.attachments.isEmpty {
+                HStack {
+                    if message.role == .user { Spacer(minLength: 36) }
+                    MessageAttachmentsView(attachments: message.attachments,
+                                           alignTrailing: message.role == .user)
+                    if message.role != .user { Spacer(minLength: 0) }
+                }
+            }
+            if !message.markdown.isEmpty {
+                HStack {
+                    if message.role == .user { Spacer(minLength: 36) }
+                    if message.role == .user {
+                        MarkdownBlockText(text: message.markdown)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Color.accentColor.opacity(0.12))
+                            .foregroundStyle(Color.accentColor)
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .contentShape(Rectangle())
+                            .modifier(MessageInteractionModifier(isUser: true,
+                                                                 onCopy: copyMessage,
+                                                                 onTapAssistant: {}))
+                    } else {
+                        // No bubble and deliberately no clip: the old rounded
+                        // clip cut the square corners of code/table
+                        // backgrounds, which read as an oval mask over the
+                        // reply.
+                        MarkdownBlockText(text: message.markdown)
+                            .textSelection(.enabled)
+                            .contentShape(Rectangle())
+                            .modifier(MessageInteractionModifier(isUser: false,
+                                                                 onCopy: copyMessage,
+                                                                 onTapAssistant: {
+                                                                     withAnimation(.easeOut(duration: 0.15)) {
+                                                                         showActions = true
+                                                                     }
+                                                                 }))
                     }
-                if message.role != .user { Spacer(minLength: 36) }
+                    if message.role != .user { Spacer(minLength: 0) }
+                }
             }
 
-            if model.showMessageActionsByDefault || showActions {
+            if message.role != .user && (model.showMessageActionsByDefault || showActions) {
+                // The two glyphs share one visual height (resizable + fixed
+                // height) so their top/bottom edges line up. Two SF Symbols
+                // at the same font size never match visually because each
+                // glyph carries its own bounding box — that was the mismatch
+                // in the screenshot.
                 HStack(spacing: 12) {
-                    if message.role == .user { Spacer(minLength: 36) }
-
                     Button(action: copyMessage) {
                         Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                            .frame(width: 28, height: 24)
+                            .resizable()
+                            .scaledToFit()
+                            .fontWeight(.medium)
+                            .frame(height: 17)
+                            .frame(width: 28, height: 28)
                     }
                     .accessibilityLabel(didCopy ? "Copied" : "Copy")
 
-                    Button(role: .destructive) {
-                        showDeleteConfirmation = true
-                    } label: {
-                        Image(systemName: "trash")
-                            .frame(width: 28, height: 24)
+                    if let onBranch {
+                        // One size down from copy, same centered box: quieter
+                        // secondary action, still easy to hit.
+                        Button(action: onBranch) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .resizable()
+                                .scaledToFit()
+                                .fontWeight(.medium)
+                                .frame(height: 14)
+                                .frame(width: 28, height: 28)
+                        }
+                        .accessibilityLabel("从此分支新建会话")
                     }
-                    .accessibilityLabel("Delete")
-
-                    if message.role != .user { Spacer(minLength: 36) }
+                    if let timeText = messageTimeText {
+                        Text(timeText)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
                 }
-                .font(.caption)
                 .foregroundStyle(.secondary)
                 .buttonStyle(.plain)
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .confirmationDialog("Delete this message?",
-                            isPresented: $showDeleteConfirmation,
-                            titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                model.hideMessage(message.id, in: sessionID)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This removes the message from this iPhone only. The original Harness history on your Mac is unchanged.")
-        }
     }
 
-    private func copyMessage() {
-        let attachmentLines = message.attachments.map { "📎 \($0.name)" }
+    /// Reply timestamp ("Tuesday 17:56" / "星期二 17:56"), stamped from the
+    /// event envelope on first sighting. Absent for rows that predate it.
+    private var messageTimeText: String? {
+        guard let ms = message.timestamp, ms > 0 else { return nil }
+        return Self.timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1_000))
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "EEEE HH:mm"
+        return formatter
+    }()
+
+    private func copyMessage() {        let attachmentLines = message.attachments.map { "📎 \($0.name)" }
         let value = ([message.markdown] + attachmentLines)
             .filter { !$0.isEmpty }
             .joined(separator: message.markdown.isEmpty ? "\n" : "\n\n")
@@ -1472,30 +3108,34 @@ private struct MessageBubble: View {
         }
     }
 
-    @ViewBuilder private var messageContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !message.attachments.isEmpty {
-                MessageAttachmentsView(attachments: message.attachments)
-            }
-            if !message.markdown.isEmpty {
-                MarkdownBlockText(text: message.markdown)
-                    // Long-press to select and copy a reply.
-                    .textSelection(.enabled)
-            }
-        }
-    }
 }
 
+/// Square thumbnails in one row so any number of quoted images stays tidy.
 private struct MessageAttachmentsView: View {
     let attachments: [DSHMessageAttachment]
+    /// User uploads sit on the right with the user's bubble; Mac-side
+    /// attachments stay left with the assistant.
+    var alignTrailing = false
+
+    private var images: [DSHMessageAttachment] { attachments.filter(\.isImage) }
+    private var files: [DSHMessageAttachment] { attachments.filter { !$0.isImage } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(attachments) { attachment in
+        VStack(alignment: alignTrailing ? .trailing : .leading, spacing: 6) {
+            if !images.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(images) { attachment in
+                            MessageAttachmentPreview(attachment: attachment)
+                        }
+                    }
+                }
+            }
+            ForEach(files) { attachment in
                 MessageAttachmentPreview(attachment: attachment)
             }
         }
-        .frame(maxWidth: 280, alignment: .leading)
+        .frame(maxWidth: 300, alignment: alignTrailing ? .trailing : .leading)
     }
 }
 
@@ -1506,20 +3146,11 @@ private struct MessageAttachmentPreview: View {
 
     var body: some View {
         Group {
-            if attachment.isImage, let data, let image = UIImage(data: data) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: 260, maxHeight: 190)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                    Text(attachment.name)
-                        .font(.caption2)
-                        .lineLimit(1)
-                }
-            } else {
+            if let data, attachment.isImage, UIImage(data: data) != nil {
+                MessageImageThumbnail(data: data, name: attachment.name)
+            } else if !attachment.isImage {
                 HStack(spacing: 8) {
-                    Image(systemName: attachment.isImage ? "photo" : "paperclip")
+                    Image(systemName: "paperclip")
                         .font(.caption.weight(.semibold))
                     Text(attachment.name)
                         .font(.caption)
@@ -1529,10 +3160,87 @@ private struct MessageAttachmentPreview: View {
                 .padding(.horizontal, 9)
                 .padding(.vertical, 7)
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                // Image bytes not in cache yet: keep the square slot so the
+                // row does not jump when the thumbnail lands.
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(width: 96, height: 96)
+                    .overlay {
+                        Image(systemName: "photo")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel(attachment.name)
             }
         }
         .task(id: attachment.id) {
             data = model.attachmentData(for: attachment)
+        }
+    }
+}
+
+/// Full-screen image preview for staged and quoted thumbnails.
+struct DSHImageViewer: View {
+    let image: UIImage
+    let name: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack {
+                HStack {
+                    Text(name)
+                        .font(.subheadline)
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 12)
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭预览")
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+}
+
+/// Fixed square thumbnail: every quoted image occupies the same slot.
+/// Tapping opens the full-screen viewer.
+private struct MessageImageThumbnail: View {
+    let data: Data
+    let name: String
+
+    @State private var showViewer = false
+
+    var body: some View {
+        if let image = UIImage(data: data) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 96, height: 96)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .contentShape(Rectangle())
+                .onTapGesture { showViewer = true }
+                .accessibilityLabel(name)
+                .accessibilityAddTraits(.isButton)
+                .fullScreenCover(isPresented: $showViewer) {
+                    DSHImageViewer(image: image, name: name)
+                }
         }
     }
 }
@@ -1645,6 +3353,8 @@ private struct MarkdownBlockView: View {
                 inline(text).foregroundStyle(.secondary)
             }
             .fixedSize(horizontal: false, vertical: true)
+            .padding(10)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
         case .table(let header, let rows):
             MarkdownTableView(header: header, rows: rows)
@@ -1721,81 +3431,131 @@ private struct AssistantTurnView: View {
     @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
     let block: DSHTranscriptBlock
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(block.visibleMessages) { message in
-                MessageBubble(sessionID: sessionID, message: message)
-            }
-            if !block.reasoning.isEmpty {
-                ThinkingDisclosure(text: block.reasoning,
-                                   answerCount: block.visibleMessages.count,
-                                   usage: block.visibleMessages.last?.usage,
-                                   showUsage: model.showTurnUsage)
-            }
-        }
-    }
-}
-
-/// Collapsed by default: one subdued row per turn. Expanding is capped in
-/// height and scrolls, so a long chain-of-thought can never push the answers
-/// off screen — the failure mode this replaced.
-private struct ThinkingDisclosure: View {
-    let text: String
-    let answerCount: Int
-    let usage: DSHSessionUsage?
-    let showUsage: Bool
+    let tools: [DSHToolActivity]
+    let onBranch: () -> Void
 
     @State private var isExpanded = false
+    /// Whether the open state came from the reader's own tap. Auto-opened
+    /// traces collapse again when their tools settle, so finished steps never
+    /// bury the conversation; a manually opened trace stays as left.
+    @State private var manualExpansion = false
 
-    private var title: String {
-        isExpanded ? "Hide thinking" : "Thinking"
+    private var text: String { block.reasoning }
+    private var answerCount: Int { block.visibleMessages.count }
+    private var usage: DSHSessionUsage? { block.visibleMessages.last?.usage }
+    private var showUsage: Bool { model.showTurnUsage }
+
+    /// Live means literally running: failed/error/cancelled tools are
+    /// settled, not live. Counting them as live kept turns (and the live
+    /// trail) stuck open forever after any failure.
+    private var hasRunningTools: Bool {
+        tools.contains { $0.status.lowercased() == "running" }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                    Text(title)
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    Spacer(minLength: 0)
-                    if showUsage, let usage {
-                        Text(turnStats(usage))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 0) {
+            if isExpandable || turnDurationText(usage) != nil {
+                timelineRow
+                // Same width as the reply text: no full-bleed. The old
+                // -16 bleed drew the rule past the text on both sides.
+                Divider()
+                    .padding(.top, 8)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(isExpanded ? "Hide reasoning" : "Show reasoning")
-            .accessibilityHint(answerCount > 1
-                ? "Reasoning behind \(answerCount) answers in this turn"
-                : "Reasoning behind this answer")
-
-            if isExpanded {
-                ScrollView {
-                    Text(text)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 240)
-                .padding(10)
-                .background(Color.secondary.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .transition(.opacity.combined(with: .move(edge: .top)))
+            ForEach(block.visibleMessages) { message in
+                MessageBubble(sessionID: sessionID, message: message, onBranch: onBranch)
+                    .padding(.top, 12)
             }
         }
-        .frame(maxWidth: 320, alignment: .leading)
+        .onAppear {
+            if hasRunningTools { isExpanded = true }
+        }
+        .onChange(of: hasRunningTools) { _, running in
+            // Never hide live work: a newly started tool reopens the trace.
+            // When the tools settle, an auto-opened trace folds itself away;
+            // one the reader opened by hand stays as left.
+            if running {
+                withAnimation(.easeOut(duration: 0.2)) { isExpanded = true; manualExpansion = false }
+            } else if !manualExpansion {
+                withAnimation(.easeOut(duration: 0.2)) { isExpanded = false }
+            }
+        }
+    }
+
+    private var isExpandable: Bool {
+        !block.reasoning.isEmpty || !tools.isEmpty
+    }
+
+    /// Reference layout: timing text with the chevron tucked right behind
+    /// it (not pinned to the trailing edge), then a full-bleed divider.
+    @ViewBuilder
+    private var timelineRow: some View {
+        if isExpandable {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) { isExpanded.toggle(); manualExpansion = true }
+            } label: {
+                timelineLabel
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.vertical, 8)
+            .accessibilityLabel(DSHLocalization.string(isExpanded ? "Hide reasoning" : "Show reasoning"))
+            .accessibilityHint(answerCount > 1
+                ? String(format: DSHLocalization.string("Reasoning behind %lld answers in this turn"),
+                         answerCount)
+                : DSHLocalization.string("Reasoning behind this answer"))
+        } else {
+            timelineLabel
+                .padding(.vertical, 8)
+        }
+
+        if isExpanded {
+            VStack(alignment: .leading, spacing: 8) {
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    ScrollView {
+                        Text(text)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 240)
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                ForEach(tools) { tool in
+                    ToolActivityCard(tool: tool)
+                }
+            }
+            .padding(.bottom, 4)
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
+    }
+
+    @ViewBuilder
+    private var timelineLabel: some View {
+        HStack(spacing: 6) {
+            Text(timelineTitle)
+                .font(.body)
+                .foregroundStyle(.secondary)
+            if isExpandable {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
+            if showUsage, let usage {
+                Text(turnStats(usage))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var timelineTitle: String {
+        turnDurationText(usage) ?? DSHLocalization.string("Thinking")
     }
 
     private func turnStats(_ usage: DSHSessionUsage) -> String {
@@ -1803,6 +3563,27 @@ private struct ThinkingDisclosure: View {
         let output = usage.outputTokens ?? 0
         if input == 0 && output == 0 { return "" }
         return "\(compact(input + output)) tok"
+    }
+
+    /// Wall-clock estimate from the turn's own counters: tokens ÷ speed.
+    private func turnDurationText(_ usage: DSHSessionUsage?) -> String? {
+        guard let usage,
+              let speed = usage.tokensPerSecond, speed > 0 else { return nil }
+        let total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+        guard total > 0 else { return nil }
+        let seconds = Int((total / speed).rounded())
+        if seconds < 60 {
+            return String(format: DSHLocalization.string("Took %lld sec"), seconds)
+        }
+        let minutes = seconds / 60
+        let rest = seconds % 60
+        if minutes < 60 {
+            return rest == 0
+                ? String(format: DSHLocalization.string("Took %lld min"), minutes)
+                : String(format: DSHLocalization.string("Took %lld min %lld sec"), minutes, rest)
+        }
+        return String(format: DSHLocalization.string("Took %lld hr %lld min"),
+                      minutes / 60, minutes % 60)
     }
 
     private func compact(_ value: Double) -> String {

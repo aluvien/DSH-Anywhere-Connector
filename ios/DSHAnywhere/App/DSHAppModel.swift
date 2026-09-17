@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UserNotifications
 
 private enum DSHAttachmentUploadError: LocalizedError {
     case timedOut
@@ -44,6 +45,14 @@ enum DSHDeviceStatus: Equatable {
     case approvalRequired
 }
 
+/// Per-session traffic light shown as the row dot.
+enum DSHSessionDot: Sendable, Equatable {
+    case none
+    case green
+    case yellow
+    case red
+}
+
 @MainActor
 final class DSHAppModel: ObservableObject {
     @Published private(set) var state: DSHStoreState
@@ -62,10 +71,11 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.object(forKey: DSHAppModel.usageFooterKey) as? Bool ?? true
     @Published var showTurnUsage: Bool =
         UserDefaults.standard.object(forKey: DSHAppModel.turnUsageKey) as? Bool ?? false
-    /// Message copy/delete controls stay out of the transcript until a user
-    /// taps a message. Power users can opt into showing them on every row.
+    /// Assistant copy/branch controls are visible by default, matching Remote.
+    /// The setting remains available for a quieter transcript; user messages
+    /// always use the native long-press copy menu instead of inline controls.
     @Published var showMessageActionsByDefault: Bool =
-        UserDefaults.standard.object(forKey: DSHAppModel.messageActionsKey) as? Bool ?? false
+        UserDefaults.standard.object(forKey: DSHAppModel.messageActionsKey) as? Bool ?? true
     @Published var collapseComposerControls: Bool =
         UserDefaults.standard.object(forKey: DSHAppModel.composerCollapsedKey) as? Bool ?? true
     /// Both home experiences remain in the app so a user can switch between
@@ -125,7 +135,18 @@ final class DSHAppModel: ObservableObject {
     /// message. Queue the local thumbnails so that event can attach them to the
     /// correct transcript row without guessing by message text.
     private var pendingMessageAttachmentsBySession: [String: [[DSHMessageAttachment]]] = [:]
-    private var attachmentDataByReceipt: [String: Data] = [:]
+    /// Thumbnail bytes by receipt. NSCache, not a dict: image bytes are the
+    /// largest thing the app holds, a dict would grow without bound, and
+    /// cache reads happen off the main actor where a dict would race.
+    private let attachmentDataCache: NSCache<NSString, NSData> = {
+        let cache = NSCache<NSString, NSData>()
+        cache.countLimit = 100
+        cache.totalCostLimit = 50 * 1024 * 1024
+        return cache
+    }()
+    /// Disk ceiling for the same thumbnails; enforced oldest-first on write.
+    /// Nonisolated: the eviction sweep runs on a detached background task.
+    nonisolated static let attachmentDiskBudgetBytes = 200 * 1024 * 1024
     private let deviceID = "ios-device"
     /// Every in-flight `session.create` request keeps the snapshot it was
     /// created against. The Connector echoes that request id in
@@ -137,6 +158,35 @@ final class DSHAppModel: ObservableObject {
     /// the session exists. They are uploaded and sent as one initial prompt
     /// immediately after the matching `session.created` event arrives.
     private var pendingInitialMessagesByRequestID: [String: DSHPendingInitialMessage] = [:]
+    /// Request ids currently awaited by `uploadAttachmentAndWait`. Their
+    /// `protocolError`s are consumed by that waiter (see `surfaceProtocolError`)
+    /// and must not also pop the global alert.
+    private var uploadWaitRequestIDs: Set<String> = []
+    /// Last `openSession` per session, to collapse duplicate replays.
+    private var lastOpenSessionAt: [String: Date] = [:]
+    /// Force-merge tasks for history batches whose closing bracket never
+    /// arrives (bridge died mid-stream). Keyed by session id.
+    private var historyTimeoutTasks: [String: Task<Void, Never>] = [:]
+    /// Already-notified request ids and failed sessions (see notifyForEvent).
+    private var notifiedApprovalIDs: Set<String> = []
+    private var notifiedQuestionIDs: Set<String> = []
+    private var notifiedFailedSessions: Set<String> = []
+
+    /// Drops all in-flight per-machine bookkeeping. History batches belong to
+    /// the previous machine's socket, so their timeouts die here too (the
+    /// state reset already drops any carried-over rows).
+    private func resetTransientRequestState() {
+        pendingEvents.removeAll(keepingCapacity: false)
+        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
+        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        for task in historyTimeoutTasks.values { task.cancel() }
+        historyTimeoutTasks.removeAll(keepingCapacity: false)
+        lastOpenSessionAt.removeAll(keepingCapacity: false)
+        // Queued prompts belong to one machine: swap the in-memory set for
+        // the newly active machine's persisted one (disk already holds both).
+        queuedPromptsBySession.removeAll(keepingCapacity: false)
+        restoreQueuedPrompts()
+    }
     private let profiles = DSHProfileStore()
     private let unreadBaseline = DSHAppModel.loadOrCreateUnreadBaseline()
     static let groupingKey = "dsh-anywhere.session-list-grouping"
@@ -164,6 +214,7 @@ final class DSHAppModel: ObservableObject {
             self.machineName = active.machineName
             self.machineID = active.machineId
         }
+        restoreQueuedPrompts()
     }
 
     /// The Mac the app is currently talking to.
@@ -175,6 +226,20 @@ final class DSHAppModel: ObservableObject {
     var pendingApprovals: [DSHApprovalRequest] { state.pendingApprovals }
     var pendingQuestions: [DSHQuestionRequest] { state.pendingQuestions }
     var connectionState: DSHConnectionState { state.connectionState }
+
+    /// Per-session traffic light, same hues as the header status dot:
+    /// red = turn died on an error, yellow = the Mac is waiting on the
+    /// user (approval or questions), green = unread or running activity.
+    func sessionDot(for session: DSHSessionSummary) -> DSHSessionDot {
+        let turn = turnState(for: session.id).lowercased()
+        if turn == "failed" || turn == "error" { return .red }
+        if pendingApprovals.contains(where: { $0.sessionId == session.id })
+            || pendingQuestions.contains(where: { $0.sessionId == session.id }) {
+            return .yellow
+        }
+        if session.running == true || isSessionUnread(session) { return .green }
+        return .none
+    }
 
     var deviceStatus: DSHDeviceStatus {
         switch state.transportState {
@@ -227,6 +292,11 @@ final class DSHAppModel: ObservableObject {
         )
     }
 
+    /// Render units: assistant turns with their tool calls folded in.
+    func transcriptSections(for sessionID: String) -> [DSHTranscriptSection] {
+        transcriptEntries(for: sessionID).groupedTurns()
+    }
+
     /// Hides one message on this device. Per-message deletion is not currently
     /// exposed by the Connector/Harness protocol, so this intentionally does
     /// not pretend to mutate the Mac's source history.
@@ -270,13 +340,16 @@ final class DSHAppModel: ObservableObject {
     /// on disk for a later session-history reload. Only the thumbnail bytes are
     /// cached; the original camera-library asset never leaves Photos.
     func cacheAttachmentData(_ data: Data, for receiptId: String) {
-        attachmentDataByReceipt[receiptId] = data
+        attachmentDataCache.setObject(data as NSData, forKey: receiptId as NSString, cost: data.count)
         let url = attachmentCacheURL.appendingPathComponent(receiptId.dshAttachmentCacheFileName)
         Task.detached(priority: .utility) {
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                           withIntermediateDirectories: true)
                 try data.write(to: url, options: [.atomic])
+                Self.evictAttachmentCache(
+                    directory: url.deletingLastPathComponent(),
+                    keepingBytesUnder: Self.attachmentDiskBudgetBytes)
             } catch {
                 // A cache miss only removes the thumbnail; the Harness file and
                 // the message itself remain intact.
@@ -284,12 +357,37 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
+    /// Deletes oldest-first until the thumbnail directory fits the budget.
+    /// Internal (not private) so the eviction order is unit-tested.
+    /// Nonisolated: it runs on a detached background task and only touches
+    /// its parameters plus FileManager.
+    nonisolated static func evictAttachmentCache(directory: URL, keepingBytesUnder budget: Int) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]) else { return }
+        var entries: [(url: URL, size: Int, date: Date)] = []
+        var total = 0
+        for url in files {
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let size = values.fileSize else { continue }
+            total += size
+            entries.append((url, size, values.contentModificationDate ?? .distantPast))
+        }
+        guard total > budget else { return }
+        for entry in entries.sorted(by: { $0.date < $1.date }) {
+            try? FileManager.default.removeItem(at: entry.url)
+            total -= entry.size
+            if total <= budget { break }
+        }
+    }
+
     func attachmentData(for attachment: DSHMessageAttachment) -> Data? {
         let key = attachment.receiptId ?? attachment.id
-        if let cached = attachmentDataByReceipt[key] { return cached }
+        if let cached = attachmentDataCache.object(forKey: key as NSString) { return cached as Data }
         let url = attachmentCacheURL.appendingPathComponent(key.dshAttachmentCacheFileName)
         guard let data = try? Data(contentsOf: url) else { return nil }
-        attachmentDataByReceipt[key] = data
+        attachmentDataCache.setObject(data as NSData, forKey: key as NSString, cost: data.count)
         return data
     }
 
@@ -349,9 +447,7 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        pendingEvents.removeAll(keepingCapacity: false)
-        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
-        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        resetTransientRequestState()
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
@@ -441,9 +537,7 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        pendingEvents.removeAll(keepingCapacity: false)
-        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
-        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        resetTransientRequestState()
         Task { await transport.disconnect() }
         state.transportState = .disconnected
         state.machineOnline = false
@@ -456,9 +550,7 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        pendingEvents.removeAll(keepingCapacity: false)
-        pendingSessionCreationKnownIDs.removeAll(keepingCapacity: false)
-        pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        resetTransientRequestState()
         Task { @MainActor [weak self] in
             do { try await self?.transport.forgetPairing() }
             catch { self?.errorMessage = error.localizedDescription }
@@ -502,7 +594,9 @@ final class DSHAppModel: ObservableObject {
         pendingSessionCreationKnownIDs[requestId] = known
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         var payload: [String: DSHJSONValue] = ["title": .string(cleanTitle.isEmpty ? "新会话" : cleanTitle)]
-        if let workingDirectory {
+        // The bridge accepts workspaceId OR cwd, never both: the workspace
+        // registry already resolves the directory, so sending both is a 400.
+        if workspace == nil, let workingDirectory {
             let cleanPath = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleanPath.isEmpty { payload["workingDirectory"] = .string(cleanPath) }
         }
@@ -571,7 +665,13 @@ final class DSHAppModel: ObservableObject {
     /// Loads the durable transcript for an existing session. Session snapshots
     /// intentionally contain metadata only; opening a conversation asks the
     /// Mac bridge to inspect that session and stream its normalized history.
+    /// Replays less than two seconds apart are the same user gesture (appear
+    /// plus pull-to-refresh): the second stream would only interleave a
+    /// duplicate of the first, so it is skipped.
     func openSession(_ sessionID: String) {
+        let now = Date()
+        if let last = lastOpenSessionAt[sessionID], now.timeIntervalSince(last) < 2 { return }
+        lastOpenSessionAt[sessionID] = now
         send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
                                     sessionId: sessionID))
     }
@@ -669,15 +769,296 @@ final class DSHAppModel: ObservableObject {
     }
 
     func sendPrompt(_ text: String, attachments: [String],
-                    messageAttachments: [DSHMessageAttachment] = [], to sessionID: String) {
+                    messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
+                    mode: String = "queue") {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         if !messageAttachments.isEmpty {
             pendingMessageAttachmentsBySession[sessionID, default: []].append(messageAttachments)
         }
+        let requestId = UUID().uuidString
+        pendingSendsByRequestID[requestId] = DSHPendingSend(
+            id: requestId, text: trimmed, receipts: attachments,
+            sessionID: sessionID, sentAt: .now)
+        armSendAckTimeout(requestId: requestId)
         let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
         send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
-                                   sessionId: sessionID, text: trimmed, attachments: parts))
+                                   sessionId: sessionID, text: trimmed, attachments: parts,
+                                   mode: mode, requestId: requestId))
+    }
+
+    /// An outbound prompt awaiting its accepted user message. If nothing
+    /// comes back, the send failed somewhere between this phone and the Mac.
+    struct DSHPendingSend: Sendable, Equatable, Identifiable {
+        let id: String
+        let text: String
+        let receipts: [String]
+        let sessionID: String
+        let sentAt: Date
+    }
+
+    enum DSHSendFailure: Sendable, Equatable {
+        /// Never left the phone (socket down at send time or at timeout).
+        case local(String)
+        /// Left the phone but the Mac never acknowledged (or rejected it).
+        case server(String)
+    }
+
+    struct DSHFailedSend: Sendable, Equatable, Identifiable {
+        let id: String
+        let text: String
+        let receipts: [String]
+        let sessionID: String
+        let failure: DSHSendFailure
+    }
+
+    private var pendingSendsByRequestID: [String: DSHPendingSend] = [:]
+    @Published var failedSend: DSHFailedSend?
+    /// Acceptance window before a send is declared lost. Internal for tests.
+    var sendAckTimeout: TimeInterval = 15
+
+    func pendingSendCount(for sessionID: String) -> Int {
+        pendingSendsByRequestID.values.filter { $0.sessionID == sessionID }.count
+    }
+
+    private func armSendAckTimeout(requestId: String) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(self?.sendAckTimeout ?? 15))
+            self?.timeoutPendingSend(requestId: requestId)
+        }
+    }
+
+    func timeoutPendingSend(requestId: String) {
+        guard let pending = pendingSendsByRequestID[requestId] else { return }
+        pendingSendsByRequestID.removeValue(forKey: requestId)
+        let failure: DSHSendFailure
+        if let detail = state.protocolErrorsByRequestID[requestId], !detail.isEmpty {
+            failure = .server(detail)
+        } else if connectionState != .connected {
+            failure = .local("连接已断开")
+        } else {
+            failure = .server("Mac 未响应")
+        }
+        failedSend = DSHFailedSend(id: requestId, text: pending.text,
+                                   receipts: pending.receipts,
+                                   sessionID: pending.sessionID, failure: failure)
+    }
+
+    /// An accepted user message acknowledges the matching send (and heals a
+    /// stale failure banner for the same text).
+    func confirmPendingSend(text: String, sessionID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let key = pendingSendsByRequestID.values.first(
+            where: { $0.sessionID == sessionID && $0.text == trimmed })?.id {
+            pendingSendsByRequestID.removeValue(forKey: key)
+        }
+        if failedSend?.sessionID == sessionID && failedSend?.text == trimmed {
+            failedSend = nil
+        }
+    }
+
+    /// A transport throw means the prompt never left the phone: park it for
+    /// retry instead of only flashing an alert, and drop its staged
+    /// thumbnails so they cannot attach to a later, unrelated message.
+    /// Internal for tests.
+    func parkFailedPromptSend(_ command: DSHCommand, error: Error) {
+        pendingSendsByRequestID.removeValue(forKey: command.requestId)
+        var receipts: [String] = []
+        var text = ""
+        var sessionID = ""
+        if case .object(let payload) = command.payload {
+            if case .string(let value) = payload["text"] { text = value }
+            if let sid = command.sessionId { sessionID = sid }
+            for key in ["attachments", "content"] {
+                if let value = payload[key] { receipts += receiptIds(in: value) }
+            }
+        }
+        if !receipts.isEmpty, var queues = pendingMessageAttachmentsBySession[sessionID] {
+            queues.removeAll { inner in
+                !inner.isEmpty && inner.allSatisfy { receipts.contains($0.receiptId ?? $0.id) }
+            }
+            pendingMessageAttachmentsBySession[sessionID] = queues
+        }
+        failedSend = DSHFailedSend(id: command.requestId, text: text, receipts: receipts,
+                                   sessionID: sessionID, failure: .local(error.localizedDescription))
+    }
+
+    private func receiptIds(in value: DSHJSONValue) -> [String] {
+        switch value {
+        case .object(let object):
+            if case .string(let receipt) = object["receiptId"] { return [receipt] }
+            return []
+        case .array(let items):
+            return items.flatMap { receiptIds(in: $0) }
+        default:
+            return []
+        }
+    }
+
+    func retryFailedSend() {
+        guard let failed = failedSend else { return }
+        failedSend = nil
+        sendPrompt(failed.text, attachments: failed.receipts, to: failed.sessionID)
+    }
+
+    func dismissFailedSend() {
+        failedSend = nil
+    }
+
+    /// A prompt this device queued while its session was busy. Text-only
+    /// holds stay on the device (editable/cancellable, auto-sent when the
+    /// turn settles); attachment sends go to the server queue immediately and
+    /// are only mirrored here for the bubble. Entries retire when accepted.
+    struct DSHQueuedPrompt: Sendable, Equatable, Identifiable, Codable {
+        let id: String
+        var text: String
+        let mode: String
+        let sentAt: Date
+        /// False = held locally (editable, cancellable, sendable). True =
+        /// already sent to the server queue (bubble mirror only).
+        let sent: Bool
+
+        init(id: String = UUID().uuidString, text: String, mode: String,
+             sentAt: Date = .now, sent: Bool = false) {
+            self.id = id; self.text = text; self.mode = mode
+            self.sentAt = sentAt; self.sent = sent
+        }
+    }
+
+    private var queuedPromptsBySession: [String: [DSHQueuedPrompt]] = [:]
+    private static let queuedPromptTTL: TimeInterval = 24 * 60 * 60
+    private static let queuedPromptsDefaultsKey = "dsh-anywhere.queued-prompts"
+
+    private var queuedPromptsDefaultsKey: String {
+        "\(Self.queuedPromptsDefaultsKey).\(machineID)"
+    }
+
+    /// Holds a text prompt locally until the turn settles (cancellable).
+    func holdQueuedPrompt(text: String, for sessionID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        queuedPromptsBySession[sessionID, default: []].append(
+            DSHQueuedPrompt(text: String(trimmed.prefix(2000)), mode: "queue"))
+        persistQueuedPrompts()
+    }
+
+    /// Mirrors an attachment send that went straight to the server queue.
+    func noteQueuedPrompt(text: String, mode: String, for sessionID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        queuedPromptsBySession[sessionID, default: []].append(
+            DSHQueuedPrompt(text: String(trimmed.prefix(500)), mode: mode, sent: true))
+        persistQueuedPrompts()
+    }
+
+    func queuedPrompts(for sessionID: String) -> [DSHQueuedPrompt] {
+        let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
+        let fresh = queuedPromptsBySession[sessionID, default: []].filter { $0.sentAt > cutoff }
+        if fresh.count != queuedPromptsBySession[sessionID]?.count {
+            queuedPromptsBySession[sessionID] = fresh
+            persistQueuedPrompts()
+        }
+        return fresh
+    }
+
+    func updateQueuedPrompt(id: String, text: String, sessionID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return }
+        queue[index].text = String(trimmed.prefix(2000))
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
+    }
+
+    /// Drops a locally held prompt before it ever fires. Server-sent entries
+    /// cannot be retracted (no queue API) and are refused here.
+    @discardableResult
+    func cancelQueuedPrompt(id: String, sessionID: String) -> Bool {
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return false }
+        queue.remove(at: index)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
+        return true
+    }
+
+    /// Pops the oldest locally held prompt for immediate sending.
+    func takeQueuedPrompt(id: String, sessionID: String) -> DSHQueuedPrompt? {
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return nil }
+        let item = queue.remove(at: index)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
+        return item
+    }
+
+    /// Fires the oldest held prompt when a turn settles. Returns false when
+    /// there is nothing to fire (or the session is gone).
+    @discardableResult
+    private func flushQueuedPrompt(for sessionID: String) -> Bool {
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { !$0.sent }) else { return false }
+        let item = queue.remove(at: index)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
+        sendPrompt(item.text, to: sessionID)
+        return true
+    }
+
+    private func persistQueuedPrompts() {
+        guard let data = try? JSONEncoder().encode(queuedPromptsBySession) else { return }
+        UserDefaults.standard.set(data, forKey: queuedPromptsDefaultsKey)
+    }
+
+    func restoreQueuedPrompts() {
+        guard let data = UserDefaults.standard.data(forKey: queuedPromptsDefaultsKey),
+              let restored = try? JSONDecoder().decode([String: [DSHQueuedPrompt]].self, from: data)
+        else { return }
+        let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
+        queuedPromptsBySession = restored.mapValues { $0.filter { $0.sentAt > cutoff } }
+    }
+
+    /// Retires the oldest queued entry whose text matches an accepted user
+    /// message (the queued prompt surfacing for its turn).
+    func matchQueuedPrompt(text: String, sessionID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.text == trimmed }) else { return }
+        queue.remove(at: index)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
+    }
+
+    /// A queued prompt surfacing for its turn arrives as an accepted user
+    /// message: retire the matching bubble entry.
+    private func retireQueuedPrompt(_ event: DSHEvent) {
+        guard case .userMessageAccepted(let message) = event.kind,
+              let sessionId = event.envelope.sessionId else { return }
+        matchQueuedPrompt(text: message.markdown, sessionID: sessionId)
+    }
+
+    /// An accepted user message is the send acknowledgment: the matching
+    /// outbound prompt made it to the Mac.
+    private func confirmSendAccepted(_ event: DSHEvent) {
+        guard case .userMessageAccepted(let message) = event.kind,
+              let sessionId = event.envelope.sessionId else { return }
+        confirmPendingSend(text: message.markdown, sessionID: sessionId)
+    }
+
+    /// When a turn settles, fire the oldest locally held prompt (FIFO — the
+    /// rest follow as their turns end). Only locally held prompts; the turn
+    /// that just ended already consumed the wire.
+    private func flushQueueOnSettle(_ event: DSHEvent) {
+        guard case .turnStateChanged(let turn) = event.kind else { return }
+        switch turn.state.lowercased() {
+        case "completed", "failed", "cancelled":
+            flushQueuedPrompt(for: turn.sessionId)
+        default:
+            break
+        }
     }
 
     func selectModel(_ selection: DSHModelSelection, for sessionID: String) {
@@ -742,6 +1123,8 @@ final class DSHAppModel: ObservableObject {
     /// the user taps Send.
     func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String) async throws -> String {
         let requestId = UUID().uuidString
+        uploadWaitRequestIDs.insert(requestId)
+        defer { uploadWaitRequestIDs.remove(requestId) }
         let command = DSHCommand.uploadAttachment(deviceId: deviceID, machineId: machineID,
                                                    sessionId: sessionID, name: name, data: data,
                                                    requestId: requestId)
@@ -851,7 +1234,17 @@ final class DSHAppModel: ObservableObject {
     private func send(_ command: DSHCommand) {
         Task { @MainActor [weak self] in
             do { try await self?.transport.send(command) }
-            catch { self?.errorMessage = error.localizedDescription }
+            catch {
+                guard let self else { return }
+                // A prompt that never left the phone parks for retry (with
+                // its text intact) instead of only flashing an alert while
+                // the draft is already gone.
+                if command.type == "prompt.send" {
+                    self.parkFailedPromptSend(command, error: error)
+                } else {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -886,7 +1279,129 @@ final class DSHAppModel: ObservableObject {
 
         for event in events {
             handleSessionCreated(event)
+            retireQueuedPrompt(event)
+            confirmSendAccepted(event)
+            flushQueueOnSettle(event)
+            surfaceProtocolError(event)
+            trackHistoryBatch(event)
+            notifyForEvent(event)
         }
+    }
+
+    /// Mirrors the yellow/red session dots in Notification Center: the Mac is
+    /// waiting on the user (approval, questions) or a turn died on an error.
+    /// Each request notifies once; a session re-arms its failure notice when
+    /// it leaves the failed state, so the next failure pings again.
+    private func notifyForEvent(_ event: DSHEvent) {
+        switch event.kind {
+        case .approvalRequested(let approval):
+            guard notifiedApprovalIDs.insert(approval.id).inserted else { return }
+            let sessionTitle = sessions.first(where: { $0.id == approval.sessionId })?.title
+            postLocalNotification(
+                title: approvalNotificationTitle(sessionTitle: sessionTitle),
+                body: "\(approval.toolName)：\(approval.reason)"
+            )
+        case .questionAsked(let request):
+            guard notifiedQuestionIDs.insert(request.id).inserted else { return }
+            let first = request.questions.first?.question ?? ""
+            postLocalNotification(title: "需要你回答问题", body: String(first.prefix(120)))
+        case .turnStateChanged(let turn):
+            let failed = turn.state.lowercased() == "failed" || turn.state.lowercased() == "error"
+            if failed {
+                guard !notifiedFailedSessions.contains(turn.sessionId) else { return }
+                notifiedFailedSessions.insert(turn.sessionId)
+                let sessionTitle = sessions.first(where: { $0.id == turn.sessionId })?.title
+                postLocalNotification(
+                    title: "任务执行中断",
+                    body: sessionTitle?.isEmpty == false ? (sessionTitle ?? "") : turn.sessionId
+                )
+            } else {
+                notifiedFailedSessions.remove(turn.sessionId)
+            }
+        default:
+            break
+        }
+    }
+
+    private func approvalNotificationTitle(sessionTitle: String?) -> String {
+        if let sessionTitle, !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "“\(sessionTitle)”需要权限确认"
+        }
+        return "需要权限确认"
+    }
+
+    /// Local notifications need no Info.plist key; the system prompts on
+    /// first use. Silent when denied — the in-app dots remain the fallback.
+    private func postLocalNotification(title: String, body: String) {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                switch status {
+                case .authorized, .provisional, .ephemeral:
+                    self.scheduleLocalNotification(title: title, body: body)
+                case .notDetermined:
+                    do {
+                        let granted = try await UNUserNotificationCenter.current()
+                            .requestAuthorization(options: [.alert, .sound])
+                        if granted {
+                            self.scheduleLocalNotification(title: title, body: body)
+                        }
+                    } catch {
+                        // Denied or failed: stay silent, dots cover it.
+                    }
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func scheduleLocalNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(
+            identifier: UUID().uuidString, content: content, trigger: nil
+        ))
+    }
+
+    /// Arms (or disarms) the force-merge fallback for one history batch. If
+    /// `history.completed` never arrives, the carry entry would linger; after
+    /// ten seconds it is merged back (normally a no-op, since rows are never
+    /// cleared for replays) and the entry is dropped.
+    private func trackHistoryBatch(_ event: DSHEvent) {
+        switch event.kind {
+        case .historyStarted(let batch):
+            historyTimeoutTasks[batch.sessionId]?.cancel()
+            historyTimeoutTasks[batch.sessionId] = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                guard let self, self.state.historyCarryOverBySession[batch.sessionId] != nil else { return }
+                var next = self.state
+                self.reducer.completeHistory(sessionId: batch.sessionId, batchId: nil, into: &next)
+                self.state = next
+                self.historyTimeoutTasks.removeValue(forKey: batch.sessionId)
+            }
+        case .historyCompleted(let batch):
+            historyTimeoutTasks[batch.sessionId]?.cancel()
+            historyTimeoutTasks.removeValue(forKey: batch.sessionId)
+        default:
+            break
+        }
+    }
+
+    /// Fire-and-forget commands (`selectModel`, `setPermission`, `sendPrompt`,
+    /// …) have no per-call waiter, so a Harness rejection used to sit unread
+    /// in `protocolErrorsByRequestID` while the UI acted as if the tap had
+    /// worked. Surface each one through the shared error alert instead.
+    /// Attachment uploads are excluded: their waiter already reports the same
+    /// error next to the composer, and double-reporting would just overwrite it.
+    private func surfaceProtocolError(_ event: DSHEvent) {
+        guard case .protocolError(let error) = event.kind else { return }
+        guard !uploadWaitRequestIDs.contains(event.envelope.messageId) else { return }
+        errorMessage = error.message
     }
 
     private func attachPendingMessageThumbnails(to state: inout DSHStoreState,
@@ -1015,6 +1530,10 @@ final class DSHAppModel: ObservableObject {
         let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
         model.machineName = "macmini"
         model.selectedSessionID = session.id
+        // Preview fixtures should always exercise the Remote surface even if
+        // a developer previously chose the classic layout in Settings.
+        model.useRemoteTaskLayout = true
+        model.showMessageActionsByDefault = true
         return model
     }
 

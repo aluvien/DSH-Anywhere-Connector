@@ -37,6 +37,28 @@ describe("DSH Anywhere wire protocol", () => {
     }
   });
 
+  it("parses history replay brackets carrying the same batch id", () => {
+    const started = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "history.started",
+      payload: { sessionId: "session-1", batchId: "batch-1" },
+    });
+    const completed = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sequence: 99,
+      sessionId: "session-1",
+      type: "history.completed",
+      payload: { sessionId: "session-1", batchId: "batch-1" },
+    });
+
+    expect(started.type).toBe("history.started");
+    expect(completed.type).toBe("history.completed");
+    if (started.type === "history.started" && completed.type === "history.completed") {
+      expect(started.payload.batchId).toBe(completed.payload.batchId);
+    }
+  });
+
   it("parses pairing request and accepted response", () => {
     const request = PairingRequestSchema.parse({
       version: PROTOCOL_VERSION,
