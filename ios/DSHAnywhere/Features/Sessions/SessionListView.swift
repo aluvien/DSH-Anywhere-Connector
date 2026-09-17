@@ -872,11 +872,137 @@ private enum DSHRemoteHomeMetrics {
     static let projectTextInset: CGFloat = 47
 }
 
-private struct DSHRemoteHomeWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
+/// The home dock deliberately shares the conversation composer's resting
+/// geometry: a 52pt capsule, horizontal 12pt page inset, and a 16pt distance
+/// from the safe-area edge.  Keeping it outside `ToolbarItem(.bottomBar)` is
+/// important: the system toolbar adds a second, opaque material slab and its
+/// own vertical margins, so it cannot line up with the conversation editor.
+///
+/// This view is intentionally internal rather than private.  It gives layout
+/// tests a stable surface for checking the resting and focused search states
+/// without having to traverse the home page's navigation tree.
+struct DSHHomeBottomBar: View {
+    @Binding private var searchText: String
+    @Binding private var isSearching: Bool
+    private let onNewTask: () -> Void
+    @FocusState private var searchFieldFocused: Bool
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+    init(searchText: Binding<String>,
+         isSearching: Binding<Bool>,
+         onNewTask: @escaping () -> Void) {
+        _searchText = searchText
+        _isSearching = isSearching
+        self.onNewTask = onNewTask
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if isSearching {
+                focusedSearchField
+                closeSearchButton
+            } else {
+                restingSearchButton
+                newChatButton
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12)
+        // These insets match `ConversationView.composer(proxy:)` exactly.
+        .padding(.top, 7)
+        .padding(.bottom, 8)
+        .accessibilityIdentifier("home-bottom-bar")
+        .onAppear { updateSearchFocus(isSearching) }
+        .onChange(of: isSearching) { _, searching in
+            updateSearchFocus(searching)
+        }
+    }
+
+    private var focusedSearchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 19, weight: .medium))
+                .foregroundStyle(.primary)
+
+            TextField("搜索聊天", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 17))
+                .focused($searchFieldFocused)
+                .submitLabel(.search)
+                .accessibilityIdentifier("home-search-field")
+        }
+        .padding(.horizontal, 17)
+        .frame(maxWidth: .infinity, minHeight: 52)
+        .dshFloatingChrome(Capsule())
+    }
+
+    private var closeSearchButton: some View {
+        Button { closeSearch() } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 20, weight: .medium))
+                .frame(width: 52, height: 52)
+                .contentShape(Circle())
+                .dshFloatingChrome(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("关闭搜索")
+        .accessibilityIdentifier("home-search-close-button")
+    }
+
+    private var restingSearchButton: some View {
+        Button {
+            isSearching = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 17, weight: .medium))
+                Text("搜索聊天")
+                    .font(.system(size: 17))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 17)
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .dshFloatingChrome(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("搜索聊天")
+        .accessibilityIdentifier("home-search-button")
+    }
+
+    private var newChatButton: some View {
+        Button(action: onNewTask) {
+            HStack(spacing: 6) {
+                DSHRemoteComposeGlyph(size: 18)
+                Text("聊天")
+                    .font(.system(size: 17, weight: .medium))
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 52)
+            .dshFloatingChrome(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("新建聊天")
+        .accessibilityIdentifier("home-new-chat-button")
+    }
+
+    private func closeSearch() {
+        searchText = ""
+        isSearching = false
+    }
+
+    private func updateSearchFocus(_ searching: Bool) {
+        guard searching else {
+            searchFieldFocused = false
+            return
+        }
+        // Waiting until the new TextField is in the hierarchy preserves
+        // native keyboard animation instead of briefly focusing a removed
+        // toolbar field.
+        DispatchQueue.main.async {
+            searchFieldFocused = true
+        }
     }
 }
 
@@ -888,8 +1014,6 @@ struct DSHRemoteHomeView: View {
     @State private var showSettings = false
     @State private var showSearch = false
     @State private var searchText = ""
-    @FocusState private var searchFieldFocused: Bool
-    @State private var homeContentWidth: CGFloat = 0
     @State private var showNewTask = {
         #if DEBUG
         return ProcessInfo.processInfo.arguments.contains("--dsh-preview-new-session")
@@ -1044,21 +1168,21 @@ struct DSHRemoteHomeView: View {
                 model.sendModelCatalog()
             }
             .background(Color(.systemBackground))
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(key: DSHRemoteHomeWidthPreferenceKey.self,
-                                           value: proxy.size.width)
-                }
-            }
             .safeAreaInset(edge: .top, spacing: 0) {
                 if !showSearch { remoteHeader }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                DSHHomeBottomBar(searchText: $searchText,
+                                 isSearching: $showSearch,
+                                 onNewTask: { openNewTask() })
+                    // ConversationView adds this final clearance outside its
+                    // own composer dock.  Match it so the two resting bars
+                    // land on the same baseline above the home indicator.
+                    .padding(.bottom, 8)
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
-            .toolbar { remoteHomeToolbar }
-            .toolbarBackground(.visible, for: .bottomBar)
-            .toolbarBackground(.ultraThinMaterial, for: .bottomBar)
             .navigationDestination(for: String.self) { id in
                 ConversationView(sessionID: id)
             }
@@ -1113,10 +1237,6 @@ struct DSHRemoteHomeView: View {
                 if !model.hasLoadedSessions {
                     model.refreshSessions()
                 }
-            }
-            .onPreferenceChange(DSHRemoteHomeWidthPreferenceKey.self) { width in
-                guard width > 0, abs(homeContentWidth - width) > 0.5 else { return }
-                homeContentWidth = width
             }
         }
     }
@@ -1320,81 +1440,6 @@ struct DSHRemoteHomeView: View {
             Spacer(minLength: 96)
         }
         .frame(maxWidth: .infinity)
-    }
-
-    /// Native toolbar semantics keep the bottom controls aligned with the
-    /// system glass and keyboard inset on every supported iOS version.
-    @ToolbarContentBuilder
-    private var remoteHomeToolbar: some ToolbarContent {
-        if showSearch {
-            ToolbarItem(placement: .bottomBar) {
-                HStack(spacing: 8) {
-                    TextField("搜索聊天", text: $searchText)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($searchFieldFocused)
-                        .submitLabel(.search)
-                        .frame(width: homeSearchWidth)
-                        .accessibilityIdentifier("home-search-field")
-                        .task { searchFieldFocused = true }
-
-                    Button {
-                        searchText = ""
-                        showSearch = false
-                        searchFieldFocused = false
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .accessibilityLabel("关闭搜索")
-                }
-                .layoutPriority(1)
-            }
-        } else {
-            // Keep the two actions as separate native toolbar items. A wide
-            // custom group can be treated as one overflowing item by iOS and
-            // the system then drops the leading search control altogether.
-            ToolbarItem(placement: .bottomBar) {
-                Button {
-                    showSearch = true
-                    searchFieldFocused = true
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 17, weight: .medium))
-                        Text("搜索聊天")
-                            .lineLimit(1)
-                    }
-                    .frame(width: homeSearchWidth, height: 44, alignment: .leading)
-                }
-                .accessibilityLabel("搜索聊天")
-                .accessibilityIdentifier("home-search-button")
-            }
-
-            ToolbarItem(placement: .bottomBar) {
-                Button { openNewTask() } label: {
-                    HStack(spacing: 8) {
-                        DSHRemoteComposeGlyph(size: 17)
-                        Text("聊天").fixedSize()
-                    }
-                    .padding(.horizontal, 8)
-                }
-                .labelStyle(.titleAndIcon)
-                .buttonStyle(.borderedProminent)
-                .accessibilityLabel("新建聊天")
-                .accessibilityIdentifier("home-new-chat-button")
-            }
-        }
-    }
-
-    /// Reserve the trailing chat action and toolbar margins while allowing
-    /// the search control to fill the remaining width on each device.
-    private var homeSearchWidth: CGFloat {
-        let reservedWidth: CGFloat = showSearch ? 56 : 184
-        let fallbackWidth: CGFloat = showSearch ? 220 : 224
-        let available = homeContentWidth > 0 ? homeContentWidth : 402
-        // The system bottom bar adds its own margins around each item. Keep
-        // enough room for the trailing action so iOS does not hide this item,
-        // while retaining the broad search field from the original home.
-        return min(236, max(190, min(available - reservedWidth, fallbackWidth)))
     }
 
     private var archivedDivider: some View {

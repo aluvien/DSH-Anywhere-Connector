@@ -814,7 +814,72 @@ final class DSHConversationViewportTests: XCTestCase {
 
 #if canImport(UIKit)
 @MainActor
+private final class DSHHomeSearchFixture: ObservableObject {
+    @Published var text = ""
+    @Published var searching = true
+}
+
+private struct DSHHomeSearchFixtureView: View {
+    @ObservedObject var fixture: DSHHomeSearchFixture
+    var body: some View {
+        Color(.systemBackground)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                DSHHomeBottomBar(searchText: $fixture.text, isSearching: $fixture.searching, onNewTask: {})
+                    .padding(.bottom, 8)
+            }
+    }
+}
+
+@MainActor
 final class DSHHomeLayoutTests: XCTestCase {
+    func testSearchDockMatchesConversationAndTracksKeyboardSafeArea() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        window.overrideUserInterfaceStyle = .light
+        let model = DSHAppModel.preview()
+        model.showUsageFooter = false
+        model.draft = ""
+        let host = UIHostingController(rootView: AnyView(NavigationStack {
+            ConversationView(sessionID: "preview-session").environmentObject(model)
+        }))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        func capture(_ name: String) {
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        try await Task.sleep(for: .milliseconds(650))
+        let conversationField = try XCTUnwrap(descendants(host.view).first { $0 is UITextField || $0 is UITextView })
+        let conversationCenter = conversationField.convert(conversationField.bounds, to: window).midY
+        let fixture = DSHHomeSearchFixture()
+        host.rootView = AnyView(DSHHomeSearchFixtureView(fixture: fixture))
+        try await Task.sleep(for: .milliseconds(650))
+        let search = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UITextField }.first)
+        let searchRect = search.convert(search.bounds, to: window)
+        XCTAssertEqual(search.returnKeyType, .search)
+        XCTAssertTrue(search.isFirstResponder)
+        XCTAssertGreaterThan(search.bounds.width, window.bounds.width * 0.6)
+        XCTAssertEqual(searchRect.midY, conversationCenter, accuracy: 3)
+        capture("home-search-expanded")
+        host.additionalSafeAreaInsets.bottom = 320
+        try await Task.sleep(for: .milliseconds(350))
+        window.layoutIfNeeded()
+        let raisedRect = search.convert(search.bounds, to: window)
+        XCTAssertEqual(searchRect.midY - raisedRect.midY, 320, accuracy: 2)
+        capture("home-search-keyboard-inset")
+        fixture.searching = false
+        host.additionalSafeAreaInsets.bottom = 0
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(descendants(host.view).compactMap { $0 as? UITextField }.isEmpty)
+        capture("home-dock-aligned")
+    }
+
     func testNewTaskRightSwipeDistinguishesReturnFromScrollingAndControlDrags() {
         XCTAssertTrue(dshShouldDismissNewTaskForRightSwipe(
             translation: CGSize(width: 150, height: 12), predictedEndTranslation: CGSize(width: 220, height: 16)))
