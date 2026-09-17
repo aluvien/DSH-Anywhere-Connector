@@ -134,21 +134,25 @@ public struct DSHEventReducer: Sendable {
             }
             appendOrReplace(stamped, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
         case .assistantMessageCompleted(let message):
-            // A completion replaces the streaming partial, so carry the
-            // reasoning that arrived as its own event back onto the message.
+            let sessionId = event.envelope.sessionId ?? ""
+            let messages = state.messagesBySession[sessionId, default: []]
+            let canonical = messages.first { $0.id == message.id }
+            let partial = message.replacesMessageId.flatMap { id in messages.first { $0.id == id } }
+            let first = [canonical, partial].compactMap { $0 }
+                .min { ($0.sequence ?? Int64.max) < ($1.sequence ?? Int64.max) }
             var completed = message
-            if let sessionId = event.envelope.sessionId,
-               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }) {
-                completed.reasoning = existing.reasoning
-                // Keep where the message started rather than where it finished,
-                // so interleaving with tool calls stays chronological.
-                completed.sequence = existing.sequence
-                completed.timestamp = existing.timestamp
-            } else {
-                completed.sequence = event.envelope.sequence
-                completed.timestamp = event.envelope.timestamp
+            completed.reasoning = message.reasoning ?? canonical?.reasoning ?? partial?.reasoning
+            completed.sequence = first?.sequence ?? event.envelope.sequence
+            completed.timestamp = first?.timestamp ?? event.envelope.timestamp
+            if let replaced = message.replacesMessageId, replaced != message.id {
+                state.messagesBySession[sessionId]?.removeAll { $0.id == replaced }
+                state.historyCarryOverBySession[sessionId]?.messages.removeAll { $0.id == replaced }
             }
-            appendOrReplace(completed, in: &state.messagesBySession, sessionId: event.envelope.sessionId)
+            appendOrReplace(completed, in: &state.messagesBySession, sessionId: sessionId)
+        case .assistantMessageDiscarded(let discarded):
+            let sessionId = event.envelope.sessionId ?? ""
+            state.messagesBySession[sessionId]?.removeAll { $0.id == discarded.messageId }
+            state.historyCarryOverBySession[sessionId]?.messages.removeAll { $0.id == discarded.messageId }
         case .assistantReasoning(let reasoning):
             let sessionId = event.envelope.sessionId ?? ""
             var messages = state.messagesBySession[sessionId, default: []]

@@ -91,6 +91,10 @@ export class DSHAnywhereConnector {
   private readonly recentEvents: EventEnvelope[] = [];
   /** Each device's archive view is a query choice, never a global cache. */
   private readonly includeArchivedByDevice = new Map<string, boolean>();
+  /** Devices explicitly opted in to transient output for one open session.
+   * This state belongs to the Connector (which knows device identity), not the
+   * Bridge (which has one trusted Connector socket). */
+  private readonly streamingDevicesBySession = new Map<string, Set<string>>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -132,6 +136,7 @@ export class DSHAnywhereConnector {
     this.bridge = undefined;
     this.pendingEvents.length = 0;
     this.recentEvents.length = 0;
+    this.streamingDevicesBySession.clear();
   }
 
   private connectRelay(): void {
@@ -192,6 +197,14 @@ export class DSHAnywhereConnector {
     // old projection. Lists travel through correlated HTTP commands below;
     // retain live created/title events but never forward this bridge greeting.
     if (event.data.type === "session.snapshot") return;
+    if (event.data.type === "assistant.message.delta" || event.data.type === "assistant.message.discarded") {
+      this.sendStreamingEvent(event.data);
+      return;
+    }
+    if (event.data.type === "assistant.message.completed" && event.data.payload.replacesMessageId !== undefined) {
+      this.sendStreamingCompletion(event.data);
+      return;
+    }
     this.sendEvent(event.data);
   }
 
@@ -239,6 +252,10 @@ export class DSHAnywhereConnector {
       // and make the following archive mutation refresh the wrong projection.
       if (command.type === "session.list") {
         this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
+      }
+      if (command.type === "session.open") {
+        this.setStreamingPreference(command.sessionId ?? command.payload.sessionId,
+                                    command.deviceId, command.payload.streaming === true);
       }
       const request = bridgeRequestFor(command);
       // A photo can be several megabytes after base64 encoding. Keep normal
@@ -509,6 +526,43 @@ export class DSHAnywhereConnector {
 
   private sessionListPath(deviceId: string): string {
     return this.includeArchivedByDevice.get(deviceId) === true ? "/sessions?includeArchived=true" : "/sessions";
+  }
+
+  private setStreamingPreference(sessionId: string, deviceId: string, enabled: boolean): void {
+    const devices = this.streamingDevicesBySession.get(sessionId) ?? new Set<string>();
+    if (enabled) devices.add(deviceId);
+    else devices.delete(deviceId);
+    if (devices.size === 0) this.streamingDevicesBySession.delete(sessionId);
+    else this.streamingDevicesBySession.set(sessionId, devices);
+  }
+
+  /** Live deltas and abandoned-attempt cleanups are never broadcast: legacy
+   * clients do not know that their temporary ids must be removed. Readdressing
+   * the body itself, rather than only Relay's target, also keeps replay scoped
+   * to the opted-in device. */
+  private sendStreamingEvent(event: Extract<EventEnvelope,
+    { type: "assistant.message.delta" | "assistant.message.discarded" }>): void {
+    const sessionId = event.sessionId;
+    if (sessionId === undefined) return;
+    for (const deviceId of this.streamingDevicesBySession.get(sessionId) ?? []) {
+      this.sendEvent({ ...event, deviceId }, deviceId);
+    }
+  }
+
+  /** Deliver the replacement hint only to clients that received the temporary
+   * stream. Everyone receives the same canonical completion without the new
+   * field, so strict legacy decoders remain valid. The targeted event is sent
+   * before the broadcast completion, allowing a current client to remove its
+   * transient bubble before the canonical row is observed. */
+  private sendStreamingCompletion(event: Extract<EventEnvelope, { type: "assistant.message.completed" }>): void {
+    const sessionId = event.sessionId;
+    if (sessionId !== undefined) {
+      for (const deviceId of this.streamingDevicesBySession.get(sessionId) ?? []) {
+        this.sendEvent({ ...event, deviceId }, deviceId);
+      }
+    }
+    const { replacesMessageId: _replacement, ...canonicalPayload } = event.payload;
+    this.sendEvent({ ...event, payload: canonicalPayload });
   }
 
   private sendEvent(event: EventEnvelope, targetDeviceId?: string): void {

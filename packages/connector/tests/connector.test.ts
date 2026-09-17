@@ -271,6 +271,68 @@ describe("Relay and bridge forwarding", () => {
     expect(created.payload.title).toBe("From the phone");
     await connector.stop();
   });
+
+  it("routes transient streaming only to an opted-in opener and keeps replay safe for legacy devices", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ accepted: true }), {
+      status: 202, headers: { "content-type": "application/json" },
+    }));
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+
+    relay.emit("message", JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "open-stream", sender: "device",
+      body: {
+        version: PROTOCOL_VERSION, requestId: "open-stream", machineId: "machine-1", deviceId: "phone-stream",
+        sessionId: "session-1", timestamp: 1, type: "session.open",
+        payload: { sessionId: "session-1", streaming: true },
+      },
+    }));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    bridge.emit("message", JSON.stringify({
+      version: PROTOCOL_VERSION, messageId: "delta", machineId: "mac", deviceId: "broadcast", sequence: 1, timestamp: 1,
+      sessionId: "session-1", type: "assistant.message.delta", payload: { messageId: "stream-1", text: "hel" },
+    }));
+    bridge.emit("message", JSON.stringify({
+      version: PROTOCOL_VERSION, messageId: "final", machineId: "mac", deviceId: "broadcast", sequence: 2, timestamp: 2,
+      sessionId: "session-1", type: "assistant.message.completed",
+      payload: { id: "assistant-1", role: "assistant", markdown: "hello", replacesMessageId: "stream-1" },
+    }));
+    await vi.waitFor(() => expect(relay.sent).toHaveLength(3));
+    const delivered = relay.sent.map((raw) => JSON.parse(raw));
+    expect(delivered[0]).toMatchObject({ targetDeviceId: "phone-stream", body: {
+      type: "assistant.message.delta", deviceId: "phone-stream", payload: { messageId: "stream-1" },
+    } });
+    expect(delivered[1]).toMatchObject({ targetDeviceId: "phone-stream", body: {
+      type: "assistant.message.completed", deviceId: "phone-stream", payload: { replacesMessageId: "stream-1" },
+    } });
+    expect(delivered[2]).toMatchObject({ body: {
+      type: "assistant.message.completed", deviceId: "broadcast", payload: { id: "assistant-1", markdown: "hello" },
+    } });
+    expect(delivered[2].targetDeviceId).toBeUndefined();
+    expect(delivered[2].body.payload.replacesMessageId).toBeUndefined();
+
+    relay.emit("message", JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "legacy-resume", sender: "device",
+      body: {
+        version: PROTOCOL_VERSION, requestId: "legacy-resume", machineId: "machine-1", deviceId: "phone-legacy",
+        timestamp: 3, type: "connection.resume", payload: { lastSequence: 0 },
+      },
+    }));
+    await vi.waitFor(() => expect(relay.sent.length).toBeGreaterThanOrEqual(5));
+    const legacy = relay.sent.slice(3).map((raw) => JSON.parse(raw));
+    expect(legacy.some((message) => message.body?.type === "assistant.message.delta"
+      || message.body?.payload?.replacesMessageId !== undefined)).toBe(false);
+    expect(legacy.some((message) => message.body?.type === "assistant.message.completed")).toBe(true);
+    await connector.stop();
+  });
 });
 
 class FakeSocket {

@@ -37,6 +37,42 @@ describe("DSH Anywhere wire protocol", () => {
     }
   });
 
+  it("keeps transient streaming controls explicit and opt-in", () => {
+    const open = CommandEnvelopeSchema.parse({
+      version: PROTOCOL_VERSION,
+      requestId: "open-1",
+      machineId: "mac-1",
+      deviceId: "iphone-1",
+      sessionId: "session-1",
+      timestamp: 1,
+      type: "session.open",
+      payload: { sessionId: "session-1", streaming: true },
+    });
+    expect(open.type === "session.open" && open.payload.streaming).toBe(true);
+
+    const completed = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "assistant.message.completed",
+      payload: {
+        id: "assistant-final",
+        role: "assistant",
+        markdown: "done",
+        replacesMessageId: "assistant-live",
+      },
+    });
+    expect(completed.type === "assistant.message.completed" && completed.payload.replacesMessageId)
+      .toBe("assistant-live");
+
+    const discarded = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "assistant.message.discarded",
+      payload: { messageId: "assistant-live" },
+    });
+    expect(discarded.type === "assistant.message.discarded").toBe(true);
+  });
+
   it("parses history replay brackets carrying the same batch id", () => {
     const started = EventEnvelopeSchema.parse({
       ...envelopeFields,

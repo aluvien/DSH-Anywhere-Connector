@@ -198,6 +198,11 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(prompt.payload, .object(["text": .string("hello")]))
     }
 
+    func testStreamingOpenSessionExplicitlyOptsIn() {
+        let command = DSHCommand.openSession(deviceId: "d", machineId: "m", sessionId: "s", streaming: true)
+        XCTAssertEqual(command.payload, .object(["sessionId": .string("s"), "streaming": .bool(true)]))
+    }
+
     func testOpenSessionCommandCarriesTheSessionID() {
         let command = DSHCommand.openSession(deviceId: "d", machineId: "m", sessionId: "s")
         XCTAssertEqual(command.type, "session.open")
@@ -832,6 +837,29 @@ private struct DSHHomeSearchFixtureView: View {
 
 @MainActor
 final class DSHHomeLayoutTests: XCTestCase {
+    func testHeaderSeparatorTracksContentPassingHeaderAndReturnsToHidden() async throws {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+        scroll.contentInset.top = 80
+        scroll.contentSize = CGSize(width: 390, height: 1400)
+        scroll.contentOffset.y = -80
+        let probe = DSHHeaderScrollProbe.Probe()
+        var overlaps = true
+        probe.publish = { overlaps = $0 }
+        scroll.addSubview(probe)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(overlaps)
+        scroll.contentOffset.y = -60
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(overlaps)
+        scroll.contentOffset.y = -95
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(overlaps)
+        scroll.contentSize = .zero
+        scroll.contentOffset.y = 0
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(overlaps)
+    }
+
     func testArchivedTasksStaySeparateAndSearchableWithoutAProject() {
         let sessions = [
             DSHSessionSummary(id: "active", title: "Active", updatedAt: 40, workspaceName: "Project"),

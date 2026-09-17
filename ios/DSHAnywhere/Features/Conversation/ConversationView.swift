@@ -201,6 +201,7 @@ struct DSHComposerQuickActionsMenu: View {
     let onFile: () -> Void
     var onCamera: (() -> Void)? = nil
     @State private var isPresented = false
+    @State private var pendingPicker: (() -> Void)?
 
     var body: some View {
         Button { isPresented = true } label: {
@@ -221,17 +222,26 @@ struct DSHComposerQuickActionsMenu: View {
                     .padding(.vertical, 4)
                 menuSectionHeader("添加附件")
                 menuRow(title: "文件", subtitle: "从文件 App 选取",
-                        icon: .file, action: onFile)
+                        icon: .file, afterDismissal: true, action: onFile)
                 if onCamera != nil && DSHCameraPicker.isAvailable {
                     menuRow(title: "相机", subtitle: "拍摄一张照片",
-                            icon: .camera, action: { onCamera?() })
+                            icon: .camera, afterDismissal: true, action: { onCamera?() })
                 }
                 menuRow(title: "照片", subtitle: "从相簿选取",
-                        icon: .photos, action: onPhoto)
+                        icon: .photos, afterDismissal: true, action: onPhoto)
             }
             .padding(.vertical, 8)
             .frame(width: 280)
             .presentationCompactAdaptation(.popover)
+            .onDisappear {
+                guard let action = pendingPicker else { return }
+                pendingPicker = nil
+                // Present only after the menu has left the presentation tree.
+                Task { @MainActor in
+                    await Task.yield()
+                    action()
+                }
+            }
         }
         .accessibilityLabel("More actions")
         .tint(.primary)
@@ -246,10 +256,11 @@ struct DSHComposerQuickActionsMenu: View {
     }
 
     private func menuRow(title: String, subtitle: String, icon: DSHRemoteActionGlyph.Kind,
-                         action: @escaping () -> Void) -> some View {
+                         afterDismissal: Bool = false, action: @escaping () -> Void) -> some View {
         Button {
+            if afterDismissal { pendingPicker = action }
             isPresented = false
-            action()
+            if !afterDismissal { action() }
         } label: {
             HStack(spacing: 12) {
                 DSHRemoteActionGlyph(kind: icon)
@@ -641,6 +652,7 @@ struct ConversationView: View {
 
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
+    @State private var headerOverlapsContent = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showCamera = false
     @State private var capturedPhoto: UIImage?
@@ -888,6 +900,7 @@ struct ConversationView: View {
             .padding(.horizontal)
             .padding(.vertical, 12)
             .background(DSHScrollFinder(coordinator: scrollCoordinator))
+            .background(DSHHeaderScrollProbe(overlaps: $headerOverlapsContent))
         }
         // Let the transcript pass behind the floating material while the
         // real safe-area insets keep its resting first/last rows unobscured.
@@ -1066,10 +1079,10 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        // The shared 50% page-color surface also covers the status area.
-        .background(DSHHeaderBackdrop())
+        // Blur scrolling content beneath the header and status area.
+        .background(DSHHeaderBackdrop(frosted: true, contentUnderneath: headerOverlapsContent))
         .overlay(alignment: .bottom) {
-            Color.primary.opacity(0.1).frame(height: 0.5)
+            if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }
     }
 

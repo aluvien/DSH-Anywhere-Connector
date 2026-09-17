@@ -27,7 +27,7 @@ actor DSHRemoteTransport: DSHAppTransport {
     private let tokenStore: any DSHTokenStore
     private let store: DSHProfileStore
     private var connection: DSHWebSocketConnection?
-    private var verifiedCatalogRelay: URL?
+    private var relaySchema: (url: URL, revision: Int)?
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -74,30 +74,50 @@ actor DSHRemoteTransport: DSHAppTransport {
         if ["workspace.catalog", "workspace.create", "mode.catalog", "directory.list", "session.rename"].contains(command.type) {
             try await verifyCatalogRelay()
         }
-        try await connection.send(command)
+        var outgoing = command
+        if command.type == "session.open",
+           case .object(var payload) = command.payload,
+           payload["streaming"] != nil,
+           ((try? await relaySchemaRevision()) ?? 0) < 8 {
+            // Older relays reject unknown fields. Preserve ordinary history
+            // and chat even when live-stream support is not deployed there.
+            payload.removeValue(forKey: "streaming")
+            outgoing = DSHCommand(version: command.version, requestId: command.requestId,
+                                  deviceId: command.deviceId, machineId: command.machineId,
+                                  sessionId: command.sessionId, timestamp: command.timestamp,
+                                  type: command.type, payload: .object(payload))
+        }
+        try await connection.send(outgoing)
     }
 
     /// New routed commands require schema 7. A staged rollout must not send
     /// unknown messages to an older Relay and tear down existing chat traffic.
     private func verifyCatalogRelay() async throws {
+        guard try await relaySchemaRevision() >= 7 else { throw DSHRelayUpgradeRequired() }
+    }
+
+    private func relaySchemaRevision() async throws -> Int {
         guard let profile = store.activeProfile else { throw DSHAPIError.missingCredentials }
         let baseURL = profile.relayBaseURL
-        guard verifiedCatalogRelay != baseURL else { return }
+        if let relaySchema, relaySchema.url == baseURL { return relaySchema.revision }
         var request = URLRequest(url: baseURL.appending(path: "health"))
         request.timeoutInterval = 10
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await URLSession.shared.data(for: request)
         struct Health: Decodable { let schemaRevision: Int? }
         guard (response as? HTTPURLResponse)?.statusCode == 200,
-              let health = try? JSONDecoder().decode(Health.self, from: data),
-              (health.schemaRevision ?? 0) >= 7 else { throw DSHRelayUpgradeRequired() }
-        verifiedCatalogRelay = baseURL
+              let health = try? JSONDecoder().decode(Health.self, from: data) else {
+            throw DSHRelayUpgradeRequired()
+        }
+        let revision = health.schemaRevision ?? 0
+        relaySchema = (baseURL, revision)
+        return revision
     }
 
     func disconnect() async {
         await connection?.disconnect()
         connection = nil
-        verifiedCatalogRelay = nil
+        relaySchema = nil
     }
 
     func forgetPairing() async throws {

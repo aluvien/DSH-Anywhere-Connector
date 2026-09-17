@@ -28,8 +28,11 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024;
  *    (web uploads, model-returned images) reach the phone; older Relays
  *    reject thumbnail-bearing messages as invalid, so the Relay must be
  *    redeployed BEFORE any bridge starts sending them.
+ * 8: added transient assistant-stream discard events, opt-in session opens,
+ *    and the optional completion replacement id used to reconcile a live
+ *    bubble with its durable assistant message.
  */
-const RELAY_SCHEMA_REVISION = 7;
+const RELAY_SCHEMA_REVISION = 8;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day

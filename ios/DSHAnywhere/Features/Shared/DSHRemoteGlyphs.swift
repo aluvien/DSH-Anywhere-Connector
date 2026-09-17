@@ -1,12 +1,76 @@
 import SwiftUI
 import UIKit
 
-/// Match the page color while allowing content to show through.
+/// Keep secondary screens unchanged; scrolling home/conversation headers use
+/// a real blur material with a small page-color wash for readable controls.
 struct DSHHeaderBackdrop: View {
+    var frosted = false
+    var contentUnderneath = true
     var body: some View {
-        Color(.systemBackground).opacity(0.5)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        Group {
+            if frosted {
+                Rectangle().fill(.regularMaterial)
+                    .overlay(Color(.systemBackground).opacity(contentUnderneath ? 0.18 : 1))
+            } else {
+                Color(.systemBackground).opacity(0.5)
+            }
+        }
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Observes only its enclosing scroll view, including programmatic scrolling.
+/// Publishing on the next run-loop avoids state changes during UIKit layout.
+struct DSHHeaderScrollProbe: UIViewRepresentable {
+    @Binding var overlaps: Bool
+    var topSpacing: CGFloat = 12
+
+    func makeUIView(context: Context) -> Probe { Probe() }
+    func updateUIView(_ view: Probe, context: Context) {
+        view.topSpacing = topSpacing
+        view.publish = { overlaps = $0 }
+        view.attach()
+    }
+
+    final class Probe: UIView {
+        var publish: ((Bool) -> Void)?
+        var topSpacing: CGFloat = 12
+        private weak var scroll: UIScrollView?
+        private var observations: [NSKeyValueObservation] = []
+        private var lastValue: Bool?
+        override func didMoveToSuperview() { super.didMoveToSuperview(); attach() }
+        override func didMoveToWindow() { super.didMoveToWindow(); attach() }
+        func attach() {
+            isUserInteractionEnabled = false
+            var ancestor = superview
+            while let view = ancestor {
+                if let found = view as? UIScrollView {
+                    if scroll !== found {
+                        scroll = found
+                        observations = [
+                            found.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in self?.refresh() },
+                            found.observe(\.adjustedContentInset, options: [.new]) { [weak self] _, _ in self?.refresh() },
+                            found.observe(\.contentSize, options: [.new]) { [weak self] _, _ in self?.refresh() }
+                        ]
+                    }
+                    refresh()
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
+        private func refresh() {
+            guard let scroll else { return }
+            let value = scroll.contentSize.height > 0
+                && scroll.contentOffset.y + scroll.adjustedContentInset.top > topSpacing
+            guard lastValue != value else { return }
+            lastValue = value
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let latest = self.lastValue else { return }
+                self.publish?(latest)
+            }
+        }
     }
 }
 

@@ -669,7 +669,7 @@ final class DSHAppModel: ObservableObject {
         if let last = lastOpenSessionAt[sessionID], now.timeIntervalSince(last) < 2 { return }
         lastOpenSessionAt[sessionID] = now
         send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
-                                    sessionId: sessionID))
+                                    sessionId: sessionID, streaming: true))
     }
 
     func sendModelCatalog() {

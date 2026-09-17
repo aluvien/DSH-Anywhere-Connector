@@ -1,5 +1,5 @@
 import { hostname } from 'node:os'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -729,10 +729,70 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   // small in-memory projection lets the bridge turn a real mid-session switch
   // into a transcript event while ignoring the initial selection.
   const modelSelections = new Map<string, ModelSelectionProjection>()
+  // The Harness assigns the durable assistant-message UUID only after an
+  // attempt settles. Keep the temporary stream id by its durable turn/step so
+  // the following session/event can explicitly replace the live bubble.
+  const liveStreamMessageIDs = new Map<string, string>()
+  const liveStreamAttempts = new Map<string, { key: string; messageId: string; sessionId: string }>()
+
+  ctx.on('agent/assistant-stream' as never, ((value: unknown) => {
+    const payload = recordOf(value)
+    const agent = recordOf(payload.agent)
+    const sessionId = typeof agent.id === 'string' ? agent.id : undefined
+    const frame = recordOf(payload.frame)
+    const frameType = typeof frame.type === 'string' ? frame.type : ''
+    const attemptId = typeof frame.attemptId === 'string' ? frame.attemptId : undefined
+    if (sessionId === undefined || attemptId === undefined) return
+
+    if (frameType === 'start') {
+      const key = liveStreamKey(sessionId, frame.turn, frame.step)
+      if (key === undefined) return
+      const messageId = liveStreamMessageID(key)
+      liveStreamMessageIDs.set(key, messageId)
+      liveStreamAttempts.set(attemptId, { key, messageId, sessionId })
+      return
+    }
+
+    const attempt = liveStreamAttempts.get(attemptId)
+    if (attempt === undefined) return
+    if (frameType === 'chunk') {
+      const chunk = recordOf(frame.chunk)
+      if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
+        publish({
+          sessionId: attempt.sessionId,
+          type: 'assistant.message.delta',
+          payload: { messageId: attempt.messageId, text: chunk.text },
+        })
+      }
+      return
+    }
+
+    if (frameType === 'end') {
+      const outcome = recordOf(frame.outcome)
+      const committedMessage = outcome.kind === 'committed' && outcome.eventType === 'assistant/message'
+      if (!committedMessage) {
+        publish({
+          sessionId: attempt.sessionId,
+          type: 'assistant.message.discarded',
+          payload: { messageId: attempt.messageId },
+        })
+        liveStreamMessageIDs.delete(attempt.key)
+      }
+      liveStreamAttempts.delete(attemptId)
+    }
+  }) as never, { global: true })
+
   ctx.on('session/event' as never, ((session: { id: string }, event: unknown) => {
     if (isSilentSetupEcho(session.id, event)) return
-    const normalized = normalizeSessionEvents(session.id, event, toolNames, usageCounters, modelSelections)
+    const normalized = normalizeSessionEvents(
+      session.id, event, toolNames, usageCounters, modelSelections, liveStreamMessageIDs,
+    )
     for (const next of normalized) publish(next)
+    if (recordOf(event).type === 'assistant/message') {
+      const data = recordOf(recordOf(event).data)
+      const key = liveStreamKey(session.id, data.turn, data.step)
+      if (key !== undefined) liveStreamMessageIDs.delete(key)
+    }
     // The native title service writes a durable `session/title` event after
     // the first actual user message. Project that fresh authoritative summary
     // immediately so a new phone session stops saying “新会话” without waiting
@@ -1848,12 +1908,27 @@ function sameModelSelection(left: ModelSelectionProjection, right: ModelSelectio
     && left.reasoningEffort === right.reasoningEffort
 }
 
+/** A bridge-local, bounded identifier for the transient output of one durable
+ * assistant turn/step. The same turn/step appears on the final session event;
+ * unlike the Harness attempt id, it survives the boundary where the durable
+ * message UUID is minted. */
+function liveStreamKey(sessionId: string, turn: unknown, step: unknown): string | undefined {
+  if (typeof turn !== 'number' || typeof step !== 'number'
+      || !Number.isSafeInteger(turn) || !Number.isSafeInteger(step) || turn < 0 || step < 0) return undefined
+  return `${sessionId}\u0000${turn}\u0000${step}`
+}
+
+function liveStreamMessageID(key: string): string {
+  return `stream-${createHash('sha256').update(key).digest('hex')}`
+}
+
 export function normalizeSessionEvents(
   sessionId: string,
   value: unknown,
   toolNames: Map<string, string>,
   usageCounters = new Map<string, UsageCounter>(),
   modelSelections = new Map<string, ModelSelectionProjection>(),
+  liveStreamMessageIDs?: ReadonlyMap<string, string>,
 ): NativeEventInput[] {
   const event = recordOf(value)
   const type = typeof event.type === 'string' ? event.type : ''
@@ -1882,8 +1957,9 @@ export function normalizeSessionEvents(
     if (usage !== undefined && tokensPerSecond !== undefined) usage.tokensPerSecond = tokensPerSecond
     const source = recordOf(message.source)
     const messageId = stringOr(message.id, randomUUID())
+    const streamKey = liveStreamKey(sessionId, data.turn, data.step)
+    const replacesMessageId = streamKey === undefined ? undefined : liveStreamMessageIDs?.get(streamKey)
     const sessionUsage = usage === undefined ? undefined : aggregateUsage(counters, usage, messageId)
-    const streamedText = streamText(data.stream)
     // Assistant-side images (model-returned or read back) travel the same
     // attachment path as user uploads, thumbnails included.
     const attachments = contentAttachments(message.content)
@@ -1898,15 +1974,9 @@ export function normalizeSessionEvents(
         ...(usage === undefined ? {} : { usage }),
         ...(typeof source.provider === 'string' ? { provider: source.provider } : {}),
         ...(typeof source.model === 'string' ? { model: source.model } : {}),
+        ...(replacesMessageId === undefined ? {} : { replacesMessageId }),
       },
     }]
-    if (streamedText.length > 0) {
-      normalized.unshift({
-        type: 'assistant.message.delta',
-        sessionId,
-        payload: { messageId, text: streamedText },
-      })
-    }
     const reasoning = reasoningText(message.content)
     if (reasoning.length > 0) {
       // Sent as its own event so the answer stays clean and the phone can fold
@@ -2268,21 +2338,6 @@ function blockText(value: unknown, kind: 'text' | 'reasoning'): string {
   return value.flatMap((entry) => {
     const block = recordOf(entry)
     if (block.type === kind && typeof block.text === 'string') return [block.text]
-    return []
-  }).join('')
-}
-
-function streamText(value: unknown): string {
-  if (!Array.isArray(value)) return ''
-  return value.flatMap((entry) => {
-    const record = recordOf(entry)
-    if (record.type === 'text-chunks' && Array.isArray(record.texts)) {
-      return record.texts.filter((text): text is string => typeof text === 'string')
-    }
-    if (record.type === 'chunk') {
-      const chunk = recordOf(record.chunk)
-      return chunk.type === 'text-delta' && typeof chunk.text === 'string' ? [chunk.text] : []
-    }
     return []
   }).join('')
 }

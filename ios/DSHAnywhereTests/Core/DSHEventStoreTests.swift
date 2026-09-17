@@ -3,6 +3,44 @@ import XCTest
 
 final class DSHEventStoreTests: XCTestCase {
     @MainActor
+    func testStreamingCompletionKeepsCanonicalIDAndDoesNotResurrectPartialOnReplay() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ type: String, _ sequence: Int64, _ payload: [String: DSHJSONValue]) {
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "e-\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", sequence: sequence, type: type, payload: .object(payload))), into: &state)
+        }
+        apply("assistant.message.delta", 1, ["messageId": .string("partial"), "text": .string("Hello")])
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.markdown, "Hello")
+        apply("assistant.message.delta", 2, ["messageId": .string("partial"), "text": .string(" world")])
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.markdown, "Hello world")
+        reducer.reduce(historyEvent(type: "history.started", sequence: 3), into: &state)
+        apply("assistant.reasoning", 4, ["messageId": .string("canonical"), "text": .string("Reasoning")])
+        apply("assistant.message.completed", 5, ["id": .string("canonical"), "role": .string("assistant"),
+            "markdown": .string("Hello world!"), "replacesMessageId": .string("partial")])
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 6), into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["canonical"])
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.markdown, "Hello world!")
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.reasoning, "Reasoning")
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.sequence, 1)
+        apply("assistant.message.completed", 7, ["id": .string("canonical"), "role": .string("assistant"), "markdown": .string("Hello world!")])
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 1)
+    }
+
+    @MainActor
+    func testAbandonedStreamIsRemovedFromLiveAndHistoryCarry() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "d", deviceId: "d", machineId: "m", sessionId: "s", sequence: 1,
+            type: "assistant.message.delta", payload: .object(["messageId": .string("partial"), "text": .string("obsolete")]))), into: &state)
+        reducer.reduce(historyEvent(type: "history.started", sequence: 2), into: &state)
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "x", deviceId: "d", machineId: "m", sessionId: "s", sequence: 3,
+            type: "assistant.message.discarded", payload: .object(["messageId": .string("partial")]))), into: &state)
+        reducer.reduce(historyEvent(type: "history.completed", sequence: 4), into: &state)
+        XCTAssertTrue(state.messagesBySession["s", default: []].isEmpty)
+    }
+
+    @MainActor
     func testSessionBecomesUnreadOnlyAfterNewerActivity() {
         UserDefaults.standard.removeObject(forKey: DSHAppModel.lastReadSessionsKey)
         UserDefaults.standard.removeObject(forKey: DSHAppModel.unreadBaselineKey)

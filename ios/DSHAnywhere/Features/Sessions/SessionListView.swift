@@ -1040,6 +1040,7 @@ struct DSHRemoteHomeView: View {
     @State private var showSettings = false
     @State private var showSearch = false
     @State private var searchText = ""
+    @State private var headerOverlapsContent = false
     @State private var showNewTask = {
         #if DEBUG
         return ProcessInfo.processInfo.arguments.contains("--dsh-preview-new-session")
@@ -1180,19 +1181,18 @@ struct DSHRemoteHomeView: View {
                         }
                     }
 
-                    if !isLoadingTasks {
-                        archivedDivider
-                        if model.showArchivedSessions {
-                            archivedSection
-                        }
+                    if !isLoadingTasks && model.showArchivedSessions {
+                        archivedSection
                     }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 18)
+                .background(DSHHeaderScrollProbe(overlaps: $headerOverlapsContent, topSpacing: 14))
                 .id(model.groupsSessionsByWorkspace ? "remote-workspaces" : "remote-flat")
             }
             .scrollIndicators(.hidden)
+            .scrollClipDisabled()
             .scrollDismissesKeyboard(.interactively)
             .refreshable {
                 model.refreshSessions(includeArchived: model.showArchivedSessions)
@@ -1369,7 +1369,10 @@ struct DSHRemoteHomeView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop())
+        .background(DSHHeaderBackdrop(frosted: true, contentUnderneath: headerOverlapsContent))
+        .overlay(alignment: .bottom) {
+            if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
+        }
     }
 
     @ViewBuilder
@@ -1472,25 +1475,6 @@ struct DSHRemoteHomeView: View {
             Spacer(minLength: 96)
         }
         .frame(maxWidth: .infinity)
-    }
-
-    private var archivedDivider: some View {
-        Button {
-            model.setShowArchived(!model.showArchivedSessions)
-        } label: {
-            HStack(spacing: 10) {
-                Rectangle().fill(Color.secondary.opacity(0.28)).frame(height: 1)
-                Text(DSHLocalization.string(model.showArchivedSessions ? "Hide archived" : "Show archived"))
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .fixedSize()
-                Image(systemName: model.showArchivedSessions ? "chevron.up" : "chevron.down")
-                    .font(.caption.weight(.semibold))
-                Rectangle().fill(Color.secondary.opacity(0.28)).frame(height: 1)
-            }
-            .padding(.vertical, 9)
-        }
-        .buttonStyle(.plain)
     }
 
     private var archivedSection: some View {

@@ -184,6 +184,13 @@ export const AssistantMessageDeltaPayloadSchema = StrictObject({
 });
 export type AssistantMessageDeltaPayload = z.infer<typeof AssistantMessageDeltaPayloadSchema>;
 
+/** A transient live-stream bubble that did not produce a durable assistant
+ * message (for example a cancelled or retried attempt). */
+export const AssistantMessageDiscardedPayloadSchema = StrictObject({
+  messageId: IdentifierSchema,
+});
+export type AssistantMessageDiscardedPayload = z.infer<typeof AssistantMessageDiscardedPayloadSchema>;
+
 export const ChatMessagePayloadSchema = StrictObject({
   id: IdentifierSchema,
   role: ChatRoleSchema,
@@ -194,6 +201,8 @@ export const ChatMessagePayloadSchema = StrictObject({
   model: z.string().min(1).max(512).optional(),
   reasoningEffort: z.string().min(1).max(256).optional(),
   contextWindow: z.number().positive().optional(),
+  /** Transient live-stream id which this durable message replaces. */
+  replacesMessageId: IdentifierSchema.optional(),
 });
 export type ChatMessagePayload = z.infer<typeof ChatMessagePayloadSchema>;
 
@@ -379,6 +388,7 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("directory.list", DirectoryListPayloadSchema),
   EventEnvelope("user.message.accepted", ChatMessagePayloadSchema),
   EventEnvelope("assistant.message.delta", AssistantMessageDeltaPayloadSchema),
+  EventEnvelope("assistant.message.discarded", AssistantMessageDiscardedPayloadSchema),
   EventEnvelope("assistant.message.completed", ChatMessagePayloadSchema),
   EventEnvelope("tool.started", ToolStartedPayloadSchema),
   EventEnvelope("tool.completed", ToolCompletedPayloadSchema),
@@ -432,7 +442,11 @@ export const SessionCreatePayloadSchema = StrictObject({
   permissionMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
   initialPrompt: z.string().max(100_000).optional(),
 });
-export const SessionOpenPayloadSchema = StrictObject({ sessionId: IdentifierSchema });
+export const SessionOpenPayloadSchema = StrictObject({
+  sessionId: IdentifierSchema,
+  /** Opt in to transient assistant-stream events for this session only. */
+  streaming: z.boolean().optional(),
+});
 export const ConnectionResumePayloadSchema = StrictObject({ lastSequence: z.number().int().nonnegative() });
 /**
  * A reference to a file that was already uploaded. The Harness resolves these

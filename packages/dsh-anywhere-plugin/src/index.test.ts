@@ -142,6 +142,25 @@ describe('DeepSeek Harness event normalization', () => {
     })
   })
 
+  it('uses the live stream replacement only for the matching durable turn and never replays final stream text as a delta', () => {
+    const replacement = new Map([['s1\u00001\u00002', 'stream-live-1']])
+    const events = normalizeSessionEvents('s1', {
+      type: 'assistant/message',
+      data: {
+        turn: 1,
+        step: 2,
+        message: { id: 'assistant-final-1', content: [{ type: 'text', text: 'finished' }] },
+        stream: [{ type: 'text-chunks', time0: 1, index: 0, dt: [], texts: ['fin', 'ished'] }],
+      },
+    }, new Map(), new Map(), new Map(), replacement)
+
+    expect(events).toContainEqual({
+      type: 'assistant.message.completed', sessionId: 's1',
+      payload: { id: 'assistant-final-1', role: 'assistant', markdown: 'finished', replacesMessageId: 'stream-live-1' },
+    })
+    expect(events.some((event) => event.type === 'assistant.message.delta')).toBe(false)
+  })
+
   it('omits the reasoning event entirely when there is none', () => {
     const events = normalizeSessionEvents('s1', {
       type: 'assistant/message',

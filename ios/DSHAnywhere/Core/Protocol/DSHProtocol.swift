@@ -177,11 +177,13 @@ public struct DSHCommand: Codable, Sendable, Equatable {
     /// asks the Mac bridge to inspect that session and forwards the normalized
     /// history as ordinary transcript events over the existing socket.
     public static func openSession(deviceId: String, machineId: String,
-                                   sessionId: String,
+                                   sessionId: String, streaming: Bool = false,
                                    requestId: String = UUID().uuidString) -> DSHCommand {
-        DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+        var payload: [String: DSHJSONValue] = ["sessionId": .string(sessionId)]
+        if streaming { payload["streaming"] = .bool(true) }
+        return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
                    sessionId: sessionId, type: "session.open",
-                   payload: .object(["sessionId": .string(sessionId)]))
+                   payload: .object(payload))
     }
 
     public static func archiveSession(deviceId: String, machineId: String, sessionId: String,
@@ -946,6 +948,7 @@ public func dshDataURLBytes(_ value: String) -> Data? {
 public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let role: DSHMessageRole
+    public var replacesMessageId: String?
     public var markdown: String
     public var attachments: [DSHMessageAttachment]
     public var usage: DSHSessionUsage?
@@ -967,21 +970,24 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
                 attachments: [DSHMessageAttachment] = [],
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, contextWindow: Double? = nil,
-                reasoning: String? = nil, sequence: Int64? = nil, timestamp: Int64? = nil) {
+                reasoning: String? = nil, sequence: Int64? = nil, timestamp: Int64? = nil,
+                replacesMessageId: String? = nil) {
         self.id = id; self.role = role; self.markdown = markdown; self.attachments = attachments
         self.usage = usage; self.provider = provider; self.model = model
         self.reasoningEffort = reasoningEffort; self.contextWindow = contextWindow
         self.reasoning = reasoning; self.sequence = sequence; self.timestamp = timestamp
+        self.replacesMessageId = replacesMessageId
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, role, markdown, attachments, usage, provider, model,
+        case id, role, markdown, attachments, usage, provider, model, replacesMessageId,
              reasoningEffort, contextWindow, reasoning, sequence, timestamp
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
+        replacesMessageId = try container.decodeIfPresent(String.self, forKey: .replacesMessageId)
         role = try container.decode(DSHMessageRole.self, forKey: .role)
         markdown = try container.decode(String.self, forKey: .markdown)
         // Older Relay/Connector builds did not include this field.
@@ -1391,6 +1397,10 @@ public struct DSHTurnState: Codable, Sendable, Equatable {
     public init(sessionId: String, state: String) { self.sessionId = sessionId; self.state = state }
 }
 
+public struct DSHDiscardedMessage: Codable, Sendable, Equatable {
+    public let messageId: String
+}
+
 public enum DSHEventKind: Sendable, Equatable {
     /// Phone-to-Relay socket state. This is deliberately separate from Mac
     /// presence: the Relay can remain reachable after the Connector goes away.
@@ -1403,6 +1413,7 @@ public enum DSHEventKind: Sendable, Equatable {
     case userMessageAccepted(DSHChatMessage)
     case assistantMessageDelta(DSHAssistantDelta)
     case assistantMessageCompleted(DSHChatMessage)
+    case assistantMessageDiscarded(DSHDiscardedMessage)
     case toolStarted(DSHToolActivity)
     case toolCompleted(DSHToolActivity)
     case approvalRequested(DSHApprovalRequest)
@@ -1461,6 +1472,7 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "session.created": return decode(DSHSessionSummary.self, payload).map(DSHEventKind.sessionCreated) ?? .unknown
         case "user.message.accepted": return decode(DSHChatMessage.self, payload).map(DSHEventKind.userMessageAccepted) ?? .unknown
         case "assistant.message.delta": return decode(DSHAssistantDelta.self, payload).map(DSHEventKind.assistantMessageDelta) ?? .unknown
+        case "assistant.message.discarded": return decode(DSHDiscardedMessage.self, payload).map(DSHEventKind.assistantMessageDiscarded) ?? .unknown
         case "assistant.message.completed": return decode(DSHChatMessage.self, payload).map(DSHEventKind.assistantMessageCompleted) ?? .unknown
         case "tool.started": return decode(DSHToolActivity.self, payload).map(DSHEventKind.toolStarted) ?? .unknown
         case "tool.completed": return decode(DSHToolActivity.self, payload).map(DSHEventKind.toolCompleted) ?? .unknown
