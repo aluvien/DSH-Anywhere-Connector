@@ -1000,7 +1000,9 @@ async function handleHttp(
     const sessionId = decodeURIComponent(openMatch[1]!)
     const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === sessionId)
     if (summary === undefined) throw new HttpError(404, 'session not found')
-    await publishSessionHistory(ctx, summary, device.id, publish)
+    const body = objectOf(await readJson(req))
+    const recipient = historyRecipient(device.id, body.deviceId)
+    await publishSessionHistory(ctx, summary, recipient, publish)
     json(res, 202, { accepted: true, sessionId })
     return
   }
@@ -1330,6 +1332,15 @@ async function listSummaries(
  * the session transcript atomically instead of interleaving the replay with
  * (and renumbering) live output.
  */
+export function historyRecipient(authenticatedDeviceId: string, requestedDeviceId: unknown): string {
+  // Only the trusted local Connector may route a request on behalf of a
+  // paired phone. A direct bridge client cannot target another device.
+  return authenticatedDeviceId === CONNECTOR_DEVICE_ID
+    && typeof requestedDeviceId === 'string' && requestedDeviceId.length > 0
+    && requestedDeviceId.length <= 256
+    ? requestedDeviceId : authenticatedDeviceId
+}
+
 async function publishSessionHistory(
   ctx: NativeContext,
   session: ReturnType<typeof normalizeSessionSummary>,

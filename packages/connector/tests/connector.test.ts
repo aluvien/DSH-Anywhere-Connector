@@ -37,7 +37,7 @@ describe("bridge command mapping", () => {
       version: PROTOCOL_VERSION, requestId: "archives", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
       type: "session.list", payload: { includeArchived: true },
     } satisfies CommandEnvelope)).toEqual({ method: "GET", path: "/sessions?includeArchived=true" });
-    expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: {} });
+    expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: { deviceId: "phone-1" } });
     expect(bridgeRequestFor(command("session.create"))).toEqual({ method: "POST", path: "/sessions", body: { cwd: "/tmp" } });
     expect(bridgeRequestFor({
       version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,

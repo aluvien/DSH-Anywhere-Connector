@@ -205,3 +205,9 @@
 - 验证：iOS全套115项通过；最终顶部底色微调后15项界面复验通过。后端94项测试、全包构建和类型检查通过。真实Mac短回复收到6次增量、共110字符，首段早于最终完成101ms，临时ID与最终替换字段匹配；独立测试会话已归档。真实软键盘/照片选择交互仍需设备体验。
 - 部署备份：服务器 `/opt/dsh-backup-112-20260918-073615`，旧镜像 `relay-relay:before112`；原.env和配对数据卷保留。升级包 `artifacts/server/DSH-ANYWHERE-RELAY-SERVER-20260918-r14-schema8.zip`。
 - 产物：`artifacts/ios/streaming-build112-20260918/`；IPA SHA256：`6b58c9b733b110016e18e3da34f2b512ece803345c3f76e9b93493bebae5f5ca`。
+
+
+## 44. 2026-09-18 修复历史记录路由到本机连接器而非手机
+- 原因：session.open通过可信本机Connector凭据调用Bridge，历史publish沿用认证设备ID（dsh-anywhere-connector）；定向转发后Relay不会把这些历史事件送给实际请求的iPhone。Mac日志本身完整，列表与实时广播不受同一路径影响。
+- 修复：Connector向Bridge open请求传入真实command.deviceId；Bridge仅允许可信Connector代指定历史接收方，普通直接连接设备仍只能读取发给自己的历史。历史开始/消息/工具/结束事件使用同一请求设备ID。
+- 验证：修复前真实会话历史目标为dsh-anywhere-connector；部署后独立请求收到34条消息事件且目标统一为history-routing-probe。95项后端测试、全包build和diff检查通过。Mac Bridge/Connector已重启生效，无需新TestFlight客户端。

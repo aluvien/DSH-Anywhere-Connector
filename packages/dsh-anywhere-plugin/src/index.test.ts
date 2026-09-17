@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { PairingRateLimiter, apply, inject, isSubagentSession, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
+import { historyRecipient, CONNECTOR_DEVICE_ID, PairingRateLimiter, apply, inject, isSubagentSession, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -579,3 +579,12 @@ describe('silent setup echoes', () => {
     expect(isSilentSetupEcho('s', { type: 'tool/call', data: {} })).toBe(false)
   })
 });
+
+describe('history recipient routing', () => {
+  it('routes connector history to the requesting phone and restricts direct clients', () => {
+    expect(historyRecipient(CONNECTOR_DEVICE_ID, 'phone-1')).toBe('phone-1')
+    expect(historyRecipient(CONNECTOR_DEVICE_ID, undefined)).toBe(CONNECTOR_DEVICE_ID)
+    expect(historyRecipient(CONNECTOR_DEVICE_ID, '')).toBe(CONNECTOR_DEVICE_ID)
+    expect(historyRecipient('phone-1', 'phone-2')).toBe('phone-1')
+  })
+})

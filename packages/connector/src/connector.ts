@@ -732,7 +732,7 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
       return {
         method: "POST",
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/open`,
-        body: {},
+        body: { deviceId: command.deviceId },
       };
     case "session.create":
       return {
