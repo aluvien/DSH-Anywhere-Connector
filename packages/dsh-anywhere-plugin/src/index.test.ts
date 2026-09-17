@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
 import { PairingRateLimiter, apply, inject, isSubagentSession, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
@@ -445,8 +445,34 @@ describe('native bridge mutations', () => {
     expect(renameCalls).toEqual([{ sessionId: 'session-new', title: '重命名后标题' }])
   })
 
-  it('reports an unavailable directory browser instead of fabricating local paths', async () => {
+  it('lists paired-Mac folders when Harness selected its native chooser', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-directory-browser-'))
+    await Promise.all([
+      mkdir(join(directory, 'Zebra')),
+      mkdir(join(directory, 'alpha')),
+      mkdir(join(directory, '.hidden')),
+      writeFile(join(directory, 'not-a-folder.txt'), 'ignored', 'utf8'),
+    ])
     const request = mount({ directoryPicker: { capability: () => ({ kind: 'native' }) } })
+    await expect(request('GET', `/dsh-anywhere/v1/directories?path=${encodeURIComponent(directory)}`))
+      .resolves.toEqual({
+        status: 200,
+        body: {
+          path: directory,
+          parentPath: dirname(directory),
+          directories: [
+            { name: '.hidden', path: join(directory, '.hidden') },
+            { name: 'alpha', path: join(directory, 'alpha') },
+            { name: 'Zebra', path: join(directory, 'Zebra') },
+          ],
+        },
+      })
+    await expect(request('GET', '/dsh-anywhere/v1/directories?path=not-an-absolute-path'))
+      .resolves.toMatchObject({ status: 400, body: { error: 'cannot list "not-an-absolute-path": not an absolute path' } })
+  })
+
+  it('reports an unavailable directory browser when Harness provides no picker capability', async () => {
+    const request = mount()
     await expect(request('GET', '/dsh-anywhere/v1/directories?path=%2FUsers%2Fme'))
       .resolves.toMatchObject({ status: 501, body: { error: 'Harness directory browsing is unavailable' } })
   })

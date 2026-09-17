@@ -1,9 +1,9 @@
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, opendir, readFile, stat, writeFile } from 'node:fs/promises'
 import { readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -970,17 +970,30 @@ async function handleHttp(
   if (req.method === 'GET' && path === '/directories') {
     const picker = directoryPickerOf(ctx)
     const capability = picker?.capability()
-    if (capability?.kind !== 'browse' || capability.list === undefined) {
+    if (capability === undefined) {
       throw new HttpError(501, 'Harness directory browsing is unavailable')
     }
     try {
-      const listing = await capability.list(url.searchParams.get('path') ?? undefined, AbortSignal.timeout(15_000))
+      const signal = AbortSignal.timeout(15_000)
+      // The desktop web app deliberately uses the native macOS chooser when
+      // it is attached to a local display.  That chooser has no `list` API:
+      // it can only show a dialog on the Mac itself.  The paired phone needs
+      // an in-app folder browser, so retain the Harness browse implementation
+      // when present and provide its same one-level read-only operation for
+      // the native chooser case.
+      const listing = capability.kind === 'browse' && capability.list !== undefined
+        ? await capability.list(url.searchParams.get('path') ?? undefined, signal)
+        : capability.kind === 'native'
+          ? await listDirectoriesForPairedDevice(url.searchParams.get('path') ?? undefined, signal)
+          : undefined
+      if (listing === undefined) throw new HttpError(501, 'Harness directory browsing is unavailable')
       json(res, 200, {
         path: listing.path,
         ...(dirname(listing.path) === listing.path ? {} : { parentPath: dirname(listing.path) }),
         directories: listing.entries.map((entry) => ({ name: entry.name, path: entry.path })),
       })
     } catch (error) {
+      if (error instanceof HttpError) throw error
       throw new HttpError(400, error instanceof Error ? error.message : String(error))
     }
     return
@@ -1622,6 +1635,64 @@ function directoryPickerOf(ctx: NativeContext): NonNullable<NativeContext['direc
   } catch {
     return undefined
   }
+}
+
+/**
+ * One-level directory browser used only while Harness selected its native OS
+ * chooser.  It intentionally mirrors the browse capability's scope: the
+ * paired device receives directory names and absolute paths only, never file
+ * names or file contents.  Calls are still protected by the connector token
+ * at the HTTP route above.
+ */
+async function listDirectoriesForPairedDevice(path: string | undefined, signal: AbortSignal): Promise<{
+  path: string
+  entries: { name: string; path: string }[]
+}> {
+  if (path !== undefined && !isAbsolute(path)) {
+    throw new Error(`cannot list "${path}": not an absolute path`)
+  }
+  signal.throwIfAborted()
+  const directoryPath = resolve(path ?? homedir())
+  const directory = await opendir(directoryPath)
+  const entries: { name: string; path: string }[] = []
+  try {
+    for await (const entry of directory) {
+      signal.throwIfAborted()
+      const entryPath = join(directoryPath, entry.name)
+      if (entry.isDirectory()) {
+        insertBoundedDirectory(entries, { name: entry.name, path: entryPath })
+        continue
+      }
+      // `Dirent#isDirectory` does not follow symbolic links.  The native
+      // Harness browser does, so preserve enterable linked folders too.
+      if (entry.isSymbolicLink()) {
+        try {
+          if ((await stat(entryPath)).isDirectory()) insertBoundedDirectory(entries, { name: entry.name, path: entryPath })
+        } catch {
+          // A broken or unreadable link is not enterable; omit it like the
+          // native browse capability does.
+        }
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined)
+  }
+  return { path: directoryPath, entries }
+}
+
+/** Match Harness's browse backend: sorted, bounded to one thousand folders. */
+function insertBoundedDirectory(entries: { name: string; path: string }[], entry: { name: string; path: string }): void {
+  const maximumEntries = 1_000
+  if (entries.length === maximumEntries && entry.name.localeCompare(entries[entries.length - 1]!.name) >= 0) return
+  let lower = 0
+  let upper = entries.length
+  while (lower < upper) {
+    const middle = (lower + upper) >>> 1
+    if (entry.name.localeCompare(entries[middle]!.name) < 0) upper = middle
+    else lower = middle + 1
+  }
+  entries.splice(lower, 0, entry)
+  if (entries.length > maximumEntries) entries.pop()
 }
 
 /**

@@ -165,10 +165,16 @@
 - IPA 与截图：`artifacts/ios/wide-search-build108-20260918/`。IPA SHA256：`5ee7aafc8acb15bca46938f30c2750ba2fb484f9f004e4b8a0f22b5e6990328e`。
 
 
-## 40. 2026-09-18 远端项目、模式与会话同步（Build 109 候选）
-- 状态：签名归档通过，尚未上传 TestFlight；线上 Relay 仍为 schemaRevision 6，需先部署 schemaRevision 7，再同步 Mac Bridge/Connector，最后发布客户端。
+## 40. 2026-09-18 远端项目、模式与会话同步（Build 109）
+- 状态：[✓Build 109]2026-09-18 04:35（上海时间）上传成功，Apple 已接收，等待处理；Delivery UUID：acf41154-6065-433f-9943-ffc4a9b19801。Relay 已部署 schemaRevision 7 并通过健康检查，Mac Bridge/Connector 已重新构建并加载。
 - 新建任务支持页面右滑返回，滑块操作不触发返回；首页保留原生透明宽搜索框。首页菜单新增“新建项目”，浏览配对 Mac 文件夹并通过原生 workspaceRegistry 创建工作区，空工作区也显示。
 - 模式列表、默认模式和名称取自 Mac agentPresets；会话菜单改为远端重命名。空会话显示“新会话”，不持久化占位标题，发送后使用原生语意标题服务，并同步 Mac/网页标题变化。
 - 远端工作区目录和名称为准，移除本地名称与隐藏覆盖。归档过滤按设备保留；请求响应按设备路由，刷新只接受最新请求，移除重复及不完整初始快照，避免旧信息闪现。
 - 新增命令在客户端检查 Relay schemaRevision，旧服务下给出升级提示，保留已有会话通信。升级包：artifacts/server/DSH-ANYWHERE-RELAY-SERVER-20260918-r13-schema7.zip；部署说明：artifacts/server/RELAY-SCHEMA7-UPGRADE.md。保留服务器 .env 和数据卷。
 - 验证：Release 全套104项 iOS测试通过，随后新增3项请求关联/失败状态测试并通过50项 EventStore 定向复验；后端90项测试及全部包类型检查通过。临时 Relay 实例 health 验证 schemaRevision 7。首页和新建任务截图已检查；真实远端联调与真机交互需部署后验证。
+
+- 部署：服务器 `/opt/dsh-anywhere`，更新前完整源码与配对数据已备份至 `/opt/dsh-backup-109-20260918-042818`，旧镜像保留为 `relay-relay:before109`。保留原 `.env` 与数据卷，无需重新配对。
+- Mac 启动路径修复：原 launchd 指向已不存在的 `/Users/aluvien/DSH-ANYWHERE`，现改为 `/Users/aluvien/Develop/App/DSH-ANYWHERE`；LaunchAgent 原件备份至 `/tmp/dsh-launchagents-before109`。原凭据配置不变。
+- 实际联调：工作区列表正常，模式返回 standard/PTC/minimal/cordis 对应的 Mac 名称，未归档17条、已归档53条，现有手机请求继续正常处理。
+- 真机后端兼容修复：macOS 原生目录选择器没有 list API，新增受认证保护的单层目录枚举，保持 Harness 排序、符号链接和1000项上限语义。插件43项测试通过；部署后实际主目录与项目子目录浏览均返回成功。
+- 发布产物：`artifacts/ios/remote-workspaces-build109-20260918/`；IPA SHA256：`445a5db8a5984b3e88ac674821d4961112adb67d23be92c49a2d8bc95a216d6c`。包含签名、导出、上传日志和 iOS 源码摘要。
