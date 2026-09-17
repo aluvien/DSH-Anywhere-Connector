@@ -69,8 +69,6 @@ final class DSHAppModel: ObservableObject {
     /// deliberately do not alter the Harness session itself.
     @Published var showUsageFooter: Bool =
         UserDefaults.standard.object(forKey: DSHAppModel.usageFooterKey) as? Bool ?? true
-    @Published var showTurnUsage: Bool =
-        UserDefaults.standard.object(forKey: DSHAppModel.turnUsageKey) as? Bool ?? false
     /// Assistant copy/branch controls are visible by default, matching Remote.
     /// The setting remains available for a quieter transcript; user messages
     /// always use the native long-press copy menu instead of inline controls.
@@ -78,11 +76,6 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.object(forKey: DSHAppModel.messageActionsKey) as? Bool ?? true
     @Published var collapseComposerControls: Bool =
         UserDefaults.standard.object(forKey: DSHAppModel.composerCollapsedKey) as? Bool ?? true
-    /// Both home experiences remain in the app so a user can switch between
-    /// the Remote task browser and the original Happy-inspired list without
-    /// changing the paired Harness or losing any session state.
-    @Published var useRemoteTaskLayout: Bool =
-        UserDefaults.standard.object(forKey: DSHAppModel.homeLayoutKey) as? Bool ?? true
     /// List arrangement and per-section collapse survive relaunch: they are
     /// browsing preferences, not session state.
     /// ChatGPT Remote's task home is organised by project. Keep the preference
@@ -193,10 +186,8 @@ final class DSHAppModel: ObservableObject {
     static let languageKey = "dsh-anywhere.language"
     static let collapsedGroupsKey = "dsh-anywhere.collapsed-groups"
     static let usageFooterKey = "dsh-anywhere.show-session-usage"
-    static let turnUsageKey = "dsh-anywhere.show-turn-usage"
     static let messageActionsKey = "dsh-anywhere.show-message-actions-by-default"
     static let composerCollapsedKey = "dsh-anywhere.collapse-composer-controls"
-    static let homeLayoutKey = "dsh-anywhere.home-layout-remote"
     static let workspaceAliasesKey = "dsh-anywhere.workspace-aliases"
     static let hiddenWorkspacesKey = "dsh-anywhere.hidden-workspaces"
     static let hiddenMessagesKey = "dsh-anywhere.hidden-messages"
@@ -707,11 +698,6 @@ final class DSHAppModel: ObservableObject {
         UserDefaults.standard.set(value, forKey: Self.usageFooterKey)
     }
 
-    func setShowTurnUsage(_ value: Bool) {
-        showTurnUsage = value
-        UserDefaults.standard.set(value, forKey: Self.turnUsageKey)
-    }
-
     func setShowMessageActionsByDefault(_ value: Bool) {
         showMessageActionsByDefault = value
         UserDefaults.standard.set(value, forKey: Self.messageActionsKey)
@@ -720,11 +706,6 @@ final class DSHAppModel: ObservableObject {
     func setCollapseComposerControls(_ value: Bool) {
         collapseComposerControls = value
         UserDefaults.standard.set(value, forKey: Self.composerCollapsedKey)
-    }
-
-    func setUseRemoteTaskLayout(_ value: Bool) {
-        useRemoteTaskLayout = value
-        UserDefaults.standard.set(value, forKey: Self.homeLayoutKey)
     }
 
     func isGroupCollapsed(_ id: String) -> Bool { collapsedSessionGroups.contains(id) }
@@ -1539,9 +1520,6 @@ final class DSHAppModel: ObservableObject {
         let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
         model.machineName = "macmini"
         model.selectedSessionID = session.id
-        // Preview fixtures should always exercise the Remote surface even if
-        // a developer previously chose the classic layout in Settings.
-        model.useRemoteTaskLayout = true
         model.showMessageActionsByDefault = true
         return model
     }

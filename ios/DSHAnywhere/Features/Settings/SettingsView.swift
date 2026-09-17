@@ -11,24 +11,6 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Interface") {
-                    Picker("Home layout", selection: Binding(
-                        get: { model.useRemoteTaskLayout },
-                        set: model.setUseRemoteTaskLayout
-                    )) {
-                        Text("Remote tasks").tag(true)
-                        Text("Classic").tag(false)
-                    }
-                    .pickerStyle(.segmented)
-
-                    Text(model.useRemoteTaskLayout
-                         ? "Remote shows projects and tasks in a native task browser."
-                         : "Classic keeps the previous Happy-inspired session list.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .listRowBackground(settingsSectionBackground(.accentColor))
-
                 Section("Sessions") {
                     Toggle(isOn: Binding(
                         get: { model.groupsSessionsByWorkspace },
@@ -55,19 +37,13 @@ struct SettingsView: View {
                         Label("Show session usage", systemImage: "chart.bar.xaxis")
                     }
                     Toggle(isOn: Binding(
-                        get: { model.showTurnUsage },
-                        set: model.setShowTurnUsage
-                    )) {
-                        Label("Show turn usage beside Thinking", systemImage: "brain")
-                    }
-                    Toggle(isOn: Binding(
                         get: { model.showMessageActionsByDefault },
                         set: model.setShowMessageActionsByDefault
                     )) {
                         Label("Show message actions by default", systemImage: "ellipsis.circle")
                     }
                 }
-                .listRowBackground(settingsSectionBackground(.indigo))
+                .listRowBackground(settingsSectionBackground)
 
                 Section {
                     if model.machines.isEmpty {
@@ -108,7 +84,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Pairing another Mac adds it here instead of replacing the current one. Tap to switch, swipe to remove.")
                 }
-                .listRowBackground(settingsSectionBackground(.teal))
+                .listRowBackground(settingsSectionBackground)
 
                 Section {
                     if let error = model.devicesError {
@@ -153,7 +129,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Devices paired to this Mac, as reported by the relay. Revoking one signs that device out immediately.")
                 }
-                .listRowBackground(settingsSectionBackground(.purple))
+                .listRowBackground(settingsSectionBackground)
 
                 Section {
                     Picker("Language", selection: Binding(
@@ -167,7 +143,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Follow System uses your device language. The choice applies immediately.")
                 }
-                .listRowBackground(settingsSectionBackground(.orange))
+                .listRowBackground(settingsSectionBackground)
 
                 Section("Connection") {
                     LabeledContent("Machine") {
@@ -191,7 +167,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                .listRowBackground(settingsSectionBackground(.green))
+                .listRowBackground(settingsSectionBackground)
 
                 Section {
                     Button(role: .destructive) {
@@ -203,14 +179,14 @@ struct SettingsView: View {
                 } footer: {
                     Text("Disconnecting removes the device token from this iPhone's keychain. The Mac keeps running.")
                 }
-                .listRowBackground(settingsSectionBackground(.red))
+                .listRowBackground(settingsSectionBackground)
 
                 Section("About") {
                     LabeledContent("Version") {
                         Text(Self.versionDescription)
                     }
                 }
-                .listRowBackground(settingsSectionBackground(.secondary))
+                .listRowBackground(settingsSectionBackground)
             }
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
@@ -264,10 +240,10 @@ struct SettingsView: View {
         .background(DSHHeaderBackdrop())
     }
 
-    /// A small tint distinguishes each settings group without taking away the
-    /// system's grouped-list contrast in either light or dark appearance.
-    private func settingsSectionBackground(_ tint: Color) -> Color {
-        tint.opacity(0.10)
+    /// Keep every section on the same quiet grouped surface. Connection state
+    /// remains visible through its status text instead of competing row tints.
+    private var settingsSectionBackground: Color {
+        Color(.secondarySystemGroupedBackground)
     }
 
     /// The pairing screen saves the address, but nothing surfaced it afterwards.

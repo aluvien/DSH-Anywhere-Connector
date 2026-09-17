@@ -302,28 +302,6 @@
         }
       }
     },
-    "Classic" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "经典"
-          }
-        }
-      }
-    },
-    "Classic keeps the previous Happy-inspired session list." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "经典布局保留之前的 Happy 风格会话列表。"
-          }
-        }
-      }
-    },
     "Close" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -895,17 +873,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "收起思考过程"
-          }
-        }
-      }
-    },
-    "Home layout" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "首页布局"
           }
         }
       }
@@ -1554,28 +1521,6 @@
         }
       }
     },
-    "Remote shows projects and tasks in a native task browser." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Remote 布局以原生任务浏览器显示项目和任务。"
-          }
-        }
-      }
-    },
-    "Remote tasks" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Remote 任务"
-          }
-        }
-      }
-    },
     "Remove" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1828,17 +1773,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "显示会话用量"
-          }
-        }
-      }
-    },
-    "Show turn usage beside Thinking" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在“思考”旁显示本轮用量"
           }
         }
       }

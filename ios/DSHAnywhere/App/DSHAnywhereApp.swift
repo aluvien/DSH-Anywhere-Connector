@@ -47,17 +47,11 @@ struct DSHRootView: View {
                     NavigationStack {
                         ConversationView(sessionID: "preview-session")
                     }
-                } else if model.useRemoteTaskLayout {
-                    DSHRemoteHomeView()
                 } else {
-                    SessionListView()
+                    DSHRemoteHomeView()
                 }
                 #else
-                if model.useRemoteTaskLayout {
-                    DSHRemoteHomeView()
-                } else {
-                    SessionListView()
-                }
+                DSHRemoteHomeView()
                 #endif
             } else {
                 PairingView()

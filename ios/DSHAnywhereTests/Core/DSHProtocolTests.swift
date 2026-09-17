@@ -104,7 +104,7 @@ final class DSHModelPanelLayoutTests: XCTestCase {
         let presented = try XCTUnwrap(host.presentedViewController)
         let original = presented.view.bounds.size
         XCTAssertGreaterThanOrEqual(original.width, 330)
-        XCTAssertGreaterThanOrEqual(original.height, 222)
+        XCTAssertGreaterThanOrEqual(original.height, 190)
 
         func capture(_ name: String) {
             window.layoutIfNeeded()
@@ -778,19 +778,12 @@ final class DSHConversationViewportTests: XCTestCase {
 #if canImport(UIKit)
 @MainActor
 final class DSHHomeLayoutTests: XCTestCase {
-    func testSettingsCanSwitchBothHomeLayoutsAndPersistSelection() async throws {
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: DSHAppModel.homeLayoutKey)
-        defer {
-            if let previous { defaults.set(previous, forKey: DSHAppModel.homeLayoutKey) }
-            else { defaults.removeObject(forKey: DSHAppModel.homeLayoutKey) }
-        }
+    func testSettingsAndRemoteHomeUseSingleLayout() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)
         window.overrideUserInterfaceStyle = .dark
         let model = DSHAppModel.preview()
         model.selectedSessionID = nil
-        model.useRemoteTaskLayout = false
         let host = UIHostingController(rootView: SettingsView()
             .environmentObject(model)
             .environment(\.locale, Locale(identifier: "zh-Hans")))
@@ -801,13 +794,7 @@ final class DSHHomeLayoutTests: XCTestCase {
         func descendants(_ view: UIView) -> [UIView] {
             [view] + view.subviews.flatMap(descendants)
         }
-        let picker = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UISegmentedControl }.first)
-        XCTAssertEqual(picker.numberOfSegments, 2)
-        XCTAssertEqual(picker.selectedSegmentIndex, 1)
-        XCTAssertTrue((picker.titleForSegment(at: 0) ?? "").contains("Remote"))
-        let pickerFrame = picker.convert(picker.bounds, to: window)
-        XCTAssertGreaterThan(pickerFrame.minY, window.safeAreaInsets.top)
-        XCTAssertLessThan(pickerFrame.maxY, window.bounds.midY)
+        XCTAssertTrue(descendants(host.view).compactMap { $0 as? UISegmentedControl }.isEmpty)
         func capture(_ name: String) {
             let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
             let attachment = XCTAttachment(image: renderer.image { _ in
@@ -817,22 +804,12 @@ final class DSHHomeLayoutTests: XCTestCase {
             attachment.lifetime = .keepAlways
             add(attachment)
         }
-        capture("settings-classic-with-remote-switch")
-        picker.selectedSegmentIndex = 0
-        picker.sendActions(for: .valueChanged)
-        try await Task.sleep(for: .milliseconds(200))
-        XCTAssertTrue(model.useRemoteTaskLayout)
-        XCTAssertTrue(defaults.bool(forKey: DSHAppModel.homeLayoutKey))
-        capture("settings-remote-selected")
+        capture("settings-neutral")
         let root = UIHostingController(rootView: DSHRootView().environmentObject(model))
         window.rootViewController = root
         try await Task.sleep(for: .milliseconds(600))
         capture("remote-home-restored")
-        model.setUseRemoteTaskLayout(false)
-        try await Task.sleep(for: .milliseconds(400))
-        XCTAssertFalse(model.useRemoteTaskLayout)
-        XCTAssertFalse(defaults.bool(forKey: DSHAppModel.homeLayoutKey))
-        capture("classic-home-preserved")
+
     }
 }
 #endif

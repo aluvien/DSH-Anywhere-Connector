@@ -333,6 +333,7 @@ final class DSHScrollCoordinator: NSObject {
     private(set) weak var scrollView: UIScrollView?
     private var observations: [NSKeyValueObservation] = []
     private var pinScheduled = false
+    private var isAnimatingJump = false
     private(set) var isFollowingLatest = true
     var followingChanged: ((Bool) -> Void)?
 
@@ -390,18 +391,29 @@ final class DSHScrollCoordinator: NSObject {
         }
     }
 
-    func resumeFollowing() {
+    func resumeFollowing(animated: Bool = false) {
         setFollowing(true)
-        schedulePin()
+        guard animated, !UIAccessibility.isReduceMotionEnabled, let scrollView else {
+            schedulePin()
+            return
+        }
+        isAnimatingJump = true
+        UIView.animate(withDuration: 0.3, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseInOut]) {
+            scrollView.contentOffset = CGPoint(x: scrollView.contentOffset.x, y: self.bottomOffset)
+        } completion: { [weak self] _ in
+            guard let self else { return }
+            self.isAnimatingJump = false
+            self.schedulePin()
+        }
     }
 
     func schedulePin() {
-        guard isFollowingLatest, !pinScheduled else { return }
+        guard isFollowingLatest, !pinScheduled, !isAnimatingJump else { return }
         pinScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pinScheduled = false
-            guard self.isFollowingLatest else { return }
+            guard self.isFollowingLatest, !self.isAnimatingJump else { return }
             self.scrollToBottom(animated: false)
         }
     }
@@ -915,7 +927,9 @@ struct ConversationView: View {
                 }
             .background(Color(.systemBackground))
             .onAppear {
-                scrollCoordinator.followingChanged = { isFollowingLatest = $0 }
+                scrollCoordinator.followingChanged = { following in
+                    withAnimation(.easeInOut(duration: 0.25)) { isFollowingLatest = following }
+                }
                 scrollCoordinator.schedulePin()
             }
             .onDisappear { scrollCoordinator.followingChanged = nil }
@@ -1043,8 +1057,7 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        // Material keeps scrolled text softly visible without letting it
-        // compete with the title. The background also covers the status area.
+        // The shared 50% page-color surface also covers the status area.
         .background(DSHHeaderBackdrop())
         .overlay(alignment: .bottom) {
             Color.primary.opacity(0.1).frame(height: 0.5)
@@ -1120,9 +1133,8 @@ struct ConversationView: View {
                 HStack {
                     Spacer(minLength: 0)
                     Button {
-                        isFollowingLatest = true
-                        scrollCoordinator.resumeFollowing()
-                        scrollToLatest(proxy, animated: true)
+                        withAnimation(.easeInOut(duration: 0.25)) { isFollowingLatest = true }
+                        scrollCoordinator.resumeFollowing(animated: true)
                     } label: {
                         // Glass disc on iOS 26+ (transcript shows through it);
                         // below that, the ghost arrow: no disc background so
@@ -1147,6 +1159,7 @@ struct ConversationView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.bottom, 4)
+                .transition(.opacity.combined(with: .scale(scale: 0.8)).combined(with: .move(edge: .bottom)))
             }
 
             if !draftAttachments.isEmpty {
@@ -3034,12 +3047,11 @@ private struct MarkdownBlockView: View {
                         UIPasteboard.general.string = body
                         copied = true
                     } label: {
-                        // A ternary is a String, not a literal, so `Label`
-                        // would not localize it.
-                        Label(copied ? DSHLocalization.string("Copied") : DSHLocalization.string("Copy"),
-                              systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.caption2)
-                            .labelStyle(.titleAndIcon)
+                        HStack(spacing: 4) {
+                            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                            if copied { Text(DSHLocalization.string("Copied")) }
+                        }
+                        .font(.caption2)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -3057,7 +3069,7 @@ private struct MarkdownBlockView: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.tertiarySystemBackground), in: .rect(cornerRadius: 10))
+            .background(Color(.systemGray6), in: .rect(cornerRadius: 10))
             .onChange(of: copied) { _, isCopied in
                 guard isCopied else { return }
                 Task {
@@ -3169,7 +3181,6 @@ private struct MarkdownTableView: View {
 /// holding the whole turn's chain-of-thought. The transcript itself shows only
 /// final results; the reasoning lives in that one collapsed space.
 private struct AssistantTurnView: View {
-    @EnvironmentObject private var model: DSHAppModel
     let sessionID: String
     let block: DSHTranscriptBlock
     let tools: [DSHToolActivity]
@@ -3184,7 +3195,6 @@ private struct AssistantTurnView: View {
     private var text: String { block.reasoning }
     private var answerCount: Int { block.visibleMessages.count }
     private var usage: DSHSessionUsage? { block.visibleMessages.last?.usage }
-    private var showUsage: Bool { model.showTurnUsage }
 
     /// Live means literally running: failed/error/cancelled tools are
     /// settled, not live. Counting them as live kept turns (and the live
@@ -3286,24 +3296,11 @@ private struct AssistantTurnView: View {
                     .foregroundStyle(.secondary)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
             }
-            if showUsage, let usage {
-                Text(turnStats(usage))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-            }
         }
     }
 
     private var timelineTitle: String {
         turnDurationText(usage) ?? DSHLocalization.string("Thinking")
-    }
-
-    private func turnStats(_ usage: DSHSessionUsage) -> String {
-        let input = usage.inputTokens ?? 0
-        let output = usage.outputTokens ?? 0
-        if input == 0 && output == 0 { return "" }
-        return "\(compact(input + output)) tok"
     }
 
     /// Wall-clock estimate from the turn's own counters: tokens ÷ speed.
@@ -3327,11 +3324,7 @@ private struct AssistantTurnView: View {
                       minutes / 60, minutes % 60)
     }
 
-    private func compact(_ value: Double) -> String {
-        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
-        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
-        return String(Int(value))
-    }
+
 }
 
 struct ConversationView_Previews: PreviewProvider {

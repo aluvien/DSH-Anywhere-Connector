@@ -1,52 +1,12 @@
 import SwiftUI
 import UIKit
 
-/// Tune the blur itself instead of fading a finished material view, which
-/// would expose sharp transcript text behind the title.
+/// Match the page color while allowing content to show through.
 struct DSHHeaderBackdrop: View {
     var body: some View {
-        DSHHeaderBlur()
+        Color(.systemBackground).opacity(0.5)
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
-    }
-}
-
-private struct DSHHeaderBlur: UIViewRepresentable {
-    @Environment(\.colorScheme) private var colorScheme
-
-    func makeUIView(context: Context) -> DSHHeaderBlurView {
-        DSHHeaderBlurView(effect: nil)
-    }
-
-    func updateUIView(_ view: DSHHeaderBlurView, context: Context) {
-        view.configure(dark: colorScheme == .dark)
-    }
-
-    static func dismantleUIView(_ view: DSHHeaderBlurView, coordinator: ()) {
-        view.stop()
-    }
-}
-
-private final class DSHHeaderBlurView: UIVisualEffectView {
-    private var animator: UIViewPropertyAnimator?
-    private var darkAppearance: Bool?
-
-    func configure(dark: Bool) {
-        guard darkAppearance != dark else { return }
-        stop()
-        darkAppearance = dark
-        effect = nil
-        let animator = UIViewPropertyAnimator(duration: 1, curve: .linear) { [weak self] in
-            self?.effect = UIBlurEffect(style: dark ? .dark : .extraLight)
-        }
-        animator.fractionComplete = dark ? 0.35 : 0.7
-        self.animator = animator
-    }
-
-    func stop() {
-        animator?.stopAnimation(true)
-        animator = nil
-        darkAppearance = nil
     }
 }
 
@@ -324,6 +284,9 @@ struct DSHRemoteReasoningGlyph: View {
 /// above the rail live-syncs to the draft via `onChanged`; the caller commits
 /// once on dismiss.
 struct DSHRemoteReasoningSlider: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var feedback = UISelectionFeedbackGenerator()
+
     let count: Int
     let selectedIndex: Int
     let onChanged: (Int) -> Void
@@ -354,6 +317,7 @@ struct DSHRemoteReasoningSlider: View {
                         .frame(width: knobX + metrics.knobDiameter / 2 - metrics.outerInset,
                                height: metrics.knobDiameter)
                         .offset(x: metrics.outerInset, y: metrics.outerInset)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: selectedIndex)
                     ForEach(0..<count, id: \.self) { index in
                         Circle()
                             .fill(index <= selectedIndex ? Color.white.opacity(0.4) : Color(.systemGray3))
@@ -366,13 +330,14 @@ struct DSHRemoteReasoningSlider: View {
                         .overlay { Circle().strokeBorder(Color.accentColor, lineWidth: 2) }
                         .frame(width: metrics.knobDiameter, height: metrics.knobDiameter)
                         .position(x: knobX, y: metrics.height / 2)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: selectedIndex)
                 }
                 .frame(width: proxy.size.width, height: metrics.height)
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .local)
                     .onChanged { value in
                         let next = metrics.index(for: value.location.x, lastIndex: lastIndex)
-                        if next != selectedIndex { onChanged(next) }
+                        if next != selectedIndex { feedback.selectionChanged(); feedback.prepare(); onChanged(next) }
                     })
             }
             .frame(height: DSHReasoningRailMetrics.railHeight)
@@ -401,7 +366,7 @@ struct DSHRemoteReasoningSlider: View {
         .accessibilityAdjustableAction { direction in
             let delta = direction == .increment ? 1 : -1
             let next = min(max(0, selectedIndex + delta), lastIndex)
-            if next != selectedIndex { onChanged(next) }
+            if next != selectedIndex { feedback.selectionChanged(); feedback.prepare(); onChanged(next) }
         }
     }
 }
@@ -702,7 +667,7 @@ struct DSHModelConfigurationPanel: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("model-list-toggle")
                 .disabled(catalog?.groups.isEmpty ?? true)
-                Divider().padding(.bottom, 10)
+                Divider().padding(.top, 8).padding(.bottom, 18)
                 HStack {
                     Text("智能").font(.system(size: 17))
                     Spacer()
@@ -719,17 +684,16 @@ struct DSHModelConfigurationPanel: View {
                                                       reasoningEffort: efforts[index].id)
                     }
                 }
-                Spacer(minLength: 16)
+                Spacer(minLength: 0)
             }
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
-        .padding(.bottom, 20)
-        .frame(width: 330, height: 222, alignment: .top)
+        .padding(.bottom, 10)
+        .frame(width: 330, height: 190, alignment: .top)
         .foregroundStyle(.primary)
         .transaction { transaction in
             transaction.animation = nil
-            transaction.disablesAnimations = true
         }
     }
 }
