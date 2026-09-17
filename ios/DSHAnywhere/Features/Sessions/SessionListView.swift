@@ -794,6 +794,7 @@ struct RemoteWorkspacePickerSheet: View {
                             model.listDirectory(at: parent)
                         } label: {
                             Label("上一级", systemImage: "arrow.up.to.line")
+                                .foregroundStyle(.primary)
                         }
                         .disabled(model.isLoadingDirectory || model.isCreatingWorkspace)
                     }
@@ -805,15 +806,17 @@ struct RemoteWorkspacePickerSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                     } else if let listing {
-                        if listing.directories.isEmpty {
+                        let directories = dshVisibleWorkspaceDirectories(listing.directories)
+                        if directories.isEmpty {
                             ContentUnavailableView("此文件夹没有子文件夹",
                                                    systemImage: "folder.badge.questionmark")
                         } else {
-                            ForEach(listing.directories) { entry in
+                            ForEach(directories) { entry in
                                 Button {
                                     model.listDirectory(at: entry.path)
                                 } label: {
                                     Label(entry.name, systemImage: "folder")
+                                        .foregroundStyle(.primary)
                                 }
                                 .disabled(model.isCreatingWorkspace)
                             }
@@ -852,6 +855,29 @@ struct RemoteWorkspacePickerSheet: View {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         model.createWorkspace(at: path, title: cleanTitle.isEmpty ? nil : cleanTitle)
     }
+}
+
+/// The Mac directory picker intentionally keeps hidden folders out of the
+/// project browser.  The backend remains authoritative for the listing; this
+/// only applies the familiar file-picker presentation rule on the phone.
+func dshVisibleWorkspaceDirectories(_ directories: [DSHDirectoryEntry]) -> [DSHDirectoryEntry] {
+    directories.filter { !$0.name.hasPrefix(".") }
+}
+
+/// Archived sessions are deliberately a separate, time-ordered home section.
+/// Unlike active project lists, an archived task without a workspace still
+/// belongs here so it never disappears merely because its project was removed.
+func dshArchivedSessionsForHome(_ sessions: [DSHSessionSummary],
+                                matching query: String = "") -> [DSHSessionSummary] {
+    let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    return sessions
+        .filter { $0.archived == true }
+        .filter { session in
+            guard !normalizedQuery.isEmpty else { return true }
+            return session.title.localizedCaseInsensitiveContains(normalizedQuery)
+                || (session.workspaceName ?? "").localizedCaseInsensitiveContains(normalizedQuery)
+        }
+        .sorted { $0.updatedAt > $1.updatedAt }
 }
 
 /// The full-screen new-task surface accepts an intentional rightward swipe
@@ -977,10 +1003,10 @@ struct DSHHomeBottomBar: View {
                 Text("聊天")
                     .font(.system(size: 17, weight: .medium))
             }
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(.white)
             .padding(.horizontal, 16)
             .frame(minHeight: 52)
-            .dshFloatingChrome(Capsule())
+            .background(Color.accentColor, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("新建聊天")
@@ -1033,7 +1059,10 @@ struct DSHRemoteHomeView: View {
 
     private var groupedSessions: [DSHSessionGroup] {
         let sessionGroups = model.sessions
-            .groupedForList(.byWorkspace, showArchived: model.showArchivedSessions)
+            // Archived tasks have their own home section.  Never feed them
+            // into a project bucket, even after the remote snapshot includes
+            // them in response to the archive toggle.
+            .groupedForList(.byWorkspace, showArchived: false)
         let groupsByID = Dictionary(uniqueKeysWithValues: sessionGroups.map { ($0.id, $0) })
         let catalogGroups = model.workspaces.map { workspace in
             DSHSessionGroup(id: workspace.id, title: workspace.name,
@@ -1045,12 +1074,12 @@ struct DSHRemoteHomeView: View {
 
     private var flatSessions: [DSHSessionSummary] {
         model.sessions
-            .groupedForList(.flat, showArchived: model.showArchivedSessions)
+            .groupedForList(.flat, showArchived: false)
             .flatMap(\.sessions)
     }
 
-    private var hasArchivedSessions: Bool {
-        model.sessions.contains { $0.archived == true }
+    private var archivedSessions: [DSHSessionSummary] {
+        dshArchivedSessionsForHome(model.sessions, matching: searchQuery)
     }
 
     private var searchQuery: String {
@@ -1151,8 +1180,11 @@ struct DSHRemoteHomeView: View {
                         }
                     }
 
-                    if hasArchivedSessions {
+                    if !isLoadingTasks {
                         archivedDivider
+                        if model.showArchivedSessions {
+                            archivedSection
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1459,6 +1491,35 @@ struct DSHRemoteHomeView: View {
             .padding(.vertical, 9)
         }
         .buttonStyle(.plain)
+    }
+
+    private var archivedSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("已归档")
+                .font(.system(size: 17, weight: .semibold))
+                .padding(.horizontal, 12)
+                .padding(.top, 4)
+
+            if archivedSessions.isEmpty {
+                Text(searchQuery.isEmpty ? "暂无已归档任务" : "没有匹配的已归档任务")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(archivedSessions) { session in
+                    NavigationLink(value: session.id) {
+                        DSHRemoteTaskRow(session: session,
+                                         showWorkspaceName: true,
+                                         flatStyle: true)
+                            .environmentObject(model)
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu { archiveAction(for: session) }
+                }
+            }
+        }
+        .accessibilityIdentifier("home-archived-section")
     }
 
     @ViewBuilder

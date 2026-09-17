@@ -832,6 +832,64 @@ private struct DSHHomeSearchFixtureView: View {
 
 @MainActor
 final class DSHHomeLayoutTests: XCTestCase {
+    func testArchivedTasksStaySeparateAndSearchableWithoutAProject() {
+        let sessions = [
+            DSHSessionSummary(id: "active", title: "Active", updatedAt: 40, workspaceName: "Project"),
+            DSHSessionSummary(id: "older", title: "Finished", updatedAt: 10, workspaceName: "Project", archived: true),
+            DSHSessionSummary(id: "unfiled", title: "Detached", updatedAt: 30, archived: true),
+            DSHSessionSummary(id: "recent", title: "Recent", updatedAt: 20, workspaceName: "Project", archived: true)
+        ]
+        let active = sessions.groupedForList(.byWorkspace, showArchived: false).flatMap(\.sessions)
+        let archived = dshArchivedSessionsForHome(sessions)
+        XCTAssertEqual(active.map(\.id), ["active"])
+        XCTAssertEqual(archived.map(\.id), ["unfiled", "recent", "older"])
+        XCTAssertTrue(Set(active.map(\.id)).isDisjoint(with: Set(archived.map(\.id))))
+        XCTAssertEqual(dshArchivedSessionsForHome(sessions, matching: "  detached  ").map(\.id), ["unfiled"])
+        XCTAssertEqual(dshArchivedSessionsForHome(sessions, matching: "project").map(\.id), ["recent", "older"])
+        XCTAssertTrue(dshArchivedSessionsForHome(sessions, matching: "missing").isEmpty)
+    }
+
+    func testWorkspacePickerHidesDotFoldersWithoutChangingRemotePaths() {
+        let directories = [
+            DSHDirectoryEntry(name: ".git", path: "/Mac/.git"),
+            DSHDirectoryEntry(name: "Project", path: "/Mac/Project"),
+            DSHDirectoryEntry(name: ".config", path: "/Mac/.config"),
+            DSHDirectoryEntry(name: "project.v2", path: "/Mac/project.v2")
+        ]
+        XCTAssertEqual(dshVisibleWorkspaceDirectories(directories).map(\.path), ["/Mac/Project", "/Mac/project.v2"])
+        XCTAssertTrue(dshVisibleWorkspaceDirectories([directories[0]]).isEmpty)
+    }
+
+    func testHomeArchiveSectionAndChatAppearance() async throws {
+        var state = DSHStoreState()
+        state.hasLoadedSessions = true
+        state.sessions = [
+            DSHSessionSummary(id: "active", title: "正在进行的任务", updatedAt: 30, workspaceId: "work", workspaceName: "工作项目"),
+            DSHSessionSummary(id: "archived", title: "已完成的归档任务", updatedAt: 20, workspaceId: "work", workspaceName: "工作项目", archived: true),
+            DSHSessionSummary(id: "archived-unfiled", title: "无项目的归档任务", updatedAt: 10, archived: true)
+        ]
+        state.workspaceCatalog = [DSHWorkspaceOption(id: "work", name: "工作项目")]
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+        model.groupsSessionsByWorkspace = true
+        model.showArchivedSessions = true
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: DSHRemoteHomeView().environmentObject(model))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            window.overrideUserInterfaceStyle = style
+            try await Task.sleep(for: .milliseconds(600))
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = "home-archive-\(style == .light ? "light" : "dark")"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
     func testSearchDockMatchesConversationAndTracksKeyboardSafeArea() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)
