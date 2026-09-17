@@ -106,6 +106,9 @@
 ## 31. Mac 侧图片回传（缩略图内嵌）+ 漏数据审计
 - 状态：[树]根因：`{type:image, attachment:{attachmentId: sha256…}}`（网页上传/Mac 文件/模型回图）无 receiptId，手机无字节路径，桥还给随机 id（每次重播 duplicate 叠加）。做法：协议 `ChatAttachment.thumbnail?`（data URL，40 万字符封顶）+ `RELAY_SCHEMA_REVISION` 5→6；桥按 `DSH_HOME/attachments/v1/objects/ab/hex` 同步读盘嵌缩略图（256KB 封顶，超限/读不到降级纯名行；id 改用 attachmentId 保稳定；assistant 消息补发 attachments）；connector 仅重编（透传）；iOS 解 data URL，receipt 优先、缩略图兜底。测试：protocol 17（含封顶拒绝）、plugin 42（含稳定 id+内嵌正向）、relay 12、connector 13 全绿；iOS 单测走 Xcode。**发版顺序**：先重部署 Relay（旧 Relay 拒收新消息！），再发 App（旧 App 严格解码会整条丢消息！），最后 Mac 重编重启服务。审计余项：deliverables/presented（产出文件不可见）、todo/write（清单无展示，ROADMAP §6 已有）、llm/retry（重试中状态缺）、compaction/prune（压缩通知缺）、工具结果图片块（本会话零出现，暂不扩 schema）。待发版验证：网页传图→手机看缩略图。
 
+## 32. 中断不断折 + 滚动零时序依赖 + 命令入框
+- 状态：[树]①思考又被放出来（照片实锤新机制）：think 与回答之间隔了用户新消息（中途又发了一轮），用户轮把折叠打断。改为用户轮/命令卡/模型卡全部穿透（原地渲染不断折，pending 挂到下一个可见回答轮；队尾无回答才独立成段；取消轮误挂入下一时间线属罕见且默认折叠）。新增中断穿透单测。②滚动 H4 结构性消除：探针挂载时序不可远程验证，coordinator 加全窗最大 scroll view 回退（转录全屏恒最大，纯公开 API），挂载成败不再影响直驱。③加号 plan/goal 不再裸发空命令：改句首插入 `/plan `/`/goal `（替换行首旧 token，防连点叠加）并聚焦等参数；compact/export/feedback 裸跑有效不动，permission/model 照旧开面板。待发版验证（必须新版号）：思考单行、跳转落底、命令入框。
+
 ## 协作备注（2026-09-16 发现，09-17 已对齐）
 - `Features/Shared/DSHRemoteGlyphs.swift` 已进 Xcode target 并被 `ConversationView` 引用；归属已确认，无需再定。
 - 动 `ConversationView.swift` / `SessionListView.swift` 前仍先对齐，避免互盖。

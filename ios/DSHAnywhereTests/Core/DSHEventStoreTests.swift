@@ -657,6 +657,34 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(tools.map(\.id), ["t1", "t2"])
     }
 
+    func testInterruptionsDoNotSplitReasoningFold() {
+        // think → user message → /command card → answer must render ONE
+        // timeline row: interruptions render in place, the pending think
+        // attaches to the next visible assistant turn instead of stranding
+        // a lone "思考" row above the duration row.
+        let entries: [DSHTranscriptEntry] = [
+            .turn(DSHTranscriptBlock(id: "r", messages: [
+                DSHChatMessage(id: "r", role: .assistant, markdown: "",
+                               reasoning: "thinking…", sequence: 1),
+            ])),
+            .turn(DSHTranscriptBlock(id: "u", messages: [
+                DSHChatMessage(id: "u", role: .user, markdown: "and?", sequence: 2),
+            ])),
+            .command(DSHCommandResult(sessionId: "s", requestId: "c1", matched: true,
+                                      kind: "goal", text: "goal set", sequence: 3)),
+            .turn(DSHTranscriptBlock(id: "a", messages: [
+                DSHChatMessage(id: "a", role: .assistant, markdown: "done", sequence: 4),
+            ])),
+        ]
+        let sections = entries.groupedTurns()
+        XCTAssertEqual(sections.count, 3)
+        guard case .turn(let block, _) = sections[2] else {
+            return XCTFail("Think step should fold into the answer turn")
+        }
+        XCTAssertEqual(block.messages.map(\.id), ["r", "a"])
+        XCTAssertEqual(block.visibleMessages.map(\.id), ["a"])
+    }
+
     func testTrailingReasoningOnlyTurnStaysStandalone() {
         // Live streaming: reasoning arrived but the answer text has not yet.
         // It must stay visible (with its running tools) rather than vanish.

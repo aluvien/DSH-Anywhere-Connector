@@ -408,10 +408,34 @@ final class DSHScrollCoordinator: NSObject {
     weak var scrollView: UIScrollView?
 
     func scrollToBottom(animated: Bool) {
-        guard let scrollView else { return }
+        guard let scrollView = scrollView ?? Self.largestScrollView() else { return }
+        self.scrollView = scrollView
         let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height
             + scrollView.adjustedContentInset.bottom)
         scrollView.setContentOffset(CGPoint(x: 0, y: maxY), animated: animated)
+    }
+
+    /// Last-resort resolution with no mount-timing dependency: the transcript
+    /// scroll view is fullscreen, so it is always the largest scroll view in
+    /// the window (code blocks, sheets and pickers are all smaller). Public
+    /// UIKit traversal only.
+    private static func largestScrollView() -> UIScrollView? {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
+        var best: UIScrollView?
+        var bestArea: CGFloat = 0
+        func visit(_ view: UIView) {
+            if let scrollView = view as? UIScrollView {
+                let area = scrollView.bounds.width * scrollView.bounds.height
+                if area > bestArea {
+                    bestArea = area
+                    best = scrollView
+                }
+            }
+            for child in view.subviews { visit(child) }
+        }
+        for window in windows { visit(window) }
+        return best
     }
 }
 
@@ -693,12 +717,11 @@ struct ConversationView: View {
                     if !hasRenderedContent {
                         emptyConversationState
                     }
-                    // Headroom so the last row clears the floating dock: the
-                    // spacer must cover the dock's bottom lift PLUS its full
-                    // height (the anchor lands at the viewport bottom, so
-                    // anything less leaves the last line clipped behind the
-                    // dock). Includes the keyboard lift while typing.
-                    Color.clear.frame(height: dockHeight + dockBottomPadding(outer: outer) + 4)
+                    // The scroll viewport ends exactly at the dock top (see
+                    // the bottom safeAreaInset below), so no spacer is needed
+                    // here: the last row can never slide behind the dock, and
+                    // the anchor below always means dock-top, never viewport
+                    // guesswork.
                     // Tracks whether the viewport is at the newest output. It
                     // vanishes as soon as the reader scrolls back, which is what
                     // stops auto-follow from fighting a manual scroll.
@@ -735,6 +758,14 @@ struct ConversationView: View {
             // jump button goes dead). Pinning is fully owned by scrollToLatest
             // on every content change instead.
             .background(Color(.systemBackground))
+            // The transcript viewport ends exactly at the floating dock's top
+            // edge: dock height plus its bottom lift (keyboard included), so
+            // the last row rests above the dock with zero overlap math and
+            // nothing ever scrolls underneath it. The dock keeps floating
+            // over plain background; only the refraction showcase is gone.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Color.clear.frame(height: dockHeight + dockBottomPadding(outer: outer) + 4)
+            }
             .refreshable {
                 // Remote's pull-to-refresh rehydrates both the task metadata
                 // and the durable transcript without creating a second socket
@@ -854,6 +885,7 @@ struct ConversationView: View {
                         showCommandMenu = false
                         if command == "permission" { showPermissionPicker = true }
                         else if command == "model" { showModelPicker = true }
+                        else if Self.commandNeedsArguments(command) { insertCommandAtHead(command) }
                         else { model.executeCommand("/\(command)", for: sessionID) }
                     },
                     onDismiss: { showCommandMenu = false }
@@ -1033,10 +1065,16 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        // Full-width frosted bar: transcript blurs behind the whole header.
-        // frosted glass also lives on the back button and the capsule above.
-        // ultraThinMaterial works back to iOS 17, so no version branch here.
-        .background(.ultraThinMaterial)
+        // Full-width translucent bar WITHOUT blur: any blur material smears
+        // dense scrolling text into a gray haze (thin) or goes solid
+        // (regular) — a flat translucent fill is the only finish that reads
+        // both clean and translucent here. Frosted glass stays on the back
+        // button and the capsule above. A faint hairline closes the bottom
+        // so the bar reads as a surface, not a floating smear.
+        .background(Color(.systemBackground).opacity(0.85))
+        .overlay(alignment: .bottom) {
+            Color.primary.opacity(0.1).frame(height: 0.5)
+        }
         .background(GeometryReader { proxy in
             Color.clear.preference(key: DSHHeaderHeightKey.self, value: proxy.size.height)
         })
@@ -1353,7 +1391,8 @@ struct ConversationView: View {
                           }) {
             DSHComposerQuickActionsMenu(
                 onCommand: { command in
-                    model.executeCommand("/\(command)", for: sessionID)
+                    if Self.commandNeedsArguments(command) { insertCommandAtHead(command) }
+                    else { model.executeCommand("/\(command)", for: sessionID) }
                 },
                 onPhoto: { showPhotoPicker = true },
                 onFile: { showFileImporter = true },
@@ -1437,6 +1476,29 @@ struct ConversationView: View {
         let machine = model.machineName.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = machine.isEmpty ? "Mac" : machine
         return "在 \(name) 上工作"
+    }
+
+    /// Commands that are meaningless bare: sending "/plan" or "/goal" with no
+    /// task text fires an empty command. They insert at the draft head for
+    /// the user to complete instead. compact/export/feedback are valid bare
+    /// and keep executing immediately; permission/model open their pickers.
+    private static func commandNeedsArguments(_ command: String) -> Bool {
+        command == "plan" || command == "goal"
+    }
+
+    /// Prepends "/command " at the draft head (replacing any leading token
+    /// so re-tapping switches commands) and focuses the editor for arguments.
+    private func insertCommandAtHead(_ command: String) {
+        var text = model.draft
+        if text.hasPrefix("/") {
+            if let space = text.firstIndex(of: " ") {
+                text = String(text[text.index(after: space)...])
+            } else {
+                text = ""
+            }
+        }
+        model.draft = "/\(command) " + text
+        isDraftFocused = true
     }
 
     /// Two live lines above the input card while the turn runs:
@@ -3129,6 +3191,10 @@ private struct MessageAttachmentsView: View {
                             MessageAttachmentPreview(attachment: attachment)
                         }
                     }
+                    // Short rows hug the leading edge of a horizontal
+                    // scroller; stretch to the viewport so trailing
+                    // alignment (user uploads) actually holds.
+                    .frame(maxWidth: .infinity, alignment: alignTrailing ? .trailing : .leading)
                 }
             }
             ForEach(files) { attachment in
@@ -3187,14 +3253,29 @@ struct DSHImageViewer: View {
     let image: UIImage
     let name: String
     @Environment(\.dismiss) private var dismiss
+    @State private var dragOffset = CGSize.zero
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color.black
+                .opacity(1 - min(0.6, abs(dragOffset.height) / 600))
+                .ignoresSafeArea()
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .offset(y: max(0, dragOffset.height))
+                .gesture(
+                    DragGesture()
+                        .onChanged { dragOffset = $0.translation }
+                        .onEnded { value in
+                            if value.translation.height > 120 {
+                                dismiss()
+                            } else {
+                                withAnimation(.spring()) { dragOffset = .zero }
+                            }
+                        }
+                )
             VStack {
                 HStack {
                     Text(name)

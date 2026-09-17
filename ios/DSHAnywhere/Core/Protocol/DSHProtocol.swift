@@ -582,12 +582,15 @@ public extension Array where Element == DSHTranscriptSection {
     /// one logical turn renders one timeline row holding all of its reasoning
     /// and tools, with only the final answers outside.
     /// A trailing reasoning-only turn (live streaming, tools still running)
-    /// is kept as its own section so live progress is never hidden, and so is
-    /// one interrupted by a user turn or a command. Model-change notices and
-    /// orphan tools do NOT break the fold: a notice is metadata, not
-    /// conversation, and an orphan tool belongs to the pending think —
-    /// otherwise a mid-turn model switch strands a lone "思考" row above the
-    /// duration row it belongs to.
+    /// is kept as its own section so live progress is never hidden. Nothing
+    /// else breaks the fold — not user turns, command cards, or model-change
+    /// notices: an interruption between a think step and its answer must not
+    /// strand a lone "思考" row, so those rows render in place while the
+    /// pending think attaches to the next visible assistant turn. (A think
+    /// step from a cancelled turn can land in the next timeline in that
+    /// rare case; it stays folded shut, which beats a permanent stray row.)
+    /// Orphan tools do NOT break the fold either: with pending think around,
+    /// the tool belongs to it.
     func mergingReasoningOnlyTurns() -> [DSHTranscriptSection] {
         var merged: [DSHTranscriptSection] = []
         var pendingMessages: [DSHChatMessage] = []
@@ -614,7 +617,7 @@ public extension Array where Element == DSHTranscriptSection {
                     tools: pendingTools + tools))
                 pendingMessages = []
                 pendingTools = []
-            case .row(.modelChange):
+            case .row(.turn), .row(.modelChange), .row(.command):
                 merged.append(section)
             case .row(.tool(let tool)) where !pendingMessages.isEmpty || !pendingTools.isEmpty:
                 pendingTools.append(tool)
