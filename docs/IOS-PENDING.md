@@ -217,4 +217,5 @@
 - 原因：状态行只检查正在运行的工具与最后一条助手消息；工具结束后、空的工具调用消息或下一步思考期间会误回到“等待响应”。实时Bridge此前只投递正文增量，思考增量直到步骤完成才可见。
 - 修复：状态按当前用户轮次的有效轨迹选择，保留工具结束后的最新活动，排除上一轮内容；实时思考沿用已有reasoning事件和临时消息替换机制，只向开启流式的设备发送。
 - 顶部：根据补充要求，首页与会话页统一使用thinMaterial加10%页面底色，让经过的文字留下模糊轮廓；无内容经过时维持页面底色和无分隔线。
-- 验证：106项iOS定向回归、97项后端测试及全包build通过；Mac Bridge/Connector已重启，真实会话历史仍完整。签名Build113已生成，TestFlight上传中。
+- 验证：106项iOS定向回归、97项后端测试及全包build通过；Mac Bridge/Connector已重启，真实会话历史仍完整。2026-09-18 09:54（上海时间）TestFlight 1.0(113)上传成功，Apple已接收，等待处理；Delivery UUID：f77f4260-ec85-4784-a392-c03d0a7e72ea。
+- 发布产物：artifacts/ios/live-status-build113-20260918/；IPA SHA256：fdbe00a9f288edc7020885b0a7754f6653a382d936ad7daf98d5651eacea059f。无需更新Relay，schemaRevision保持8。
