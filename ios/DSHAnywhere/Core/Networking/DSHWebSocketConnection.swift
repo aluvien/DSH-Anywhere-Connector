@@ -267,6 +267,8 @@ public actor DSHWebSocketConnection {
             _state = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
             yieldControl(type: "transport.state", value: _state)
             var activeTask: (any DSHWebSocketTasking)?
+            var responseStatusCode: Int?
+            var closeCodeRawValue: Int?
             do {
                 var request = URLRequest(url: configuration.url)
                 request.setValue("Bearer \(configuration.bearerToken)", forHTTPHeaderField: "Authorization")
@@ -278,6 +280,11 @@ public actor DSHWebSocketConnection {
                     // Every receive-loop exit owns and closes exactly the task
                     // it created. Merely dropping our reference can leave a
                     // URLSession WebSocket alive across reconnect attempts.
+                    // Capture server metadata before cancellation: URLSession
+                    // may replace a remote 4401 close with our local 1001
+                    // going-away code once cancel() is called.
+                    responseStatusCode = task.responseStatusCode
+                    closeCodeRawValue = task.closeCodeRawValue
                     task.cancel(with: .goingAway, reason: nil)
                     if let current = socket,
                        (current as AnyObject) === (task as AnyObject) {
@@ -295,7 +302,9 @@ public actor DSHWebSocketConnection {
             } catch is CancellationError {
                 break
             } catch {
-                let classifiedError = classifyTransportError(error, task: activeTask)
+                let classifiedError = classifyTransportError(error, task: activeTask,
+                                                             responseStatusCode: responseStatusCode,
+                                                             closeCodeRawValue: closeCodeRawValue)
                 guard !stopped && !Task.isCancelled else { break }
                 if let socketError = classifiedError as? DSHWebSocketError,
                    case .eventBufferOverflow = socketError {
@@ -344,11 +353,13 @@ public actor DSHWebSocketConnection {
         }
     }
 
-    private func classifyTransportError(_ error: Error, task: (any DSHWebSocketTasking)?) -> Error {
-        if let status = task?.responseStatusCode, status == 401 || status == 403 {
+    private func classifyTransportError(_ error: Error, task: (any DSHWebSocketTasking)?,
+                                        responseStatusCode: Int?, closeCodeRawValue: Int?) -> Error {
+        if let status = responseStatusCode ?? task?.responseStatusCode, status == 401 || status == 403 {
             return DSHWebSocketError.authenticationRequired
         }
-        if let closeCode = task?.closeCodeRawValue, closeCode == 4401 || closeCode == 4403 {
+        if let closeCode = closeCodeRawValue ?? task?.closeCodeRawValue,
+           closeCode == 4401 || closeCode == 4403 {
             return DSHWebSocketError.authenticationRequired
         }
         if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
