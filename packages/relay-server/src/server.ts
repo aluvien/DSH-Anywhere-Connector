@@ -107,7 +107,10 @@ const PairDeviceRequestSchema = (
   if (name.length < 1 || name.length > 256) return undefined;
   const hasSecret = typeof pairingSecret === "string" && pairingSecret.length >= 1 && pairingSecret.length <= 1024;
   const hasCode = typeof pairingCode === "string" && pairingCode.trim().length >= 1 && pairingCode.length <= 64;
-  if (!hasSecret && !hasCode) return undefined;
+  // The credential forms are intentionally mutually exclusive. Accepting both
+  // would silently choose the one-time code while making callers believe the
+  // long-lived secret was also checked.
+  if (hasSecret === hasCode) return undefined;
   return {
     machineId,
     ...(hasSecret ? { pairingSecret } : {}),

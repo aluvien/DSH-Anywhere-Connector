@@ -416,6 +416,23 @@ describe("Relay server", () => {
       { machineId: machineB.machineId, pairingCode: minted.body.code, deviceName: "iPhone D" })).status).toBe(401);
   });
 
+  it("rejects ambiguous pairing requests that contain both credential forms", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const minted = await post<{ code: string }>(
+      server.url, `/v1/machines/${machine.machineId}/pairing-codes`, {}, machine.machineToken,
+    );
+    expect(minted.status).toBe(201);
+    const result = await post<{ error: string }>(server.url, "/v1/pair", {
+      machineId: machine.machineId,
+      pairingSecret: machine.pairingSecret,
+      pairingCode: minted.body.code,
+      deviceName: "iPhone",
+    });
+    expect(result.status).toBe(400);
+    expect(result.body.error).toBe("invalid_request");
+  });
+
   it("keeps the long-lived pairing secret working", async () => {
     const server = await relay();
     const machine = await register(server.url, "Mac");
