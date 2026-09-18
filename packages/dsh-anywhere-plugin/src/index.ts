@@ -269,6 +269,9 @@ export type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
    * messageId field, so publish can carry it without changing payloads. */
   readonly messageId?: string
   readonly sessionId?: string
+  /** History transcript events carry their replay batch through the Bridge
+   * and Relay so clients can keep late rows from driving live side effects. */
+  readonly historyBatchId?: string
   readonly deviceId?: string
   /** Control handshakes are sent to the current socket only and are not
    * business history that a later socket should replay. */
@@ -780,6 +783,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       type: event.type,
       payload: event.payload,
       ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
+      ...(event.historyBatchId === undefined ? {} : { historyBatchId: event.historyBatchId }),
     })
     const entry = replay.append(next, event.replay !== false)
     const wire = JSON.stringify({ ...next, sequence: entry.sequence })
@@ -946,6 +950,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             // be able to replace each session transcript atomically even
             // though 25 sessions backfill over one socket.
             publish({ deviceId: device.id, sessionId: summary.id, type: 'history.started',
+              historyBatchId: batchId,
               payload: { sessionId: summary.id, batchId } }, [client])
             for (let index = 0; index < allEvents.length; index += 1) {
               const event = allEvents[index]
@@ -953,7 +958,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
               if (index < recentStart) continue
               for (const next of normalized) {
                 if (next.type === 'usage.updated') publishedUsage = true
-                publish({ ...next, deviceId: device.id }, [client])
+                publish({ ...next, deviceId: device.id, historyBatchId: batchId }, [client])
               }
             }
             // The phone only needs recent message/tool rows, but the footer
@@ -966,6 +971,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
                 deviceId: device.id,
                 sessionId: summary.id,
                 type: 'usage.updated',
+                historyBatchId: batchId,
                 payload: {
                   sessionId: summary.id,
                   usage: { ...usageSnapshot(completeUsage), rounds: completeUsage.rounds, steps: completeUsage.steps },
@@ -973,6 +979,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
               }, [client])
             }
             publish({ deviceId: device.id, sessionId: summary.id, type: 'history.completed',
+              historyBatchId: batchId,
               payload: { sessionId: summary.id, batchId } }, [client])
             remaining -= recentCount
           }
@@ -1766,6 +1773,7 @@ async function publishSessionHistory(
   let publishedUsage = false
 
   publish({ deviceId, sessionId: session.id, type: 'history.started',
+    historyBatchId: batchId,
     payload: { sessionId: session.id, batchId } }, recipients)
   for (let index = 0; index < allEvents.length; index += 1) {
     const normalized = normalizeSessionEvents(
@@ -1778,7 +1786,7 @@ async function publishSessionHistory(
     if (index < recentStart) continue
     for (const next of normalized) {
       if (next.type === 'usage.updated') publishedUsage = true
-      publish({ ...next, deviceId }, recipients)
+      publish({ ...next, deviceId, historyBatchId: batchId }, recipients)
       published += 1
     }
   }
@@ -1792,6 +1800,7 @@ async function publishSessionHistory(
       deviceId,
       sessionId: session.id,
       type: 'usage.updated',
+      historyBatchId: batchId,
       payload: {
         sessionId: session.id,
         usage: { ...usageSnapshot(completeUsage), rounds: completeUsage.rounds, steps: completeUsage.steps },
@@ -1800,6 +1809,7 @@ async function publishSessionHistory(
     published += 1
   }
   publish({ deviceId, sessionId: session.id, type: 'history.completed',
+    historyBatchId: batchId,
     payload: { sessionId: session.id, batchId } }, recipients)
   return published
 }

@@ -178,7 +178,11 @@ actor DSHRemoteTransport: DSHAppTransport {
         let selection = machineSelectionGeneration
         pendingMachineSelectionID = machineId
         await disconnectConnection()
-        guard selection == machineSelectionGeneration else { return }
+        guard selection == machineSelectionGeneration,
+              store.profiles.contains(where: { $0.machineId == machineId }) else {
+            if pendingMachineSelectionID == machineId { pendingMachineSelectionID = nil }
+            return
+        }
         store.setActive(machineId)
         pendingMachineSelectionID = nil
     }

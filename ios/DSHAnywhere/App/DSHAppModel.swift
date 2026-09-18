@@ -166,9 +166,10 @@ final class DSHAppModel: ObservableObject {
     }
     private static let eventBatchNanoseconds: UInt64 = 50_000_000
     /// A prompt upload completes before the Harness emits its accepted user
-    /// message. Queue the local thumbnails so that event can attach them to the
-    /// correct transcript row without guessing by message text.
-    private var pendingMessageAttachmentsBySession: [String: [[DSHMessageAttachment]]] = [:]
+    /// message. Keep the local thumbnails under the prompt request id so a
+    /// concurrent prompt or a historical row cannot consume the wrong set.
+    private var pendingMessageAttachmentsByRequestID: [String: [DSHMessageAttachment]] = [:]
+    private var pendingMessageAttachmentCleanupTasks: [String: Task<Void, Never>] = [:]
     /// Thumbnail bytes by receipt. NSCache, not a dict: image bytes are the
     /// largest thing the app holds, a dict would grow without bound, and
     /// cache reads happen off the main actor where a dict would race.
@@ -225,7 +226,9 @@ final class DSHAppModel: ObservableObject {
         transcriptEntriesCache.removeAll(keepingCapacity: false)
         transcriptSectionsCache.removeAll(keepingCapacity: false)
         pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
-        pendingMessageAttachmentsBySession.removeAll(keepingCapacity: false)
+        for task in pendingMessageAttachmentCleanupTasks.values { task.cancel() }
+        pendingMessageAttachmentCleanupTasks.removeAll(keepingCapacity: false)
+        pendingMessageAttachmentsByRequestID.removeAll(keepingCapacity: false)
         pendingSendsByRequestID.removeAll(keepingCapacity: false)
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
@@ -554,10 +557,10 @@ final class DSHAppModel: ObservableObject {
     func removeMachine(_ machine: DSHRemoteProfile) {
         let wasActive = machine.machineId == activeMachine?.machineId
         let isPendingSelection = machine.machineId == pendingMachineSelectionID
-        if wasActive || isPendingSelection {
-            machineSelectionGeneration &+= 1
-            if isPendingSelection { pendingMachineSelectionID = nil }
-        }
+        let needsRecovery = wasActive || isPendingSelection
+        if needsRecovery { machineSelectionGeneration &+= 1 }
+        let recoveryGeneration = machineSelectionGeneration
+        if isPendingSelection { pendingMachineSelectionID = nil }
         if wasActive {
             eventTask?.cancel()
             eventTask = nil
@@ -571,34 +574,49 @@ final class DSHAppModel: ObservableObject {
             } catch {
                 self.errorMessage = error.localizedDescription
                 self.refreshMachines()
+                if needsRecovery, self.machineSelectionGeneration == recoveryGeneration {
+                    self.restoreActiveMachineAfterRemoval()
+                }
                 self.isPaired = !self.machines.isEmpty
                 return
             }
             self.refreshMachines()
-            guard wasActive else {
+            guard needsRecovery else {
                 self.isPaired = !self.machines.isEmpty
                 return
             }
-            self.selectedSessionID = nil
-            if let active = self.profiles.activeProfile {
-                // ProfileStore selects the remaining profile while removing
-                // the active one. Change the identity first: resetTransient-
-                // RequestState restores the queue using the current machine's
-                // persistence key, and restoring it while machineID still
-                // names the deleted Mac would load A into B's memory.
-                self.machineName = active.machineName
-                self.machineID = active.machineId
-                self.resetTransientRequestState()
-                self.state = DSHStoreState()
-                self.connect()
-            } else {
-                self.machineName = ""
-                self.machineID = ""
-                self.resetTransientRequestState()
-                self.state = DSHStoreState()
+            // If the user made another selection while deletion was in flight,
+            // its task owns recovery. Do not reconnect the old machine over it.
+            guard self.machineSelectionGeneration == recoveryGeneration else {
+                self.isPaired = !self.machines.isEmpty
+                return
             }
-            self.isPaired = !self.machines.isEmpty
+            self.pendingMachineSelectionID = nil
+            self.restoreActiveMachineAfterRemoval()
         }
+    }
+
+    /// Re-establishes the remaining active profile after an active machine or
+    /// a just-selected target is removed. Both cases may already have detached
+    /// the old socket, so merely refreshing the profile list is not enough.
+    private func restoreActiveMachineAfterRemoval() {
+        selectedSessionID = nil
+        if let active = profiles.activeProfile {
+            // ProfileStore selects the remaining profile while removing the
+            // active one. Change identity before restoring the per-machine
+            // queue so the old machine's state cannot be loaded into it.
+            machineName = active.machineName
+            machineID = active.machineId
+            resetTransientRequestState()
+            state = DSHStoreState()
+            connect()
+        } else {
+            machineName = ""
+            machineID = ""
+            resetTransientRequestState()
+            state = DSHStoreState()
+        }
+        isPaired = !machines.isEmpty
     }
 
     /// Loads the device list for the active machine from the Relay. The Relay
@@ -919,15 +937,26 @@ final class DSHAppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         guard validatePromptText(trimmed) else { return }
-        if !messageAttachments.isEmpty {
-            pendingMessageAttachmentsBySession[sessionID, default: []].append(messageAttachments)
-        }
         let requestId = requestedRequestID ?? UUID().uuidString
+        if !messageAttachments.isEmpty {
+            pendingMessageAttachmentsByRequestID[requestId] = messageAttachments
+            pendingMessageAttachmentCleanupTasks[requestId]?.cancel()
+            pendingMessageAttachmentCleanupTasks[requestId] = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                self?.clearPendingMessageAttachments(for: requestId)
+            }
+        }
         let attempt = (sendAttemptGenerations[requestId] ?? 0) + 1
         sendAttemptGenerations[requestId] = attempt
         pendingSendsByRequestID[requestId] = DSHPendingSend(
             id: requestId, text: trimmed, receipts: attachments,
-            sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt)
+            sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt,
+            messageAttachments: messageAttachments)
         armSendAckTimeout(requestId: requestId, attempt: attempt)
         let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
         send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
@@ -945,6 +974,7 @@ final class DSHAppModel: ObservableObject {
         let mode: String
         let sentAt: Date
         let attempt: Int
+        let messageAttachments: [DSHMessageAttachment]
     }
 
     enum DSHSendFailure: Sendable, Equatable {
@@ -960,6 +990,7 @@ final class DSHAppModel: ObservableObject {
         let receipts: [String]
         let sessionID: String
         let mode: String
+        let messageAttachments: [DSHMessageAttachment]
         let failure: DSHSendFailure
     }
 
@@ -1005,7 +1036,8 @@ final class DSHAppModel: ObservableObject {
         }
         failedSend = DSHFailedSend(id: requestId, text: pending.text,
                                    receipts: pending.receipts,
-                                   sessionID: pending.sessionID, mode: pending.mode, failure: failure)
+                                   sessionID: pending.sessionID, mode: pending.mode,
+                                   messageAttachments: pending.messageAttachments, failure: failure)
     }
 
     /// A request id is authoritative.  A message with an id that does not match
@@ -1029,6 +1061,11 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
+    private func clearPendingMessageAttachments(for requestID: String) {
+        pendingMessageAttachmentsByRequestID.removeValue(forKey: requestID)
+        pendingMessageAttachmentCleanupTasks.removeValue(forKey: requestID)?.cancel()
+    }
+
     /// A transport throw means the prompt never left the phone: park it for
     /// retry instead of only flashing an alert, and drop its staged
     /// thumbnails so they cannot attach to a later, unrelated message.
@@ -1038,7 +1075,7 @@ final class DSHAppModel: ObservableObject {
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         if let attempt, pendingSendsByRequestID[command.requestId]?.attempt != attempt { return }
         if attempt != nil && pendingSendsByRequestID[command.requestId] == nil { return }
-        pendingSendsByRequestID.removeValue(forKey: command.requestId)
+        let pending = pendingSendsByRequestID.removeValue(forKey: command.requestId)
         var receipts: [String] = []
         var text = ""
         var sessionID = ""
@@ -1051,14 +1088,14 @@ final class DSHAppModel: ObservableObject {
                 if let value = payload[key] { receipts += receiptIds(in: value) }
             }
         }
-        if !receipts.isEmpty, var queues = pendingMessageAttachmentsBySession[sessionID] {
-            queues.removeAll { inner in
-                !inner.isEmpty && inner.allSatisfy { receipts.contains($0.receiptId ?? $0.id) }
-            }
-            pendingMessageAttachmentsBySession[sessionID] = queues
-        }
+        let messageAttachments = pending?.messageAttachments
+            ?? pendingMessageAttachmentsByRequestID[command.requestId]
+            ?? []
+        clearPendingMessageAttachments(for: command.requestId)
         failedSend = DSHFailedSend(id: command.requestId, text: text, receipts: receipts,
-                                   sessionID: sessionID, mode: mode, failure: .local(error.localizedDescription))
+                                   sessionID: sessionID, mode: mode,
+                                   messageAttachments: messageAttachments,
+                                   failure: .local(error.localizedDescription))
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -1081,7 +1118,8 @@ final class DSHAppModel: ObservableObject {
         // Reuse the complete original command identity and mode so Connector
         // and Bridge idempotency coalesce the retry instead of executing it
         // a second time (a genuinely new submission still gets a new UUID).
-        sendPrompt(failed.text, attachments: failed.receipts, to: failed.sessionID,
+        sendPrompt(failed.text, attachments: failed.receipts,
+                   messageAttachments: failed.messageAttachments, to: failed.sessionID,
                    mode: failed.mode, requestId: failed.id)
     }
 
@@ -1540,15 +1578,17 @@ final class DSHAppModel: ObservableObject {
         // because both events happened to share one UI flush window.
         for event in acceptedEvents {
             let historyEvent: Bool
+            let explicitlyHistorical = event.envelope.historyBatchId != nil
             switch event.kind {
-            case .historyStarted(let batch):
+            case .historyStarted:
                 historyEvent = true
             case .historyCompleted(let batch):
-                historyEvent = isReplayingHistory(sessionID: batch.sessionId)
+                historyEvent = explicitlyHistorical || isReplayingHistory(sessionID: batch.sessionId)
             case .turnStateChanged(let turn):
-                historyEvent = isReplayingHistory(sessionID: turn.sessionId)
+                historyEvent = explicitlyHistorical || isReplayingHistory(sessionID: turn.sessionId)
             default:
-                historyEvent = event.envelope.sessionId.map { isReplayingHistory(sessionID: $0) } ?? false
+                historyEvent = explicitlyHistorical
+                    || (event.envelope.sessionId.map { isReplayingHistory(sessionID: $0) } ?? false)
             }
             handleSessionCreated(event)
             handleRemoteRequestCompletion(event)
@@ -1720,16 +1760,14 @@ final class DSHAppModel: ObservableObject {
         for event in events {
             guard case .userMessageAccepted(let message) = event.kind,
                   let sessionID = event.envelope.sessionId,
-                  var queue = pendingMessageAttachmentsBySession[sessionID],
-                  !queue.isEmpty,
+                  let local = pendingMessageAttachmentsByRequestID[event.envelope.messageId],
                   let index = state.messagesBySession[sessionID]?.firstIndex(where: { $0.id == message.id }) else {
                 continue
             }
-            let local = queue.removeFirst()
             if state.messagesBySession[sessionID]![index].attachments.isEmpty {
                 state.messagesBySession[sessionID]![index].attachments = local
             }
-            pendingMessageAttachmentsBySession[sessionID] = queue.isEmpty ? nil : queue
+            clearPendingMessageAttachments(for: event.envelope.messageId)
         }
     }
 

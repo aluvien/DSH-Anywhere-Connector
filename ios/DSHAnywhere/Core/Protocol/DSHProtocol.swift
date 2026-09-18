@@ -49,6 +49,9 @@ public struct DSHEnvelope: Codable, Sendable, Equatable {
     public let deviceId: String
     public let machineId: String
     public let sessionId: String?
+    /// Identifies events emitted as part of one history replay batch. Live
+    /// events leave this nil so a late replay row cannot settle local work.
+    public let historyBatchId: String?
     public let sequence: Int64
     /// Milliseconds since Unix epoch, as used by the JavaScript side.
     public let timestamp: Int64
@@ -57,6 +60,7 @@ public struct DSHEnvelope: Codable, Sendable, Equatable {
 
     public init(version: Int = 1, messageId: String, deviceId: String,
                 machineId: String, sessionId: String? = nil,
+                historyBatchId: String? = nil,
                 sequence: Int64, timestamp: Int64 = Int64(Date().timeIntervalSince1970 * 1_000),
                 type: String, payload: DSHJSONValue = .object([:])) {
         self.version = version
@@ -64,6 +68,7 @@ public struct DSHEnvelope: Codable, Sendable, Equatable {
         self.deviceId = deviceId
         self.machineId = machineId
         self.sessionId = sessionId
+        self.historyBatchId = historyBatchId
         self.sequence = sequence
         self.timestamp = timestamp
         self.type = type
@@ -74,7 +79,7 @@ public struct DSHEnvelope: Codable, Sendable, Equatable {
     // synthesized Codable implementation emits `sessionId: null`, which is
     // rejected by the relay's strict object schemas.
     private enum CodingKeys: String, CodingKey {
-        case version, messageId, deviceId, machineId, sessionId, sequence, timestamp, type, payload
+        case version, messageId, deviceId, machineId, sessionId, historyBatchId, sequence, timestamp, type, payload
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -84,6 +89,7 @@ public struct DSHEnvelope: Codable, Sendable, Equatable {
         try container.encode(deviceId, forKey: .deviceId)
         try container.encode(machineId, forKey: .machineId)
         try container.encodeIfPresent(sessionId, forKey: .sessionId)
+        try container.encodeIfPresent(historyBatchId, forKey: .historyBatchId)
         try container.encode(sequence, forKey: .sequence)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(type, forKey: .type)
@@ -131,11 +137,16 @@ public struct DSHCommand: Codable, Sendable, Equatable {
         try container.encode(payload, forKey: .payload)
     }
 
-    public static func resume(deviceId: String, machineId: String, lastSequence: Int64,
-                              includeArchived: Bool = false) -> DSHCommand {
+    public static func resume(deviceId: String, machineId: String, lastSequence: Int64) -> DSHCommand {
         DSHCommand(deviceId: deviceId, machineId: machineId, type: "connection.resume",
-                    payload: .object(["lastSequence": .number(Double(lastSequence)),
-                                      "includeArchived": .bool(includeArchived)]))
+                    payload: .object(["lastSequence": .number(Double(lastSequence))]))
+    }
+
+    public static func resume(deviceId: String, machineId: String, lastSequence: Int64,
+                              includeArchived: Bool) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, type: "connection.resume",
+                   payload: .object(["lastSequence": .number(Double(lastSequence)),
+                                     "includeArchived": .bool(includeArchived)]))
     }
 
     public static func sendPrompt(deviceId: String, machineId: String, sessionId: String,

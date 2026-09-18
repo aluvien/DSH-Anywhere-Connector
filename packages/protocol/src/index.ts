@@ -104,6 +104,8 @@ const EnvelopeFields = {
   machineId: IdentifierSchema,
   deviceId: IdentifierSchema,
   sessionId: IdentifierSchema.optional(),
+  /** Identifies events emitted as part of one history replay batch. */
+  historyBatchId: IdentifierSchema.optional(),
   sequence: SequenceSchema,
   timestamp: TimestampSchema,
 };
