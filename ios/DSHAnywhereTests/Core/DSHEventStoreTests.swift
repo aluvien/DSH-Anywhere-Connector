@@ -987,6 +987,76 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionCreationTimeoutBecomesRecoverableAndOldTimerCannotFailRetry() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 0.12
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "draft"))
+        let requestID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        try await Task.sleep(for: .milliseconds(70))
+        model.retrySessionCreation(requestID: requestID)
+
+        // The first attempt's timer has now expired, but the retry is still
+        // inside its own acknowledgement window.
+        try await Task.sleep(for: .milliseconds(70))
+        XCTAssertNil(model.sessionCreationFailure(for: requestID))
+        let retryCommand = await transport.lastCommand(ofType: "session.create")
+        XCTAssertEqual(retryCommand?.requestId, requestID)
+
+        try await Task.sleep(for: .milliseconds(90))
+        XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.resultUnknown == true)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testUnknownCreateCanBeKeptWhileEditingAndLateResultStillSettlesOriginal() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 0.04
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "original"))
+        let originalID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        try await Task.sleep(for: .milliseconds(90))
+        XCTAssertTrue(model.sessionCreationFailure(for: originalID)?.resultUnknown == true)
+
+        model.retainSessionCreationForEditing(requestID: originalID)
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "edited"))
+        let editedID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        XCTAssertNotEqual(originalID, editedID)
+
+        await transport.emit(event(type: "session.created", messageID: originalID, sequence: 1,
+                                   payload: .object([
+                                    "id": .string("late-original"),
+                                    "title": .string("Original"),
+                                    "updatedAt": .number(1),
+                                   ])))
+        try await Task.sleep(for: .milliseconds(90))
+
+        XCTAssertEqual(model.completedSessionCreationRequestID, originalID)
+        XCTAssertNil(model.sessionCreationFailure(for: originalID))
+        XCTAssertEqual(model.lastSessionCreationRequestID, editedID)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testSessionCreationRejectsModeFromAnotherMacCatalog() {
+        var state = DSHStoreState()
+        state.modeCatalog = DSHModeCatalog(defaultMode: "mac-b",
+                                           modes: [DSHModeOption(id: "mac-b", name: "Mac B")])
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+
+        XCTAssertFalse(model.createSession(mode: "mac-a", initialPrompt: "stale"))
+        XCTAssertEqual(model.errorMessage, "所选模式不属于当前 Mac，请重新选择。")
+        XCTAssertTrue(model.createSession(mode: "mac-b", initialPrompt: "valid"))
+        model.disconnect()
+    }
+
+    @MainActor
     func testPureAttachmentAcceptanceUsesRequestIdWhenMessageHasNoText() {
         let sid = "attachment-send-\(UUID().uuidString)"
         let requestID = "attachment-request-\(UUID().uuidString)"

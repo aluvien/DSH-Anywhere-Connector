@@ -101,10 +101,11 @@ struct NewSessionSheet: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 18, coordinateSpace: .local)
                 .onEnded { value in
-                    guard !isModelConfigurationPresented,
+                    guard pendingCreationRequestID == nil,
+                          !isModelConfigurationPresented,
                           dshShouldDismissNewTaskForRightSwipe(
-                        translation: value.translation,
-                        predictedEndTranslation: value.predictedEndTranslation
+                              translation: value.translation,
+                              predictedEndTranslation: value.predictedEndTranslation
                     ) else { return }
                     dismiss()
                 }
@@ -210,7 +211,9 @@ struct NewSessionSheet: View {
             selectDefaultModeIfNeeded()
         }
         .onChange(of: model.completedSessionCreationRequestID) { _, requestID in
-            guard requestID == pendingCreationRequestID else { return }
+            guard let requestID,
+                  let pendingRequestID = pendingCreationRequestID,
+                  requestID == pendingRequestID else { return }
             pendingCreationRequestID = nil
             dismiss()
         }
@@ -224,6 +227,7 @@ struct NewSessionSheet: View {
             selectedProvider = ""
             selectedModel = ""
             selectedReasoningEffort = nil
+            sessionMode = ""
         }
         .onChange(of: model.workspaces) { _, workspaces in
             if workspaceID.isEmpty, let first = workspaces.first {
@@ -263,18 +267,28 @@ struct NewSessionSheet: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("创建任务失败")
+                    Text(failure.resultUnknown ? "创建结果待确认" : "创建任务失败")
                         .font(.subheadline.weight(.semibold))
                     Text(failure.detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                    if failure.resultUnknown {
+                        Text("Mac 可能已经受理；保留原请求可避免重复创建。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
                 Spacer(minLength: 4)
                 Button("重试") { model.retrySessionCreation(requestID: requestID) }
                     .font(.subheadline.weight(.semibold))
-                Button("返回编辑") {
-                    model.cancelSessionCreation(requestID: requestID)
+                Button(failure.resultUnknown ? "保留并编辑" : "返回编辑") {
+                    if failure.resultUnknown {
+                        model.retainSessionCreationForEditing(requestID: requestID)
+                    } else {
+                        model.cancelSessionCreation(requestID: requestID)
+                    }
                     pendingCreationRequestID = nil
                 }
                 .font(.caption.weight(.semibold))
@@ -282,7 +296,7 @@ struct NewSessionSheet: View {
             .padding(10)
             .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("创建任务失败：\(failure.detail)")
+            .accessibilityLabel("\(failure.resultUnknown ? "创建结果待确认" : "创建任务失败")：\(failure.detail)")
         } else if pendingCreationRequestID != nil {
             HStack(spacing: 9) {
                 ProgressView()
@@ -456,7 +470,10 @@ struct NewSessionSheet: View {
     }
 
     private func selectDefaultModeIfNeeded() {
-        guard !model.modes.isEmpty else { return }
+        guard !model.modes.isEmpty else {
+            sessionMode = ""
+            return
+        }
         guard !model.modes.contains(where: { $0.id == sessionMode }) else { return }
         sessionMode = model.defaultModeID
             .flatMap { id in model.modes.contains(where: { $0.id == id }) ? id : nil }
@@ -674,7 +691,7 @@ struct NewSessionSheet: View {
     }
 
     private var canCreateSession: Bool {
-        !sessionMode.isEmpty
+        model.modes.contains(where: { $0.id == sessionMode })
             && (!initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !initialAttachments.isEmpty)
     }
@@ -814,6 +831,10 @@ struct NewSessionSheet: View {
     private func createSession() {
         guard pendingCreationRequestID == nil else { return }
         guard !model.workspaces.isEmpty else { return }
+        guard model.modes.contains(where: { $0.id == sessionMode }) else {
+            model.errorMessage = "模式尚未加载或不属于当前 Mac，请重新选择。"
+            return
+        }
         if !selectedModel.isEmpty,
            let catalog = model.modelCatalog,
            !selectionIsValid(in: catalog) {

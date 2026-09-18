@@ -43,6 +43,17 @@ struct DSHInitialMessageFailure: Identifiable, Equatable {
 struct DSHSessionCreationFailure: Identifiable, Equatable {
     let id: String
     let detail: String
+    /// `true` means the request may have reached the Mac but did not produce
+    /// an authoritative result.  Such a request must keep its idempotency key
+    /// until a correlated `session.created` (or an explicit user decision)
+    /// settles it.
+    let resultUnknown: Bool
+
+    init(id: String, detail: String, resultUnknown: Bool = false) {
+        self.id = id
+        self.detail = detail
+        self.resultUnknown = resultUnknown
+    }
 }
 
 /// The reasoning choices exposed by the currently selected Harness model.
@@ -220,6 +231,19 @@ final class DSHAppModel: ObservableObject {
     /// never infer the created session from a later list snapshot.
     private var pendingSessionCreationRequestIDs: Set<String> = []
     private var pendingSessionCreationCommandsByRequestID: [String: DSHCommand] = [:]
+    /// A create acknowledgement has a bounded waiting window.  Attempt
+    /// generations ensure a timer from an older retry cannot fail the newer
+    /// attempt after the same request id has been reused.
+    private var sessionCreationAttemptGenerations: [String: Int] = [:]
+    private var sessionCreationTimeoutTasks: [String: Task<Void, Never>] = [:]
+    /// Internal for deterministic tests; a real create gets fifteen seconds
+    /// before the UI changes from an indeterminate spinner to recoverable
+    /// "result unknown" state.
+    var sessionCreationAckTimeout: TimeInterval = 15
+    /// Requests explicitly kept while the user edits a new draft.  They stay
+    /// correlated so a late `session.created` can still be settled instead of
+    /// silently becoming an unrelated duplicate.
+    private var detachedSessionCreationRequestIDs: Set<String> = []
     private var pendingWorkspaceCreationRequestID: String?
     /// The picker issues one navigation request at a time. Keeping its latest
     /// id prevents a slower parent-folder response from replacing a newer
@@ -279,6 +303,10 @@ final class DSHAppModel: ObservableObject {
         lastOpenSessionAt.removeAll(keepingCapacity: false)
         pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingSessionCreationCommandsByRequestID.removeAll(keepingCapacity: false)
+        for task in sessionCreationTimeoutTasks.values { task.cancel() }
+        sessionCreationTimeoutTasks.removeAll(keepingCapacity: false)
+        sessionCreationAttemptGenerations.removeAll(keepingCapacity: false)
+        detachedSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingWorkspaceCreationRequestID = nil
         pendingDirectoryRequestID = nil
         isCreatingWorkspace = false
@@ -718,6 +746,8 @@ final class DSHAppModel: ObservableObject {
             } catch {
                 guard self.machineStateGeneration == connectionGeneration else { return }
                 self.flushPendingEvents()
+                self.markPendingSessionCreationsUnknown(
+                    detail: "连接已断开，创建结果待确认。")
                 self.errorMessage = error.localizedDescription
                 self.state.transportState = .failed(error.localizedDescription)
                 self.state.machineOnline = false
@@ -726,6 +756,10 @@ final class DSHAppModel: ObservableObject {
             }
             guard self.machineStateGeneration == connectionGeneration else { return }
             self.flushPendingEvents()
+            if !Task.isCancelled {
+                self.markPendingSessionCreationsUnknown(
+                    detail: "连接已结束，创建结果待确认。")
+            }
             self.eventTask = nil
         }
     }
@@ -782,6 +816,16 @@ final class DSHAppModel: ObservableObject {
                        initialPrompt: String? = nil,
                        initialAttachments: [DSHStagedAttachment] = []) -> Bool {
         if let initialPrompt, !validatePromptText(initialPrompt) { return false }
+        // A mode id is owned by the active Mac.  When its catalog is present,
+        // reject stale values before they can cross the machine boundary.  A
+        // nil catalog is kept compatible with older Connectors and previews;
+        // the new-session UI still waits for a non-empty catalog before it
+        // enables Create.
+        if let modeCatalog = state.modeCatalog,
+           !modeCatalog.modes.contains(where: { $0.id == mode }) {
+            errorMessage = "所选模式不属于当前 Mac，请重新选择。"
+            return false
+        }
         let requestId = UUID().uuidString
         pendingSessionCreationRequestIDs.insert(requestId)
         var payload: [String: DSHJSONValue] = [:]
@@ -829,8 +873,42 @@ final class DSHAppModel: ObservableObject {
         pendingSessionCreationCommandsByRequestID[requestId] = command
         lastSessionCreationRequestID = requestId
         failedSessionCreations.removeValue(forKey: requestId)
+        detachedSessionCreationRequestIDs.remove(requestId)
+        armSessionCreationTimeout(requestID: requestId)
         send(command)
         return true
+    }
+
+    private func armSessionCreationTimeout(requestID: String) {
+        let attempt = (sessionCreationAttemptGenerations[requestID] ?? 0) + 1
+        sessionCreationAttemptGenerations[requestID] = attempt
+        sessionCreationTimeoutTasks[requestID]?.cancel()
+        sessionCreationTimeoutTasks[requestID] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .seconds(max(0, self.sessionCreationAckTimeout)))
+            } catch {
+                return
+            }
+            guard self.sessionCreationAttemptGenerations[requestID] == attempt,
+                  self.pendingSessionCreationRequestIDs.contains(requestID) else { return }
+            self.markSessionCreationFailed(
+                requestID,
+                detail: "创建请求未收到 Mac 确认，结果待确认。",
+                resultUnknown: true)
+        }
+    }
+
+    private func cancelSessionCreationTimeout(requestID: String) {
+        sessionCreationTimeoutTasks.removeValue(forKey: requestID)?.cancel()
+        sessionCreationAttemptGenerations[requestID, default: 0] &+= 1
+    }
+
+    private func markPendingSessionCreationsUnknown(detail: String) {
+        for requestID in pendingSessionCreationRequestIDs {
+            guard failedSessionCreations[requestID] == nil else { continue }
+            markSessionCreationFailed(requestID, detail: detail, resultUnknown: true)
+        }
     }
 
     func refreshSessions(includeArchived: Bool? = nil) {
@@ -1587,7 +1665,10 @@ final class DSHAppModel: ObservableObject {
             isLoadingDirectory = false
         }
         if pendingSessionCreationRequestIDs.contains(requestID) {
-            markSessionCreationFailed(requestID, detail: detail)
+            // A transport send can fail after bytes have left the phone.  The
+            // conservative classification keeps the original idempotency
+            // key instead of allowing an unconfirmed retry to create twice.
+            markSessionCreationFailed(requestID, detail: detail, resultUnknown: true)
             return
         }
     }
@@ -1638,6 +1719,16 @@ final class DSHAppModel: ObservableObject {
         // retroactively suppress an earlier real-time terminal event merely
         // because both events happened to share one UI flush window.
         for event in acceptedEvents {
+            switch event.kind {
+            case .transportState(let connection) where connection != .connected:
+                markPendingSessionCreationsUnknown(
+                    detail: "连接已断开，创建结果待确认。")
+            case .machinePresence(false):
+                markPendingSessionCreationsUnknown(
+                    detail: "Mac 已离线，创建结果待确认。")
+            default:
+                break
+            }
             let historyEvent: Bool
             let explicitlyHistorical = event.envelope.historyBatchId != nil
             switch event.kind {
@@ -1857,9 +1948,14 @@ final class DSHAppModel: ObservableObject {
     private func completeCreatedSession(_ session: DSHSessionSummary, requestID: String) {
         pendingSessionCreationRequestIDs.remove(requestID)
         pendingSessionCreationCommandsByRequestID.removeValue(forKey: requestID)
+        cancelSessionCreationTimeout(requestID: requestID)
         failedSessionCreations.removeValue(forKey: requestID)
+        let wasDetached = detachedSessionCreationRequestIDs.remove(requestID) != nil
         completedSessionCreationRequestID = requestID
         selectedSessionID = session.id
+        if wasDetached {
+            errorMessage = "原创建请求已在 Mac 上完成；已保留原请求以避免重复创建。"
+        }
         guard var pending = pendingInitialMessagesByRequestID[requestID] else { return }
         pending.sessionID = session.id
         pendingInitialMessagesByRequestID[requestID] = pending
@@ -1897,7 +1993,8 @@ final class DSHAppModel: ObservableObject {
                 errorMessage = error.message
             }
             if pendingSessionCreationRequestIDs.contains(requestID) {
-                markSessionCreationFailed(requestID, detail: error.message)
+                markSessionCreationFailed(requestID, detail: error.message,
+                                           resultUnknown: error.code == "bridge-result-unknown")
                 errorMessage = error.message
             }
         default:
@@ -1905,12 +2002,15 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
-    private func markSessionCreationFailed(_ requestID: String, detail: String) {
+    private func markSessionCreationFailed(_ requestID: String, detail: String,
+                                           resultUnknown: Bool = false) {
         guard pendingSessionCreationCommandsByRequestID[requestID] != nil else { return }
+        cancelSessionCreationTimeout(requestID: requestID)
         failedSessionCreations[requestID] = DSHSessionCreationFailure(
             id: requestID,
             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "创建会话失败。" : detail)
+                ? "创建会话失败。" : detail,
+            resultUnknown: resultUnknown)
         errorMessage = detail
     }
 
@@ -1925,7 +2025,20 @@ final class DSHAppModel: ObservableObject {
         guard let command = pendingSessionCreationCommandsByRequestID[requestID],
               pendingSessionCreationRequestIDs.contains(requestID) else { return }
         failedSessionCreations.removeValue(forKey: requestID)
+        detachedSessionCreationRequestIDs.remove(requestID)
+        armSessionCreationTimeout(requestID: requestID)
         send(command)
+    }
+
+    /// Keeps an unknown-result request correlated while the user edits a new
+    /// draft.  It is deliberately not a cancellation: a late `session.created`
+    /// still settles the original operation and sends its original first
+    /// message, while a later draft receives a distinct request id.
+    func retainSessionCreationForEditing(requestID: String) {
+        guard let failure = failedSessionCreations[requestID], failure.resultUnknown,
+              pendingSessionCreationCommandsByRequestID[requestID] != nil else { return }
+        detachedSessionCreationRequestIDs.insert(requestID)
+        errorMessage = "原创建请求结果待确认；已保留它，稍后若 Mac 已创建会话会单独提示。"
     }
 
     /// Cancels a failed create explicitly. This is the only path that drops
@@ -1933,10 +2046,18 @@ final class DSHAppModel: ObservableObject {
     /// new-session sheet keeps its local draft so the user can edit and submit
     /// it again with a fresh request id.
     func cancelSessionCreation(requestID: String) {
+        if let failure = failedSessionCreations[requestID], failure.resultUnknown {
+            // There is no remote cancel primitive.  Never discard an
+            // operation whose side effect may already have committed.
+            retainSessionCreationForEditing(requestID: requestID)
+            return
+        }
         pendingSessionCreationRequestIDs.remove(requestID)
         pendingSessionCreationCommandsByRequestID.removeValue(forKey: requestID)
         pendingInitialMessagesByRequestID.removeValue(forKey: requestID)
         failedSessionCreations.removeValue(forKey: requestID)
+        detachedSessionCreationRequestIDs.remove(requestID)
+        cancelSessionCreationTimeout(requestID: requestID)
         if lastSessionCreationRequestID == requestID { lastSessionCreationRequestID = nil }
     }
 
