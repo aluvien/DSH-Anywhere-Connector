@@ -326,7 +326,14 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       connection.ws.readyState === WebSocket.OPEN,
     );
     if (targets.length === 0) {
-      sendError(source, "target_unavailable", `No connected ${targetRole} is available for this machine.`, payload.machineId, payload.messageId);
+      // The outer Relay message id identifies the transport frame, while the
+      // device UI waits on the command's body.requestId. Preserve that inner
+      // identity when Relay can prove the payload was not forwarded.
+      const body: unknown = payload.body;
+      const requestId = isRecord(body) && typeof body.requestId === "string"
+        ? body.requestId : payload.messageId;
+      sendError(source, "target_unavailable", `No connected ${targetRole} is available for this machine.`,
+        payload.machineId, requestId);
       return;
     }
     for (const target of targets) send(target, payload);

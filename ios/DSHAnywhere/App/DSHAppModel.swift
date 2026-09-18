@@ -135,6 +135,10 @@ final class DSHAppModel: ObservableObject {
     private var eventFlushTask: Task<Void, Never>?
     /// Invalidates delayed callbacks when the active machine/socket changes.
     private var machineStateGeneration = 0
+    /// Only the most recent machine-picker action may commit after awaiting
+    /// Transport cleanup. This is separate from the connection generation:
+    /// two valid choices can race even when both sockets are already gone.
+    private var machineSelectionGeneration = 0
     /// A send or upload task captures this token before its first suspension.
     /// Views use it to discard stale attachment callbacks without changing
     /// machine state themselves.
@@ -194,13 +198,15 @@ final class DSHAppModel: ObservableObject {
     /// Last `openSession` per session, to collapse duplicate replays.
     private var lastOpenSessionAt: [String: Date] = [:]
     /// Force-merge tasks for history batches whose closing bracket never
-    /// arrives (bridge died mid-stream). Keyed by session id.
+    /// arrives (bridge died mid-stream). Keyed by the session and batch so a
+    /// late callback from an older overlapping replay cannot cancel or clear
+    /// the newer batch's timer.
     private var historyTimeoutTasks: [String: Task<Void, Never>] = [:]
     /// History replay includes the stored terminal turn state. It must rebuild
     /// the transcript only; treating that state as a live completion would
     /// release a locally queued prompt while the user is merely opening an
     /// old session.
-    private var replayingHistorySessions: Set<String> = []
+    private var replayingHistoryBatches: [String: Set<String>] = [:]
     /// Already-notified request ids and failed sessions (see notifyForEvent).
     private var notifiedApprovalIDs: Set<String> = []
     private var notifiedQuestionIDs: Set<String> = []
@@ -222,7 +228,7 @@ final class DSHAppModel: ObservableObject {
         failedSend = nil
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
-        replayingHistorySessions.removeAll(keepingCapacity: false)
+        replayingHistoryBatches.removeAll(keepingCapacity: false)
         lastOpenSessionAt.removeAll(keepingCapacity: false)
         pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingWorkspaceCreationRequestID = nil
@@ -518,6 +524,8 @@ final class DSHAppModel: ObservableObject {
     /// because it carries the previous machine's identity.
     func switchMachine(_ machine: DSHRemoteProfile) {
         guard machine.machineId != activeMachine?.machineId else { return }
+        machineSelectionGeneration &+= 1
+        let selection = machineSelectionGeneration
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -525,6 +533,7 @@ final class DSHAppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
+            guard self.machineSelectionGeneration == selection else { return }
             self.machineName = machine.machineName
             self.machineID = machine.machineId
             // Restore only after the active identity changes. Restoring before
@@ -537,6 +546,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     func removeMachine(_ machine: DSHRemoteProfile) {
+        machineSelectionGeneration &+= 1
         let wasActive = machine.machineId == activeMachine?.machineId
         if wasActive {
             eventTask?.cancel()
@@ -647,6 +657,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     func disconnect() {
+        machineSelectionGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -660,6 +671,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     func forgetPairing() {
+        machineSelectionGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -1510,18 +1522,26 @@ final class DSHAppModel: ObservableObject {
         // transport tick, so one assignment is the bounded publication point.
         state = next
 
+        // A history bracket and its terminal turn events commonly arrive in
+        // the same UI batch. Register every opening bracket before walking
+        // side effects so an unusual event ordering cannot make a replayed
+        // terminal state release a local queue before its marker is seen.
+        for event in acceptedEvents {
+            if case .historyStarted(let batch) = event.kind {
+                beginHistoryReplay(batch)
+            }
+        }
         for event in acceptedEvents {
             let historyEvent: Bool
             switch event.kind {
             case .historyStarted(let batch):
-                replayingHistorySessions.insert(batch.sessionId)
                 historyEvent = true
             case .historyCompleted(let batch):
-                historyEvent = replayingHistorySessions.contains(batch.sessionId)
+                historyEvent = isReplayingHistory(sessionID: batch.sessionId)
             case .turnStateChanged(let turn):
-                historyEvent = replayingHistorySessions.contains(turn.sessionId)
+                historyEvent = isReplayingHistory(sessionID: turn.sessionId)
             default:
-                historyEvent = event.envelope.sessionId.map(replayingHistorySessions.contains) ?? false
+                historyEvent = event.envelope.sessionId.map { isReplayingHistory(sessionID: $0) } ?? false
             }
             handleSessionCreated(event)
             handleRemoteRequestCompletion(event)
@@ -1533,7 +1553,7 @@ final class DSHAppModel: ObservableObject {
             trackHistoryBatch(event)
             notifyForEvent(event)
             if case .historyCompleted(let batch) = event.kind {
-                replayingHistorySessions.remove(batch.sessionId)
+                endHistoryReplay(batch)
             }
         }
     }
@@ -1621,23 +1641,56 @@ final class DSHAppModel: ObservableObject {
     /// `history.completed` never arrives, the carry entry would linger; after
     /// ten seconds it is merged back (normally a no-op, since rows are never
     /// cleared for replays) and the entry is dropped.
+    private func beginHistoryReplay(_ batch: DSHHistoryBatch) {
+        replayingHistoryBatches[batch.sessionId, default: []].insert(batch.batchId)
+    }
+
+    private func endHistoryReplay(_ batch: DSHHistoryBatch) {
+        guard var batches = replayingHistoryBatches[batch.sessionId] else { return }
+        batches.remove(batch.batchId)
+        if batches.isEmpty { replayingHistoryBatches.removeValue(forKey: batch.sessionId) }
+        else { replayingHistoryBatches[batch.sessionId] = batches }
+    }
+
+    private func isReplayingHistory(sessionID: String) -> Bool {
+        !(replayingHistoryBatches[sessionID]?.isEmpty ?? true)
+    }
+
+    private func historyBatchKey(_ batch: DSHHistoryBatch) -> String {
+        "\(batch.sessionId)\u{001F}\(batch.batchId)"
+    }
+
     private func trackHistoryBatch(_ event: DSHEvent) {
         switch event.kind {
         case .historyStarted(let batch):
-            historyTimeoutTasks[batch.sessionId]?.cancel()
-            historyTimeoutTasks[batch.sessionId] = Task { @MainActor [weak self] in
+            beginHistoryReplay(batch)
+            let key = historyBatchKey(batch)
+            historyTimeoutTasks[key]?.cancel()
+            historyTimeoutTasks[key] = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
-                guard let self, self.state.historyCarryOverBySession[batch.sessionId] != nil else { return }
-                var next = self.state
-                self.reducer.completeHistory(sessionId: batch.sessionId, batchId: nil, into: &next)
-                self.invalidateTranscriptCaches(for: [batch.sessionId])
-                self.state = next
-                self.historyTimeoutTasks.removeValue(forKey: batch.sessionId)
+                guard let self else { return }
+                if self.state.historyCarryOverBySession[batch.sessionId] != nil {
+                    var next = self.state
+                    self.reducer.completeHistory(
+                        sessionId: batch.sessionId,
+                        batchId: batch.batchId,
+                        into: &next
+                    )
+                    self.invalidateTranscriptCaches(for: [batch.sessionId])
+                    self.state = next
+                }
+                // Even when the reducer has already completed the carry (or
+                // this overlapping batch was not the carry owner's batch),
+                // the replay marker must be retired so queued prompts can
+                // settle after a missing history.completed bracket.
+                self.endHistoryReplay(batch)
+                self.historyTimeoutTasks.removeValue(forKey: key)
             }
         case .historyCompleted(let batch):
-            historyTimeoutTasks[batch.sessionId]?.cancel()
-            historyTimeoutTasks.removeValue(forKey: batch.sessionId)
+            let key = historyBatchKey(batch)
+            historyTimeoutTasks[key]?.cancel()
+            historyTimeoutTasks.removeValue(forKey: key)
         default:
             break
         }

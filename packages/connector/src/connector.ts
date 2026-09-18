@@ -148,6 +148,10 @@ export class DSHAnywhereConnector {
     generation: number;
     includeArchived: boolean;
   }>();
+  /** A request superseded by a newer explicit list remains a tombstone for
+   * the dedupe window. Without this, the first retry can be rejected and a
+   * second delivery of the same request id can re-enter as a fresh query. */
+  private readonly supersededSessionListRequests = new Map<string, number>();
   /** Workspace catalogs are an independent projection from session lists.
    * A mutation push or a later explicit request must fence a slower catalog
    * response, without changing the archive-list generation above. */
@@ -156,6 +160,7 @@ export class DSHAnywhereConnector {
     requestId: string;
     generation: number;
   }>();
+  private readonly supersededWorkspaceCatalogRequests = new Map<string, number>();
   private readonly deferredSessionSnapshotDevices = new Set<string>();
   /** Workspace mutations and session projections are separate resources. A
    * stale session query must not suppress the catalog refresh that follows a
@@ -241,8 +246,10 @@ export class DSHAnywhereConnector {
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
     this.latestSessionListCommands.clear();
+    this.supersededSessionListRequests.clear();
     this.workspaceCatalogGenerationByDevice.clear();
     this.latestWorkspaceCatalogCommands.clear();
+    this.supersededWorkspaceCatalogRequests.clear();
     this.deferredSessionSnapshotDevices.clear();
     this.deferredWorkspaceCatalogDevices.clear();
     this.inFlightSessionMutations.clear();
@@ -472,7 +479,7 @@ export class DSHAnywhereConnector {
     this.dispatchCommand(command.data);
   }
 
-  private dispatchCommand(command: CommandEnvelope, retry = false): void {
+  private dispatchCommand(command: CommandEnvelope): void {
     const now = Date.now();
     for (const [key, execution] of this.commandExecutions) {
       if (execution.expiresAt <= now) this.commandExecutions.delete(key);
@@ -480,14 +487,20 @@ export class DSHAnywhereConnector {
     for (const [key, result] of this.commandResults) {
       if (result.expiresAt <= now && !this.commandExecutions.has(key)) this.commandResults.delete(key);
     }
-    // A retry is a continuation of an earlier request, not a new list/catalog
-    // choice.  Do this check only on the retry path: a fresh request must be
-    // allowed to establish the newer generation that fences the old one.
-    if (retry && command.type === "session.list" && this.isSupersededSessionList(command)) {
+    for (const [key, expiresAt] of this.supersededSessionListRequests) {
+      if (expiresAt <= now) this.supersededSessionListRequests.delete(key);
+    }
+    for (const [key, expiresAt] of this.supersededWorkspaceCatalogRequests) {
+      if (expiresAt <= now) this.supersededWorkspaceCatalogRequests.delete(key);
+    }
+    // A superseded request id remains a tombstone for the whole dedupe
+    // window. This covers the internal retry path and repeated deliveries
+    // after the first superseded response has already been sent.
+    if (command.type === "session.list" && this.isSupersededSessionList(command)) {
       this.sendSupersededSessionList(command);
       return;
     }
-    if (retry && command.type === "workspace.catalog" && this.isSupersededWorkspaceCatalog(command)) {
+    if (command.type === "workspace.catalog" && this.isSupersededWorkspaceCatalog(command)) {
       this.sendSupersededWorkspaceCatalog(command);
       return;
     }
@@ -505,7 +518,7 @@ export class DSHAnywhereConnector {
         if (outcome.state === "failed" && outcome.retryable) {
           this.commandExecutions.delete(key);
           this.commandResults.delete(key);
-          this.dispatchCommand(command, true);
+          this.dispatchCommand(command);
         } else {
           this.replayCommandResult(command);
         }
@@ -545,11 +558,8 @@ export class DSHAnywhereConnector {
         ? this.beginWorkspaceCatalogQuery(command.deviceId, command.requestId)
         : undefined;
       if (sessionSnapshotGeneration !== undefined) {
-        this.latestSessionListCommands.set(command.deviceId, {
-          requestId: command.requestId,
-          generation: sessionSnapshotGeneration,
-          includeArchived,
-        });
+        this.rememberLatestSessionListCommand(command.deviceId, command.requestId,
+                                              sessionSnapshotGeneration, includeArchived);
         if (this.inFlightSessionMutations.has(command.deviceId)) {
           this.deferredSessionSnapshotDevices.add(command.deviceId);
         }
@@ -936,11 +946,8 @@ export class DSHAnywhereConnector {
       return;
     }
     const generation = this.beginSessionSnapshotQuery(command.deviceId, command.payload.includeArchived === true);
-    this.latestSessionListCommands.set(command.deviceId, {
-      requestId: command.requestId,
-      generation,
-      includeArchived: command.payload.includeArchived === true,
-    });
+    this.rememberLatestSessionListCommand(command.deviceId, command.requestId, generation,
+                                          command.payload.includeArchived === true);
     this.pendingSessionListRequests.set(command.deviceId, {
       requestId: command.requestId,
       generation,
@@ -1136,14 +1143,30 @@ export class DSHAnywhereConnector {
   }
 
   private isSupersededSessionList(command: Extract<CommandEnvelope, { type: "session.list" }>): boolean {
-    const latest = this.latestSessionListCommands.get(command.deviceId);
-    return latest !== undefined && latest.requestId !== command.requestId;
+    return this.supersededSessionListRequests.has(this.queryTombstoneKey(command.deviceId, command.requestId));
+  }
+
+  private rememberLatestSessionListCommand(deviceId: string, requestId: string,
+                                           generation: number, includeArchived: boolean): void {
+    const previous = this.latestSessionListCommands.get(deviceId);
+    if (previous !== undefined && previous.requestId !== requestId) {
+      this.supersededSessionListRequests.set(
+        this.queryTombstoneKey(deviceId, previous.requestId), Date.now() + COMMAND_DEDUP_TTL_MS,
+      );
+    }
+    this.latestSessionListCommands.set(deviceId, { requestId, generation, includeArchived });
   }
 
   private beginWorkspaceCatalogQuery(deviceId: string, requestId?: string): number {
     const generation = (this.workspaceCatalogGenerationByDevice.get(deviceId) ?? 0) + 1;
     this.workspaceCatalogGenerationByDevice.set(deviceId, generation);
     if (requestId !== undefined) {
+      const previous = this.latestWorkspaceCatalogCommands.get(deviceId);
+      if (previous !== undefined && previous.requestId !== requestId) {
+        this.supersededWorkspaceCatalogRequests.set(
+          this.queryTombstoneKey(deviceId, previous.requestId), Date.now() + COMMAND_DEDUP_TTL_MS,
+        );
+      }
       this.latestWorkspaceCatalogCommands.set(deviceId, { requestId, generation });
     }
     return generation;
@@ -1154,8 +1177,11 @@ export class DSHAnywhereConnector {
   }
 
   private isSupersededWorkspaceCatalog(command: Extract<CommandEnvelope, { type: "workspace.catalog" }>): boolean {
-    const latest = this.latestWorkspaceCatalogCommands.get(command.deviceId);
-    return latest !== undefined && latest.requestId !== command.requestId;
+    return this.supersededWorkspaceCatalogRequests.has(this.queryTombstoneKey(command.deviceId, command.requestId));
+  }
+
+  private queryTombstoneKey(deviceId: string, requestId: string): string {
+    return `${deviceId}\0${requestId}`;
   }
 
   private finishSessionListRequest(command: CommandEnvelope, generation: number | undefined): void {

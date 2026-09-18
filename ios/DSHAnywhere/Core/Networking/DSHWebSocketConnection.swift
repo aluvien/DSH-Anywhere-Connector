@@ -442,8 +442,13 @@ public actor DSHWebSocketConnection {
             if error.code == "target_unavailable" {
                 // The Relay socket is healthy; only the paired Mac is offline.
                 // Keep this connection so its machine-presence event can wake
-                // the UI as soon as a Connector appears.
+                // the UI as soon as a Connector appears. When Relay includes
+                // the command's body.requestId, also settle that request as
+                // explicitly unaccepted; otherwise folder/session controls
+                // would remain busy forever waiting for a response that can
+                // never be produced by an offline Connector.
                 sessionSnapshotRequests.removeAll(keepingCapacity: false)
+                if error.messageId != nil { yieldRelayProtocolError(error) }
                 yieldControl(type: "machine.presence", value: false)
                 return false
             }

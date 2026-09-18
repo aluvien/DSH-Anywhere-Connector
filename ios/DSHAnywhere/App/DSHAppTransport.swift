@@ -35,6 +35,9 @@ actor DSHRemoteTransport: DSHAppTransport {
     /// an actor `await`.  Actor isolation does not make a multi-step connect
     /// transaction atomic once it awaits URLSession or the socket actor.
     private var connectionGeneration = 0
+    /// A later machine choice supersedes an earlier choice even when the
+    /// earlier socket's asynchronous cleanup finishes last.
+    private var machineSelectionGeneration = 0
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -146,6 +149,11 @@ actor DSHRemoteTransport: DSHAppTransport {
     }
 
     func disconnect() async {
+        machineSelectionGeneration &+= 1
+        await disconnectConnection()
+    }
+
+    private func disconnectConnection() async {
         connectionGeneration &+= 1
         let oldConnection = connection
         connection = nil
@@ -162,7 +170,10 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func setActiveMachine(_ machineId: String) async {
         // The socket carries the old machine's identity, so it cannot be reused.
-        await disconnect()
+        machineSelectionGeneration &+= 1
+        let selection = machineSelectionGeneration
+        await disconnectConnection()
+        guard selection == machineSelectionGeneration else { return }
         store.setActive(machineId)
     }
 
