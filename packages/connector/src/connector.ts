@@ -1036,8 +1036,18 @@ export class DSHAnywhereConnector {
   }
 
   private sendProtocolError(command: CommandEnvelope, error: unknown): boolean {
-    const resultUnknown = (error instanceof Error && error.name === "TimeoutError")
-      || (error instanceof BridgeRequestError && error.outcome === "unknown");
+    // A successful native mutation can still be followed by a broken HTTP
+    // response (for example a truncated JSON body).  Only an explicit
+    // client-error response proves that session creation was rejected before
+    // it reached the Harness; every other create failure keeps the original
+    // request id in the recoverable "result unknown" state.
+    const definitelyRejected = error instanceof BridgeRequestError
+      && error.status >= 400 && error.status < 500 && error.outcome !== "unknown";
+    const resultUnknown = !definitelyRejected && (
+      (error instanceof Error && error.name === "TimeoutError")
+      || (error instanceof BridgeRequestError && error.outcome === "unknown")
+      || command.type === "session.create"
+    );
     const reason = resultUnknown
       ? "Local operation did not confirm completion before the deadline; its result is unknown"
       : error instanceof BridgeRequestError
@@ -1049,7 +1059,7 @@ export class DSHAnywhereConnector {
     // An explicit Bridge `unknown` outcome remains non-retryable because the
     // native side may already have committed a partial effect.
     const retryable = resultUnknown
-      ? error instanceof Error && error.name === "TimeoutError"
+      ? command.type === "session.create" || (error instanceof Error && error.name === "TimeoutError")
       : isRetryable(error);
     this.sendEvent({
       version: PROTOCOL_VERSION,

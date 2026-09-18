@@ -48,12 +48,30 @@ struct DSHSessionCreationFailure: Identifiable, Equatable {
     /// until a correlated `session.created` (or an explicit user decision)
     /// settles it.
     let resultUnknown: Bool
+    /// The server-side idempotency records are guaranteed through this point.
+    /// Unknown results must not be re-executed after the deadline.
+    let retryUntil: Date
 
-    init(id: String, detail: String, resultUnknown: Bool = false) {
+    init(id: String, detail: String, resultUnknown: Bool = false,
+         retryUntil: Date = .distantFuture) {
         self.id = id
         self.detail = detail
         self.resultUnknown = resultUnknown
+        self.retryUntil = retryUntil
     }
+}
+
+private struct DSHSessionCreationTransaction {
+    let command: DSHCommand
+    let initialMessage: DSHPendingInitialMessage?
+    let failure: DSHSessionCreationFailure?
+    let detached: Bool
+    let retryDeadline: Date
+}
+
+private struct DSHInitialMessageTransaction {
+    let pending: DSHPendingInitialMessage
+    let failure: DSHInitialMessageFailure?
 }
 
 /// The reasoning choices exposed by the currently selected Harness model.
@@ -148,6 +166,10 @@ final class DSHAppModel: ObservableObject {
     @Published private(set) var failedSessionCreations: [String: DSHSessionCreationFailure] = [:]
     @Published private(set) var lastSessionCreationRequestID: String?
     @Published private(set) var completedSessionCreationRequestID: String?
+    /// Completion is request-scoped.  The legacy single id remains a useful
+    /// last-completed hint, but a dictionary prevents two acknowledgements in
+    /// one event batch from overwriting the id a sheet is waiting for.
+    @Published private(set) var sessionCreationResults: [String: String] = [:]
     /// Every Mac this iPhone is paired with, and which one is active.
     @Published private(set) var machines: [DSHRemoteProfile]
     /// Devices paired to the active machine, as the Relay reports them.
@@ -240,6 +262,24 @@ final class DSHAppModel: ObservableObject {
     /// before the UI changes from an indeterminate spinner to recoverable
     /// "result unknown" state.
     var sessionCreationAckTimeout: TimeInterval = 15
+    /// This mirrors the Connector/Bridge idempotency retention contract.  A
+    /// client-side UUID is not an eternal dedupe key: after this point the UI
+    /// must stop re-executing an unresolved create and ask the user to inspect
+    /// the refreshed session list instead.
+    static let sessionCreationIdempotencyWindow: TimeInterval = 10 * 60
+    var sessionCreationRetryWindow: TimeInterval = 10 * 60
+    private var sessionCreationRetryDeadlines: [String: Date] = [:]
+    private var sessionCreationResultOrder: [String] = []
+    /// Unknown creates are business transactions, not socket scratch state.
+    /// Keep one snapshot per paired Mac so switching A -> B cannot delete an
+    /// A request that may still complete on the original machine.
+    private var sessionCreationTransactionsByMachine: [String: [String: DSHSessionCreationTransaction]] = [:]
+    private var lastSessionCreationRequestIDsByMachine: [String: String] = [:]
+    /// A session may already exist while its first prompt is still uploading
+    /// or awaiting acceptance. Keep that second phase by machine as well, so
+    /// a normal disconnect/switch cannot strand the user's original text or
+    /// attachments in the cleared socket state.
+    private var initialMessageTransactionsByMachine: [String: [String: DSHInitialMessageTransaction]] = [:]
     /// Requests explicitly kept while the user edits a new draft.  They stay
     /// correlated so a late `session.created` can still be settled instead of
     /// silently becoming an unrelated duplicate.
@@ -276,6 +316,106 @@ final class DSHAppModel: ObservableObject {
     private var notifiedQuestionIDs: Set<String> = []
     private var notifiedFailedSessions: Set<String> = []
 
+    private func suspendSessionCreationTransactions(for machineID: String) {
+        guard !machineID.isEmpty else { return }
+        var snapshot: [String: DSHSessionCreationTransaction] = [:]
+        for requestID in pendingSessionCreationRequestIDs {
+            guard let command = pendingSessionCreationCommandsByRequestID[requestID] else { continue }
+            snapshot[requestID] = DSHSessionCreationTransaction(
+                command: command,
+                initialMessage: pendingInitialMessagesByRequestID[requestID],
+                failure: failedSessionCreations[requestID],
+                detached: detachedSessionCreationRequestIDs.contains(requestID),
+                retryDeadline: sessionCreationRetryDeadlines[requestID]
+                    ?? Date().addingTimeInterval(sessionCreationRetryWindow))
+        }
+        if snapshot.isEmpty {
+            sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+            lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
+        } else {
+            sessionCreationTransactionsByMachine[machineID] = snapshot
+            if let lastSessionCreationRequestID,
+               snapshot[lastSessionCreationRequestID] != nil {
+                lastSessionCreationRequestIDsByMachine[machineID] = lastSessionCreationRequestID
+            }
+        }
+
+        var initialSnapshot: [String: DSHInitialMessageTransaction] = [:]
+        for (requestID, pending) in pendingInitialMessagesByRequestID {
+            // A message without a session id still belongs to the create
+            // transaction above. The completed-session phase is the one that
+            // needs its own recovery record.
+            guard pending.sessionID != nil else { continue }
+            let failure = failedInitialMessages[requestID]
+                ?? DSHInitialMessageFailure(
+                    id: requestID,
+                    sessionID: pending.sessionID!,
+                    text: pending.text,
+                    detail: "连接已断开，首条消息待重试。")
+            initialSnapshot[requestID] = DSHInitialMessageTransaction(
+                pending: pending, failure: failure)
+        }
+        if initialSnapshot.isEmpty {
+            initialMessageTransactionsByMachine.removeValue(forKey: machineID)
+        } else {
+            initialMessageTransactionsByMachine[machineID] = initialSnapshot
+        }
+    }
+
+    private func restoreSessionCreationTransactions(for machineID: String) {
+        if let snapshot = sessionCreationTransactionsByMachine[machineID] {
+            for (requestID, transaction) in snapshot {
+                pendingSessionCreationRequestIDs.insert(requestID)
+                pendingSessionCreationCommandsByRequestID[requestID] = transaction.command
+                if let initialMessage = transaction.initialMessage {
+                    pendingInitialMessagesByRequestID[requestID] = initialMessage
+                }
+                if let failure = transaction.failure {
+                    failedSessionCreations[requestID] = failure
+                }
+                sessionCreationRetryDeadlines[requestID] = transaction.retryDeadline
+                if transaction.detached { detachedSessionCreationRequestIDs.insert(requestID) }
+            }
+            lastSessionCreationRequestID = lastSessionCreationRequestIDsByMachine[machineID]
+                ?? snapshot.keys.sorted().last
+            for requestID in pendingSessionCreationRequestIDs where failedSessionCreations[requestID] == nil {
+                armSessionCreationTimeout(requestID: requestID)
+            }
+        }
+        if let initialSnapshot = initialMessageTransactionsByMachine[machineID] {
+            for (requestID, transaction) in initialSnapshot {
+                pendingInitialMessagesByRequestID[requestID] = transaction.pending
+                if let failure = transaction.failure {
+                    failedInitialMessages[requestID] = failure
+                }
+            }
+        }
+    }
+
+    private func removeStoredSessionCreationTransaction(_ requestID: String, for machineID: String) {
+        guard var snapshot = sessionCreationTransactionsByMachine[machineID] else { return }
+        snapshot.removeValue(forKey: requestID)
+        if snapshot.isEmpty {
+            sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+            lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
+        } else {
+            sessionCreationTransactionsByMachine[machineID] = snapshot
+            if lastSessionCreationRequestIDsByMachine[machineID] == requestID {
+                lastSessionCreationRequestIDsByMachine[machineID] = snapshot.keys.sorted().last
+            }
+        }
+    }
+
+    private func removeStoredInitialMessageTransaction(_ requestID: String, for machineID: String) {
+        guard var snapshot = initialMessageTransactionsByMachine[machineID] else { return }
+        snapshot.removeValue(forKey: requestID)
+        if snapshot.isEmpty {
+            initialMessageTransactionsByMachine.removeValue(forKey: machineID)
+        } else {
+            initialMessageTransactionsByMachine[machineID] = snapshot
+        }
+    }
+
     /// Drops all in-flight per-machine bookkeeping. History batches belong to
     /// the previous machine's socket, so their timeouts die here too (the
     /// state reset already drops any carried-over rows).
@@ -297,6 +437,9 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeAll(keepingCapacity: false)
         lastSessionCreationRequestID = nil
         completedSessionCreationRequestID = nil
+        sessionCreationResults.removeAll(keepingCapacity: false)
+        sessionCreationResultOrder.removeAll(keepingCapacity: false)
+        sessionCreationRetryDeadlines.removeAll(keepingCapacity: false)
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
         replayingHistoryBatches.removeAll(keepingCapacity: false)
@@ -605,6 +748,7 @@ final class DSHAppModel: ObservableObject {
         // The old guard treated it as a no-op, leaving the UI detached from A
         // until the stale B task eventually committed.
         guard !isCurrentMachine || pendingMachineSelectionID != nil else { return }
+        let previousMachineID = machineID
         machineSelectionGeneration &+= 1
         let selection = machineSelectionGeneration
         pendingMachineSelectionID = machine.machineId
@@ -617,12 +761,14 @@ final class DSHAppModel: ObservableObject {
             await self.transport.setActiveMachine(machine.machineId)
             guard self.machineSelectionGeneration == selection else { return }
             self.pendingMachineSelectionID = nil
+            self.suspendSessionCreationTransactions(for: previousMachineID)
             self.machineName = machine.machineName
             self.machineID = machine.machineId
             // Restore only after the active identity changes. Restoring before
             // this point reads A's key and can later overwrite B's queue.
             self.resetTransientRequestState()
             self.state = DSHStoreState()
+            self.restoreSessionCreationTransactions(for: machine.machineId)
             self.refreshMachines()
             self.connect()
         }
@@ -632,6 +778,11 @@ final class DSHAppModel: ObservableObject {
         let wasActive = machine.machineId == activeMachine?.machineId
         let isPendingSelection = machine.machineId == pendingMachineSelectionID
         let needsRecovery = wasActive || isPendingSelection
+        if wasActive || isPendingSelection {
+            sessionCreationTransactionsByMachine.removeValue(forKey: machine.machineId)
+            lastSessionCreationRequestIDsByMachine.removeValue(forKey: machine.machineId)
+            initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
+        }
         if needsRecovery { machineSelectionGeneration &+= 1 }
         let recoveryGeneration = machineSelectionGeneration
         if isPendingSelection { pendingMachineSelectionID = nil }
@@ -728,6 +879,9 @@ final class DSHAppModel: ObservableObject {
 
     func connect() {
         guard isPaired, eventTask == nil else { return }
+        if pendingSessionCreationRequestIDs.isEmpty {
+            restoreSessionCreationTransactions(for: machineID)
+        }
         let connectionGeneration = machineStateGeneration
         state.connectionState = .connecting
         state.transportState = .connecting
@@ -771,6 +925,7 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
+        suspendSessionCreationTransactions(for: machineID)
         resetTransientRequestState()
         Task { await transport.disconnect() }
         state.transportState = .disconnected
@@ -786,6 +941,9 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
+        sessionCreationTransactionsByMachine.removeAll(keepingCapacity: false)
+        lastSessionCreationRequestIDsByMachine.removeAll(keepingCapacity: false)
+        initialMessageTransactionsByMachine.removeAll(keepingCapacity: false)
         resetTransientRequestState()
         Task { @MainActor [weak self] in
             do { try await self?.transport.forgetPairing() }
@@ -872,6 +1030,8 @@ final class DSHAppModel: ObservableObject {
                                   payload: .object(payload))
         pendingSessionCreationCommandsByRequestID[requestId] = command
         lastSessionCreationRequestID = requestId
+        sessionCreationRetryDeadlines[requestId] =
+            Date().addingTimeInterval(sessionCreationRetryWindow)
         failedSessionCreations.removeValue(forKey: requestId)
         detachedSessionCreationRequestIDs.remove(requestId)
         armSessionCreationTimeout(requestID: requestId)
@@ -1422,6 +1582,7 @@ final class DSHAppModel: ObservableObject {
         })?.key {
             pendingInitialMessagesByRequestID.removeValue(forKey: key)
             failedInitialMessages.removeValue(forKey: key)
+            removeStoredInitialMessageTransaction(key, for: machineID)
         }
         retireQueuedPrompt(requestID: receipt.requestId, sessionID: receipt.sessionId)
     }
@@ -1950,9 +2111,23 @@ final class DSHAppModel: ObservableObject {
         pendingSessionCreationCommandsByRequestID.removeValue(forKey: requestID)
         cancelSessionCreationTimeout(requestID: requestID)
         failedSessionCreations.removeValue(forKey: requestID)
+        sessionCreationRetryDeadlines.removeValue(forKey: requestID)
         let wasDetached = detachedSessionCreationRequestIDs.remove(requestID) != nil
+        removeStoredSessionCreationTransaction(requestID, for: machineID)
+        sessionCreationResults[requestID] = session.id
+        sessionCreationResultOrder.removeAll { $0 == requestID }
+        sessionCreationResultOrder.append(requestID)
+        // A result can arrive while no sheet is visible. Keep enough recent
+        // request-scoped acknowledgements for a concurrent batch, but do not
+        // turn this transient UI signal into an unbounded session history.
+        while sessionCreationResultOrder.count > 64 {
+            let expired = sessionCreationResultOrder.removeFirst()
+            sessionCreationResults.removeValue(forKey: expired)
+        }
         completedSessionCreationRequestID = requestID
-        selectedSessionID = session.id
+        if !wasDetached {
+            selectedSessionID = session.id
+        }
         if wasDetached {
             errorMessage = "原创建请求已在 Mac 上完成；已保留原请求以避免重复创建。"
         }
@@ -2006,16 +2181,48 @@ final class DSHAppModel: ObservableObject {
                                            resultUnknown: Bool = false) {
         guard pendingSessionCreationCommandsByRequestID[requestID] != nil else { return }
         cancelSessionCreationTimeout(requestID: requestID)
+        let retryUntil = sessionCreationRetryDeadlines[requestID]
+            ?? Date().addingTimeInterval(sessionCreationRetryWindow)
+        sessionCreationRetryDeadlines[requestID] = retryUntil
         failedSessionCreations[requestID] = DSHSessionCreationFailure(
             id: requestID,
             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "创建会话失败。" : detail,
-            resultUnknown: resultUnknown)
+            resultUnknown: resultUnknown,
+            retryUntil: retryUntil)
         errorMessage = detail
     }
 
     func sessionCreationFailure(for requestID: String) -> DSHSessionCreationFailure? {
         failedSessionCreations[requestID]
+    }
+
+    func consumeSessionCreationResult(for requestID: String) {
+        sessionCreationResults.removeValue(forKey: requestID)
+        sessionCreationResultOrder.removeAll { $0 == requestID }
+    }
+
+    /// Returns the most recent unresolved create for the active Mac so a new
+    /// sheet can restore a transaction after a machine switch.
+    func recoverableSessionCreationRequestID() -> String? {
+        if let lastSessionCreationRequestID,
+           pendingSessionCreationRequestIDs.contains(lastSessionCreationRequestID),
+           !detachedSessionCreationRequestIDs.contains(lastSessionCreationRequestID) {
+            return lastSessionCreationRequestID
+        }
+        return pendingSessionCreationRequestIDs.first {
+            !detachedSessionCreationRequestIDs.contains($0)
+        }
+    }
+
+    func sessionCreationDraft(for requestID: String) -> (text: String, attachments: [DSHStagedAttachment])? {
+        guard let pending = pendingInitialMessagesByRequestID[requestID] else { return nil }
+        return (pending.text, pending.attachments)
+    }
+
+    func sessionCreationRetryExpired(for requestID: String) -> Bool {
+        guard let deadline = sessionCreationRetryDeadlines[requestID] else { return false }
+        return Date() >= deadline
     }
 
     /// Re-sends the exact original create command. The request id is retained
@@ -2024,6 +2231,17 @@ final class DSHAppModel: ObservableObject {
     func retrySessionCreation(requestID: String) {
         guard let command = pendingSessionCreationCommandsByRequestID[requestID],
               pendingSessionCreationRequestIDs.contains(requestID) else { return }
+        if sessionCreationRetryExpired(for: requestID) {
+            let deadline = sessionCreationRetryDeadlines[requestID]
+                ?? Date().addingTimeInterval(sessionCreationRetryWindow)
+            failedSessionCreations[requestID] = DSHSessionCreationFailure(
+                id: requestID,
+                detail: "原创建请求已超过安全恢复窗口，只能刷新任务列表确认结果。",
+                resultUnknown: true,
+                retryUntil: deadline)
+            errorMessage = "原创建请求已超过安全恢复窗口，请刷新任务列表确认是否已创建。"
+            return
+        }
         failedSessionCreations.removeValue(forKey: requestID)
         detachedSessionCreationRequestIDs.remove(requestID)
         armSessionCreationTimeout(requestID: requestID)
@@ -2056,7 +2274,9 @@ final class DSHAppModel: ObservableObject {
         pendingSessionCreationCommandsByRequestID.removeValue(forKey: requestID)
         pendingInitialMessagesByRequestID.removeValue(forKey: requestID)
         failedSessionCreations.removeValue(forKey: requestID)
+        sessionCreationRetryDeadlines.removeValue(forKey: requestID)
         detachedSessionCreationRequestIDs.remove(requestID)
+        removeStoredSessionCreationTransaction(requestID, for: machineID)
         cancelSessionCreationTimeout(requestID: requestID)
         if lastSessionCreationRequestID == requestID { lastSessionCreationRequestID = nil }
     }

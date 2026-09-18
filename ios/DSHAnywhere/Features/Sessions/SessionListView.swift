@@ -209,15 +209,28 @@ struct NewSessionSheet: View {
                 selectedReasoningEffort = catalog.default.reasoningEffort
             }
             selectDefaultModeIfNeeded()
+            restoreRecoverableCreationIfNeeded()
         }
         .onChange(of: model.completedSessionCreationRequestID) { _, requestID in
             guard let requestID,
                   let pendingRequestID = pendingCreationRequestID,
                   requestID == pendingRequestID else { return }
+            model.consumeSessionCreationResult(for: pendingRequestID)
+            pendingCreationRequestID = nil
+            dismiss()
+        }
+        .onChange(of: model.sessionCreationResults) { _, results in
+            guard let pendingRequestID = pendingCreationRequestID,
+                  results[pendingRequestID] != nil else { return }
+            model.consumeSessionCreationResult(for: pendingRequestID)
             pendingCreationRequestID = nil
             dismiss()
         }
         .onChange(of: model.machineID) { _, _ in
+            // The request belongs to the previous Mac.  Keep its transaction
+            // in the model for recovery when that Mac is selected again, but
+            // never leave this sheet showing a spinner for a different Mac.
+            pendingCreationRequestID = nil
             workspaceID = ""
             workingDirectory = ""
             branch = "main"
@@ -228,6 +241,7 @@ struct NewSessionSheet: View {
             selectedModel = ""
             selectedReasoningEffort = nil
             sessionMode = ""
+            restoreRecoverableCreationIfNeeded()
         }
         .onChange(of: model.workspaces) { _, workspaces in
             if workspaceID.isEmpty, let first = workspaces.first {
@@ -281,8 +295,13 @@ struct NewSessionSheet: View {
                     }
                 }
                 Spacer(minLength: 4)
-                Button("重试") { model.retrySessionCreation(requestID: requestID) }
-                    .font(.subheadline.weight(.semibold))
+                if !failure.resultUnknown || !model.sessionCreationRetryExpired(for: requestID) {
+                    Button("重试") { model.retrySessionCreation(requestID: requestID) }
+                        .font(.subheadline.weight(.semibold))
+                } else {
+                    Button("刷新任务列表") { model.refreshSessions() }
+                        .font(.caption.weight(.semibold))
+                }
                 Button(failure.resultUnknown ? "保留并编辑" : "返回编辑") {
                     if failure.resultUnknown {
                         model.retainSessionCreationForEditing(requestID: requestID)
@@ -317,6 +336,21 @@ struct NewSessionSheet: View {
             modeSelector
         }
         .padding(.horizontal, 14)
+    }
+
+    private func restoreRecoverableCreationIfNeeded() {
+        guard pendingCreationRequestID == nil,
+              let requestID = model.recoverableSessionCreationRequestID() else { return }
+        pendingCreationRequestID = requestID
+        // An active request owns the original draft. A detached unknown
+        // request is intentionally excluded by the model so an edited local
+        // draft remains editable while that older operation is settled.
+        if initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           initialAttachments.isEmpty,
+           let draft = model.sessionCreationDraft(for: requestID) {
+            initialPrompt = draft.text
+            initialAttachments = draft.attachments
+        }
     }
 
     private var machineSelector: some View {

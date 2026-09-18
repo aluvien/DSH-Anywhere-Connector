@@ -550,6 +550,38 @@ describe("Relay and bridge forwarding", () => {
     await connector.stop();
   });
 
+  it("treats a truncated create response as unknown and keeps the request retryable", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const fetchMock = vi.fn(async () => new Response("{\"sessionId\":", {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    }));
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined },
+      heartbeatMs: 60_000,
+    });
+    connector.start();
+    relay.emit("open");
+    bridge.emit("open");
+    relay.emit("message", JSON.stringify({ type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "relay-message-truncated",
+      sender: "device", body: command("session.create"),
+    }));
+
+    const bodies = () => relay.sent.map((raw) => JSON.parse(raw)).map((message) => message.body);
+    await vi.waitFor(() => expect(bodies().some((body) => body?.type === "protocol.error")).toBe(true));
+    expect(bodies().find((body) => body?.type === "protocol.error")).toMatchObject({
+      messageId: "request-1",
+      payload: { code: "bridge-result-unknown", retryable: true },
+    });
+    await connector.stop();
+  });
+
   it("routes transient streaming only to an opted-in opener and keeps replay safe for legacy devices", async () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();

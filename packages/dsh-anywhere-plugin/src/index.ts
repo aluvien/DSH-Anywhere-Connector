@@ -360,6 +360,13 @@ class SessionMetadataStore {
   private permissions = new Map<string, PermissionMode>()
   private titles = new Map<string, string>()
   private branches = new Map<string, string>()
+  /** Durable request -> result records for session creation.  The HTTP
+   * idempotency cache is intentionally short-lived, but a lost response must
+   * remain queryable after that cache expires or the Bridge restarts. */
+  private sessionCreationResults = new Map<string, {
+    fingerprint: string | undefined
+    response: JsonObject
+  }>()
   private persistQueue: Promise<void> = Promise.resolve()
   readonly ready: Promise<void>
 
@@ -385,6 +392,21 @@ class SessionMetadataStore {
 
   branch(sessionId: string): string | undefined {
     return this.branches.get(sessionId)
+  }
+
+  sessionCreationResult(key: string, fingerprint: string | undefined): JsonObject | undefined {
+    const entry = this.sessionCreationResults.get(key)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    return entry.response
+  }
+
+  async setSessionCreationResult(key: string, fingerprint: string | undefined,
+                                 response: JsonObject): Promise<void> {
+    this.sessionCreationResults.set(key, { fingerprint, response })
+    await this.persist()
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -446,6 +468,17 @@ class SessionMetadataStore {
           if (typeof branch === 'string' && branch.trim().length > 0) this.branches.set(id, branch.trim().slice(0, 512))
         }
       }
+      const sessionCreations = parsed.sessionCreations
+      if (typeof sessionCreations === 'object' && sessionCreations !== null && !Array.isArray(sessionCreations)) {
+        for (const [key, raw] of Object.entries(sessionCreations)) {
+          if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+          const fingerprint = typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined
+          const response = raw.response
+          if (typeof response === 'object' && response !== null && !Array.isArray(response)) {
+            this.sessionCreationResults.set(key, { fingerprint, response: response as JsonObject })
+          }
+        }
+      }
     } catch (error) {
       // A missing or corrupt presentation file must never prevent Harness from
       // starting; the durable Harness session store remains authoritative.
@@ -463,6 +496,7 @@ class SessionMetadataStore {
       permissions: Object.fromEntries(this.permissions),
       titles: Object.fromEntries(this.titles),
       branches: Object.fromEntries(this.branches),
+      sessionCreations: Object.fromEntries(this.sessionCreationResults),
     }, null, 2)
     this.persistQueue = this.persistQueue.catch(() => undefined).then(async () => {
       const directory = dirname(this.path)
@@ -1468,6 +1502,22 @@ async function handleHttp(
     return
   }
   if (req.method === 'POST' && path === '/sessions') {
+    const requestId = header(req, 'x-dsh-request-id')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : undefined
+    const durableKey = requestId === undefined || requestId.length === 0
+      ? undefined : `${device.id}\0${requestId}`
+    if (durableKey !== undefined) {
+      const remembered = metadata.sessionCreationResult(durableKey, fingerprint)
+      if (remembered !== undefined) {
+        // The in-memory HTTP response cache may have expired or the Bridge may
+        // have restarted.  Replay the durable create result without invoking
+        // Harness a second time.
+        json(res, 200, remembered)
+        return
+      }
+    }
     const body = objectOf(await readJson(req))
     const cwd = optionalStringOf(body.cwd)
     const workspaceId = optionalStringOf(body.workspaceId)
@@ -1487,6 +1537,16 @@ async function handleHttp(
       ...(agentPreset === undefined ? {} : { agentPreset }),
       ...(model === undefined ? {} : { model }),
     })
+    // The native create has already committed the side effect at this point.
+    // Persist its identity before optional title/model/permission setup, so a
+    // later setup failure or a lost response can never make a retry create a
+    // second Harness session.  The complete projection below replaces this
+    // minimal replay record once setup succeeds.
+    if (durableKey !== undefined) {
+      await metadata.setSessionCreationResult(durableKey, fingerprint, {
+        sessionId: result.sessionId,
+      })
+    }
     // A blank session is represented as “新会话” by the projection below. Do
     // not persist that placeholder: it used to override the native title
     // service forever, so the first real user message could never receive its
@@ -1513,7 +1573,9 @@ async function handleHttp(
       await metadata.setPermission(result.sessionId, permissionMode)
     }
     const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === result.sessionId)
-    json(res, 201, { ...result, ...(summary === undefined ? {} : { summary }) })
+    const response = { ...result, ...(summary === undefined ? {} : { summary }) }
+    if (durableKey !== undefined) await metadata.setSessionCreationResult(durableKey, fingerprint, response)
+    json(res, 201, response)
     return
   }
 

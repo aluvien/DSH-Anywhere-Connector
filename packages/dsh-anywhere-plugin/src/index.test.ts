@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -417,7 +418,14 @@ describe('native bridge mutations', () => {
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
     invoke?: (request: unknown) => Promise<unknown>
+    dataDir?: string
   } = {}) {
+    // Each mounted Bridge gets an isolated metadata file.  The real plugin
+    // deliberately survives restarts in this file; sharing the user's default
+    // directory between unit tests would replay an earlier request id and
+    // make the tests depend on execution order.
+    process.env.DSH_ANYWHERE_DATA_DIR = options.dataDir
+      ?? mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-test-'))
     let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
     const context = {
       logger: { info: () => undefined, warn: () => undefined },
@@ -508,6 +516,54 @@ describe('native bridge mutations', () => {
     ])
     expect(creates).toBe(1)
     expect(duplicate).toEqual(first)
+  })
+
+  it('replays the durable create identity after a Bridge restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-restart-'))
+    let creates = 0
+    const firstRequest = mount({
+      dataDir,
+      create: async () => {
+        creates += 1
+        return { sessionId: 'session-durable' }
+      },
+    })
+    await expect(firstRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'durable-create',
+    )).resolves.toMatchObject({ status: 201, body: { sessionId: 'session-durable' } })
+
+    const restartedRequest = mount({ dataDir, create: async () => ({ sessionId: 'should-not-run' }) })
+    await expect(restartedRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'durable-create',
+    )).resolves.toMatchObject({ status: 200, body: { sessionId: 'session-durable' } })
+    expect(creates).toBe(1)
+  })
+
+  it('records the native create before optional setup can fail', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-setup-failure-'))
+    let creates = 0
+    const firstRequest = mount({
+      dataDir,
+      create: async () => {
+        creates += 1
+        return { sessionId: 'session-before-setup-failure' }
+      },
+      invoke: async (request: unknown) => {
+        if ((request as { namespace?: string }).namespace === 'commands') {
+          throw new Error('permission setup failed')
+        }
+        return { ok: true, value: { presets: [] } }
+      },
+    })
+    await expect(firstRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code', permissionMode: 'workspace-write' }, 'setup-failure',
+    )).resolves.toMatchObject({ status: 500 })
+
+    const restartedRequest = mount({ dataDir, create: async () => ({ sessionId: 'should-not-run' }) })
+    await expect(restartedRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'setup-failure',
+    )).resolves.toMatchObject({ status: 200, body: { sessionId: 'session-before-setup-failure' } })
+    expect(creates).toBe(1)
   })
 
   it('does not let unauthenticated request ids consume trusted idempotency slots', async () => {

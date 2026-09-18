@@ -1038,8 +1038,116 @@ final class DSHEventStoreTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(90))
 
         XCTAssertEqual(model.completedSessionCreationRequestID, originalID)
+        XCTAssertNil(model.selectedSessionID,
+                     "A late detached result must not navigate away from the newer draft")
         XCTAssertNil(model.sessionCreationFailure(for: originalID))
         XCTAssertEqual(model.lastSessionCreationRequestID, editedID)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testSessionCreationRetryWindowStopsUnsafeReexecution() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 0.01
+        model.sessionCreationRetryWindow = 0.05
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "unknown"))
+        let requestID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        try await Task.sleep(for: .milliseconds(90))
+        XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.resultUnknown == true)
+        let before = await transport.commandCount(ofType: "session.create")
+
+        model.retrySessionCreation(requestID: requestID)
+        let after = await transport.commandCount(ofType: "session.create")
+        XCTAssertEqual(after, before, "An expired unknown request must not execute again")
+        XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.detail.contains("安全恢复窗口") == true)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testSessionCreationTransactionRestoresAfterDisconnect() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 30
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "restore me"))
+        let requestID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        model.disconnect()
+        XCTAssertNil(model.recoverableSessionCreationRequestID())
+
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(model.recoverableSessionCreationRequestID(), requestID)
+        XCTAssertEqual(model.sessionCreationDraft(for: requestID)?.text, "restore me")
+        model.disconnect()
+    }
+
+    @MainActor
+    func testInitialMessageTransactionRestoresAfterDisconnect() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 1
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "send after reconnect"))
+        let createID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        await transport.emit(event(type: "session.created", messageID: createID, sequence: 1,
+                                   payload: .object([
+                                    "id": .string("session-first-message"),
+                                    "title": .string("First message"),
+                                    "updatedAt": .number(1),
+                                   ])))
+        try await Task.sleep(for: .milliseconds(80))
+        let firstPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let firstPrompt = try XCTUnwrap(firstPromptValue)
+        model.disconnect()
+
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(model.failedInitialMessage(for: "session-first-message")?.text,
+                       "send after reconnect")
+        let failure = try XCTUnwrap(model.failedInitialMessage(for: "session-first-message"))
+        model.retryFailedInitialMessage(failure)
+        try await Task.sleep(for: .milliseconds(40))
+        let retriedPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let retriedPrompt = try XCTUnwrap(retriedPromptValue)
+        XCTAssertEqual(retriedPrompt.requestId, firstPrompt.requestId,
+                       "The first message retry must keep its prompt identity")
+        if case .object(let payload) = retriedPrompt.payload {
+            XCTAssertEqual(payload["text"], .string("send after reconnect"))
+        } else {
+            XCTFail("prompt.send payload was not an object")
+        }
+        model.disconnect()
+    }
+
+    @MainActor
+    func testTwoSessionCreationResultsInOneEventBatchRemainRequestScoped() async throws {
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        model.sessionCreationAckTimeout = 30
+        model.connect()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "one"))
+        let firstID = try XCTUnwrap(model.lastSessionCreationRequestID)
+        XCTAssertTrue(model.createSession(mode: "standard", initialPrompt: "two"))
+        let secondID = try XCTUnwrap(model.lastSessionCreationRequestID)
+
+        await transport.emit(event(type: "session.created", messageID: firstID, sequence: 1,
+                                   payload: .object(["id": .string("session-one"), "title": .string("One"), "updatedAt": .number(1)])))
+        await transport.emit(event(type: "session.created", messageID: secondID, sequence: 2,
+                                   payload: .object(["id": .string("session-two"), "title": .string("Two"), "updatedAt": .number(2)])))
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(model.sessionCreationResults[firstID], "session-one")
+        XCTAssertEqual(model.sessionCreationResults[secondID], "session-two")
         model.disconnect()
     }
 
@@ -1530,6 +1638,10 @@ private actor CorrelationTransport: DSHAppTransport {
 
     func lastCommand(ofType type: String) -> DSHCommand? {
         commands.last(where: { $0.type == type })
+    }
+
+    func commandCount(ofType type: String) -> Int {
+        commands.filter { $0.type == type }.count
     }
 
     func emit(_ event: DSHEvent) { continuation?.yield(event) }
