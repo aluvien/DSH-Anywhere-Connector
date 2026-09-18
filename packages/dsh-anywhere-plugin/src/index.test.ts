@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
-import { historyRecipient, CONNECTOR_DEVICE_ID, PairingRateLimiter, apply, inject, isSubagentSession, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
+import { historyRecipient, CONNECTOR_DEVICE_ID, LIVE_REASONING_TRAIL_LIMIT, PairingRateLimiter, apply, inject, isSubagentSession, liveReasoningTrail, liveStreamChunkEvent, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -159,6 +159,26 @@ describe('DeepSeek Harness event normalization', () => {
       payload: { id: 'assistant-final-1', role: 'assistant', markdown: 'finished', replacesMessageId: 'stream-live-1' },
     })
     expect(events.some((event) => event.type === 'assistant.message.delta')).toBe(false)
+  })
+
+  it('keeps a bounded trailing snapshot for live reasoning activity', () => {
+    expect(liveReasoningTrail('before', ' after')).toBe('before after')
+    const long = 'x'.repeat(LIVE_REASONING_TRAIL_LIMIT)
+    expect(liveReasoningTrail(long, 'tail')).toHaveLength(LIVE_REASONING_TRAIL_LIMIT)
+    expect(liveReasoningTrail(long, 'tail').endsWith('tail')).toBe(true)
+  })
+
+  it('projects a Harness reasoning-delta onto the temporary stream message', () => {
+    const attempt = { key: 's1\u00001\u00002', sessionId: 's1', messageId: 'stream-1', reasoningTrail: '' }
+    expect(liveStreamChunkEvent(attempt, { type: 'reasoning-delta', index: 0, text: 'planning' })).toEqual({
+      type: 'assistant.reasoning', sessionId: 's1',
+      payload: { messageId: 'stream-1', text: 'planning' },
+    })
+    expect(liveStreamChunkEvent(attempt, { type: 'reasoning-delta', index: 0, text: ' next' })).toEqual({
+      type: 'assistant.reasoning', sessionId: 's1',
+      payload: { messageId: 'stream-1', text: 'planning next' },
+    })
+    expect(liveStreamChunkEvent(attempt, { type: 'block-start', index: 1, blockType: 'text' })).toBeUndefined()
   })
 
   it('omits the reasoning event entirely when there is none', () => {

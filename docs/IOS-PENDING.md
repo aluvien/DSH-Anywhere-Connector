@@ -211,3 +211,10 @@
 - 原因：session.open通过可信本机Connector凭据调用Bridge，历史publish沿用认证设备ID（dsh-anywhere-connector）；定向转发后Relay不会把这些历史事件送给实际请求的iPhone。Mac日志本身完整，列表与实时广播不受同一路径影响。
 - 修复：Connector向Bridge open请求传入真实command.deviceId；Bridge仅允许可信Connector代指定历史接收方，普通直接连接设备仍只能读取发给自己的历史。历史开始/消息/工具/结束事件使用同一请求设备ID。
 - 验证：修复前真实会话历史目标为dsh-anywhere-connector；部署后独立请求收到34条消息事件且目标统一为history-routing-probe。95项后端测试、全包build和diff检查通过。Mac Bridge/Connector已重启生效，无需新TestFlight客户端。
+
+
+## 45. 2026-09-18 修复执行轨迹与编辑框状态不一致（Build 113）
+- 原因：状态行只检查正在运行的工具与最后一条助手消息；工具结束后、空的工具调用消息或下一步思考期间会误回到“等待响应”。实时Bridge此前只投递正文增量，思考增量直到步骤完成才可见。
+- 修复：状态按当前用户轮次的有效轨迹选择，保留工具结束后的最新活动，排除上一轮内容；实时思考沿用已有reasoning事件和临时消息替换机制，只向开启流式的设备发送。
+- 顶部：根据补充要求，首页与会话页统一使用thinMaterial加10%页面底色，让经过的文字留下模糊轮廓；无内容经过时维持页面底色和无分隔线。
+- 验证：106项iOS定向回归、97项后端测试及全包build通过；Mac Bridge/Connector已重启，真实会话历史仍完整。签名Build113已生成，TestFlight上传中。

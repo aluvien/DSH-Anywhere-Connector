@@ -19,6 +19,95 @@ private extension URL {
     }
 }
 
+/// Projects the latest concrete Harness activity for the active turn into the
+/// concise status line above the composer.  Events from an earlier turn must
+/// never make a newly running turn look active: the newest accepted user
+/// message is the turn boundary and every candidate has to arrive after it.
+///
+/// A tool's completion is still useful activity while the model is deciding
+/// its next step.  Previously the UI only considered tools whose status was
+/// literally `running`, so the small gap after a completed tool incorrectly
+/// fell through to "等待响应…" despite the Harness trail being visible.
+enum DSHLiveTurnStatusProjection {
+    static func trail(messages: [DSHChatMessage], tools: [DSHToolActivity]) -> String? {
+        guard let turnStart = currentTurnStart(messages) else {
+            // Without a sequence boundary we cannot distinguish this run
+            // from a historical tool row, so retain the honest fallback.
+            return nil
+        }
+
+        let currentTools = tools.filter { ($0.sequence ?? Int64.min) > turnStart }
+        if let running = newest(currentTools.filter { $0.status.lowercased() == "running" }, by: \.sequence) {
+            return DSHToolPresentation.headline(for: running)
+        }
+
+        // Ignore empty assistant frames (tool-call scaffolding).  They are
+        // emitted by Harness before a tool call and do not describe useful
+        // visible work.  Compare actual output/reasoning with a completed
+        // tool by sequence, so the line mirrors the newest real trajectory.
+        let assistantActivity = newest(messages.compactMap { message -> (message: DSHChatMessage, text: String)? in
+            guard message.role == .assistant,
+                  let sequence = message.sequence,
+                  sequence > turnStart else { return nil }
+            if !message.markdown.isEmpty {
+                let preview = previewLine(message.markdown)
+                return (message, preview.isEmpty ? "正在输出…" : "正在输出 · \(preview)")
+            }
+            if let reasoning = message.reasoning, !reasoning.isEmpty {
+                let preview = previewLine(reasoning)
+                return (message, preview.isEmpty ? "思考中…" : "思考中 · \(preview)")
+            }
+            return nil
+        }, by: { $0.message.sequence })
+        let completedTool = newest(currentTools.filter { $0.status.lowercased() != "running" }, by: \.sequence)
+
+        switch (assistantActivity, completedTool) {
+        case let (.some(activity), .some(tool)):
+            if (activity.message.sequence ?? Int64.min) > (tool.sequence ?? Int64.min) {
+                return activity.text
+            }
+            return "\(DSHToolPresentation.statusText(tool.status)) · \(DSHToolPresentation.headline(for: tool))"
+        case let (.some(activity), .none):
+            return activity.text
+        case let (.none, .some(tool)):
+            return "\(DSHToolPresentation.statusText(tool.status)) · \(DSHToolPresentation.headline(for: tool))"
+        case (.none, .none):
+            return nil
+        }
+    }
+
+    /// A currently running tool is an independent proof that a turn is live,
+    /// even if the matching `turn.state.changed` arrives late.  Completed
+    /// activity deliberately does not keep the status row visible after the
+    /// turn settles.
+    static func hasRunningTool(messages: [DSHChatMessage], tools: [DSHToolActivity]) -> Bool {
+        guard let turnStart = currentTurnStart(messages) else { return false }
+        return tools.contains {
+            ($0.sequence ?? Int64.min) > turnStart && $0.status.lowercased() == "running"
+        }
+    }
+
+    static func shouldShow(turnState: String, messages: [DSHChatMessage],
+                           tools: [DSHToolActivity]) -> Bool {
+        turnState.lowercased() == "running" || hasRunningTool(messages: messages, tools: tools)
+    }
+
+    private static func currentTurnStart(_ messages: [DSHChatMessage]) -> Int64? {
+        messages.filter { $0.role == .user }.compactMap(\.sequence).max()
+    }
+
+    private static func newest<T>(_ values: [T], by sequence: (T) -> Int64?) -> T? {
+        values.max { (sequence($0) ?? Int64.min) < (sequence($1) ?? Int64.min) }
+    }
+
+    private static func previewLine(_ text: String, limit: Int = 40) -> String {
+        let line = text.split(separator: "\n", omittingEmptySubsequences: true).last
+            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        guard !line.isEmpty else { return "" }
+        return line.count > limit ? "…" + String(line.suffix(limit)) : String(line)
+    }
+}
+
 
 /// Remote's editor has two native-looking states: a quiet single-line capsule
 /// while resting, and a taller two-row editor while the field is active.  The
@@ -692,11 +781,18 @@ struct ConversationView: View {
 
     private var session: DSHSessionSummary? { model.sessions.first { $0.id == sessionID } }
     private var isRunning: Bool { model.turnState(for: sessionID).lowercased() == "running" }
-    /// Any tool literally running right now. The live trail keys off this —
-    /// not the turn flag alone — so tools in flight always surface above the
-    /// composer even when the turn state arrives late or goes stale.
-    private var hasLiveToolActivity: Bool {
-        model.tools(for: sessionID).contains { $0.status.lowercased() == "running" }
+    /// Activity is scoped to the newest accepted user turn, not merely any
+    /// historical tool in this session.  This lets a completed tool keep the
+    /// trail alive between Harness steps without leaking an older run into the
+    /// status line.
+    private var liveTurnTrail: String? {
+        DSHLiveTurnStatusProjection.trail(messages: model.messages(for: sessionID),
+                                           tools: model.tools(for: sessionID))
+    }
+    private var showsLiveTurnStatus: Bool {
+        DSHLiveTurnStatusProjection.shouldShow(turnState: model.turnState(for: sessionID),
+                                                messages: model.messages(for: sessionID),
+                                                tools: model.tools(for: sessionID))
     }
     private var hasDraftAttachments: Bool { !draftAttachments.isEmpty }
     private var hasRenderedContent: Bool {
@@ -1191,9 +1287,10 @@ struct ConversationView: View {
             // Live turn status rides above the input card while work happens,
             // so a reader who scrolled away still sees that work is happening
             // (and what it is doing) instead of a frozen screen. Gated on
-            // actual tool activity — not only the turn state — so a stale
-            // turn flag can never hide a running 读取/编辑/Bash.
-            if isRunning || hasLiveToolActivity {
+            // current-turn activity. A running tool also keeps this visible
+            // if its turn-state update arrives late; a just-finished Harness
+            // step remains descriptive while that turn is still running.
+            if showsLiveTurnStatus {
                 liveTurnStatus
             }
 
@@ -1506,35 +1603,11 @@ struct ConversationView: View {
         }
     }
 
-    /// Newest activity first: a running tool call beats streaming text, which
-    /// beats a growing reasoning trace. The line carries live content (not
-    /// just counts), so its motion itself proves the task is moving. Tool
-    /// phrasing mirrors the web client ("读取 · path").
+    /// Newest concrete activity in this user turn.  A finished tool remains
+    /// meaningful between Harness steps, rather than collapsing to a generic
+    /// waiting label before the next event arrives.
     private var liveTrailText: String {
-        let tools = model.tools(for: sessionID)
-        if let running = tools.last(where: { $0.status.lowercased() == "running" }) {
-            return DSHToolPresentation.headline(for: running)
-        }
-        if let last = model.messages(for: sessionID).last, last.role == .assistant {
-            if !last.markdown.isEmpty {
-                let preview = Self.previewLine(last.markdown)
-                return preview.isEmpty ? "正在输出…" : "正在输出 · \(preview)"
-            }
-            if let reasoning = last.reasoning, !reasoning.isEmpty {
-                let preview = Self.previewLine(reasoning)
-                return preview.isEmpty ? "思考中…" : "思考中 · \(preview)"
-            }
-        }
-        return "等待响应…"
-    }
-
-    /// Newest non-empty line, flattened for the one-line trail. The tail —
-    /// not the head — is what is being typed right now.
-    private static func previewLine(_ text: String, limit: Int = 40) -> String {
-        let line = text.split(separator: "\n", omittingEmptySubsequences: true).last
-            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
-        guard !line.isEmpty else { return "" }
-        return line.count > limit ? "…" + String(line.suffix(limit)) : String(line)
+        liveTurnTrail ?? "等待响应…"
     }
 
     /// Queue bubble above the input card, pinned right. One queued prompt

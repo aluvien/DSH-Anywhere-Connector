@@ -203,6 +203,58 @@ final class DSHProtocolTests: XCTestCase {
         XCTAssertEqual(command.payload, .object(["sessionId": .string("s"), "streaming": .bool(true)]))
     }
 
+    func testLiveTurnStatusKeepsCompletedCurrentHarnessToolVisible() {
+        let messages = [
+            DSHChatMessage(id: "old-user", role: .user, markdown: "old", sequence: 10),
+            DSHChatMessage(id: "new-user", role: .user, markdown: "new", sequence: 100),
+            // Harness sends an empty assistant frame for a tool call. It must
+            // not hide the useful completion that follows it.
+            DSHChatMessage(id: "tool-frame", role: .assistant, markdown: "", sequence: 101),
+        ]
+        let tools = [
+            DSHToolActivity(id: "old-tool", name: "bash", status: "completed",
+                            detail: #"{"command":"old"}"#, sequence: 11),
+            DSHToolActivity(id: "current-tool", name: "bash", status: "completed",
+                            detail: #"{"command":"swift build"}"#, sequence: 102),
+        ]
+
+        XCTAssertEqual(DSHLiveTurnStatusProjection.trail(messages: messages, tools: tools),
+                       "已完成 · Bash · swift build")
+        XCTAssertFalse(DSHLiveTurnStatusProjection.hasRunningTool(messages: messages, tools: tools))
+        XCTAssertFalse(DSHLiveTurnStatusProjection.shouldShow(turnState: "completed",
+                                                               messages: messages, tools: tools))
+    }
+
+    func testLiveTurnStatusUsesCurrentStreamingReasoningAndRunningTool() {
+        let messages = [
+            DSHChatMessage(id: "user", role: .user, markdown: "inspect", sequence: 100),
+            DSHChatMessage(id: "thinking", role: .assistant, markdown: "",
+                           reasoning: "正在检查 Harness 轨迹", sequence: 104),
+        ]
+        let completed = DSHToolActivity(id: "done", name: "read", status: "completed",
+                                        detail: #"{"path":"old.swift"}"#, sequence: 102)
+        XCTAssertEqual(DSHLiveTurnStatusProjection.trail(messages: messages, tools: [completed]),
+                       "思考中 · 正在检查 Harness 轨迹")
+
+        let running = DSHToolActivity(id: "running", name: "read", status: "running",
+                                      detail: #"{"path":"live.swift"}"#, sequence: 103)
+        XCTAssertEqual(DSHLiveTurnStatusProjection.trail(messages: messages, tools: [completed, running]),
+                       "读取 · live.swift")
+        XCTAssertTrue(DSHLiveTurnStatusProjection.hasRunningTool(messages: messages,
+                                                                  tools: [completed, running]))
+    }
+
+    func testLiveTurnStatusDoesNotReusePreviousTurnActivity() {
+        let messages = [
+            DSHChatMessage(id: "old-user", role: .user, markdown: "old", sequence: 10),
+            DSHChatMessage(id: "new-user", role: .user, markdown: "new", sequence: 100),
+        ]
+        let oldTool = DSHToolActivity(id: "old-tool", name: "read", status: "running",
+                                      detail: #"{"path":"old.swift"}"#, sequence: 11)
+        XCTAssertNil(DSHLiveTurnStatusProjection.trail(messages: messages, tools: [oldTool]))
+        XCTAssertFalse(DSHLiveTurnStatusProjection.hasRunningTool(messages: messages, tools: [oldTool]))
+    }
+
     func testOpenSessionCommandCarriesTheSessionID() {
         let command = DSHCommand.openSession(deviceId: "d", machineId: "m", sessionId: "s")
         XCTAssertEqual(command.type, "session.open")

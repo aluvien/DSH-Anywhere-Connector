@@ -64,6 +64,18 @@ interface BridgeRequest {
   readonly body?: Record<string, unknown>;
 }
 
+type TransientStreamingEvent = Extract<EventEnvelope, {
+  type: "assistant.message.delta" | "assistant.message.discarded" | "assistant.reasoning";
+}>;
+
+/** A durable reasoning record belongs to every client. Only the temporary
+ * stream-id form is private to a device that opted into live output. */
+function isTransientStreamingEvent(event: EventEnvelope): event is TransientStreamingEvent {
+  return event.type === "assistant.message.delta"
+    || event.type === "assistant.message.discarded"
+    || (event.type === "assistant.reasoning" && event.payload.messageId.startsWith("stream-"));
+}
+
 /**
  * Keeps the public Relay connection and the local DSH bridge deliberately separate.
  * The Connector only ever opens outbound connections; no local port is exposed.
@@ -197,7 +209,7 @@ export class DSHAnywhereConnector {
     // old projection. Lists travel through correlated HTTP commands below;
     // retain live created/title events but never forward this bridge greeting.
     if (event.data.type === "session.snapshot") return;
-    if (event.data.type === "assistant.message.delta" || event.data.type === "assistant.message.discarded") {
+    if (isTransientStreamingEvent(event.data)) {
       this.sendStreamingEvent(event.data);
       return;
     }
@@ -536,12 +548,12 @@ export class DSHAnywhereConnector {
     else this.streamingDevicesBySession.set(sessionId, devices);
   }
 
-  /** Live deltas and abandoned-attempt cleanups are never broadcast: legacy
-   * clients do not know that their temporary ids must be removed. Readdressing
-   * the body itself, rather than only Relay's target, also keeps replay scoped
-   * to the opted-in device. */
+  /** Live deltas, reasoning snapshots, and abandoned-attempt cleanups are
+   * never broadcast: legacy clients do not know that their temporary ids must
+   * be removed. Readdressing the body itself, rather than only Relay's target,
+   * also keeps replay scoped to the opted-in device. */
   private sendStreamingEvent(event: Extract<EventEnvelope,
-    { type: "assistant.message.delta" | "assistant.message.discarded" }>): void {
+    { type: "assistant.message.delta" | "assistant.message.discarded" | "assistant.reasoning" }>): void {
     const sessionId = event.sessionId;
     if (sessionId === undefined) return;
     for (const deviceId of this.streamingDevicesBySession.get(sessionId) ?? []) {

@@ -301,23 +301,30 @@ describe("Relay and bridge forwarding", () => {
       sessionId: "session-1", type: "assistant.message.delta", payload: { messageId: "stream-1", text: "hel" },
     }));
     bridge.emit("message", JSON.stringify({
-      version: PROTOCOL_VERSION, messageId: "final", machineId: "mac", deviceId: "broadcast", sequence: 2, timestamp: 2,
+      version: PROTOCOL_VERSION, messageId: "reasoning", machineId: "mac", deviceId: "broadcast", sequence: 2, timestamp: 2,
+      sessionId: "session-1", type: "assistant.reasoning", payload: { messageId: "stream-1", text: "thinking" },
+    }));
+    bridge.emit("message", JSON.stringify({
+      version: PROTOCOL_VERSION, messageId: "final", machineId: "mac", deviceId: "broadcast", sequence: 3, timestamp: 3,
       sessionId: "session-1", type: "assistant.message.completed",
       payload: { id: "assistant-1", role: "assistant", markdown: "hello", replacesMessageId: "stream-1" },
     }));
-    await vi.waitFor(() => expect(relay.sent).toHaveLength(3));
+    await vi.waitFor(() => expect(relay.sent).toHaveLength(4));
     const delivered = relay.sent.map((raw) => JSON.parse(raw));
     expect(delivered[0]).toMatchObject({ targetDeviceId: "phone-stream", body: {
       type: "assistant.message.delta", deviceId: "phone-stream", payload: { messageId: "stream-1" },
     } });
     expect(delivered[1]).toMatchObject({ targetDeviceId: "phone-stream", body: {
+      type: "assistant.reasoning", deviceId: "phone-stream", payload: { messageId: "stream-1", text: "thinking" },
+    } });
+    expect(delivered[2]).toMatchObject({ targetDeviceId: "phone-stream", body: {
       type: "assistant.message.completed", deviceId: "phone-stream", payload: { replacesMessageId: "stream-1" },
     } });
-    expect(delivered[2]).toMatchObject({ body: {
+    expect(delivered[3]).toMatchObject({ body: {
       type: "assistant.message.completed", deviceId: "broadcast", payload: { id: "assistant-1", markdown: "hello" },
     } });
-    expect(delivered[2].targetDeviceId).toBeUndefined();
-    expect(delivered[2].body.payload.replacesMessageId).toBeUndefined();
+    expect(delivered[3].targetDeviceId).toBeUndefined();
+    expect(delivered[3].body.payload.replacesMessageId).toBeUndefined();
 
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "legacy-resume", sender: "device",
@@ -326,9 +333,10 @@ describe("Relay and bridge forwarding", () => {
         timestamp: 3, type: "connection.resume", payload: { lastSequence: 0 },
       },
     }));
-    await vi.waitFor(() => expect(relay.sent.length).toBeGreaterThanOrEqual(5));
-    const legacy = relay.sent.slice(3).map((raw) => JSON.parse(raw));
+    await vi.waitFor(() => expect(relay.sent.length).toBeGreaterThanOrEqual(6));
+    const legacy = relay.sent.slice(4).map((raw) => JSON.parse(raw));
     expect(legacy.some((message) => message.body?.type === "assistant.message.delta"
+      || message.body?.type === "assistant.reasoning"
       || message.body?.payload?.replacesMessageId !== undefined)).toBe(false);
     expect(legacy.some((message) => message.body?.type === "assistant.message.completed")).toBe(true);
     await connector.stop();

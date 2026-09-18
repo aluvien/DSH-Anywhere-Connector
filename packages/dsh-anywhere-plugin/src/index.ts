@@ -142,9 +142,17 @@ export class PairingRateLimiter {
   }
 }
 
-type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
+export type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
   readonly sessionId?: string
   readonly deviceId?: string
+}
+
+/** Mutable state belonging to one active Harness assistant-stream attempt. */
+export interface LiveStreamAttempt {
+  readonly key: string
+  readonly messageId: string
+  readonly sessionId: string
+  reasoningTrail: string
 }
 
 interface NativeContext extends Context {
@@ -733,7 +741,11 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   // attempt settles. Keep the temporary stream id by its durable turn/step so
   // the following session/event can explicitly replace the live bubble.
   const liveStreamMessageIDs = new Map<string, string>()
-  const liveStreamAttempts = new Map<string, { key: string; messageId: string; sessionId: string }>()
+  // Keep just a short trailing window of live reasoning. It is enough for the
+  // composer activity line (which follows the newest text), avoids repeatedly
+  // relaying an unbounded chain of thought, and the durable assistant event
+  // restores the complete folded reasoning once the step commits.
+  const liveStreamAttempts = new Map<string, LiveStreamAttempt>()
 
   ctx.on('agent/assistant-stream' as never, ((value: unknown) => {
     const payload = recordOf(value)
@@ -749,21 +761,15 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       if (key === undefined) return
       const messageId = liveStreamMessageID(key)
       liveStreamMessageIDs.set(key, messageId)
-      liveStreamAttempts.set(attemptId, { key, messageId, sessionId })
+      liveStreamAttempts.set(attemptId, { key, messageId, sessionId, reasoningTrail: '' })
       return
     }
 
     const attempt = liveStreamAttempts.get(attemptId)
     if (attempt === undefined) return
     if (frameType === 'chunk') {
-      const chunk = recordOf(frame.chunk)
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
-        publish({
-          sessionId: attempt.sessionId,
-          type: 'assistant.message.delta',
-          payload: { messageId: attempt.messageId, text: chunk.text },
-        })
-      }
+      const event = liveStreamChunkEvent(attempt, frame.chunk)
+      if (event !== undefined) publish(event)
       return
     }
 
@@ -1931,6 +1937,43 @@ function liveStreamKey(sessionId: string, turn: unknown, step: unknown): string 
 
 function liveStreamMessageID(key: string): string {
   return `stream-${createHash('sha256').update(key).digest('hex')}`
+}
+
+/** The mobile live-trail renders the tail of this snapshot. Keeping it small
+ * prevents a long reasoning turn from repeatedly shipping its entire trace;
+ * the full reasoning remains in the canonical durable assistant event. */
+export const LIVE_REASONING_TRAIL_LIMIT = 4_096
+
+export function liveReasoningTrail(previous: string, chunk: string): string {
+  return `${previous}${chunk}`.slice(-LIVE_REASONING_TRAIL_LIMIT)
+}
+
+/**
+ * Project one real Harness stream chunk onto the existing phone events. This
+ * is deliberately limited to visible answer text and the bounded reasoning
+ * trail: block markers and tool-call deltas have no useful composer status.
+ */
+export function liveStreamChunkEvent(attempt: LiveStreamAttempt, value: unknown): NativeEventInput | undefined {
+  const chunk = recordOf(value)
+  if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
+    return {
+      sessionId: attempt.sessionId,
+      type: 'assistant.message.delta',
+      payload: { messageId: attempt.messageId, text: chunk.text },
+    }
+  }
+  if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
+    attempt.reasoningTrail = liveReasoningTrail(attempt.reasoningTrail, chunk.text)
+    // `assistant.reasoning` already has a compatible phone decoder. Use the
+    // temporary stream id so this live row is replaced atomically by the
+    // durable message (or discarded for a non-committing attempt).
+    return {
+      sessionId: attempt.sessionId,
+      type: 'assistant.reasoning',
+      payload: { messageId: attempt.messageId, text: attempt.reasoningTrail },
+    }
+  }
+  return undefined
 }
 
 export function normalizeSessionEvents(

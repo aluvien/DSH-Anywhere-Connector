@@ -9,8 +9,8 @@ struct DSHHeaderBackdrop: View {
     var body: some View {
         Group {
             if frosted {
-                Rectangle().fill(.regularMaterial)
-                    .overlay(Color(.systemBackground).opacity(contentUnderneath ? 0.18 : 1))
+                Rectangle().fill(.thinMaterial)
+                    .overlay(Color(.systemBackground).opacity(contentUnderneath ? 0.10 : 1))
             } else {
                 Color(.systemBackground).opacity(0.5)
             }
