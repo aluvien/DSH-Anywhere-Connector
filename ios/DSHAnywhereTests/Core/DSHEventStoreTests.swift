@@ -1177,6 +1177,55 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.messagesBySession["s"]?.first?.timestamp, 1_000)
     }
 
+    func testReplayWithoutAttachmentMetadataRetainsLocalMessageAttachments() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        let attachment = DSHMessageAttachment(id: "receipt-1", name: "photo.jpg",
+                                               mediaType: "image/jpeg", receiptId: "receipt-1")
+        let live = DSHEvent(envelope: DSHEnvelope(
+            messageId: "live", deviceId: "d", machineId: "m", sessionId: "s",
+            sequence: 1, type: "user.message.accepted",
+            payload: .object([
+                "id": .string("message-1"), "role": .string("user"),
+                "markdown": .string("look"),
+                "attachments": .array([.object([
+                    "id": .string("receipt-1"), "name": .string("photo.jpg"),
+                    "mediaType": .string("image/jpeg"), "receiptId": .string("receipt-1")
+                ])])
+            ])))
+        reducer.reduce(live, into: &state)
+
+        let replay = DSHEvent(envelope: DSHEnvelope(
+            messageId: "replay", deviceId: "d", machineId: "m", sessionId: "s",
+            historyBatchId: "history-1", sequence: 2, type: "user.message.accepted",
+            payload: .object([
+                "id": .string("message-1"), "role": .string("user"),
+                "markdown": .string("look")
+            ])))
+        reducer.reduce(replay, into: &state)
+        XCTAssertEqual(state.messagesBySession["s"]?.first?.attachments, [attachment])
+    }
+
+    func testHistoricalTurnStateDoesNotOverrideLiveProjection() {
+        var state = DSHStoreState()
+        state.turnStateBySession["s"] = "running"
+        let historical = DSHEvent(envelope: DSHEnvelope(
+            messageId: "history-turn", deviceId: "d", machineId: "m", sessionId: "s",
+            historyBatchId: "history-1", sequence: 1, type: "turn.state.changed",
+            payload: .object(["sessionId": .string("s"), "state": .string("completed")])
+        ))
+        DSHEventReducer().reduce(historical, into: &state)
+        XCTAssertEqual(state.turnStateBySession["s"], "running")
+
+        let live = DSHEvent(envelope: DSHEnvelope(
+            messageId: "live-turn", deviceId: "d", machineId: "m", sessionId: "s",
+            sequence: 2, type: "turn.state.changed",
+            payload: .object(["sessionId": .string("s"), "state": .string("completed")])
+        ))
+        DSHEventReducer().reduce(live, into: &state)
+        XCTAssertEqual(state.turnStateBySession["s"], "completed")
+    }
+
     @MainActor
     func testSessionDotPrioritizesErrorOverApprovalOverActivity() {
         var state = DSHStoreState()

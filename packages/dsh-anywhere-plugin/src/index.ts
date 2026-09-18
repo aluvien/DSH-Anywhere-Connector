@@ -870,6 +870,16 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         return
       }
       wss.handleUpgrade(req, socket, head, (client) => {
+        // A WebSocket can emit `error` for a malformed frame or a peer-side
+        // transport failure without closing first.  `ws` treats an unhandled
+        // error event as an uncaught exception, which would bring down the
+        // Bridge process and every Connector attached to it.  Install the
+        // listener before replaying anything to the client; the close handler
+        // below remains the single place that releases connection state.
+        client.on('error', (error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error)
+          ctx.logger.warn(`Bridge WebSocket error: ${detail}`)
+        })
         clients.add(client)
         clientDeviceIds.set(client, device.id)
         const requestedConnectorId = device.id === CONNECTOR_DEVICE_ID

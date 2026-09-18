@@ -122,19 +122,28 @@ public struct DSHEventReducer: Sendable {
             upsert(session, into: &state.sessions)
         case .userMessageAccepted(let message):
             var stamped = message
+            let existingMessage: DSHChatMessage? = event.envelope.sessionId.flatMap { sessionId in
+                state.messagesBySession[sessionId]?.first(where: { $0.id == message.id })
+            }
+            // Attachment thumbnails are supplemented locally immediately
+            // after a prompt is accepted.  A later replay of the same row may
+            // carry no attachment metadata, so replacing the row wholesale
+            // would erase the local files on every refresh.  Prefer
+            // authoritative server metadata when it is present; otherwise
+            // retain the local supplement.
+            if stamped.attachments.isEmpty, let existingMessage,
+               !existingMessage.attachments.isEmpty {
+                stamped.attachments = existingMessage.attachments
+            }
             // First sighting wins: replays (re-open, refresh, reconnect
             // backfill) update content in place but must not renumber the
             // row ahead of live output that followed it.
-            if let sessionId = event.envelope.sessionId,
-               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }),
-               let existingSequence = existing.sequence {
+            if let existing = existingMessage, let existingSequence = existing.sequence {
                 stamped.sequence = existingSequence
             } else if stamped.sequence == nil {
                 stamped.sequence = event.envelope.sequence
             }
-            if let sessionId = event.envelope.sessionId,
-               let existing = state.messagesBySession[sessionId]?.first(where: { $0.id == message.id }),
-               let existingTimestamp = existing.timestamp {
+            if let existing = existingMessage, let existingTimestamp = existing.timestamp {
                 stamped.timestamp = existingTimestamp
             } else if stamped.timestamp == nil {
                 stamped.timestamp = event.envelope.timestamp
@@ -227,7 +236,14 @@ public struct DSHEventReducer: Sendable {
         case .questionResolved(let resolution):
             state.pendingQuestions.removeAll { $0.id == resolution.id }
         case .turnStateChanged(let turn):
-            state.turnStateBySession[turn.sessionId] = turn.state
+            // History replays describe a stored terminal state, not the
+            // current live turn.  Applying it here can make a running turn
+            // look completed while an old transcript is being opened.  The
+            // bridge tags every replay event explicitly, so only untagged
+            // live events update the projection.
+            if event.envelope.historyBatchId == nil {
+                state.turnStateBySession[turn.sessionId] = turn.state
+            }
         case .modelCatalog(let catalog):
             state.modelCatalog = catalog
         case .workspaceCatalog(let workspaces):

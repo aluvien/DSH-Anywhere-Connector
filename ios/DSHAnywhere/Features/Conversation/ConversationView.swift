@@ -1512,6 +1512,39 @@ struct ConversationView: View {
                 .accessibilityLabel("\(failedSendTitle(failed))：\(failed.text)")
             }
 
+            if let failedInitial = model.failedInitialMessage,
+               failedInitial.sessionID == sessionID {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperclip.circle.fill")
+                        .foregroundStyle(.red)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("首条消息发送失败")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(failedInitial.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    Button("重试") { model.retryFailedInitialMessage() }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Button { model.dismissFailedInitialMessage() } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
+                    }
+                    .accessibilityLabel("关闭首条消息失败提示")
+                }
+                .padding(10)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("首条消息发送失败：\(failedInitial.text)")
+            }
+
             compactComposer
 
             if hasRenderedContent && model.showUsageFooter && hasSessionUsageData {

@@ -20,8 +20,17 @@ private struct DSHRemoteCommandError: LocalizedError {
 }
 
 private struct DSHPendingInitialMessage {
+    let promptRequestID: String
     let text: String
     let attachments: [DSHStagedAttachment]
+    var sessionID: String?
+}
+
+struct DSHInitialMessageFailure: Identifiable {
+    let id: String
+    let sessionID: String
+    let text: String
+    let detail: String
 }
 
 /// The reasoning choices exposed by the currently selected Harness model.
@@ -104,6 +113,10 @@ final class DSHAppModel: ObservableObject {
     @Published var language: DSHLanguage =
         DSHLanguage(rawValue: UserDefaults.standard.string(forKey: DSHAppModel.languageKey) ?? "") ?? .system
     @Published var errorMessage: String?
+    /// A new-session attachment can fail before a normal prompt request is
+    /// created. Keep its staged bytes in the pending map and expose a retry
+    /// action for the conversation that was just created.
+    @Published var failedInitialMessage: DSHInitialMessageFailure?
     /// Every Mac this iPhone is paired with, and which one is active.
     @Published private(set) var machines: [DSHRemoteProfile]
     /// Devices paired to the active machine, as the Relay reports them.
@@ -196,6 +209,7 @@ final class DSHAppModel: ObservableObject {
     /// the session exists. They are uploaded and sent as one initial prompt
     /// immediately after the matching `session.created` event arrives.
     private var pendingInitialMessagesByRequestID: [String: DSHPendingInitialMessage] = [:]
+    private var pendingInitialMessageUploads: Set<String> = []
     /// Request ids currently awaited by `uploadAttachmentAndWait`. Their
     /// `protocolError`s are consumed by that waiter (see `surfaceProtocolError`)
     /// and must not also pop the global alert.
@@ -226,6 +240,7 @@ final class DSHAppModel: ObservableObject {
         transcriptEntriesCache.removeAll(keepingCapacity: false)
         transcriptSectionsCache.removeAll(keepingCapacity: false)
         pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        pendingInitialMessageUploads.removeAll(keepingCapacity: false)
         for task in pendingMessageAttachmentCleanupTasks.values { task.cancel() }
         pendingMessageAttachmentCleanupTasks.removeAll(keepingCapacity: false)
         pendingMessageAttachmentsByRequestID.removeAll(keepingCapacity: false)
@@ -233,6 +248,7 @@ final class DSHAppModel: ObservableObject {
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
         failedSend = nil
+        failedInitialMessage = nil
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
         replayingHistoryBatches.removeAll(keepingCapacity: false)
@@ -530,7 +546,12 @@ final class DSHAppModel: ObservableObject {
     /// Points the app at another paired Mac. The socket is torn down first
     /// because it carries the previous machine's identity.
     func switchMachine(_ machine: DSHRemoteProfile) {
-        guard machine.machineId != activeMachine?.machineId else { return }
+        let isCurrentMachine = machine.machineId == activeMachine?.machineId
+        // A second tap on the original machine is a cancellation when a
+        // previous A -> B switch is still waiting for its socket teardown.
+        // The old guard treated it as a no-op, leaving the UI detached from A
+        // until the stale B task eventually committed.
+        guard !isCurrentMachine || pendingMachineSelectionID != nil else { return }
         machineSelectionGeneration &+= 1
         let selection = machineSelectionGeneration
         pendingMachineSelectionID = machine.machineId
@@ -763,19 +784,19 @@ final class DSHAppModel: ObservableObject {
             payload["model"] = .object(modelValue)
         }
         payload["permissionMode"] = .string(permissionMode)
-        // `session.create` can carry plain text, but attachments need a
-        // session id before they can be uploaded. When the new-session
-        // composer contains files, defer the complete prompt until the
-        // matching `session.created` event below.
-        if initialAttachments.isEmpty, let initialPrompt {
-            let trimmedPrompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedPrompt.isEmpty {
-                payload["initialPrompt"] = .string(trimmedPrompt)
-            }
-        }
-        if !initialAttachments.isEmpty {
+        // Keep every initial message out of `session.create`, including
+        // text-only prompts.  The Connector used to send the creation
+        // acknowledgement first and then submit this prompt with the same
+        // request id; a prompt failure consequently discarded the only copy
+        // of the user's text.  Sending it after `session.created` gives it a
+        // normal, independently retryable prompt request id.
+        let trimmedInitialPrompt = initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedInitialPrompt.isEmpty || !initialAttachments.isEmpty {
             pendingInitialMessagesByRequestID[requestId] = DSHPendingInitialMessage(
-                text: initialPrompt ?? "", attachments: initialAttachments)
+                promptRequestID: UUID().uuidString,
+                text: trimmedInitialPrompt,
+                attachments: initialAttachments,
+                sessionID: nil)
         }
         let command = DSHCommand(requestId: requestId, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
@@ -1290,6 +1311,12 @@ final class DSHAppModel: ObservableObject {
     private func confirmPromptAccepted(_ event: DSHEvent) {
         guard case .promptAccepted(let receipt) = event.kind else { return }
         confirmPendingSend(text: "", sessionID: receipt.sessionId, requestID: receipt.requestId)
+        if let key = pendingInitialMessagesByRequestID.first(where: {
+            $0.value.promptRequestID == receipt.requestId && $0.value.sessionID == receipt.sessionId
+        })?.key {
+            pendingInitialMessagesByRequestID.removeValue(forKey: key)
+            failedInitialMessage = nil
+        }
         retireQueuedPrompt(requestID: receipt.requestId, sessionID: receipt.sessionId)
     }
 
@@ -1598,7 +1625,10 @@ final class DSHAppModel: ObservableObject {
             if !historyEvent { flushQueueOnSettle(event) }
             surfaceProtocolError(event)
             trackHistoryBatch(event)
-            notifyForEvent(event)
+            // A replay may contain a stored approval/question/failure state,
+            // but it must not notify the user as if something just happened
+            // on the live machine.
+            if !historyEvent { notifyForEvent(event) }
             if case .historyCompleted(let batch) = event.kind {
                 endHistoryReplay(batch)
             }
@@ -1793,10 +1823,13 @@ final class DSHAppModel: ObservableObject {
     private func completeCreatedSession(_ session: DSHSessionSummary, requestID: String) {
         pendingSessionCreationRequestIDs.remove(requestID)
         selectedSessionID = session.id
-        guard let pending = pendingInitialMessagesByRequestID.removeValue(forKey: requestID) else { return }
+        guard var pending = pendingInitialMessagesByRequestID[requestID] else { return }
+        pending.sessionID = session.id
+        pendingInitialMessagesByRequestID[requestID] = pending
         let machineGeneration = self.machineStateGeneration
         Task { @MainActor [weak self] in
-            await self?.sendInitialMessage(pending, to: session.id, machineGeneration: machineGeneration)
+            await self?.sendInitialMessage(pending, creationRequestID: requestID,
+                                            to: session.id, machineGeneration: machineGeneration)
         }
     }
 
@@ -1847,9 +1880,12 @@ final class DSHAppModel: ObservableObject {
         requestModes()
     }
 
-    private func sendInitialMessage(_ pending: DSHPendingInitialMessage, to sessionID: String,
+    private func sendInitialMessage(_ pending: DSHPendingInitialMessage,
+                                    creationRequestID: String,
+                                    to sessionID: String,
                                     machineGeneration: Int? = nil) async {
-        guard !pending.attachments.isEmpty else { return }
+        guard pendingInitialMessageUploads.insert(creationRequestID).inserted else { return }
+        defer { pendingInitialMessageUploads.remove(creationRequestID) }
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         do {
             var receipts: [String] = []
@@ -1874,11 +1910,36 @@ final class DSHAppModel: ObservableObject {
             }
             if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
             sendPrompt(pending.text, attachments: receipts,
-                       messageAttachments: messageAttachments, to: sessionID)
+                       messageAttachments: messageAttachments, to: sessionID,
+                       requestId: pending.promptRequestID,
+                       expectedMachineGeneration: machineGeneration,
+                       expectedMachineID: machineID)
         } catch {
             if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
+            failedInitialMessage = DSHInitialMessageFailure(
+                id: creationRequestID, sessionID: sessionID, text: pending.text,
+                detail: error.localizedDescription)
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Retries an initial upload that failed before a normal prompt request
+    /// could be sent. The staged bytes remain in the pending map until the
+    /// matching `prompt.accepted` receipt arrives.
+    func retryFailedInitialMessage() {
+        guard let failure = failedInitialMessage,
+              let pending = pendingInitialMessagesByRequestID[failure.id],
+              let sessionID = pending.sessionID else { return }
+        failedInitialMessage = nil
+        let generation = machineStateGeneration
+        Task { @MainActor [weak self] in
+            await self?.sendInitialMessage(pending, creationRequestID: failure.id,
+                                            to: sessionID, machineGeneration: generation)
+        }
+    }
+
+    func dismissFailedInitialMessage() {
+        failedInitialMessage = nil
     }
 
     static func preview(longConversation: Bool = false) -> DSHAppModel {
