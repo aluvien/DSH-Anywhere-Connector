@@ -270,6 +270,9 @@ export type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
   readonly messageId?: string
   readonly sessionId?: string
   readonly deviceId?: string
+  /** Control handshakes are sent to the current socket only and are not
+   * business history that a later socket should replay. */
+  readonly replay?: boolean
 }
 
 /** Mutable state belonging to one active Harness assistant-stream attempt. */
@@ -778,7 +781,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       payload: event.payload,
       ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
     })
-    const entry = replay.append(next)
+    const entry = replay.append(next, event.replay !== false)
     const wire = JSON.stringify({ ...next, sequence: entry.sequence })
     for (const client of recipients) {
       if (client.readyState === WebSocket.OPEN) client.send(wire)
@@ -822,11 +825,20 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       // processes cannot execute the same local side effect twice.
       const requestId = header(req, 'x-dsh-request-id')
       const authorization = header(req, 'authorization')
+      // Authenticate before reserving an idempotency slot.  A caller with an
+      // invalid token can reach this local HTTP listener, but must not be able
+      // to fill the shared 2,000-entry tombstone budget with 401 responses and
+      // starve the trusted Connector.  The authenticated device id is the
+      // stable cache scope; the bearer itself is intentionally not retained in
+      // the key or any captured request state.
+      const authenticatedDevice = authorization === undefined
+        ? undefined
+        : pairing.authenticate(authorization)
       if (req.method === 'POST' && requestId !== undefined && requestId.length > 0 && requestId.length <= 256 &&
-          authorization !== undefined) {
+          authenticatedDevice !== undefined) {
         const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
         const key = createHash('sha256')
-          .update(`${authorization}\0${req.method}\0${pathname}\0${requestId}`)
+          .update(`${authenticatedDevice.id}\0${req.method}\0${pathname}\0${requestId}`)
           .digest('hex')
         const suppliedHash = header(req, 'x-dsh-request-hash')
         const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
@@ -878,6 +890,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         publish({
           deviceId: device.id,
           type: 'connection.ready',
+          replay: false,
           payload: {
             machineId,
             deviceId: device.id,
@@ -1312,13 +1325,15 @@ async function handleHttp(
       // Bridge generations fence delayed HTTP requests independently of the
       // Relay epoch.  A random Relay epoch has no ordering semantics, so an
       // older socket must not become authoritative merely because its epoch
-      // string differs from the current one.
+      // string differs from the current one.  A newer persistent Relay lease
+      // is the primary owner, however: its Bridge socket may have been opened
+      // before an older owner's socket and must still be able to take over.
+      // Only compare Bridge generations while both reports belong to the same
+      // Relay lease.
       if (latestBridgeLease !== undefined &&
-          (generation < latestBridgeLease.generation ||
-           (generation === latestBridgeLease.generation &&
-            (relayGeneration < latestBridgeLease.relayGeneration ||
-             (relayGeneration === latestBridgeLease.relayGeneration &&
-              latestBridgeLease.relayEpoch !== relayEpoch))))) {
+          latestBridgeLease.relayGeneration === relayGeneration &&
+          latestBridgeLease.relayEpoch === relayEpoch &&
+          generation < latestBridgeLease.generation) {
         throw new HttpError(409, 'Bridge connector lease is stale')
       }
       const currentLease = relayDeviceLeases.get(deviceId)

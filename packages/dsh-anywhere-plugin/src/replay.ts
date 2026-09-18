@@ -13,10 +13,12 @@ export class ReplayBuffer<T> {
     }
   }
 
-  append(event: T): SequencedEvent<T> {
+  append(event: T, retain = true): SequencedEvent<T> {
     const entry = { sequence: this.nextSequence++, event }
-    this.entries.push(entry)
-    if (this.entries.length > this.capacity) this.entries.shift()
+    if (retain) {
+      this.entries.push(entry)
+      if (this.entries.length > this.capacity) this.entries.shift()
+    }
     return entry
   }
 

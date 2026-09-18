@@ -15,6 +15,9 @@ import { Registry, type RelayPrincipal } from "./registry.js";
 const MAX_HTTP_BODY_BYTES = 16 * 1024;
 const MAX_RELAY_MESSAGE_BYTES = 16 * 1024 * 1024;
 const MAX_SOCKET_BUFFER_BYTES = 2 * MAX_RELAY_MESSAGE_BYTES;
+const MAX_INITIALIZATION_BUFFER_BYTES = MAX_RELAY_MESSAGE_BYTES;
+const MAX_INITIALIZATION_BUFFER_MESSAGES = 32;
+const INITIALIZATION_TIMEOUT_MS = 10_000;
 const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
 /**
  * Bumped whenever the routed `WireMessage` union changes shape. The Relay
@@ -175,21 +178,50 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const connect = async (ws: WebSocket, principal: RelayPrincipal): Promise<void> => {
     const connection: RelayConnection = { id: randomUUID(), ws, principal };
     const pendingMessages: RawData[] = [];
+    let pendingMessageBytes = 0;
     let initialized = false;
+    let initializationTimer: NodeJS.Timeout | undefined;
+    const clearInitialization = (): void => {
+      if (initializationTimer !== undefined) clearTimeout(initializationTimer);
+      initializationTimer = undefined;
+      pendingMessages.length = 0;
+      pendingMessageBytes = 0;
+    };
+    const rejectInitialization = (code: number, reason: string): void => {
+      clearInitialization();
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(code, reason);
+      }
+    };
     // The lease counter is persisted asynchronously. Attach the message and
     // close handlers before waiting for that write, otherwise a client can
     // send its first frame immediately after the WebSocket upgrade and have
     // it disappear before the connection enters the Relay set.
     ws.on("message", (raw) => {
-      if (!initialized) pendingMessages.push(raw);
+      if (!initialized) {
+        const bytes = rawDataBytes(raw);
+        if (pendingMessages.length >= MAX_INITIALIZATION_BUFFER_MESSAGES ||
+            bytes > MAX_INITIALIZATION_BUFFER_BYTES ||
+            pendingMessageBytes + bytes > MAX_INITIALIZATION_BUFFER_BYTES) {
+          rejectInitialization(1009, "initialization buffer limit exceeded");
+          return;
+        }
+        pendingMessages.push(raw);
+        pendingMessageBytes += bytes;
+      }
       else handleSocketMessage(connection, raw);
     });
     ws.once("close", () => {
+      clearInitialization();
       // A superseded machine was removed before it was closed. Do not publish
       // a false offline edge after its replacement is already online.
       if (connections.delete(connection)) broadcastPresence(principal, false);
     });
     ws.once("error", () => undefined);
+    initializationTimer = setTimeout(() => {
+      if (!initialized) rejectInitialization(1013, "connection initialization timed out");
+    }, INITIALIZATION_TIMEOUT_MS);
+    initializationTimer.unref?.();
     let leaseGeneration: number | undefined;
     if (principal.role === "machine") {
       try {
@@ -210,6 +242,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     }
     connections.add(connection);
     initialized = true;
+    if (initializationTimer !== undefined) clearTimeout(initializationTimer);
+    initializationTimer = undefined;
+    const bufferedMessages = pendingMessages.splice(0);
+    pendingMessageBytes = 0;
     send(connection, {
       type: "relay.ready",
       machineId: principal.machineId,
@@ -224,7 +260,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       send(connection, presence(existing.principal, true));
     }
     broadcastPresence(principal, true);
-    for (const raw of pendingMessages) handleSocketMessage(connection, raw);
+    for (const raw of bufferedMessages) handleSocketMessage(connection, raw);
   };
 
   const handleSocketMessage = (source: RelayConnection, raw: RawData): void => {
@@ -243,7 +279,9 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     }
     const parsed = RelayMessageSchema.safeParse(decoded);
     if (!parsed.success) {
-      sendError(source, "invalid_message", "Relay message does not match the protocol schema.");
+      const context = malformedRelayRequestContext(decoded);
+      sendError(source, "invalid_message", "Relay message does not match the protocol schema.",
+        context.machineId, context.messageId);
       return;
     }
     if (parsed.data.type !== "relay.payload") {
@@ -479,6 +517,13 @@ const send = (connection: RelayConnection, message: RelayMessage): void => {
   connection.ws.send(JSON.stringify(message));
 };
 
+const rawDataBytes = (raw: RawData): number => {
+  if (typeof raw === "string") return Buffer.byteLength(raw);
+  if (raw instanceof ArrayBuffer) return raw.byteLength;
+  if (Array.isArray(raw)) return raw.reduce((total, chunk) => total + chunk.byteLength, 0);
+  return raw.byteLength;
+};
+
 const sendError = (connection: RelayConnection, code: string, message: string, machineId?: string, messageId?: string): void => {
   send(connection, RelayErrorMessageSchema.parse({
     type: "relay.error",
@@ -552,6 +597,22 @@ const recordPairAttempt = (attempts: Map<string, PairAttempt>, key: string, now:
   else attempt.count += 1;
 };
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const malformedRelayRequestContext = (value: unknown): {
+  machineId?: string;
+  messageId?: string;
+} => {
+  if (!isRecord(value)) return {};
+  const body = isRecord(value.body) ? value.body : undefined;
+  const identifier = (candidate: unknown): string | undefined =>
+    typeof candidate === "string" && candidate.length > 0 && candidate.length <= 256 ? candidate : undefined;
+  // A malformed relay.payload can still carry the application request id in
+  // its body. Preserve it so a client can settle the matching spinner rather
+  // than waiting for a generic timeout. The wrapper id is only a fallback:
+  // Relay's own `messageId` is not necessarily the app command id.
+  const messageId = identifier(body?.requestId) ?? identifier(value.messageId);
+  const machineId = identifier(value.machineId);
+  return { ...(machineId === undefined ? {} : { machineId }), ...(messageId === undefined ? {} : { messageId }) };
+};
 const hasMachineId = (value: object): value is { readonly machineId: string } => "machineId" in value;
 const hasDeviceId = (value: object): value is { readonly deviceId: string } => "deviceId" in value;
 const samePrincipal = (left: RelayPrincipal, right: RelayPrincipal): boolean =>

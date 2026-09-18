@@ -453,13 +453,14 @@ describe('native bridge mutations', () => {
       effect: () => undefined,
     } as unknown as Context
     apply(context, { connectorToken })
-    return async (method: string, url: string, body?: unknown, requestId?: string): Promise<{ status: number; body: unknown }> => {
+    return async (method: string, url: string, body?: unknown, requestId?: string,
+                  authorization = `Bearer ${connectorToken}`): Promise<{ status: number; body: unknown }> => {
       const request = Readable.from([body === undefined ? '' : JSON.stringify(body)]) as unknown as IncomingMessage
       Object.assign(request, {
         method,
         url,
         headers: {
-          authorization: `Bearer ${connectorToken}`,
+          authorization,
           ...(requestId === undefined ? {} : { 'x-dsh-request-id': requestId }),
         },
         socket: { remoteAddress: '127.0.0.1' },
@@ -507,6 +508,19 @@ describe('native bridge mutations', () => {
     ])
     expect(creates).toBe(1)
     expect(duplicate).toEqual(first)
+  })
+
+  it('does not let unauthenticated request ids consume trusted idempotency slots', async () => {
+    const request = mount()
+    for (let index = 0; index < 2_000; index += 1) {
+      await expect(request(
+        'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, `invalid-${index}`,
+        'Bearer invalid-connector-token',
+      )).resolves.toMatchObject({ status: 401 })
+    }
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'trusted-after-invalid-flood',
+    )).resolves.toMatchObject({ status: 201 })
   })
 
   it('does not permanently cache a prompt rejection under its request id', async () => {

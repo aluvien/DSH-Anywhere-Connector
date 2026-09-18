@@ -148,6 +148,14 @@ export class DSHAnywhereConnector {
     generation: number;
     includeArchived: boolean;
   }>();
+  /** Workspace catalogs are an independent projection from session lists.
+   * A mutation push or a later explicit request must fence a slower catalog
+   * response, without changing the archive-list generation above. */
+  private readonly workspaceCatalogGenerationByDevice = new Map<string, number>();
+  private readonly latestWorkspaceCatalogCommands = new Map<string, {
+    requestId: string;
+    generation: number;
+  }>();
   private readonly deferredSessionSnapshotDevices = new Set<string>();
   /** Workspace mutations and session projections are separate resources. A
    * stale session query must not suppress the catalog refresh that follows a
@@ -233,6 +241,8 @@ export class DSHAnywhereConnector {
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
     this.latestSessionListCommands.clear();
+    this.workspaceCatalogGenerationByDevice.clear();
+    this.latestWorkspaceCatalogCommands.clear();
     this.deferredSessionSnapshotDevices.clear();
     this.deferredWorkspaceCatalogDevices.clear();
     this.inFlightSessionMutations.clear();
@@ -330,13 +340,16 @@ export class DSHAnywhereConnector {
       // distinguish history from the current handshake.
       const connectionId = event.data.payload.bridgeConnectionId;
       if (connectionId === undefined) {
-        // A Bridge without the per-socket identity cannot safely distinguish a
-        // replayed greeting from the current handshake. Refuse that mixed
-        // version instead of guessing from sequence numbers and risking a
-        // stale cursor or replayTruncated flag changing the live connection.
-        this.log("warn", "Bridge greeting is missing its connection identity");
-        this.bridgeBufferedEvents = [];
-        socket.close(1002, "Bridge handshake identity required");
+        // A direct phone/browser client may have a legitimate greeting in the
+        // Bridge replay buffer, but it has no Connector socket identity. It is
+        // therefore history, not evidence that this Connector is incompatible.
+        // Keep it quarantined until the current socket's identified greeting
+        // arrives; handleBridgeEvent() will ignore the historical control
+        // event after the current handshake authorizes the stream.
+        this.log("warn", "Ignored Bridge greeting without a Connector socket identity");
+        if (!this.bridgeReady && this.bridgeBufferedEvents.length < MAX_REPLAY_EVENTS) {
+          this.bridgeBufferedEvents.push(event.data);
+        }
         return;
       }
       if (connectionId !== this.bridgeConnectorId) {
@@ -459,13 +472,24 @@ export class DSHAnywhereConnector {
     this.dispatchCommand(command.data);
   }
 
-  private dispatchCommand(command: CommandEnvelope): void {
+  private dispatchCommand(command: CommandEnvelope, retry = false): void {
     const now = Date.now();
     for (const [key, execution] of this.commandExecutions) {
       if (execution.expiresAt <= now) this.commandExecutions.delete(key);
     }
     for (const [key, result] of this.commandResults) {
       if (result.expiresAt <= now && !this.commandExecutions.has(key)) this.commandResults.delete(key);
+    }
+    // A retry is a continuation of an earlier request, not a new list/catalog
+    // choice.  Do this check only on the retry path: a fresh request must be
+    // allowed to establish the newer generation that fences the old one.
+    if (retry && command.type === "session.list" && this.isSupersededSessionList(command)) {
+      this.sendSupersededSessionList(command);
+      return;
+    }
+    if (retry && command.type === "workspace.catalog" && this.isSupersededWorkspaceCatalog(command)) {
+      this.sendSupersededWorkspaceCatalog(command);
+      return;
     }
     const key = commandKey(command.machineId, command.deviceId, command.requestId);
     const existing = this.commandExecutions.get(key);
@@ -481,7 +505,7 @@ export class DSHAnywhereConnector {
         if (outcome.state === "failed" && outcome.retryable) {
           this.commandExecutions.delete(key);
           this.commandResults.delete(key);
-          this.dispatchCommand(command);
+          this.dispatchCommand(command, true);
         } else {
           this.replayCommandResult(command);
         }
@@ -495,6 +519,8 @@ export class DSHAnywhereConnector {
   }
 
   private async executeCommand(command: CommandEnvelope): Promise<CommandExecutionOutcome> {
+    let sessionSnapshotGeneration: number | undefined;
+    let workspaceCatalogGeneration: number | undefined;
     try {
       // The Connector owns the Relay-side replay window. This lets a device
       // connect after the bridge has already emitted its initial snapshot.
@@ -512,8 +538,11 @@ export class DSHAnywhereConnector {
       // and make the following archive mutation refresh the wrong projection.
       const isSessionList = command.type === "session.list";
       const includeArchived = isSessionList && command.payload.includeArchived === true;
-      const sessionSnapshotGeneration = isSessionList
+      sessionSnapshotGeneration = isSessionList
         ? this.beginSessionSnapshotQuery(command.deviceId, includeArchived)
+        : undefined;
+      workspaceCatalogGeneration = command.type === "workspace.catalog"
+        ? this.beginWorkspaceCatalogQuery(command.deviceId, command.requestId)
         : undefined;
       if (sessionSnapshotGeneration !== undefined) {
         this.latestSessionListCommands.set(command.deviceId, {
@@ -542,10 +571,20 @@ export class DSHAnywhereConnector {
         bridgeTimeoutFor(command),
         command.requestId,
       );
-      await this.emitCommandResult(command, response, sessionSnapshotGeneration);
+      await this.emitCommandResult(command, response, sessionSnapshotGeneration, workspaceCatalogGeneration);
       return { state: "completed" };
     } catch (error) {
+      const staleSessionList = command.type === "session.list" &&
+        sessionSnapshotGeneration !== undefined &&
+        !this.isCurrentSessionSnapshotQuery(command.deviceId, sessionSnapshotGeneration);
+      const staleWorkspaceCatalog = command.type === "workspace.catalog" &&
+        workspaceCatalogGeneration !== undefined &&
+        !this.isCurrentWorkspaceCatalogQuery(command.deviceId, workspaceCatalogGeneration);
       if (command.type === "session.list") this.finishSessionListRequest(command, undefined);
+      // A newer request (or an automatic authoritative push) owns the current
+      // projection. Do not surface the older timeout as a user error or retry
+      // it into an outdated archive/catalog response.
+      if (staleSessionList || staleWorkspaceCatalog) return { state: "completed" };
       return { state: "failed", retryable: this.sendProtocolError(command, error) };
     }
   }
@@ -603,7 +642,8 @@ export class DSHAnywhereConnector {
   }
 
   private async emitCommandResult(command: CommandEnvelope, response: unknown,
-                                  sessionSnapshotGeneration?: number): Promise<void> {
+                                  sessionSnapshotGeneration?: number,
+                                  workspaceCatalogGeneration?: number): Promise<void> {
     if (command.type === "session.open") {
       // The bridge publishes the requested historical events over its existing
       // event socket. There is no extra command-result card for opening a
@@ -745,6 +785,8 @@ export class DSHAnywhereConnector {
       return;
     }
     if (command.type === "workspace.catalog") {
+      if (workspaceCatalogGeneration === undefined ||
+          !this.isCurrentWorkspaceCatalogQuery(command.deviceId, workspaceCatalogGeneration)) return;
       const data = asRecord(response);
       this.sendEvent({
         version: PROTOCOL_VERSION,
@@ -863,6 +905,13 @@ export class DSHAnywhereConnector {
       void this.replaySessionList(command);
       return;
     }
+    if (command.type === "workspace.catalog") {
+      // A catalog has no durable side effect to cache. Re-read the current
+      // native registry and correlate the fresh response to this request;
+      // replaying an older catalog could overwrite a mutation push.
+      void this.replayWorkspaceCatalog(command);
+      return;
+    }
     // Reissue through sendEvent so the result receives a fresh monotonic
     // transport sequence. Reusing the original sequence is silently filtered
     // by the iOS reducer after it has processed later events.
@@ -908,6 +957,36 @@ export class DSHAnywhereConnector {
     } catch (error) {
       this.log("warn", `Failed to replay session list for device ${shortID(command.deviceId)}: ${safeError(error, this.config)}`);
       this.finishSessionListRequest(command, generation);
+      if (!this.isCurrentSessionSnapshotQuery(command.deviceId, generation)) return;
+      this.sendProtocolError(command, error);
+    }
+  }
+
+  private async replayWorkspaceCatalog(command: Extract<CommandEnvelope, { type: "workspace.catalog" }>): Promise<void> {
+    const latest = this.latestWorkspaceCatalogCommands.get(command.deviceId);
+    if (latest !== undefined && latest.requestId !== command.requestId) {
+      this.sendSupersededWorkspaceCatalog(command);
+      return;
+    }
+    const generation = this.beginWorkspaceCatalogQuery(command.deviceId, command.requestId);
+    try {
+      const data = asRecord(await this.callBridge({ method: "GET", path: "/workspaces" }));
+      if (!this.isCurrentWorkspaceCatalogQuery(command.deviceId, generation)) return;
+      const current = this.latestWorkspaceCatalogCommands.get(command.deviceId);
+      if (current?.requestId !== command.requestId || current.generation !== generation) return;
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: command.requestId,
+        machineId: this.config.machineId,
+        deviceId: command.deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "workspace.catalog",
+        payload: WorkspaceCatalogPayloadSchema.parse(data),
+      }, command.deviceId, command.requestId);
+    } catch (error) {
+      this.log("warn", `Failed to replay workspace catalog for device ${shortID(command.deviceId)}: ${safeError(error, this.config)}`);
+      if (!this.isCurrentWorkspaceCatalogQuery(command.deviceId, generation)) return;
       this.sendProtocolError(command, error);
     }
   }
@@ -924,6 +1003,23 @@ export class DSHAnywhereConnector {
       payload: {
         code: "request-superseded",
         message: "A newer session list request already established the current filter.",
+        retryable: false,
+      },
+    }, command.deviceId, command.requestId);
+  }
+
+  private sendSupersededWorkspaceCatalog(command: Extract<CommandEnvelope, { type: "workspace.catalog" }>): void {
+    this.sendEvent({
+      version: PROTOCOL_VERSION,
+      messageId: command.requestId,
+      machineId: this.config.machineId,
+      deviceId: command.deviceId,
+      sequence: ++this.sequence,
+      timestamp: Date.now(),
+      type: "protocol.error",
+      payload: {
+        code: "request-superseded",
+        message: "A newer workspace catalog request already established the current registry.",
         retryable: false,
       },
     }, command.deviceId, command.requestId);
@@ -984,8 +1080,10 @@ export class DSHAnywhereConnector {
   }
 
   private async pushWorkspaceCatalog(deviceId: string): Promise<void> {
+    const generation = this.beginWorkspaceCatalogQuery(deviceId);
     try {
       const data = asRecord(await this.callBridge({ method: "GET", path: "/workspaces" }));
+      if (!this.isCurrentWorkspaceCatalogQuery(deviceId, generation)) return;
       this.sendEvent({
         version: PROTOCOL_VERSION,
         messageId: `workspace-push-${randomUUID()}`,
@@ -1035,6 +1133,29 @@ export class DSHAnywhereConnector {
 
   private isCurrentSessionSnapshotQuery(deviceId: string, generation: number): boolean {
     return this.sessionSnapshotGenerationByDevice.get(deviceId) === generation;
+  }
+
+  private isSupersededSessionList(command: Extract<CommandEnvelope, { type: "session.list" }>): boolean {
+    const latest = this.latestSessionListCommands.get(command.deviceId);
+    return latest !== undefined && latest.requestId !== command.requestId;
+  }
+
+  private beginWorkspaceCatalogQuery(deviceId: string, requestId?: string): number {
+    const generation = (this.workspaceCatalogGenerationByDevice.get(deviceId) ?? 0) + 1;
+    this.workspaceCatalogGenerationByDevice.set(deviceId, generation);
+    if (requestId !== undefined) {
+      this.latestWorkspaceCatalogCommands.set(deviceId, { requestId, generation });
+    }
+    return generation;
+  }
+
+  private isCurrentWorkspaceCatalogQuery(deviceId: string, generation: number): boolean {
+    return this.workspaceCatalogGenerationByDevice.get(deviceId) === generation;
+  }
+
+  private isSupersededWorkspaceCatalog(command: Extract<CommandEnvelope, { type: "workspace.catalog" }>): boolean {
+    const latest = this.latestWorkspaceCatalogCommands.get(command.deviceId);
+    return latest !== undefined && latest.requestId !== command.requestId;
   }
 
   private finishSessionListRequest(command: CommandEnvelope, generation: number | undefined): void {

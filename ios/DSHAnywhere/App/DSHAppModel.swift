@@ -196,6 +196,11 @@ final class DSHAppModel: ObservableObject {
     /// Force-merge tasks for history batches whose closing bracket never
     /// arrives (bridge died mid-stream). Keyed by session id.
     private var historyTimeoutTasks: [String: Task<Void, Never>] = [:]
+    /// History replay includes the stored terminal turn state. It must rebuild
+    /// the transcript only; treating that state as a live completion would
+    /// release a locally queued prompt while the user is merely opening an
+    /// old session.
+    private var replayingHistorySessions: Set<String> = []
     /// Already-notified request ids and failed sessions (see notifyForEvent).
     private var notifiedApprovalIDs: Set<String> = []
     private var notifiedQuestionIDs: Set<String> = []
@@ -217,6 +222,7 @@ final class DSHAppModel: ObservableObject {
         failedSend = nil
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
+        replayingHistorySessions.removeAll(keepingCapacity: false)
         lastOpenSessionAt.removeAll(keepingCapacity: false)
         pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingWorkspaceCreationRequestID = nil
@@ -761,6 +767,14 @@ final class DSHAppModel: ObservableObject {
         let cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanPath.isEmpty, !isCreatingWorkspace else { return }
         let cleanTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The protocol and Harness registry count JavaScript UTF-16 code
+        // units. Reject an overlong title locally so the command spinner can
+        // settle immediately instead of relying on a malformed relay error
+        // after the request has already left the phone.
+        if let cleanTitle, cleanTitle.utf16.count > 512 {
+            errorMessage = "工作区名称不能超过 512 个字符。"
+            return
+        }
         let requestId = UUID().uuidString
         createdWorkspace = nil
         isCreatingWorkspace = true
@@ -1497,15 +1511,30 @@ final class DSHAppModel: ObservableObject {
         state = next
 
         for event in acceptedEvents {
+            let historyEvent: Bool
+            switch event.kind {
+            case .historyStarted(let batch):
+                replayingHistorySessions.insert(batch.sessionId)
+                historyEvent = true
+            case .historyCompleted(let batch):
+                historyEvent = replayingHistorySessions.contains(batch.sessionId)
+            case .turnStateChanged(let turn):
+                historyEvent = replayingHistorySessions.contains(turn.sessionId)
+            default:
+                historyEvent = event.envelope.sessionId.map(replayingHistorySessions.contains) ?? false
+            }
             handleSessionCreated(event)
             handleRemoteRequestCompletion(event)
             requestRemoteCatalogsWhenConnected(event)
             retireQueuedPrompt(event)
             confirmPromptAccepted(event)
-            flushQueueOnSettle(event)
+            if !historyEvent { flushQueueOnSettle(event) }
             surfaceProtocolError(event)
             trackHistoryBatch(event)
             notifyForEvent(event)
+            if case .historyCompleted(let batch) = event.kind {
+                replayingHistorySessions.remove(batch.sessionId)
+            }
         }
     }
 

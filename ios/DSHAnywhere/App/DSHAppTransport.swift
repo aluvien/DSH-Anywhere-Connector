@@ -31,6 +31,10 @@ actor DSHRemoteTransport: DSHAppTransport {
     private var connection: DSHWebSocketConnection?
     private var relaySchema: (url: URL, revision: Int)?
     private var includeArchivedSessions = false
+    /// Invalidates every connect/disconnect operation that is suspended across
+    /// an actor `await`.  Actor isolation does not make a multi-step connect
+    /// transaction atomic once it awaits URLSession or the socket actor.
+    private var connectionGeneration = 0
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -57,6 +61,7 @@ actor DSHRemoteTransport: DSHAppTransport {
         guard let (profile, token) = credentials else {
             return AsyncThrowingStream { $0.finish(throwing: DSHAPIError.missingCredentials) }
         }
+        let generation = connectionGeneration
         if let connection { return await connection.connect() }
         var components = URLComponents(url: profile.relayBaseURL, resolvingAgainstBaseURL: false)
         let socketScheme = components?.scheme == "https" ? "wss" : "ws"
@@ -69,8 +74,21 @@ actor DSHRemoteTransport: DSHAppTransport {
             url: relayURL, bearerToken: token, deviceId: profile.deviceId, machineId: profile.machineId
         ))
         await socket.setIncludeArchived(includeArchivedSessions)
+        guard generation == connectionGeneration,
+              store.activeMachineId == profile.machineId else {
+            await socket.disconnect()
+            return AsyncThrowingStream { $0.finish() }
+        }
         connection = socket
-        return await socket.connect()
+        let stream = await socket.connect()
+        guard generation == connectionGeneration,
+              store.activeMachineId == profile.machineId,
+              connection === socket else {
+            if connection === socket { connection = nil }
+            await socket.disconnect()
+            return AsyncThrowingStream { $0.finish() }
+        }
+        return stream
     }
 
     func setIncludeArchived(_ value: Bool) async {
@@ -128,9 +146,11 @@ actor DSHRemoteTransport: DSHAppTransport {
     }
 
     func disconnect() async {
-        await connection?.disconnect()
+        connectionGeneration &+= 1
+        let oldConnection = connection
         connection = nil
         relaySchema = nil
+        await oldConnection?.disconnect()
     }
 
     func forgetPairing() async throws {
