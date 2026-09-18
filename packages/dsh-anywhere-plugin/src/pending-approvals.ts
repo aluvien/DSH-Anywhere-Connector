@@ -55,6 +55,11 @@ export class PendingApprovals {
     for (const id of [...this.pending.keys()]) this.reject(id)
   }
 
+  /** Removes a phone-side request after another approval surface wins. */
+  discard(id: string): void {
+    this.take(id)
+  }
+
   private take(id: string): PendingApproval | undefined {
     const item = this.pending.get(id)
     if (item === undefined) return undefined

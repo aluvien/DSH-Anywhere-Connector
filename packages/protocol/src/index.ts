@@ -2,6 +2,10 @@ import { z } from "zod";
 
 /** The wire format is intentionally pinned. Bump this only with a migration plan. */
 export const PROTOCOL_VERSION = 1 as const;
+/** Product limit for one original attachment before base64 transport encoding. */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+/** Exact maximum length of a padded base64 encoding of MAX_ATTACHMENT_BYTES. */
+export const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4;
 
 const IdentifierSchema = z.string().min(1).max(256);
 const TimestampSchema = z.number().int().nonnegative();
@@ -523,7 +527,7 @@ export const PermissionSetPayloadSchema = StrictObject({
 });
 export const AttachmentUploadPayloadSchema = StrictObject({
   name: z.string().min(1).max(512),
-  data: z.string().min(1),
+  data: z.string().min(1).max(MAX_ATTACHMENT_BASE64_CHARS),
 });
 /** One answered question. `selected` carries option labels verbatim. */
 export const QuestionAnswerItemSchema = StrictObject({

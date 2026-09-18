@@ -779,6 +779,7 @@ class DSHAppModel(
      * its receipt — the only safe value to put into a subsequent prompt.
      */
     suspend fun uploadAttachmentAndWait(name: String, data: ByteArray, sessionID: String): String {
+        if (data.size > 10 * 1024 * 1024) throw AttachmentTooLarge()
         val requestId = UUID.randomUUID().toString()
         val command = DSHCommand.uploadAttachment(
             deviceId = deviceID, machineId = machineID, sessionId = sessionID,
@@ -804,6 +805,9 @@ class DSHAppModel(
 
     class AttachmentUploadTimeout :
         Exception(DSHLocalization.string("The attachment upload timed out. Please try again."))
+
+    class AttachmentTooLarge :
+        Exception(DSHLocalization.string("Attachments must be 10 MiB or smaller."))
 
     class RemoteCommandError(message: String) : Exception(message)
 

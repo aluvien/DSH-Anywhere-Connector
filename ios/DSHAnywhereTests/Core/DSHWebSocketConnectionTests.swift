@@ -8,6 +8,20 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertEqual(backoff.delayNanoseconds(for: 2), 20)
         XCTAssertEqual(backoff.delayNanoseconds(for: 3), 25)
         XCTAssertEqual(backoff.delayNanoseconds(for: 0), 0)
+
+        let productionBackoff = DSHExponentialBackoff()
+        for attempt in [7, 36, 37, 100, 1_000] {
+            XCTAssertEqual(productionBackoff.delayNanoseconds(for: attempt), 30_000_000_000,
+                           "attempt \(attempt) must remain capped without trapping")
+        }
+        XCTAssertEqual(DSHExponentialBackoff(initialNanoseconds: 100, maximumNanoseconds: 10)
+            .delayNanoseconds(for: 1), 10)
+        XCTAssertEqual(DSHExponentialBackoff(initialNanoseconds: 10, maximumNanoseconds: 100,
+                                             multiplier: .nan)
+            .delayNanoseconds(for: 100), 10)
+        XCTAssertEqual(DSHExponentialBackoff(initialNanoseconds: UInt64.max,
+                                             maximumNanoseconds: UInt64.max)
+            .delayNanoseconds(for: 2), UInt64.max)
     }
 
     func testBearerRequestAndRelayResumeAreSentAfterReady() async throws {
@@ -81,6 +95,33 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         await connection.disconnect()
     }
 
+    func testUnavailableMacKeepsTheHealthyRelaySocketOpen() async throws {
+        let unavailable = DSHRelayErrorMessage(type: "relay.error", code: "target_unavailable",
+                                               message: "No connected machine is available.",
+                                               machineId: "machine", messageId: "resume")
+        let fake = RecordingWebSocketTask(additionalMessages: [
+            .data(try JSONEncoder().encode(unavailable)),
+        ])
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1),
+                                                maximumReconnectAttempts: 0)
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        let stream = await connection.connect()
+        var iterator = stream.makeAsyncIterator()
+        var sawOffline = false
+        for _ in 0..<5 {
+            guard let event = try await iterator.next() else { break }
+            if case .machinePresence(false) = event.kind { sawOffline = true; break }
+        }
+
+        XCTAssertTrue(sawOffline)
+        let state = await connection.state
+        XCTAssertEqual(state, .connected)
+        XCTAssertEqual(fake.resumeCount, 1)
+        await connection.disconnect()
+    }
+
     func testOnlyLatestCorrelatedListSnapshotCanResetAConnectorEpoch() async throws {
         let fake = RecordingWebSocketTask()
         let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
@@ -113,6 +154,40 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertTrue(receivedSnapshot?.establishesSequenceEpoch == true)
         let finalSequence = await connection.lastSequence
         XCTAssertEqual(finalSequence, 1)
+        await connection.disconnect()
+    }
+
+    func testLateOlderListSnapshotCannotOverwriteAcceptedNewerSnapshot() async throws {
+        let fake = RecordingWebSocketTask()
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1),
+                                                maximumReconnectAttempts: 0)
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        let stream = await connection.connect()
+        var iterator = stream.makeAsyncIterator()
+        try await connection.send(DSHCommand(requestId: "list-active", deviceId: "device", machineId: "machine",
+                                             type: "session.list",
+                                             payload: .object(["includeArchived": .bool(false)])))
+        try await connection.send(DSHCommand(requestId: "list-archive", deviceId: "device", machineId: "machine",
+                                             type: "session.list",
+                                             payload: .object(["includeArchived": .bool(true)])))
+
+        // The newer response wins first. The older response then arrives after
+        // it and must be discarded using its retained request identity.
+        fake.enqueue(try relaySnapshot(messageID: "list-archive", sequence: 2, title: "Archive"))
+        fake.enqueue(try relaySnapshot(messageID: "list-active", sequence: 3, title: "Active"))
+        fake.enqueue(try relaySnapshot(messageID: "snapshot-push-test", sequence: 4, title: "Push"))
+
+        var snapshots: [String] = []
+        for _ in 0..<10 {
+            guard let event = try await iterator.next() else { break }
+            if case .sessionSnapshot = event.kind {
+                snapshots.append(event.envelope.messageId)
+                if snapshots.count == 2 { break }
+            }
+        }
+        XCTAssertEqual(snapshots, ["list-archive", "snapshot-push-test"])
         await connection.disconnect()
     }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { PROTOCOL_VERSION, type CommandEnvelope } from "@dsh-anywhere/protocol";
-import { DSHAnywhereConnector, backoffDelay, bridgeRequestFor } from "../src/connector.js";
+import { DSHAnywhereConnector, backoffDelay, bridgeRequestFor, bridgeTimeoutFor } from "../src/connector.js";
 import { requestPairingCode } from "../src/setup.js";
 import type { ConnectorConfig } from "../src/config.js";
 
@@ -74,9 +74,73 @@ describe("bridge command mapping", () => {
     expect(backoffDelay(4, 10, 100)).toBe(80);
     expect(backoffDelay(8, 10, 100)).toBe(100);
   });
+
+  it("keeps the Connector deadline outside long-running Harness commands", () => {
+    const execute = {
+      version: PROTOCOL_VERSION, requestId: "execute", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      sessionId: "session-1", type: "command.execute", payload: { line: "/slow" },
+    } satisfies CommandEnvelope;
+    expect(bridgeTimeoutFor(execute)).toBe(125_000);
+    expect(bridgeTimeoutFor(command("session.list"))).toBe(15_000);
+  });
 });
 
 describe("Relay and bridge forwarding", () => {
+  it("reports real Relay device presence to the local approval bridge", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const calls: Array<{ url: string; body?: string }> = [];
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ url: String(input), ...(typeof init?.body === "string" ? { body: init.body } : {}) });
+        return new Response(JSON.stringify(String(input).endsWith("/sessions") ? { items: [] } : { accepted: true }), {
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch,
+      webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    relay.emit("message", JSON.stringify({
+      type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: true, serverTime: 1,
+    }));
+    await vi.waitFor(() => expect(calls.some((call) => call.url.endsWith("/devices/phone-1/presence")
+      && call.body === JSON.stringify({ online: true }))).toBe(true));
+    relay.emit("message", JSON.stringify({
+      type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: false, serverTime: 2,
+    }));
+    await vi.waitFor(() => expect(calls.some((call) => call.url.endsWith("/devices/phone-1/presence")
+      && call.body === JSON.stringify({ online: false }))).toBe(true));
+    await connector.stop();
+  });
+
+  it("coalesces duplicate request ids before a local side effect", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      sessionId: "session-once", summary: { id: "session-once", title: "Once", updatedAt: 1 },
+    }), { status: 201, headers: { "content-type": "application/json" } }));
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const duplicate = JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "relay-copy", sender: "device",
+      body: command("session.create"),
+    });
+    relay.emit("message", duplicate);
+    relay.emit("message", duplicate);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const requestInit = (fetchMock.mock.calls as unknown as [unknown, RequestInit?][])[0]![1];
+    expect(new Headers(requestInit?.headers).get("x-dsh-request-id")).toBe("request-1");
+    await connector.stop();
+  });
+
   it("drops the connector-only bridge snapshot so it cannot overwrite a phone refresh", async () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();

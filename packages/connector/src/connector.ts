@@ -22,6 +22,13 @@ import { redactSecrets, type ConnectorConfig } from "./config.js";
 import { requestPairingCode, writePairingCodeFile } from "./setup.js";
 
 const MAX_REPLAY_EVENTS = 2_000;
+const MAX_REPLAY_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_EVENTS = 1_000;
+const MAX_PENDING_BYTES = 8 * 1024 * 1024;
+const MAX_RELAY_BUFFERED_BYTES = 32 * 1024 * 1024;
+const COMMAND_DEDUP_TTL_MS = 10 * 60_000;
+const LONG_BRIDGE_TIMEOUT_MS = 125_000;
+const UNSOLICITED_SESSION_SNAPSHOT_PREFIX = "snapshot-push-";
 /** Comfortably inside the relay's 10-minute code lifetime. */
 const PAIRING_CODE_REFRESH_MS = 5 * 60_000;
 
@@ -32,6 +39,7 @@ export interface Logger {
 
 export interface WebSocketLike {
   readonly readyState: number;
+  readonly bufferedAmount?: number;
   send(data: string): void;
   close(code?: number, reason?: string): void;
   terminate?(): void;
@@ -101,12 +109,19 @@ export class DSHAnywhereConnector {
   private state: ConnectorState = "stopped";
   private readonly pendingEvents: EventEnvelope[] = [];
   private readonly recentEvents: EventEnvelope[] = [];
+  private pendingEventBytes = 0;
+  private recentEventBytes = 0;
+  private pendingEventsDropped = false;
   /** Each device's archive view is a query choice, never a global cache. */
   private readonly includeArchivedByDevice = new Map<string, boolean>();
   /** Devices explicitly opted in to transient output for one open session.
    * This state belongs to the Connector (which knows device identity), not the
    * Bridge (which has one trusted Connector socket). */
   private readonly streamingDevicesBySession = new Map<string, Set<string>>();
+  /** Coalesces duplicate Relay delivery/retry by the caller's stable id. */
+  private readonly commandExecutions = new Map<string, { promise: Promise<void>; expiresAt: number }>();
+  private readonly onlineRelayDevices = new Set<string>();
+  private readonly presenceUpdates = new Map<string, Promise<void>>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -148,7 +163,13 @@ export class DSHAnywhereConnector {
     this.bridge = undefined;
     this.pendingEvents.length = 0;
     this.recentEvents.length = 0;
+    this.pendingEventBytes = 0;
+    this.recentEventBytes = 0;
+    this.pendingEventsDropped = false;
     this.streamingDevicesBySession.clear();
+    this.commandExecutions.clear();
+    this.onlineRelayDevices.clear();
+    this.presenceUpdates.clear();
   }
 
   private connectRelay(): void {
@@ -173,6 +194,9 @@ export class DSHAnywhereConnector {
       if (this.relay !== socket) return;
       this.stopHeartbeat();
       this.relay = undefined;
+      const disconnectedDevices = [...this.onlineRelayDevices];
+      this.onlineRelayDevices.clear();
+      for (const deviceId of disconnectedDevices) void this.reportDevicePresence(deviceId, false);
       if (this.running) this.scheduleRelayReconnect();
     });
   }
@@ -185,6 +209,7 @@ export class DSHAnywhereConnector {
       if (this.bridge !== socket || !this.running) return;
       this.bridgeAttempts = 0;
       this.log("info", "Local DSH bridge connected");
+      for (const deviceId of this.onlineRelayDevices) void this.reportDevicePresence(deviceId, true);
     });
     socket.on("message", (raw: RawData) => this.onBridgeMessage(socket, raw));
     socket.on("error", (error: Error) => this.log("warn", `Bridge socket error: ${safeError(error, this.config)}`));
@@ -232,8 +257,11 @@ export class DSHAnywhereConnector {
       return;
     }
     if (message.data.type === "relay.presence") {
-      if (message.data.role === "device" && message.data.online && message.data.deviceId !== undefined) {
-        void this.pushSessionSnapshot(message.data.deviceId);
+      if (message.data.role === "device" && message.data.deviceId !== undefined) {
+        if (message.data.online) this.onlineRelayDevices.add(message.data.deviceId);
+        else this.onlineRelayDevices.delete(message.data.deviceId);
+        void this.reportDevicePresence(message.data.deviceId, message.data.online);
+        if (message.data.online) void this.pushSessionSnapshot(message.data.deviceId);
       }
       return;
     }
@@ -244,7 +272,26 @@ export class DSHAnywhereConnector {
       return;
     }
     this.log("info", `Received ${command.data.type} from device ${shortID(command.data.deviceId)}`);
-    void this.executeCommand(command.data);
+    this.dispatchCommand(command.data);
+  }
+
+  private dispatchCommand(command: CommandEnvelope): void {
+    const now = Date.now();
+    for (const [key, execution] of this.commandExecutions) {
+      if (execution.expiresAt <= now) this.commandExecutions.delete(key);
+    }
+    const key = `${command.machineId}\u0000${command.deviceId}\u0000${command.requestId}`;
+    const existing = this.commandExecutions.get(key);
+    if (existing !== undefined) {
+      // The original result may have crossed just before a reconnect. Once the
+      // shared execution settles, replay any correlated result without running
+      // the local side effect again.
+      void existing.promise.then(() => this.replayCommandResult(command));
+      return;
+    }
+    const promise = this.executeCommand(command);
+    this.commandExecutions.set(key, { promise, expiresAt: now + COMMAND_DEDUP_TTL_MS });
+    void promise;
   }
 
   private async executeCommand(command: CommandEnvelope): Promise<void> {
@@ -275,7 +322,8 @@ export class DSHAnywhereConnector {
       // to download, decode, and persist a large attachment.
       const response = await this.callBridge(
         request,
-        command.type === "attachment.upload" || command.type === "session.open" ? 120_000 : 15_000,
+        bridgeTimeoutFor(command),
+        command.requestId,
       );
       await this.emitCommandResult(command, response);
     } catch (error) {
@@ -283,11 +331,12 @@ export class DSHAnywhereConnector {
     }
   }
 
-  private async callBridge(request: BridgeRequest, timeoutMs = 15_000): Promise<unknown> {
+  private async callBridge(request: BridgeRequest, timeoutMs = 15_000, idempotencyKey?: string): Promise<unknown> {
     const response = await this.request(bridgeAPIURL(this.config.bridgeBaseURL, request.path), {
       method: request.method,
       headers: {
         ...authorization(this.config.bridgeToken),
+        ...(idempotencyKey === undefined ? {} : { "x-dsh-request-id": idempotencyKey }),
         ...(request.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
@@ -296,6 +345,26 @@ export class DSHAnywhereConnector {
     if (!response.ok) throw new BridgeRequestError(response.status);
     const contentType = response.headers.get("content-type") ?? "";
     return contentType.includes("application/json") ? response.json() : undefined;
+  }
+
+  private reportDevicePresence(deviceId: string, online: boolean): Promise<void> {
+    const previous = this.presenceUpdates.get(deviceId) ?? Promise.resolve();
+    const update = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.callBridge({
+          method: "POST",
+          path: `/devices/${encodeURIComponent(deviceId)}/presence`,
+          body: { online },
+        });
+      } catch (error) {
+        this.log("warn", `Could not report device presence to local bridge: ${safeError(error, this.config)}`);
+      }
+    });
+    this.presenceUpdates.set(deviceId, update);
+    void update.finally(() => {
+      if (this.presenceUpdates.get(deviceId) === update) this.presenceUpdates.delete(deviceId);
+    });
+    return update;
   }
 
   private async emitCommandResult(command: CommandEnvelope, response: unknown): Promise<void> {
@@ -359,16 +428,7 @@ export class DSHAnywhereConnector {
       const items = Array.isArray(refreshed.items)
         ? refreshed.items.map((item) => SessionSummarySchema.parse(item))
         : [];
-      this.sendEvent({
-        version: PROTOCOL_VERSION,
-        messageId: command.requestId,
-        machineId: this.config.machineId,
-        deviceId: command.deviceId,
-        sequence: ++this.sequence,
-        timestamp: Date.now(),
-        type: "session.snapshot",
-        payload: items,
-      });
+      this.sendSessionSnapshot(items, command.deviceId);
       return;
     }
     if (command.type === "model.catalog") {
@@ -491,10 +551,21 @@ export class DSHAnywhereConnector {
     }
   }
 
+  private replayCommandResult(command: CommandEnvelope): void {
+    for (const event of this.recentEvents) {
+      if (event.messageId === command.requestId && event.deviceId === command.deviceId) {
+        this.sendRelayEvent(event, command.deviceId);
+      }
+    }
+  }
+
   private sendProtocolError(command: CommandEnvelope, error: unknown): void {
-    const reason = error instanceof BridgeRequestError
-      ? `Local DSH bridge request failed (HTTP ${error.status})`
-      : "Local DSH bridge request failed";
+    const resultUnknown = error instanceof Error && error.name === "TimeoutError";
+    const reason = resultUnknown
+      ? "Local operation did not confirm completion before the deadline; its result is unknown"
+      : error instanceof BridgeRequestError
+        ? `Local DSH bridge request failed (HTTP ${error.status})`
+        : "Local DSH bridge request failed";
     this.log("warn", `${reason} for ${command.type}: ${safeError(error, this.config)}`);
     this.sendEvent({
       version: PROTOCOL_VERSION,
@@ -505,7 +576,13 @@ export class DSHAnywhereConnector {
       sequence: ++this.sequence,
       timestamp: Date.now(),
       type: "protocol.error",
-      payload: { code: "bridge-request-failed", message: reason, retryable: isRetryable(error) },
+      payload: {
+        code: resultUnknown ? "bridge-result-unknown" : "bridge-request-failed",
+        message: reason,
+        // Retrying with a fresh id could duplicate a side effect. A caller may
+        // reconnect and resend the same request id, which the deduper coalesces.
+        retryable: resultUnknown ? false : isRetryable(error),
+      },
     });
   }
 
@@ -520,7 +597,11 @@ export class DSHAnywhereConnector {
     }
   }
 
-  private sendSessionSnapshot(items: SessionSummary[], deviceId: string, messageId: string = randomUUID()): void {
+  private sendSessionSnapshot(
+    items: SessionSummary[],
+    deviceId: string,
+    messageId: string = `${UNSOLICITED_SESSION_SNAPSHOT_PREFIX}${randomUUID()}`,
+  ): void {
     // One full snapshot is authoritative. The old compatibility pre-snapshot
     // briefly replaced current rows with stale stripped data, causing the
     // home screen to flash several times during launch.
@@ -603,6 +684,10 @@ export class DSHAnywhereConnector {
   private sendRelayEvent(body: EventEnvelope, targetDeviceId?: string): void {
     const relay = this.relay;
     if (relay === undefined || relay.readyState !== WebSocket.OPEN) return;
+    if ((relay.bufferedAmount ?? 0) > MAX_RELAY_BUFFERED_BYTES) {
+      relay.terminate?.();
+      return;
+    }
     const message = RelayPayloadMessageSchema.parse({
       type: "relay.payload",
       machineId: this.config.machineId,
@@ -615,11 +700,35 @@ export class DSHAnywhereConnector {
   }
 
   private rememberEvent(event: EventEnvelope): void {
-    if (this.recentEvents.length >= MAX_REPLAY_EVENTS) this.recentEvents.shift();
+    const bytes = eventBytes(event);
+    while (this.recentEvents.length > 0 &&
+      (this.recentEvents.length >= MAX_REPLAY_EVENTS || this.recentEventBytes + bytes > MAX_REPLAY_BYTES)) {
+      this.recentEventBytes -= eventBytes(this.recentEvents.shift()!);
+    }
+    if (bytes > MAX_REPLAY_BYTES) return;
     this.recentEvents.push(event);
+    this.recentEventBytes += bytes;
   }
 
   private replayAfter(lastSequence: number, targetDeviceId: string): void {
+    const oldest = this.recentEvents[0]?.sequence;
+    if (lastSequence > 0 && oldest !== undefined && oldest > lastSequence + 1) {
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: randomUUID(),
+        machineId: this.config.machineId,
+        deviceId: targetDeviceId,
+        sequence: this.sequence,
+        timestamp: Date.now(),
+        type: "protocol.error",
+        payload: {
+          code: "replay-window-exceeded",
+          message: "Some offline events expired; reopen the session to resynchronize.",
+          retryable: true,
+        },
+      }, targetDeviceId);
+      return;
+    }
     for (const event of this.recentEvents) {
       // Catalogs and snapshots are request-scoped, not durable live events.
       // Replaying another device's old result corrupts an in-flight refresh
@@ -634,15 +743,43 @@ export class DSHAnywhereConnector {
   }
 
   private queueEvent(event: EventEnvelope): void {
-    // Keep a short outage from losing interactive output while avoiding unbounded memory use.
-    if (this.pendingEvents.length >= 1_000) this.pendingEvents.shift();
+    const bytes = eventBytes(event);
+    while (this.pendingEvents.length > 0 &&
+      (this.pendingEvents.length >= MAX_PENDING_EVENTS || this.pendingEventBytes + bytes > MAX_PENDING_BYTES)) {
+      this.pendingEventsDropped = true;
+      this.pendingEventBytes -= eventBytes(this.pendingEvents.shift()!);
+    }
+    if (bytes > MAX_PENDING_BYTES) {
+      this.pendingEventsDropped = true;
+      return;
+    }
     this.pendingEvents.push(event);
+    this.pendingEventBytes += bytes;
   }
 
   private flushPendingEvents(): void {
     if (this.relay === undefined || this.relay.readyState !== WebSocket.OPEN) return;
     const pending = this.pendingEvents.splice(0);
+    const dropped = this.pendingEventsDropped;
+    this.pendingEventBytes = 0;
+    this.pendingEventsDropped = false;
     for (const event of pending) this.sendEvent(event);
+    if (dropped) {
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: randomUUID(),
+        machineId: this.config.machineId,
+        deviceId: "broadcast",
+        sequence: this.sequence,
+        timestamp: Date.now(),
+        type: "protocol.error",
+        payload: {
+          code: "offline-queue-exceeded",
+          message: "Some offline events expired; reopen active sessions to resynchronize.",
+          retryable: true,
+        },
+      });
+    }
   }
 
   /**
@@ -852,6 +989,24 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
   }
 }
 
+export function bridgeTimeoutFor(command: CommandEnvelope): number {
+  switch (command.type) {
+    // These Bridge paths may legitimately await Harness work for up to 120s.
+    // The Connector stays slightly outside that deadline so a locally accepted
+    // operation cannot be reported as failed while it is still executing.
+    case "session.create":
+    case "session.open":
+    case "command.execute":
+    case "permission.set":
+    case "attachment.upload":
+    case "workspace.create":
+    case "workspace.delete":
+      return LONG_BRIDGE_TIMEOUT_MS;
+    default:
+      return 15_000;
+  }
+}
+
 export function relayConnectURL(relayURL: string): string {
   return new URL("v1/connect", trailingSlash(relayURL)).toString();
 }
@@ -897,6 +1052,10 @@ function parseJson(raw: RawData): unknown {
   } catch {
     return undefined;
   }
+}
+
+function eventBytes(event: EventEnvelope): number {
+  return Buffer.byteLength(JSON.stringify(event));
 }
 
 function trailingSlash(value: string): string {

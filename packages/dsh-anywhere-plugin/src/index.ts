@@ -3,9 +3,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { mkdir, opendir, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, opendir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { readFileSync, statSync } from 'node:fs'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types'
@@ -29,6 +29,70 @@ import { HttpError, json, readJson } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
 import { PendingQuestions, firstAnswered } from './pending-questions.js'
 import { ReplayBuffer } from './replay.js'
+
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
+const IDEMPOTENCY_TTL_MS = 10 * 60_000
+const MAX_IDEMPOTENCY_ENTRIES = 2_000
+
+interface CapturedHttpResponse {
+  readonly status: number
+  readonly headers: OutgoingHttpHeaders
+  readonly body: string | Buffer
+}
+
+/** Shared by every Connector socket attached to this Bridge process. */
+class IdempotentHttpResponses {
+  private readonly entries = new Map<string, { expiresAt: number; result: Promise<CapturedHttpResponse> }>()
+
+  async respond(
+    key: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+    handler: (capture: ServerResponse) => Promise<void>,
+  ): Promise<void> {
+    const now = Date.now()
+    for (const [entryKey, entry] of this.entries) {
+      if (entry.expiresAt <= now) this.entries.delete(entryKey)
+    }
+    let entry = this.entries.get(key)
+    if (entry === undefined) {
+      while (this.entries.size >= MAX_IDEMPOTENCY_ENTRIES) {
+        const oldest = this.entries.keys().next().value as string | undefined
+        if (oldest === undefined) break
+        this.entries.delete(oldest)
+      }
+      entry = { expiresAt: now + IDEMPOTENCY_TTL_MS, result: captureHttpResponse(handler) }
+      this.entries.set(key, entry)
+    } else {
+      // The winning handler consumes its own request body. Drain duplicate
+      // bodies as well so their keep-alive connections remain reusable.
+      req.resume()
+    }
+    const captured = await entry.result
+    res.writeHead(captured.status, captured.headers)
+    res.end(captured.body)
+  }
+}
+
+async function captureHttpResponse(handler: (capture: ServerResponse) => Promise<void>): Promise<CapturedHttpResponse> {
+  let status = 200
+  let headers: OutgoingHttpHeaders = {}
+  let body: string | Buffer = ''
+  const capture = {
+    writeHead: (nextStatus: number, nextHeaders?: OutgoingHttpHeaders) => {
+      status = nextStatus
+      headers = nextHeaders ?? {}
+      return capture
+    },
+    end: (chunk?: string | Buffer) => {
+      body = chunk ?? ''
+      return capture
+    },
+  } as unknown as ServerResponse
+  await handler(capture)
+  return { status, headers, body }
+}
 
 export const name = 'dsh-anywhere-native-bridge'
 // workspaceRegistry is the source of truth for sessions archived from the
@@ -229,9 +293,13 @@ class SessionMetadataStore {
   private permissions = new Map<string, PermissionMode>()
   private titles = new Map<string, string>()
   private branches = new Map<string, string>()
+  private persistQueue: Promise<void> = Promise.resolve()
   readonly ready: Promise<void>
 
-  constructor(private readonly path: string) {
+  constructor(
+    private readonly path: string,
+    private readonly warn: (message: string) => void = () => undefined,
+  ) {
     this.ready = this.load()
   }
 
@@ -311,26 +379,42 @@ class SessionMetadataStore {
           if (typeof branch === 'string' && branch.trim().length > 0) this.branches.set(id, branch.trim().slice(0, 512))
         }
       }
-    } catch {
+    } catch (error) {
       // A missing or corrupt presentation file must never prevent Harness from
       // starting; the durable Harness session store remains authoritative.
+      if (!isMissingFileError(error)) this.warn('Session presentation metadata is unreadable; keeping Harness data authoritative')
     }
   }
 
-  private async persist(): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true })
-    await writeFile(this.path, JSON.stringify({
+  private persist(): Promise<void> {
+    // Capture an immutable snapshot at mutation time. Concurrent requests then
+    // serialize atomic replacements instead of racing writeFile calls against
+    // the same path or exposing a partially-written JSON document on crash.
+    const snapshot = JSON.stringify({
       archived: [...this.archived],
       unarchived: [...this.unarchived],
       permissions: Object.fromEntries(this.permissions),
       titles: Object.fromEntries(this.titles),
       branches: Object.fromEntries(this.branches),
-    }, null, 2), { mode: 0o600 })
+    }, null, 2)
+    this.persistQueue = this.persistQueue.catch(() => undefined).then(async () => {
+      const directory = dirname(this.path)
+      await mkdir(directory, { recursive: true })
+      await chmod(directory, 0o700)
+      const temporaryPath = `${this.path}.${randomUUID()}.tmp`
+      await writeFile(temporaryPath, `${snapshot}\n`, { encoding: 'utf8', mode: 0o600 })
+      await rename(temporaryPath, this.path)
+    })
+    return this.persistQueue
   }
 }
 
 function isPermissionMode(value: unknown): value is PermissionMode {
   return value === 'ask' || value === 'never' || value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access'
+}
+
+function isMissingFileError(value: unknown): value is NodeJS.ErrnoException {
+  return typeof value === 'object' && value !== null && 'code' in value && value.code === 'ENOENT'
 }
 
 function isPermissionPreset(value: PermissionMode): value is 'read-only' | 'workspace-write' | 'danger-full-access' {
@@ -581,8 +665,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const replay = new ReplayBuffer<EventEnvelope>(config.eventBufferSize ?? 2_000)
   const approvals = new PendingApprovals()
   const questions = new PendingQuestions()
-  const metadata = new SessionMetadataStore(metadataPath())
+  const idempotentResponses = new IdempotentHttpResponses()
+  const metadata = new SessionMetadataStore(metadataPath(), (message) => ctx.logger.warn(message))
   const clients = new Set<WebSocket>()
+  const clientDeviceIds = new Map<WebSocket, string>()
+  const relayDevices = new Set<string>()
+  const hasRemoteDecisionClient = (): boolean => relayDevices.size > 0 ||
+    [...clientDeviceIds.values()].some((deviceId) => deviceId !== CONNECTOR_DEVICE_ID)
   const wss = new WebSocketServer({ noServer: true })
 
   const publish = (event: NativeEventInput, recipients: Iterable<WebSocket> = clients): void => {
@@ -607,16 +696,41 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     kind: 'prefix',
     path: prefix,
     handler: async (req, res) => {
-      try {
-        await handleHttp(
-          ctx, req, res, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
-          config.connectorConfigPath ?? defaultConnectorConfigPath(),
-          questions,
-        )
-      } catch (error) {
-        const status = error instanceof HttpError ? error.status : 500
-        json(res, status, { error: error instanceof Error ? error.message : String(error) })
+      const serve = async (target: ServerResponse): Promise<void> => {
+        try {
+          await handleHttp(
+            ctx, req, target, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
+            config.connectorConfigPath ?? defaultConnectorConfigPath(),
+            questions,
+            relayDevices,
+            () => {
+              if (!hasRemoteDecisionClient()) {
+                approvals.rejectAll()
+                questions.rejectAll(new Error('all remote devices disconnected'))
+              }
+            },
+          )
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          json(target, status, { error: error instanceof Error ? error.message : String(error) })
+        }
       }
+
+      // The Connector forwards the phone's request id. Scope the cache to the
+      // authenticated principal and exact mutation route so two Connector
+      // processes cannot execute the same local side effect twice.
+      const requestId = header(req, 'x-dsh-request-id')
+      const authorization = header(req, 'authorization')
+      if (req.method === 'POST' && requestId !== undefined && requestId.length > 0 && requestId.length <= 256 &&
+          authorization !== undefined) {
+        const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+        const key = createHash('sha256')
+          .update(`${authorization}\0${req.method}\0${pathname}\0${requestId}`)
+          .digest('hex')
+        await idempotentResponses.respond(key, req, res, serve)
+        return
+      }
+      await serve(res)
     },
   })
 
@@ -631,6 +745,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       }
       wss.handleUpgrade(req, socket, head, (client) => {
         clients.add(client)
+        clientDeviceIds.set(client, device.id)
         const after = parseAfter(req.url)
         for (const entry of replay.after(after)) {
           client.send(JSON.stringify({ ...entry.event, sequence: entry.sequence }))
@@ -725,7 +840,12 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         })
         client.once('close', () => {
           clients.delete(client)
-          if (clients.size === 0) approvals.rejectAll()
+          clientDeviceIds.delete(client)
+          if (device.id === CONNECTOR_DEVICE_ID) relayDevices.clear()
+          if (!hasRemoteDecisionClient()) {
+            approvals.rejectAll()
+            questions.rejectAll(new Error('all remote devices disconnected'))
+          }
         })
       })
     },
@@ -833,7 +953,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     request: ApprovalRequestEvent,
     next: () => Promise<ApprovalOutcome>,
   ): Promise<ApprovalOutcome> {
-    if (clients.size === 0) return next()
+    if (!hasRemoteDecisionClient()) return next()
     const pending = approvals.create(config.approvalTimeoutMs ?? 120_000, request.signal)
     publish({
       type: 'approval.requested',
@@ -847,13 +967,17 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       },
     })
     try {
-      const decision = await pending.result
+      const decision = await firstAnswered<ApprovalOutcome>(
+        pending.result.then<ApprovalOutcome>((value) => value).catch(() => undefined),
+        next(),
+      )
+      approvals.discard(pending.id)
       publish({
         type: 'approval.resolved',
         sessionId: request.agent.id,
         payload: { id: pending.id, allowed: decision === 'allowed-once' },
       })
-      return decision
+      return decision ?? 'unavailable'
     } catch {
       publish({ type: 'approval.resolved', sessionId: request.agent.id, payload: { id: pending.id, allowed: false } })
       return 'unavailable'
@@ -878,7 +1002,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     },
     next: () => Promise<{ answers: readonly QuestionAnswerItem[] }>,
   ): Promise<{ answers: readonly QuestionAnswerItem[] }> {
-    if (clients.size === 0) return next()
+    if (!hasRemoteDecisionClient()) return next()
     const sessionId = request.agent?.id ?? 'unknown'
     const pending = questions.create(config.questionTimeoutMs ?? 600_000, request.signal)
     publish({
@@ -955,6 +1079,8 @@ async function handleHttp(
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
   connectorConfigPath: string,
   questions: PendingQuestions,
+  relayDevices: Set<string>,
+  onRemotePresenceChanged: () => void,
 ): Promise<void> {
   await metadata.ready
   const url = new URL(req.url ?? '/', 'http://localhost')
@@ -994,6 +1120,19 @@ async function handleHttp(
 
   const device = pairing.authenticate(header(req, 'authorization'))
   if (device === undefined) throw new HttpError(401, 'unauthorized')
+
+  const presenceMatch = /^\/devices\/([^/]+)\/presence$/.exec(path)
+  if (req.method === 'POST' && presenceMatch !== null) {
+    if (device.id !== CONNECTOR_DEVICE_ID) throw new HttpError(403, 'only the Connector may report Relay presence')
+    const deviceId = decodeURIComponent(presenceMatch[1]!)
+    const body = objectOf(await readJson(req))
+    if (body.online === true) relayDevices.add(deviceId)
+    else if (body.online === false) relayDevices.delete(deviceId)
+    else throw new HttpError(400, 'online must be a boolean')
+    onRemotePresenceChanged()
+    json(res, 202, { accepted: true, deviceId, online: body.online })
+    return
+  }
 
   if (req.method === 'GET' && path === '/sessions') {
     const includeArchived = url.searchParams.get('includeArchived') === 'true'
@@ -1277,7 +1416,18 @@ async function handleHttp(
 
   const uploadMatch = /^\/sessions\/([^/]+)\/attachments$/.exec(path)
   if (req.method === 'POST' && uploadMatch !== null) {
-    const body = AttachmentUploadPayloadSchema.parse(await readJson(req))
+    // Base64 expands bytes by 4/3. Only this route receives the larger budget;
+    // all ordinary control requests retain readJson's 1 MiB ceiling.
+    const input = objectOf(await readJson(req, MAX_ATTACHMENT_BASE64_CHARS + 4_096))
+    if (typeof input.data === 'string' && input.data.length > MAX_ATTACHMENT_BASE64_CHARS) {
+      throw new HttpError(413, 'attachment is larger than 10 MiB')
+    }
+    const parsed = AttachmentUploadPayloadSchema.safeParse(input)
+    if (!parsed.success) throw new HttpError(400, 'attachment name and base64 data are required')
+    const body = parsed.data
+    if (Buffer.byteLength(body.data, 'base64') > MAX_ATTACHMENT_BYTES) {
+      throw new HttpError(413, 'attachment is larger than 10 MiB')
+    }
     const sessionId = decodeURIComponent(uploadMatch[1]!)
     const result = await uploadAttachment(ctx, sessionId, body.data, body.name)
     json(res, 201, result)

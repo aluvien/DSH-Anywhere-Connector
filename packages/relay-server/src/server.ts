@@ -13,6 +13,9 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { Registry, type RelayPrincipal } from "./registry.js";
 
 const MAX_HTTP_BODY_BYTES = 16 * 1024;
+const MAX_RELAY_MESSAGE_BYTES = 16 * 1024 * 1024;
+const MAX_SOCKET_BUFFER_BYTES = 2 * MAX_RELAY_MESSAGE_BYTES;
+const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
 /**
  * Bumped whenever the routed `WireMessage` union changes shape. The Relay
  * validates every forwarded body against that union, so a Relay older than the
@@ -56,7 +59,11 @@ export interface RelayServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly pairRateLimit?: number;
+  readonly pairIpRateLimit?: number;
   readonly pairRateWindowMs?: number;
+  readonly pairRateMaxBuckets?: number;
+  /** Exact socket addresses of reverse proxies whose X-Forwarded-For header is trusted. */
+  readonly trustedProxyAddresses?: readonly string[];
 }
 
 export interface RunningRelayServer {
@@ -115,14 +122,18 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   await registry.load();
   const connections = new Set<RelayConnection>();
   const pairAttempts = new Map<string, PairAttempt>();
+  const pairIpAttempts = new Map<string, PairAttempt>();
   const pairRateLimit = options.pairRateLimit ?? 5;
+  const pairIpRateLimit = options.pairIpRateLimit ?? pairRateLimit * 20;
   const pairRateWindowMs = options.pairRateWindowMs ?? 60_000;
   const httpServer = createServer((request, response) => {
     void handleHttp(request, response).catch((error: unknown) => {
       respondJson(response, 500, { error: "internal_error", message: error instanceof Error ? error.message : "Unexpected error" });
     });
   });
-  const wss = new WebSocketServer({ noServer: true });
+  const pairRateMaxBuckets = options.pairRateMaxBuckets ?? DEFAULT_PAIR_RATE_BUCKETS;
+  const trustedProxyAddresses = new Set(options.trustedProxyAddresses ?? []);
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_MESSAGE_BYTES });
 
   httpServer.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "http://relay.invalid");
@@ -142,6 +153,14 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
 
   const connect = (ws: WebSocket, principal: RelayPrincipal): void => {
     const connection: RelayConnection = { id: randomUUID(), ws, principal };
+    // Each credential represents one active lease. Replacing the old socket
+    // before publishing the new one prevents duplicate local execution and
+    // avoids a stale mobile socket later emitting a false offline edge.
+    for (const existing of connections) {
+      if (!samePrincipal(existing.principal, principal)) continue;
+      connections.delete(existing);
+      existing.ws.close(4001, "superseded by a newer connection");
+    }
     connections.add(connection);
     send(connection, {
       type: "relay.ready",
@@ -157,8 +176,9 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     broadcastPresence(principal, true);
     ws.on("message", (raw) => handleSocketMessage(connection, raw));
     ws.once("close", () => {
-      connections.delete(connection);
-      broadcastPresence(principal, false);
+      // A superseded machine was removed before it was closed. Do not publish
+      // a false offline edge after its replacement is already online.
+      if (connections.delete(connection)) broadcastPresence(principal, false);
     });
     ws.once("error", () => undefined);
   };
@@ -262,15 +282,25 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         respondJson(response, 400, { error: "invalid_request", message: "machineId, pairingSecret and deviceName are required." });
         return;
       }
-      const key = `${clientIp(request)}:${body.machineId}`;
+      const ip = clientIp(request, trustedProxyAddresses);
+      const key = `${ip}:${body.machineId}`;
       const now = Date.now();
+      sweepPairAttempts(pairAttempts, now, pairRateWindowMs);
+      sweepPairAttempts(pairIpAttempts, now, pairRateWindowMs);
+      if ((!pairAttempts.has(key) && pairAttempts.size >= pairRateMaxBuckets) ||
+          (!pairIpAttempts.has(ip) && pairIpAttempts.size >= pairRateMaxBuckets)) {
+        respondJson(response, 429, { error: "rate_limited", message: "Pairing rate-limit capacity reached. Try again later." });
+        return;
+      }
       const attempt = pairAttempts.get(key);
-      if (attempt !== undefined && now - attempt.startedAt < pairRateWindowMs && attempt.count >= pairRateLimit) {
+      const ipAttempt = pairIpAttempts.get(ip);
+      if ((attempt !== undefined && attempt.count >= pairRateLimit) ||
+          (ipAttempt !== undefined && ipAttempt.count >= pairIpRateLimit)) {
         respondJson(response, 429, { error: "rate_limited", message: "Too many pairing attempts. Try again later." });
         return;
       }
-      if (attempt === undefined || now - attempt.startedAt >= pairRateWindowMs) pairAttempts.set(key, { startedAt: now, count: 1 });
-      else attempt.count += 1;
+      recordPairAttempt(pairAttempts, key, now);
+      recordPairAttempt(pairIpAttempts, ip, now);
       const pairing = body.pairingCode === undefined
         ? await registry.pairDevice(body.machineId, body.pairingSecret!, body.deviceName)
         : await registry.pairDeviceWithCode(body.machineId, body.pairingCode, body.deviceName);
@@ -381,7 +411,13 @@ const presence = (principal: RelayPrincipal, online: boolean): RelayMessage => (
 });
 
 const send = (connection: RelayConnection, message: RelayMessage): void => {
-  if (connection.ws.readyState === WebSocket.OPEN) connection.ws.send(JSON.stringify(message));
+  if (connection.ws.readyState !== WebSocket.OPEN) return;
+  // A slow peer must not turn the Relay into an unbounded in-memory queue.
+  if (connection.ws.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+    connection.ws.close(1009, "outbound buffer limit exceeded");
+    return;
+  }
+  connection.ws.send(JSON.stringify(message));
 };
 
 const sendError = (connection: RelayConnection, code: string, message: string, machineId?: string, messageId?: string): void => {
@@ -427,7 +463,28 @@ const respondJson = (response: ServerResponse, status: number, value: unknown): 
   response.end(JSON.stringify(value));
 };
 
-const clientIp = (request: IncomingMessage): string => request.socket.remoteAddress ?? "unknown";
+const clientIp = (request: IncomingMessage, trustedProxies: ReadonlySet<string>): string => {
+  const peer = request.socket.remoteAddress ?? "unknown";
+  if (!trustedProxies.has(peer)) return peer;
+  const forwarded = request.headers["x-forwarded-for"];
+  const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  const first = value?.split(",", 1)[0]?.trim();
+  return first && first.length <= 128 ? first : peer;
+};
+
+const sweepPairAttempts = (attempts: Map<string, PairAttempt>, now: number, windowMs: number): void => {
+  for (const [key, attempt] of attempts) {
+    if (now - attempt.startedAt >= windowMs) attempts.delete(key);
+  }
+};
+const recordPairAttempt = (attempts: Map<string, PairAttempt>, key: string, now: number): void => {
+  const attempt = attempts.get(key);
+  if (attempt === undefined) attempts.set(key, { startedAt: now, count: 1 });
+  else attempt.count += 1;
+};
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const hasMachineId = (value: object): value is { readonly machineId: string } => "machineId" in value;
 const hasDeviceId = (value: object): value is { readonly deviceId: string } => "deviceId" in value;
+const samePrincipal = (left: RelayPrincipal, right: RelayPrincipal): boolean =>
+  left.role === right.role && left.machineId === right.machineId &&
+  (left.role === "machine" || (right.role === "device" && left.deviceId === right.deviceId));

@@ -24,6 +24,9 @@ if (isEntrypoint) {
     registryPath: process.env.DSH_RELAY_REGISTRY_PATH ?? "./dsh-anywhere-relay.json",
     ...(parsedPort === undefined ? {} : { port: parsedPort }),
     ...(process.env.HOST === undefined ? {} : { host: process.env.HOST }),
+    ...(process.env.DSH_RELAY_TRUSTED_PROXIES === undefined ? {} : {
+      trustedProxyAddresses: process.env.DSH_RELAY_TRUSTED_PROXIES.split(",").map((value) => value.trim()).filter(Boolean),
+    }),
   });
   console.log(`DSH Anywhere Relay listening at ${relay.url}`);
 }

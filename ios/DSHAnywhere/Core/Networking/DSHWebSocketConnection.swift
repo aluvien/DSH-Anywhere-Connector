@@ -48,8 +48,20 @@ public struct DSHExponentialBackoff: Sendable, Equatable {
 
     public func delayNanoseconds(for attempt: Int) -> UInt64 {
         guard attempt > 0 else { return 0 }
-        let scaled = Double(initialNanoseconds) * pow(multiplier, Double(attempt - 1))
-        return min(maximumNanoseconds, UInt64(min(scaled, Double(UInt64.max))))
+        guard maximumNanoseconds > 0 else { return 0 }
+        let cappedInitial = min(initialNanoseconds, maximumNanoseconds)
+        guard cappedInitial < maximumNanoseconds else { return maximumNanoseconds }
+        // Invalid configuration must degrade to a finite first delay rather
+        // than allowing NaN or infinity to reach UInt64's trapping conversion.
+        guard multiplier.isFinite, multiplier > 0 else { return cappedInitial }
+        let scaled = Double(cappedInitial) * pow(multiplier, Double(attempt - 1))
+        // Compare before converting. UInt64(Double) traps when the floating
+        // value is outside the representable range, and the cap must protect
+        // that conversion as well as the returned value.
+        guard scaled.isFinite, scaled < Double(maximumNanoseconds) else {
+            return maximumNanoseconds
+        }
+        return UInt64(scaled)
     }
 }
 
@@ -120,6 +132,8 @@ public struct DSHWebSocketConfiguration: Sendable, Equatable {
 /// machine become `DSHEvent`s; Relay control traffic never reaches the store.
 public actor DSHWebSocketConnection {
     public typealias TaskFactory = @Sendable (URLRequest) -> any DSHWebSocketTasking
+    private static let maxBufferedEvents = 512
+    private static let unsolicitedSessionSnapshotPrefix = "snapshot-push-"
 
     private let configuration: DSHWebSocketConfiguration
     private let makeTask: TaskFactory
@@ -134,7 +148,21 @@ public actor DSHWebSocketConnection {
     /// answers one of this device's own session-list requests may establish a
     /// new epoch without a preceding connection.ready; arbitrary replayed
     /// snapshots are deliberately ignored when they are older.
-    private var pendingSessionSnapshotRequestGenerations: [String: Int] = [:]
+    private enum SessionSnapshotRequestStatus {
+        case pending
+        case accepted
+        case expired
+    }
+
+    private struct SessionSnapshotRequest {
+        let generation: Int
+        var status: SessionSnapshotRequestStatus
+    }
+
+    /// Keep completed/expired request identities long enough to reject a late
+    /// response. An unknown snapshot is only accepted when the Connector marks
+    /// it as an unsolicited push; it is never inferred from a missing map key.
+    private var sessionSnapshotRequests: [String: SessionSnapshotRequest] = [:]
     private var latestSessionSnapshotRequestGeneration = 0
 
     public init(configuration: DSHWebSocketConfiguration,
@@ -153,7 +181,7 @@ public actor DSHWebSocketConnection {
     public func connect() -> AsyncThrowingStream<DSHEvent, Error> {
         if let activeStream { return activeStream }
         stopped = false
-        let stream = AsyncThrowingStream<DSHEvent, Error> { continuation in
+        let stream = AsyncThrowingStream<DSHEvent, Error>(bufferingPolicy: .bufferingOldest(Self.maxBufferedEvents)) { continuation in
             self.continuation = continuation
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.disconnect() }
@@ -191,8 +219,13 @@ public actor DSHWebSocketConnection {
         }
         guard !stopped, let socket else { throw DSHWebSocketError.notConnected }
         let normalized = normalized(command)
-        try await sendRelay(normalized, over: socket)
-        rememberSessionSnapshotRequestIfNeeded(normalized)
+        let generation = rememberSessionSnapshotRequestIfNeeded(normalized)
+        do {
+            try await sendRelay(normalized, over: socket)
+        } catch {
+            revokeSessionSnapshotRequest(normalized.requestId, generation: generation)
+            throw error
+        }
     }
 
     private func run() async {
@@ -206,6 +239,16 @@ public actor DSHWebSocketConnection {
                 request.setValue("dsh-anywhere/1", forHTTPHeaderField: "User-Agent")
                 let task = makeTask(request)
                 socket = task
+                defer {
+                    // Every receive-loop exit owns and closes exactly the task
+                    // it created. Merely dropping our reference can leave a
+                    // URLSession WebSocket alive across reconnect attempts.
+                    task.cancel(with: .goingAway, reason: nil)
+                    if let current = socket,
+                       (current as AnyObject) === (task as AnyObject) {
+                        socket = nil
+                    }
+                }
                 task.resume()
                 var didReceiveReady = false
                 while !stopped && !Task.isCancelled {
@@ -216,8 +259,14 @@ public actor DSHWebSocketConnection {
             } catch is CancellationError {
                 break
             } catch {
-                socket = nil
                 guard !stopped && !Task.isCancelled else { break }
+                if !shouldReconnect(after: error) {
+                    _state = .failed(error.localizedDescription)
+                    yieldControl(type: "transport.state", value: _state)
+                    continuation?.finish(throwing: error)
+                    continuation = nil
+                    return
+                }
                 attempt += 1
                 if let maximum = configuration.maximumReconnectAttempts, attempt > maximum {
                     _state = .failed(error.localizedDescription)
@@ -236,6 +285,18 @@ public actor DSHWebSocketConnection {
         if !stopped {
             _state = .failed(DSHWebSocketError.closed.localizedDescription)
             yieldControl(type: "transport.state", value: _state)
+        }
+    }
+
+    private func shouldReconnect(after error: Error) -> Bool {
+        guard let socketError = error as? DSHWebSocketError else { return true }
+        switch socketError {
+        case .notConnected, .closed:
+            return true
+        case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole, .relay:
+            // Retrying unchanged credentials or an incompatible wire message
+            // cannot heal the connection and otherwise becomes a tight loop.
+            return false
         }
     }
 
@@ -261,7 +322,7 @@ public actor DSHWebSocketConnection {
             _state = .connected
             // Requests from a dead socket can never receive a useful reply.
             // The fresh handshake list below becomes the only list authority.
-            pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
+            sessionSnapshotRequests.removeAll(keepingCapacity: false)
             yieldControl(type: "transport.state", value: _state)
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
                                         lastSequence: _lastSequence), over: task)
@@ -271,8 +332,13 @@ public actor DSHWebSocketConnection {
             // connection.ready event that may no longer be buffered.
             let list = DSHCommand.listSessions(deviceId: configuration.deviceId,
                                                machineId: configuration.machineId)
-            try await sendRelay(list, over: task)
-            rememberSessionSnapshotRequestIfNeeded(list)
+            let generation = rememberSessionSnapshotRequestIfNeeded(list)
+            do {
+                try await sendRelay(list, over: task)
+            } catch {
+                revokeSessionSnapshotRequest(list.requestId, generation: generation)
+                throw error
+            }
             return true
         case .presence(let presence):
             if presence.machineId == configuration.machineId, presence.role == .machine {
@@ -280,6 +346,14 @@ public actor DSHWebSocketConnection {
             }
             return false
         case .error(let error):
+            if error.code == "target_unavailable" {
+                // The Relay socket is healthy; only the paired Mac is offline.
+                // Keep this connection so its machine-presence event can wake
+                // the UI as soon as a Connector appears.
+                sessionSnapshotRequests.removeAll(keepingCapacity: false)
+                yieldControl(type: "machine.presence", value: false)
+                return false
+            }
             throw DSHWebSocketError.relay(code: error.code, message: error.message)
         case .payload(let payload):
             // The Relay may notify this device about control messages. Only
@@ -289,36 +363,47 @@ public actor DSHWebSocketConnection {
             guard event.envelope.version == 1 else {
                 throw DSHWebSocketError.unsupportedProtocolVersion(event.envelope.version)
             }
-            let snapshotGeneration = event.isSessionSnapshot
-                ? pendingSessionSnapshotRequestGenerations.removeValue(forKey: event.envelope.messageId)
+            let snapshotRequest = event.isSessionSnapshot
+                ? sessionSnapshotRequests[event.envelope.messageId]
                 : nil
+            let snapshotGeneration = snapshotRequest?.generation
+            let isCorrelatedSnapshot = snapshotRequest?.status == .pending &&
+                snapshotGeneration == latestSessionSnapshotRequestGeneration
             // Two refreshes can cross on the wire (for example, opening
             // Archives while the initial list is still in flight). The older
             // result is still valid server data, but it is not the answer to
             // the current screen state and must not overwrite it.
-            if let snapshotGeneration,
-               snapshotGeneration < latestSessionSnapshotRequestGeneration {
-                return false
+            if event.isSessionSnapshot {
+                if let snapshotRequest {
+                    guard snapshotRequest.status == .pending else { return false }
+                    guard snapshotRequest.generation == latestSessionSnapshotRequestGeneration else {
+                        sessionSnapshotRequests[event.envelope.messageId]?.status = .expired
+                        return false
+                    }
+                    sessionSnapshotRequests[event.envelope.messageId]?.status = .accepted
+                    // Older requests may still be in flight. Retain their ids,
+                    // but mark them expired so their late responses are dropped.
+                    for (requestID, request) in sessionSnapshotRequests
+                    where request.generation < latestSessionSnapshotRequestGeneration && request.status == .pending {
+                        sessionSnapshotRequests[requestID]?.status = .expired
+                    }
+                } else {
+                    // Connector-generated unsolicited snapshots carry an
+                    // explicit prefix. A missing request id alone is not proof
+                    // that a snapshot is a valid push, which closes the stale
+                    // response path after the request table is pruned.
+                    guard event.envelope.messageId.hasPrefix(Self.unsolicitedSessionSnapshotPrefix),
+                          !hasPendingSessionSnapshotRequest else { return false }
+                }
             }
             // During a current list request, a replay/presence snapshot has no
             // request correlation. Wait for the current answer instead of
             // briefly painting whatever old list happened to arrive first.
-            if event.isSessionSnapshot, snapshotGeneration == nil,
-               !pendingSessionSnapshotRequestGenerations.isEmpty {
-                return false
-            }
-            let isCorrelatedSnapshot = snapshotGeneration == latestSessionSnapshotRequestGeneration
-            if isCorrelatedSnapshot {
-                // Once the newest response wins, older requests are obsolete;
-                // retaining them would block later unsolicited live snapshots
-                // forever when an old response never arrives.
-                pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
-            }
             if case .protocolError = event.kind,
-               let failedGeneration = pendingSessionSnapshotRequestGenerations
-                .removeValue(forKey: event.envelope.messageId),
-               failedGeneration == latestSessionSnapshotRequestGeneration {
-                pendingSessionSnapshotRequestGenerations.removeAll(keepingCapacity: false)
+               let failedRequest = sessionSnapshotRequests[event.envelope.messageId],
+               failedRequest.status == .pending,
+               failedRequest.generation == latestSessionSnapshotRequestGeneration {
+                sessionSnapshotRequests[event.envelope.messageId]?.status = .expired
             }
             let establishesEpoch = event.startsNewSequenceEpoch(comparedTo: _lastSequence,
                                                                   matchingSessionListRequest: isCorrelatedSnapshot)
@@ -331,8 +416,13 @@ public actor DSHWebSocketConnection {
                 _lastSequence = 0
             }
             if event.sequence > _lastSequence { _lastSequence = event.sequence }
-            continuation?.yield(DSHEvent(envelope: event.envelope,
-                                         establishesSequenceEpoch: establishesEpoch))
+            let delivered = continuation?.yield(DSHEvent(envelope: event.envelope,
+                                                          establishesSequenceEpoch: establishesEpoch))
+            if let delivered, case .dropped = delivered {
+                // Bound UI backpressure. Closing this attempt lets Connector
+                // replay durable events after the consumer catches up.
+                task.cancel(with: .goingAway, reason: nil)
+            }
             return false
         }
     }
@@ -350,17 +440,32 @@ public actor DSHWebSocketConnection {
         try await task.send(.data(try JSONEncoder().encode(payload)))
     }
 
-    private func rememberSessionSnapshotRequestIfNeeded(_ command: DSHCommand) {
-        guard command.type == "session.list" else { return }
+    @discardableResult
+    private func rememberSessionSnapshotRequestIfNeeded(_ command: DSHCommand) -> Int? {
+        guard command.type == "session.list" else { return nil }
         latestSessionSnapshotRequestGeneration += 1
-        pendingSessionSnapshotRequestGenerations[command.requestId] = latestSessionSnapshotRequestGeneration
+        let generation = latestSessionSnapshotRequestGeneration
+        sessionSnapshotRequests[command.requestId] = SessionSnapshotRequest(generation: generation, status: .pending)
         // A timed-out response must not turn an unrelated future event into a
         // reset. The bounded set also preserves the most recent refreshes when
         // several pull-to-refresh gestures race.
-        if pendingSessionSnapshotRequestGenerations.count > 12 {
-            pendingSessionSnapshotRequestGenerations = pendingSessionSnapshotRequestGenerations
-                .filter { $0.value >= latestSessionSnapshotRequestGeneration - 6 }
+        if sessionSnapshotRequests.count > 24 {
+            let cutoff = latestSessionSnapshotRequestGeneration - 12
+            sessionSnapshotRequests = sessionSnapshotRequests.filter { $0.value.generation >= cutoff || $0.value.status == .pending }
         }
+        return generation
+    }
+
+    private func revokeSessionSnapshotRequest(_ requestID: String, generation: Int?) {
+        guard let generation,
+              let request = sessionSnapshotRequests[requestID],
+              request.generation == generation,
+              request.status == .pending else { return }
+        sessionSnapshotRequests.removeValue(forKey: requestID)
+    }
+
+    private var hasPendingSessionSnapshotRequest: Bool {
+        sessionSnapshotRequests.values.contains { $0.status == .pending }
     }
 
     /// Feeds Relay control-plane state through the same batched UI stream as
@@ -368,7 +473,7 @@ public actor DSHWebSocketConnection {
     private func yieldControl<T: Encodable>(type: String, value: T) {
         guard let data = try? JSONEncoder().encode(value),
               let payload = try? JSONDecoder().decode(DSHJSONValue.self, from: data) else { return }
-        continuation?.yield(DSHEvent(envelope: DSHEnvelope(
+        let delivered = continuation?.yield(DSHEvent(envelope: DSHEnvelope(
             messageId: UUID().uuidString,
             deviceId: configuration.deviceId,
             machineId: configuration.machineId,
@@ -376,6 +481,9 @@ public actor DSHWebSocketConnection {
             type: type,
             payload: payload
         )))
+        if let delivered, case .dropped = delivered {
+            socket?.cancel(with: .goingAway, reason: nil)
+        }
     }
 }
 

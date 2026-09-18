@@ -415,6 +415,7 @@ describe('native bridge mutations', () => {
     rename?: (request: { sessionId: string; title: string }) => Promise<unknown>
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
+    invoke?: (request: unknown) => Promise<unknown>
   } = {}) {
     let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
     const context = {
@@ -444,17 +445,23 @@ describe('native bridge mutations', () => {
         archiveSession: async () => undefined,
       },
       typertGateway: {
-        invoke: async () => ({ ok: true, value: { presets: [] } }),
+        invoke: options.invoke ?? (async () => ({ ok: true, value: { presets: [] } })),
       },
       ...(options.directoryPicker === undefined ? {} : { directoryPicker: options.directoryPicker }),
       on: () => undefined,
       effect: () => undefined,
     } as unknown as Context
     apply(context, { connectorToken })
-    return async (method: string, url: string, body?: unknown): Promise<{ status: number; body: unknown }> => {
+    return async (method: string, url: string, body?: unknown, requestId?: string): Promise<{ status: number; body: unknown }> => {
       const request = Readable.from([body === undefined ? '' : JSON.stringify(body)]) as unknown as IncomingMessage
       Object.assign(request, {
-        method, url, headers: { authorization: `Bearer ${connectorToken}` }, socket: { remoteAddress: '127.0.0.1' },
+        method,
+        url,
+        headers: {
+          authorization: `Bearer ${connectorToken}`,
+          ...(requestId === undefined ? {} : { 'x-dsh-request-id': requestId }),
+        },
+        socket: { remoteAddress: '127.0.0.1' },
       })
       let status = 0
       let response = ''
@@ -482,6 +489,23 @@ describe('native bridge mutations', () => {
     await expect(request('POST', '/dsh-anywhere/v1/sessions/session-new/rename', { title: '重命名后标题' }))
       .resolves.toMatchObject({ status: 202 })
     expect(renameCalls).toEqual([{ sessionId: 'session-new', title: '重命名后标题' }])
+  })
+
+  it('coalesces the same authenticated mutation across Connector processes', async () => {
+    let creates = 0
+    const request = mount({
+      create: async () => {
+        creates += 1
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        return { sessionId: 'session-once' }
+      },
+    })
+    const [first, duplicate] = await Promise.all([
+      request('POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'same-phone-request'),
+      request('POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'same-phone-request'),
+    ])
+    expect(creates).toBe(1)
+    expect(duplicate).toEqual(first)
   })
 
   it('lists paired-Mac folders when Harness selected its native chooser', async () => {
@@ -514,6 +538,27 @@ describe('native bridge mutations', () => {
     const request = mount()
     await expect(request('GET', '/dsh-anywhere/v1/directories?path=%2FUsers%2Fme'))
       .resolves.toMatchObject({ status: 501, body: { error: 'Harness directory browsing is unavailable' } })
+  })
+
+  it('gives only the attachment route a bounded 10 MiB upload budget', async () => {
+    let uploads = 0
+    const request = mount({
+      invoke: async () => {
+        uploads += 1
+        return { ok: true, value: { receiptId: 'receipt-1', file: { size: 825_000 } } }
+      },
+    })
+    // This JSON body is larger than the ordinary 1 MiB readJson ceiling and
+    // therefore proves the real route, rather than a mocked fetch, accepts it.
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s1/attachments', {
+      name: 'photo.jpg', data: 'A'.repeat(1_100_000),
+    })).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-1' } })
+    expect(uploads).toBe(1)
+
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s1/attachments', {
+      name: 'too-large.bin', data: 'A'.repeat(Math.ceil((10 * 1024 * 1024) / 3) * 4 + 1),
+    })).resolves.toMatchObject({ status: 413 })
+    expect(uploads).toBe(1)
   })
 })
 

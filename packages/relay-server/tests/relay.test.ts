@@ -27,7 +27,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function relay(pairRateLimit?: number): Promise<RunningRelayServer> {
+async function relay(pairRateLimit?: number, trustedProxyAddresses?: readonly string[]): Promise<RunningRelayServer> {
   const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-relay-"));
   directories.push(directory);
   const server = await createRelayServer({
@@ -36,6 +36,7 @@ async function relay(pairRateLimit?: number): Promise<RunningRelayServer> {
     host: "127.0.0.1",
     port: 0,
     ...(pairRateLimit === undefined ? {} : { pairRateLimit }),
+    ...(trustedProxyAddresses === undefined ? {} : { trustedProxyAddresses }),
   });
   servers.push(server);
   return server;
@@ -166,6 +167,23 @@ describe("Relay server", () => {
     for (const socket of [machineSocketA, machineSocketB, deviceSocketA, deviceSocketB]) socket.close();
   });
 
+  it("keeps only the newest Connector lease for a machine", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const device = await pair(server.url, machine);
+    const firstMachineSocket = await connect(server.url, machine.machineToken);
+    const firstClosed = new Promise<number>((resolve) => firstMachineSocket.once("close", (code) => resolve(code)));
+    const secondMachineSocket = await connect(server.url, machine.machineToken);
+    const secondMessages = messages(secondMachineSocket);
+    const deviceSocket = await connect(server.url, device.deviceToken);
+
+    await expect(firstClosed).resolves.toBe(4001);
+    deviceSocket.send(JSON.stringify(payload(machine.machineId, "device", device.deviceId)));
+    await waitForMessage(secondMessages, "relay.payload");
+
+    for (const socket of [secondMachineSocket, deviceSocket]) socket.close();
+  });
+
   // The Relay validates every routed body against the strict WireMessage union
   // before forwarding it: an unknown event or command type is answered with
   // `invalid_message` instead of being routed. A Relay image built before these
@@ -285,6 +303,22 @@ describe("Relay server", () => {
       deviceName: "iPhone",
     });
     expect(second.status).toBe(429);
+  });
+
+  it("uses forwarded client addresses only from an explicitly trusted proxy", async () => {
+    const server = await relay(1, ["127.0.0.1"]);
+    const machine = await register(server.url, "Mac");
+    const attempt = async (ip: string, pairingSecret: string) => {
+      const response = await fetch(`${server.url}/v1/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": ip },
+        body: JSON.stringify({ machineId: machine.machineId, pairingSecret, deviceName: "iPhone" }),
+      });
+      return response.status;
+    };
+
+    expect(await attempt("203.0.113.10", "incorrect")).toBe(401);
+    expect(await attempt("203.0.113.11", machine.pairingSecret)).toBe(201);
   });
 
   async function devices(base: string, machineId: string, token: string) {

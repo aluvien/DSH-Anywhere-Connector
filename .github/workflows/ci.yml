@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm check
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test iOS app
+        shell: bash
+        run: |
+          device_id=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ && id == "" {id=$2} END {print id}')
+          test -n "$device_id"
+          xcodebuild test \
+            -project ios/DSHAnywhere.xcodeproj \
+            -scheme DSHAnywhere \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$device_id" \
+            CODE_SIGNING_ALLOWED=NO

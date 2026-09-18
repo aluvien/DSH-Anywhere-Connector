@@ -33,3 +33,10 @@ The bootstrap token can register machines and must never be shipped in the iOS
 app or shared with end users. This JSON registry is appropriate for the first
 private vertical slice only; migrate accounts and device records to PostgreSQL
 before a public launch.
+
+The Relay can inspect plaintext messages while routing them; TLS protects the
+links, but this is not end-to-end encryption. Treat the Relay host as trusted.
+When Nginx fronts the container, set `DSH_RELAY_TRUSTED_PROXIES` to the exact
+source IP address(es) Nginx uses to reach it (comma-separated). Forwarded client
+addresses are ignored for every other peer so they cannot be spoofed to evade
+pairing rate limits.

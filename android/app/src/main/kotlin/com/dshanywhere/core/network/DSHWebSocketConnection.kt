@@ -38,6 +38,8 @@ sealed class DSHWebSocketError(message: String) : Exception(message) {
         DSHWebSocketError("Unsupported protocol version $version.")
     class UnauthorizedRelayRole :
         DSHWebSocketError("The Relay authenticated this connection with an unexpected role.")
+    class UnauthorizedRelayCredential :
+        DSHWebSocketError("The Relay rejected this device credential. Pair the device again.")
     class Relay(code: String, msg: String) : DSHWebSocketError("Relay error $code: $msg")
     class Closed : DSHWebSocketError("The Relay WebSocket connection is closed.")
 }
@@ -70,7 +72,7 @@ class DSHWebSocketConnection(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
-    private var eventChannel = Channel<DSHEvent>(Channel.UNLIMITED)
+    private var eventChannel = Channel<DSHEvent>(capacity = MAX_PENDING_EVENTS)
 
     private val stateFlow = MutableStateFlow<DSHConnectionState>(DSHConnectionState.Disconnected)
     val state: Flow<DSHConnectionState> get() = stateFlow
@@ -98,7 +100,7 @@ class DSHWebSocketConnection(
             // hand out a fresh channel, mirroring AsyncThrowingStream's
             // recreation in the Swift actor.
             if (eventChannel.isClosedForSend) {
-                eventChannel = Channel(Channel.UNLIMITED)
+                eventChannel = Channel(capacity = MAX_PENDING_EVENTS)
             }
             runner = scope.launch { run() }
             return eventChannel.receiveAsFlow()
@@ -143,7 +145,11 @@ class DSHWebSocketConnection(
             stateFlow.value = if (attempt == 0) DSHConnectionState.Connecting
             else DSHConnectionState.Reconnecting(attempt)
             publishTransportState()
-            val frames = Channel<String>(Channel.UNLIMITED)
+            // Bound raw network frames. If the consumer cannot keep up, close
+            // and reconnect so Connector replay can restore durable events
+            // instead of growing phone memory without limit.
+            val frames = Channel<String>(capacity = MAX_PENDING_FRAMES)
+            var attemptSocket: WebSocket? = null
             try {
                 val request = Request.Builder()
                     .url(configuration.url)
@@ -152,21 +158,27 @@ class DSHWebSocketConnection(
                     .build()
                 val webSocket = client.newWebSocket(request, object : WebSocketListener() {
                     override fun onMessage(webSocket: WebSocket, text: String) {
-                        frames.trySend(text)
+                        if (frames.trySend(text).isFailure) {
+                            webSocket.close(CLOSE_MESSAGE_TOO_BIG, "receive queue limit exceeded")
+                        }
                     }
 
                     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                        frames.trySend(bytes.utf8())
+                        if (frames.trySend(bytes.utf8()).isFailure) {
+                            webSocket.close(CLOSE_MESSAGE_TOO_BIG, "receive queue limit exceeded")
+                        }
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                        frames.close(t)
+                        frames.close(if (response?.code == 401) DSHWebSocketError.UnauthorizedRelayCredential() else t)
                     }
 
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                        frames.close()
+                        if (code == CLOSE_UNAUTHORIZED) frames.close(DSHWebSocketError.UnauthorizedRelayCredential())
+                        else frames.close()
                     }
                 })
+                attemptSocket = webSocket
                 socket = webSocket
                 var didReceiveReady = false
                 for (text in frames) {
@@ -184,8 +196,13 @@ class DSHWebSocketConnection(
             } catch (e: CancellationException) {
                 break
             } catch (e: Exception) {
-                socket = null
                 if (stopped || !coroutineActive()) break
+                if (!shouldReconnect(e)) {
+                    stateFlow.value = DSHConnectionState.Failed(e.message ?: e.javaClass.simpleName)
+                    publishTransportState()
+                    eventChannel.close(e)
+                    return
+                }
                 attempt += 1
                 val maximum = configuration.maximumReconnectAttempts
                 if (maximum != null && attempt > maximum) {
@@ -198,6 +215,11 @@ class DSHWebSocketConnection(
                 publishTransportState()
                 delay(configuration.backoff.delayMillisFor(attempt))
             } finally {
+                // Closing only the frame channel leaves OkHttp's network
+                // socket alive. Each loop iteration must retire the exact
+                // socket it created before another attempt starts.
+                attemptSocket?.cancel()
+                if (socket === attemptSocket) socket = null
                 frames.close()
             }
         }
@@ -208,6 +230,15 @@ class DSHWebSocketConnection(
     }
 
     private suspend fun coroutineActive(): Boolean = currentCoroutineContext().isActive
+
+    private fun shouldReconnect(error: Exception): Boolean = when (error) {
+        is DSHWebSocketError.InvalidMessage,
+        is DSHWebSocketError.UnsupportedProtocolVersion,
+        is DSHWebSocketError.UnauthorizedRelayRole,
+        is DSHWebSocketError.UnauthorizedRelayCredential,
+        is DSHWebSocketError.Relay -> false
+        else -> true
+    }
 
     /**
      * Returns true for the relay handshake, which is the point at which a
@@ -251,8 +282,17 @@ class DSHWebSocketConnection(
                 }
                 false
             }
-            is DSHRelayMessage.Error ->
-                throw DSHWebSocketError.Relay(relay.message.code, relay.message.message)
+            is DSHRelayMessage.Error -> {
+                if (relay.message.code == "target_unavailable") {
+                    // Relay connectivity and Mac availability are separate.
+                    // Stay on this socket so a later presence event restores
+                    // the machine without a reconnect loop.
+                    yieldControl("machine.presence", kotlinx.serialization.json.JsonPrimitive(false))
+                    false
+                } else {
+                    throw DSHWebSocketError.Relay(relay.message.code, relay.message.message)
+                }
+            }
             is DSHRelayMessage.Payload -> {
                 val payload = relay.message
                 // The relay may notify this device about control messages. Only
@@ -272,7 +312,7 @@ class DSHWebSocketConnection(
                     lastSequence = 0
                 }
                 if (event.sequence > lastSequence) lastSequence = event.sequence
-                eventChannel.trySend(event)
+                if (eventChannel.trySend(event).isFailure) socket?.cancel()
                 false
             }
         }
@@ -296,7 +336,7 @@ class DSHWebSocketConnection(
             type = type,
             payload = payload,
         )
-        eventChannel.trySend(DSHEvent(envelope))
+        if (eventChannel.trySend(DSHEvent(envelope)).isFailure) socket?.cancel()
     }
 
     private fun publishTransportState() {
@@ -318,5 +358,9 @@ class DSHWebSocketConnection(
 
     private companion object {
         const val CLOSE_GOING_AWAY = 1001
+        const val CLOSE_MESSAGE_TOO_BIG = 1009
+        const val CLOSE_UNAUTHORIZED = 4401
+        const val MAX_PENDING_FRAMES = 256
+        const val MAX_PENDING_EVENTS = 512
     }
 }

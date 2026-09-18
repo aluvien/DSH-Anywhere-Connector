@@ -9,6 +9,7 @@ services:
       PORT: 8787
       DSH_RELAY_BOOTSTRAP_TOKEN: ${DSH_RELAY_BOOTSTRAP_TOKEN:?set DSH_RELAY_BOOTSTRAP_TOKEN}
       DSH_RELAY_REGISTRY_PATH: /data/registry.json
+      DSH_RELAY_TRUSTED_PROXIES: ${DSH_RELAY_TRUSTED_PROXIES:-}
     volumes:
       - relay-data:/data
     ports:

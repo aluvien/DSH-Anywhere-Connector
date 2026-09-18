@@ -4,10 +4,12 @@ import UserNotifications
 
 private enum DSHAttachmentUploadError: LocalizedError {
     case timedOut
+    case tooLarge
 
     var errorDescription: String? {
         switch self {
         case .timedOut: return "The attachment upload timed out. Please try again."
+        case .tooLarge: return "Attachments must be 10 MiB or smaller."
         }
     }
 }
@@ -1150,6 +1152,7 @@ final class DSHAppModel: ObservableObject {
     /// subsequent prompt, so the composer can now defer all network work until
     /// the user taps Send.
     func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String) async throws -> String {
+        guard data.count <= 10 * 1024 * 1024 else { throw DSHAttachmentUploadError.tooLarge }
         let requestId = UUID().uuidString
         uploadWaitRequestIDs.insert(requestId)
         defer { uploadWaitRequestIDs.remove(requestId) }
