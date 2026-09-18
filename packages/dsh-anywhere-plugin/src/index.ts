@@ -241,9 +241,26 @@ export class PairingRateLimiter {
 }
 
 export type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
+  /** Optional correlation id for events that acknowledge a phone request.
+   * This stays internal to the Bridge; the public event schema already has a
+   * messageId field, so publish can carry it without changing payloads. */
+  readonly messageId?: string
   readonly sessionId?: string
   readonly deviceId?: string
 }
+
+interface PendingPromptRequest {
+  readonly sessionId: string
+  readonly requestId: string
+  readonly text: string
+  readonly receiptIds: readonly string[]
+  readonly expiresAt: number
+}
+
+/** A prompt may be accepted after the HTTP call has timed out. Keep its
+ * request identity long enough to correlate that late durable user/message,
+ * while bounding the memory held by abandoned requests. */
+const PENDING_PROMPT_TTL_MS = 5 * 60_000
 
 /** Mutable state belonging to one active Harness assistant-stream attempt. */
 export interface LiveStreamAttempt {
@@ -704,6 +721,12 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const clients = new Set<WebSocket>()
   const clientDeviceIds = new Map<WebSocket, string>()
   const relayDevices = new Set<string>()
+  /** Each Connector process owns a lease on the Relay presence it reports.
+   * A superseded process must not be able to clear the replacement's state. */
+  const relayDeviceLeases = new Map<string, string>()
+  const clientConnectorIds = new Map<WebSocket, string>()
+  const hasActiveConnector = (connectorId: string): boolean =>
+    [...clientConnectorIds.values()].some((value) => value === connectorId)
   const hasRemoteDecisionClient = (): boolean => relayDevices.size > 0 ||
     [...clientDeviceIds.values()].some((deviceId) => deviceId !== CONNECTOR_DEVICE_ID)
   const wss = new WebSocketServer({ noServer: true })
@@ -712,12 +735,14 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     const sequence = replay.latestSequence + 1
     const next = EventEnvelopeSchema.parse({
       version: PROTOCOL_VERSION,
-      messageId: randomUUID(),
+      messageId: event.messageId ?? randomUUID(),
       timestamp: Date.now(),
       machineId,
       deviceId: event.deviceId ?? 'broadcast',
       sequence,
-      ...event,
+      type: event.type,
+      payload: event.payload,
+      ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
     })
     const entry = replay.append(next)
     const wire = JSON.stringify({ ...next, sequence: entry.sequence })
@@ -737,6 +762,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             config.connectorConfigPath ?? defaultConnectorConfigPath(),
             questions,
             relayDevices,
+            relayDeviceLeases,
+            registerPendingPromptRequest,
+            removePendingPromptRequest,
             () => {
               if (!hasRemoteDecisionClient()) {
                 approvals.rejectAll()
@@ -789,6 +817,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       wss.handleUpgrade(req, socket, head, (client) => {
         clients.add(client)
         clientDeviceIds.set(client, device.id)
+        if (device.id === CONNECTOR_DEVICE_ID) {
+          const connectorId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('connectorId')
+          clientConnectorIds.set(client, connectorId ?? randomUUID())
+        }
         const after = parseAfter(req.url)
         for (const entry of replay.after(after)) {
           client.send(JSON.stringify({ ...entry.event, sequence: entry.sequence }))
@@ -851,7 +883,12 @@ export function apply(baseCtx: Context, config: Config = {}): void {
               if (index < recentStart) continue
               for (const next of normalized) {
                 if (next.type === 'usage.updated') publishedUsage = true
-                publish({ ...next, deviceId: device.id }, [client])
+                // History can contain an older text-only message with the
+                // same words as a still-pending prompt. Receipt identities
+                // are safe to correlate here; live events also allow the
+                // text fallback for older Harness payloads.
+                const requestId = claimPendingPromptRequest(summary.id, next, false)
+                publish({ ...next, deviceId: device.id, ...(requestId === undefined ? {} : { messageId: requestId }) }, [client])
               }
             }
             // The phone only needs recent message/tool rows, but the footer
@@ -884,7 +921,17 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         client.once('close', () => {
           clients.delete(client)
           clientDeviceIds.delete(client)
-          if (device.id === CONNECTOR_DEVICE_ID) relayDevices.clear()
+          if (device.id === CONNECTOR_DEVICE_ID) {
+            const connectorId = clientConnectorIds.get(client)
+            clientConnectorIds.delete(client)
+            if (connectorId !== undefined && !hasActiveConnector(connectorId)) {
+              for (const [deviceId, lease] of relayDeviceLeases) {
+                if (lease !== connectorId) continue
+                relayDeviceLeases.delete(deviceId)
+                relayDevices.delete(deviceId)
+              }
+            }
+          }
           if (!hasRemoteDecisionClient()) {
             approvals.rejectAll()
             questions.rejectAll(new Error('all remote devices disconnected'))
@@ -909,6 +956,64 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   // relaying an unbounded chain of thought, and the durable assistant event
   // restores the complete folded reasoning once the step commits.
   const liveStreamAttempts = new Map<string, LiveStreamAttempt>()
+  const pendingPromptRequests = new Map<string, PendingPromptRequest[]>()
+
+  const prunePendingPromptRequests = (): void => {
+    const now = Date.now()
+    for (const [sessionId, requests] of pendingPromptRequests) {
+      const active = requests.filter((request) => request.expiresAt > now)
+      if (active.length === 0) pendingPromptRequests.delete(sessionId)
+      else if (active.length !== requests.length) pendingPromptRequests.set(sessionId, active)
+    }
+  }
+
+  const registerPendingPromptRequest = (request: Omit<PendingPromptRequest, 'expiresAt'>): void => {
+    prunePendingPromptRequests()
+    const requests = (pendingPromptRequests.get(request.sessionId) ?? [])
+      .filter((entry) => entry.requestId !== request.requestId)
+    requests.push({ ...request, expiresAt: Date.now() + PENDING_PROMPT_TTL_MS })
+    pendingPromptRequests.set(request.sessionId, requests)
+  }
+
+  const removePendingPromptRequest = (sessionId: string, requestId: string): void => {
+    const requests = pendingPromptRequests.get(sessionId)
+    if (requests === undefined) return
+    const remaining = requests.filter((request) => request.requestId !== requestId)
+    if (remaining.length === 0) pendingPromptRequests.delete(sessionId)
+    else pendingPromptRequests.set(sessionId, remaining)
+  }
+
+  const claimPendingPromptRequest = (sessionId: string, event: NativeEventInput,
+                                     allowText = true): string | undefined => {
+    if (event.type !== 'user.message.accepted') return undefined
+    prunePendingPromptRequests()
+    const requests = pendingPromptRequests.get(sessionId)
+    if (requests === undefined || requests.length === 0) return undefined
+    const payload = recordOf(event.payload)
+    const text = typeof payload.markdown === 'string' ? payload.markdown.trim() : ''
+    const receiptIds = Array.isArray(payload.attachments)
+      ? payload.attachments.flatMap((attachment) => {
+          const receiptId = recordOf(attachment).receiptId
+          return typeof receiptId === 'string' ? [receiptId] : []
+        })
+      : []
+    // Receipts are durable identities and are safer than text when several
+    // queued prompts happen to contain the same words. Prefer an exact set
+    // match for mixed and attachment-only sends.
+    const receiptMatch = receiptIds.length > 0
+      ? requests.findIndex((request) => request.receiptIds.length === receiptIds.length
+          && request.receiptIds.every((receiptId) => receiptIds.includes(receiptId)))
+      : -1
+    const textMatch = !allowText || receiptMatch >= 0 || text.length === 0
+      ? -1
+      : requests.findIndex((request) => request.text === text)
+    const index = receiptMatch >= 0 ? receiptMatch : textMatch
+    if (index < 0) return undefined
+    const [matched] = requests.splice(index, 1)
+    if (requests.length === 0) pendingPromptRequests.delete(sessionId)
+    else pendingPromptRequests.set(sessionId, requests)
+    return matched?.requestId
+  }
 
   ctx.on('agent/assistant-stream' as never, ((value: unknown) => {
     const payload = recordOf(value)
@@ -956,7 +1061,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     const normalized = normalizeSessionEvents(
       session.id, event, toolNames, usageCounters, modelSelections, liveStreamMessageIDs,
     )
-    for (const next of normalized) publish(next)
+    for (const next of normalized) {
+      const requestId = claimPendingPromptRequest(session.id, next)
+      publish(requestId === undefined ? next : { ...next, messageId: requestId })
+    }
     if (recordOf(event).type === 'assistant/message') {
       const data = recordOf(recordOf(event).data)
       const key = liveStreamKey(session.id, data.turn, data.step)
@@ -1124,6 +1232,9 @@ async function handleHttp(
   connectorConfigPath: string,
   questions: PendingQuestions,
   relayDevices: Set<string>,
+  relayDeviceLeases: Map<string, string>,
+  registerPendingPromptRequest: (request: Omit<PendingPromptRequest, 'expiresAt'>) => void,
+  removePendingPromptRequest: (sessionId: string, requestId: string) => void,
   onRemotePresenceChanged: () => void,
 ): Promise<void> {
   await metadata.ready
@@ -1170,8 +1281,19 @@ async function handleHttp(
     if (device.id !== CONNECTOR_DEVICE_ID) throw new HttpError(403, 'only the Connector may report Relay presence')
     const deviceId = decodeURIComponent(presenceMatch[1]!)
     const body = objectOf(await readJson(req))
-    if (body.online === true) relayDevices.add(deviceId)
-    else if (body.online === false) relayDevices.delete(deviceId)
+    const connectorId = stringOf(body.connectorId)
+    if (connectorId.length === 0 || connectorId.length > 256) {
+      throw new HttpError(400, 'connectorId is required')
+    }
+    if (body.online === true) {
+      relayDeviceLeases.set(deviceId, connectorId)
+      relayDevices.add(deviceId)
+    } else if (body.online === false) {
+      if (relayDeviceLeases.get(deviceId) === connectorId) {
+        relayDeviceLeases.delete(deviceId)
+        relayDevices.delete(deviceId)
+      }
+    }
     else throw new HttpError(400, 'online must be a boolean')
     onRemotePresenceChanged()
     json(res, 202, { accepted: true, deviceId, online: body.online })
@@ -1336,13 +1458,36 @@ async function handleHttp(
             : [{ type: 'text' as const, text }]),
           ...declaredContent,
         ]
-    const result = await ctx.sessionController.prompt({
+    const sessionId = decodeURIComponent(promptMatch[1]!)
+    const correlationText = text.length > 0
+      ? text
+      : content.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+        .map((part) => part.text).join('').trim()
+    registerPendingPromptRequest({
       requestId,
-      sessionId: decodeURIComponent(promptMatch[1]!),
-      mode,
-      content,
-      ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
-    }, AbortSignal.timeout(15_000))
+      sessionId,
+      text: correlationText,
+      receiptIds: content.flatMap((part) => part.type === 'file' ? [part.receiptId] : []),
+    })
+    let result: { accepted: true }
+    try {
+      result = await ctx.sessionController.prompt({
+        requestId,
+        sessionId,
+        mode,
+        content,
+        ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
+      }, AbortSignal.timeout(15_000))
+    } catch (error) {
+      // A timeout is ambiguous: the Harness may have accepted the prompt just
+      // before the local deadline and emit the durable user/message later.
+      // Keep that registration for correlation. Definite validation or
+      // transport failures cannot produce an accepted message and should not
+      // shadow a later identical prompt.
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+      if (!timedOut) removePendingPromptRequest(sessionId, requestId)
+      throw error
+    }
     json(res, 202, { ...result, requestId })
     return
   }

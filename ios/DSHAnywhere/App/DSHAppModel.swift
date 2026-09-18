@@ -876,9 +876,18 @@ final class DSHAppModel: ObservableObject {
                                    sessionID: pending.sessionID, mode: pending.mode, failure: failure)
     }
 
-    /// An accepted user message acknowledges the matching send (and heals a
-    /// stale failure banner for the same text).
-    func confirmPendingSend(text: String, sessionID: String) {
+    /// An accepted user message acknowledges the matching send (by request id
+    /// when available, with text matching for older Bridges) and heals a stale
+    /// failure banner.
+    func confirmPendingSend(text: String, sessionID: String, requestID: String? = nil) {
+        if let requestID {
+            let removed = pendingSendsByRequestID.removeValue(forKey: requestID) != nil
+            let clearedFailure = failedSend?.id == requestID
+            if removed || clearedFailure {
+                if clearedFailure { failedSend = nil }
+                return
+            }
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         if let key = pendingSendsByRequestID.values.first(
@@ -1084,7 +1093,12 @@ final class DSHAppModel: ObservableObject {
     private func confirmSendAccepted(_ event: DSHEvent) {
         guard case .userMessageAccepted(let message) = event.kind,
               let sessionId = event.envelope.sessionId else { return }
-        confirmPendingSend(text: message.markdown, sessionID: sessionId)
+        // The Bridge carries the originating prompt request id in the event
+        // envelope. This is the only reliable acknowledgement for a pure
+        // attachment prompt, whose markdown is legitimately empty; text
+        // matching remains as a compatibility fallback for older Bridges.
+        confirmPendingSend(text: message.markdown, sessionID: sessionId,
+                          requestID: event.envelope.messageId)
     }
 
     /// When a turn settles, fire the oldest locally held prompt (FIFO — the

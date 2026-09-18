@@ -123,12 +123,12 @@ describe("Relay and bridge forwarding", () => {
       type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: true, serverTime: 1,
     }));
     await vi.waitFor(() => expect(calls.some((call) => call.url.endsWith("/devices/phone-1/presence")
-      && call.body === JSON.stringify({ online: true }))).toBe(true));
+      && JSON.parse(call.body ?? "{}").online === true)).toBe(true));
     relay.emit("message", JSON.stringify({
       type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: false, serverTime: 2,
     }));
     await vi.waitFor(() => expect(calls.some((call) => call.url.endsWith("/devices/phone-1/presence")
-      && call.body === JSON.stringify({ online: false }))).toBe(true));
+      && JSON.parse(call.body ?? "{}").online === false)).toBe(true));
     await connector.stop();
   });
 
@@ -169,6 +169,48 @@ describe("Relay and bridge forwarding", () => {
     await vi.waitFor(() => expect(relay.sent.filter((raw) => JSON.parse(raw).body?.type === "session.created")).toHaveLength(2));
     const replayedResult = relay.sent.map((raw) => JSON.parse(raw)).filter((message) => message.body?.type === "session.created")[1];
     expect(replayedResult.body.sequence).toBeGreaterThan(firstResult.body.sequence);
+    await connector.stop();
+  });
+
+  it("retries a failed request with the same idempotency key after a duplicate delivery", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const requests: RequestInit[] = [];
+    let attempt = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {});
+      attempt += 1;
+      if (attempt === 1) throw new Error("bridge temporarily unavailable");
+      return new Response(JSON.stringify({
+        sessionId: "session-recovered", summary: { id: "session-recovered", title: "Recovered", updatedAt: 1 },
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    });
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const duplicate = JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "retry-copy", sender: "device",
+      body: { ...command("session.create"), payload: { workingDirectory: "/tmp" } },
+    });
+    relay.emit("message", duplicate);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .some((message) => message.body?.type === "protocol.error")).toBe(true));
+    // A mobile reconnect can resend the same command after seeing the first
+    // protocol error. The Connector must retry the same request id, allowing
+    // the Bridge's idempotency store to return an already-accepted result.
+    relay.emit("message", duplicate);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(requests.map((init) => new Headers(init.headers).get("x-dsh-request-id"))).toEqual([
+      "request-1", "request-1",
+    ]);
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .some((message) => message.body?.type === "session.created"
+        && message.body?.sessionId === "session-recovered")).toBe(true));
     await connector.stop();
   });
 
@@ -273,6 +315,52 @@ describe("Relay and bridge forwarding", () => {
       sessionId: "session-1", type: "session.archive", payload: { archived: true },
     } }));
     await vi.waitFor(() => expect(urls.filter((url) => url.endsWith("/sessions?includeArchived=true")).length).toBeGreaterThanOrEqual(2));
+    await connector.stop();
+  });
+
+  it("defers an automatic mutation refresh until an explicit list response settles", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const pendingLists: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/sessions") || url.endsWith("/sessions?includeArchived=true")) {
+        return new Promise<Response>((resolve) => pendingLists.push(resolve));
+      }
+      return Promise.resolve(new Response(JSON.stringify({ accepted: true }), {
+        status: 202, headers: { "content-type": "application/json" },
+      }));
+    });
+    let calls = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const explicit = { ...command("session.list"), requestId: "explicit-list" };
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "list", sender: "device", body: explicit }));
+    await vi.waitFor(() => expect(pendingLists).toHaveLength(1));
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archive", sender: "device", body: {
+      version: PROTOCOL_VERSION, requestId: "archive", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      sessionId: "session-1", type: "session.archive", payload: { archived: true },
+    } }));
+    // The mutation completes while the explicit list is still in flight. It
+    // must mark a deferred refresh instead of superseding the request.
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    pendingLists[0]!(new Response(JSON.stringify({ items: [{ id: "before", title: "Before", updatedAt: 1 }] }), {
+      headers: { "content-type": "application/json" },
+    }));
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .some((message) => message.body?.type === "session.snapshot" && message.body?.messageId === "explicit-list")).toBe(true));
+    await vi.waitFor(() => expect(pendingLists).toHaveLength(2));
+    pendingLists[1]!(new Response(JSON.stringify({ items: [{ id: "after", title: "After", updatedAt: 2 }] }), {
+      headers: { "content-type": "application/json" },
+    }));
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .some((message) => message.body?.type === "session.snapshot"
+        && message.body?.messageId?.startsWith("snapshot-push-")
+        && message.body?.payload?.[0]?.id === "after")).toBe(true));
     await connector.stop();
   });
 

@@ -908,6 +908,29 @@ final class DSHEventStoreTests: XCTestCase {
         model.dismissFailedSend()
     }
 
+    @MainActor
+    func testPureAttachmentAcceptanceUsesRequestIdWhenMessageHasNoText() {
+        let sid = "attachment-send-\(UUID().uuidString)"
+        let requestID = "attachment-request-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        model.sendPrompt("", attachments: ["receipt-1"], to: sid, requestId: requestID)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 1)
+
+        // The accepted user message can contain only a file, so its markdown
+        // is empty. The Bridge correlates the envelope message id to the
+        // original prompt request and must still clear the pending bubble.
+        model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 0)
+        XCTAssertNil(model.failedSend)
+
+        let lateRequestID = "late-attachment-request-\(UUID().uuidString)"
+        model.sendPrompt("", attachments: ["receipt-2"], to: sid, requestId: lateRequestID)
+        model.timeoutPendingSend(requestId: lateRequestID)
+        XCTAssertNotNil(model.failedSend)
+        model.confirmPendingSend(text: "", sessionID: sid, requestID: lateRequestID)
+        XCTAssertNil(model.failedSend)
+    }
+
     func testToolsFoldIntoPrecedingAssistantTurn() {
         let entries: [DSHTranscriptEntry] = [
             .turn(DSHTranscriptBlock(id: "q", messages: [
