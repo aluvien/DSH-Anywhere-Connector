@@ -412,6 +412,7 @@ describe('native bridge mutations', () => {
 
   function mount(options: {
     create?: (request: { cwd?: string; workspaceId?: string; agentPreset?: string }) => Promise<{ sessionId: string }>
+    prompt?: () => Promise<{ accepted: true }>
     rename?: (request: { sessionId: string; title: string }) => Promise<unknown>
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
@@ -434,7 +435,7 @@ describe('native bridge mutations', () => {
         selectModel: async () => undefined,
         modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, routableProviders: [], groups: [], failures: [] }),
         resolveAgent: async () => ({ error: 'none' }),
-        prompt: async () => ({ accepted: true }),
+        prompt: options.prompt ?? (async () => ({ accepted: true })),
         cancel: () => ({ accepted: true }),
         inspect: async () => ({ events: [] }),
       },
@@ -506,6 +507,22 @@ describe('native bridge mutations', () => {
     ])
     expect(creates).toBe(1)
     expect(duplicate).toEqual(first)
+  })
+
+  it('does not permanently cache a prompt rejection under its request id', async () => {
+    let attempts = 0
+    const request = mount({
+      prompt: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('Harness was temporarily unavailable')
+        return { accepted: true }
+      },
+    })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/session-1/prompt', { text: 'hello', requestId: 'prompt-retry' }, 'prompt-retry'))
+      .resolves.toMatchObject({ status: 503, body: { error: 'Harness was temporarily unavailable' } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/session-1/prompt', { text: 'hello', requestId: 'prompt-retry' }, 'prompt-retry'))
+      .resolves.toMatchObject({ status: 202, body: { accepted: true, requestId: 'prompt-retry' } })
+    expect(attempts).toBe(2)
   })
 
   it('lists paired-Mac folders when Harness selected its native chooser', async () => {

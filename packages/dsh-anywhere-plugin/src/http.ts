@@ -1,12 +1,14 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-export function json(res: ServerResponse, status: number, value: unknown): void {
+export function json(res: ServerResponse, status: number, value: unknown,
+                     extraHeaders: Record<string, string> = {}): void {
   const body = JSON.stringify(value)
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
+    ...extraHeaders,
   })
   res.end(body)
 }
@@ -29,7 +31,19 @@ export async function readJson(req: IncomingMessage, limit = 1_048_576): Promise
 }
 
 export class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly idempotencyOutcome: 'final' | 'retryable' | 'unknown' = status >= 500 ? 'unknown' : 'final',
+  ) {
     super(message)
+  }
+}
+
+/** The handler is certain that no side effect was accepted.  The idempotency
+ * layer may let the same request id try again after this response. */
+export class RetryableHttpError extends HttpError {
+  constructor(status: number, message: string) {
+    super(status, message, 'retryable')
   }
 }

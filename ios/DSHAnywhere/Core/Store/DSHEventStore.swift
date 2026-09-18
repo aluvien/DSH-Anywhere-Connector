@@ -311,6 +311,10 @@ public struct DSHEventReducer: Sendable {
             var values = state.attachmentsBySession[attachment.sessionId, default: []]
             if !values.contains(where: { $0.id == attachment.id }) { values.append(attachment) }
             state.attachmentsBySession[attachment.sessionId] = values
+        case .promptAccepted:
+            // Request receipts are consumed by DSHAppModel to settle the
+            // composer; they are not transcript rows.
+            break
         case .protocolError(let error):
             state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
             if error.code == "bridge-request-failed" { state.bridgeReachable = false }

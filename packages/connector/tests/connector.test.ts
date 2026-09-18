@@ -46,7 +46,8 @@ describe("bridge command mapping", () => {
       method: "POST", path: "/sessions", body: { cwd: "/tmp", permissionMode: "danger-full-access" },
     });
     expect(bridgeRequestFor(command("prompt.send"))).toEqual({
-      method: "POST", path: "/sessions/session-1/prompt", body: { text: "hello", requestId: "request-1" },
+      method: "POST", path: "/sessions/session-1/prompt",
+      body: { text: "hello", deviceId: "phone-1", requestId: "request-1" },
     });
     expect(bridgeRequestFor(command("turn.cancel"))).toEqual({ method: "POST", path: "/sessions/session-1/cancel", body: {} });
     expect(bridgeRequestFor(command("approval.decide"))).toEqual({
@@ -211,6 +212,44 @@ describe("Relay and bridge forwarding", () => {
     await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
       .some((message) => message.body?.type === "session.created"
         && message.body?.sessionId === "session-recovered")).toBe(true));
+    await connector.stop();
+  });
+
+  it("emits and replays a targeted prompt acceptance receipt", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ accepted: true, requestId: "request-1" }), {
+      status: 202, headers: { "content-type": "application/json" },
+    }));
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    const duplicate = JSON.stringify({
+      type: "relay.payload", machineId: "machine-1", messageId: "prompt-copy", sender: "device",
+      body: command("prompt.send"),
+    });
+    relay.emit("message", duplicate);
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .filter((message) => message.body?.type === "prompt.accepted")).toHaveLength(1));
+    const first = relay.sent.map((raw) => JSON.parse(raw)).find((message) => message.body?.type === "prompt.accepted")!;
+    expect(first).toMatchObject({ targetDeviceId: "phone-1", body: {
+      type: "prompt.accepted", messageId: "request-1", deviceId: "phone-1",
+      sessionId: "session-1", payload: { sessionId: "session-1", requestId: "request-1" },
+    }});
+
+    // A duplicate delivery is answered from the Connector's request-result
+    // cache, with a fresh transport sequence but the same request identity.
+    relay.emit("message", duplicate);
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .filter((message) => message.body?.type === "prompt.accepted")).toHaveLength(2));
+    const receipts = relay.sent.map((raw) => JSON.parse(raw)).filter((message) => message.body?.type === "prompt.accepted");
+    expect(receipts[1].body.messageId).toBe(receipts[0].body.messageId);
+    expect(receipts[1].body.sequence).toBeGreaterThan(receipts[0].body.sequence);
+    expect(fetchMock).toHaveBeenCalledOnce();
     await connector.stop();
   });
 

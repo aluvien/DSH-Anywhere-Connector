@@ -25,7 +25,7 @@ import {
   type QuestionAnswerItem,
 } from '@dsh-anywhere/protocol'
 import { PairingAuthority } from './auth.js'
-import { HttpError, json, readJson } from './http.js'
+import { HttpError, json, readJson, RetryableHttpError } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
 import { PendingQuestions, firstAnswered } from './pending-questions.js'
 import { ReplayBuffer } from './replay.js'
@@ -84,10 +84,20 @@ export class IdempotentHttpResponses {
       entry = pending
       this.entries.set(key, entry)
       void entry.result.then(
-        () => {
+        (captured) => {
           if (this.entries.get(key) === entry) {
-            entry!.completed = true
-            entry!.expiresAt = Date.now() + IDEMPOTENCY_TTL_MS
+            const outcome = idempotencyOutcomeOf(captured)
+            if (outcome === 'retryable') {
+              // The handler explicitly established that no side effect was
+              // accepted. Let a same-id retry invoke it again after recovery.
+              this.entries.delete(key)
+            } else {
+              // `unknown` is deliberately retained: a timeout or late native
+              // failure may have happened after the side effect was accepted,
+              // so replaying it is safer than executing twice.
+              entry!.completed = true
+              entry!.expiresAt = Date.now() + IDEMPOTENCY_TTL_MS
+            }
           }
         },
         () => {
@@ -126,6 +136,12 @@ async function captureHttpResponse(handler: (capture: ServerResponse) => Promise
   } as unknown as ServerResponse
   await handler(capture)
   return { status, headers, body }
+}
+
+function idempotencyOutcomeOf(captured: CapturedHttpResponse): 'final' | 'retryable' | 'unknown' {
+  const header = captured.headers['x-dsh-idempotency-outcome']
+  const value = Array.isArray(header) ? header[0] : header
+  return value === 'retryable' ? 'retryable' : value === 'final' ? 'final' : 'unknown'
 }
 
 export const name = 'dsh-anywhere-native-bridge'
@@ -209,6 +225,11 @@ export interface Config {
 export const CONNECTOR_DEVICE_ID = 'dsh-anywhere-connector'
 export const CONNECTOR_DEVICE_NAME = 'DSH Anywhere Connector'
 
+interface ConnectorLease {
+  readonly connectorId: string
+  readonly generation: number
+}
+
 export class PairingRateLimiter {
   private readonly failuresByAddress = new Map<string, { count: number; resetAt: number }>()
 
@@ -248,19 +269,6 @@ export type NativeEventInput = Pick<EventEnvelope, 'type' | 'payload'> & {
   readonly sessionId?: string
   readonly deviceId?: string
 }
-
-interface PendingPromptRequest {
-  readonly sessionId: string
-  readonly requestId: string
-  readonly text: string
-  readonly receiptIds: readonly string[]
-  readonly expiresAt: number
-}
-
-/** A prompt may be accepted after the HTTP call has timed out. Keep its
- * request identity long enough to correlate that late durable user/message,
- * while bounding the memory held by abandoned requests. */
-const PENDING_PROMPT_TTL_MS = 5 * 60_000
 
 /** Mutable state belonging to one active Harness assistant-stream attempt. */
 export interface LiveStreamAttempt {
@@ -723,10 +731,19 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const relayDevices = new Set<string>()
   /** Each Connector process owns a lease on the Relay presence it reports.
    * A superseded process must not be able to clear the replacement's state. */
-  const relayDeviceLeases = new Map<string, string>()
+  const relayDeviceLeases = new Map<string, ConnectorLease>()
   const clientConnectorIds = new Map<WebSocket, string>()
+  const connectorGenerations = new Map<string, number>()
+  const clientConnectorGenerations = new Map<WebSocket, number>()
+  let nextConnectorGeneration = 0
+  const connectorGenerationOf = (connectorId: string): number | undefined => {
+    const generation = connectorGenerations.get(connectorId)
+    return generation !== undefined && [...clientConnectorGenerations.values()].includes(generation)
+      ? generation : undefined
+  }
+  const latestConnectorGeneration = (): number => Math.max(0, ...[...connectorGenerations.values()])
   const hasActiveConnector = (connectorId: string): boolean =>
-    [...clientConnectorIds.values()].some((value) => value === connectorId)
+    [...clientConnectorIds.entries()].some(([client, value]) => value === connectorId && client.readyState === WebSocket.OPEN)
   const hasRemoteDecisionClient = (): boolean => relayDevices.size > 0 ||
     [...clientDeviceIds.values()].some((deviceId) => deviceId !== CONNECTOR_DEVICE_ID)
   const wss = new WebSocketServer({ noServer: true })
@@ -763,8 +780,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             questions,
             relayDevices,
             relayDeviceLeases,
-            registerPendingPromptRequest,
-            removePendingPromptRequest,
+            connectorGenerationOf,
+            latestConnectorGeneration,
             () => {
               if (!hasRemoteDecisionClient()) {
                 approvals.rejectAll()
@@ -774,7 +791,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           )
         } catch (error) {
           const status = error instanceof HttpError ? error.status : 500
-          json(target, status, { error: error instanceof Error ? error.message : String(error) })
+          const outcome = error instanceof HttpError ? error.idempotencyOutcome : 'unknown'
+          json(target, status, { error: error instanceof Error ? error.message : String(error) }, {
+            'x-dsh-idempotency-outcome': outcome,
+          })
         }
       }
 
@@ -819,7 +839,11 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         clientDeviceIds.set(client, device.id)
         if (device.id === CONNECTOR_DEVICE_ID) {
           const connectorId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('connectorId')
-          clientConnectorIds.set(client, connectorId ?? randomUUID())
+          const id = connectorId ?? randomUUID()
+          const generation = ++nextConnectorGeneration
+          clientConnectorIds.set(client, id)
+          clientConnectorGenerations.set(client, generation)
+          connectorGenerations.set(id, generation)
         }
         const after = parseAfter(req.url)
         for (const entry of replay.after(after)) {
@@ -883,12 +907,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
               if (index < recentStart) continue
               for (const next of normalized) {
                 if (next.type === 'usage.updated') publishedUsage = true
-                // History can contain an older text-only message with the
-                // same words as a still-pending prompt. Receipt identities
-                // are safe to correlate here; live events also allow the
-                // text fallback for older Harness payloads.
-                const requestId = claimPendingPromptRequest(summary.id, next, false)
-                publish({ ...next, deviceId: device.id, ...(requestId === undefined ? {} : { messageId: requestId }) }, [client])
+                publish({ ...next, deviceId: device.id }, [client])
               }
             }
             // The phone only needs recent message/tool rows, but the footer
@@ -924,9 +943,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           if (device.id === CONNECTOR_DEVICE_ID) {
             const connectorId = clientConnectorIds.get(client)
             clientConnectorIds.delete(client)
-            if (connectorId !== undefined && !hasActiveConnector(connectorId)) {
+            const generation = clientConnectorGenerations.get(client)
+            clientConnectorGenerations.delete(client)
+            if (connectorId !== undefined && generation !== undefined &&
+                connectorGenerations.get(connectorId) === generation && !hasActiveConnector(connectorId)) {
+              connectorGenerations.delete(connectorId)
               for (const [deviceId, lease] of relayDeviceLeases) {
-                if (lease !== connectorId) continue
+                if (lease.connectorId !== connectorId || lease.generation !== generation) continue
                 relayDeviceLeases.delete(deviceId)
                 relayDevices.delete(deviceId)
               }
@@ -956,65 +979,6 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   // relaying an unbounded chain of thought, and the durable assistant event
   // restores the complete folded reasoning once the step commits.
   const liveStreamAttempts = new Map<string, LiveStreamAttempt>()
-  const pendingPromptRequests = new Map<string, PendingPromptRequest[]>()
-
-  const prunePendingPromptRequests = (): void => {
-    const now = Date.now()
-    for (const [sessionId, requests] of pendingPromptRequests) {
-      const active = requests.filter((request) => request.expiresAt > now)
-      if (active.length === 0) pendingPromptRequests.delete(sessionId)
-      else if (active.length !== requests.length) pendingPromptRequests.set(sessionId, active)
-    }
-  }
-
-  const registerPendingPromptRequest = (request: Omit<PendingPromptRequest, 'expiresAt'>): void => {
-    prunePendingPromptRequests()
-    const requests = (pendingPromptRequests.get(request.sessionId) ?? [])
-      .filter((entry) => entry.requestId !== request.requestId)
-    requests.push({ ...request, expiresAt: Date.now() + PENDING_PROMPT_TTL_MS })
-    pendingPromptRequests.set(request.sessionId, requests)
-  }
-
-  const removePendingPromptRequest = (sessionId: string, requestId: string): void => {
-    const requests = pendingPromptRequests.get(sessionId)
-    if (requests === undefined) return
-    const remaining = requests.filter((request) => request.requestId !== requestId)
-    if (remaining.length === 0) pendingPromptRequests.delete(sessionId)
-    else pendingPromptRequests.set(sessionId, remaining)
-  }
-
-  const claimPendingPromptRequest = (sessionId: string, event: NativeEventInput,
-                                     allowText = true): string | undefined => {
-    if (event.type !== 'user.message.accepted') return undefined
-    prunePendingPromptRequests()
-    const requests = pendingPromptRequests.get(sessionId)
-    if (requests === undefined || requests.length === 0) return undefined
-    const payload = recordOf(event.payload)
-    const text = typeof payload.markdown === 'string' ? payload.markdown.trim() : ''
-    const receiptIds = Array.isArray(payload.attachments)
-      ? payload.attachments.flatMap((attachment) => {
-          const receiptId = recordOf(attachment).receiptId
-          return typeof receiptId === 'string' ? [receiptId] : []
-        })
-      : []
-    // Receipts are durable identities and are safer than text when several
-    // queued prompts happen to contain the same words. Prefer an exact set
-    // match for mixed and attachment-only sends.
-    const receiptMatch = receiptIds.length > 0
-      ? requests.findIndex((request) => request.receiptIds.length === receiptIds.length
-          && request.receiptIds.every((receiptId) => receiptIds.includes(receiptId)))
-      : -1
-    const textMatch = !allowText || receiptMatch >= 0 || text.length === 0
-      ? -1
-      : requests.findIndex((request) => request.text === text)
-    const index = receiptMatch >= 0 ? receiptMatch : textMatch
-    if (index < 0) return undefined
-    const [matched] = requests.splice(index, 1)
-    if (requests.length === 0) pendingPromptRequests.delete(sessionId)
-    else pendingPromptRequests.set(sessionId, requests)
-    return matched?.requestId
-  }
-
   ctx.on('agent/assistant-stream' as never, ((value: unknown) => {
     const payload = recordOf(value)
     const agent = recordOf(payload.agent)
@@ -1061,10 +1025,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     const normalized = normalizeSessionEvents(
       session.id, event, toolNames, usageCounters, modelSelections, liveStreamMessageIDs,
     )
-    for (const next of normalized) {
-      const requestId = claimPendingPromptRequest(session.id, next)
-      publish(requestId === undefined ? next : { ...next, messageId: requestId })
-    }
+    for (const next of normalized) publish(next)
     if (recordOf(event).type === 'assistant/message') {
       const data = recordOf(recordOf(event).data)
       const key = liveStreamKey(session.id, data.turn, data.step)
@@ -1232,9 +1193,9 @@ async function handleHttp(
   connectorConfigPath: string,
   questions: PendingQuestions,
   relayDevices: Set<string>,
-  relayDeviceLeases: Map<string, string>,
-  registerPendingPromptRequest: (request: Omit<PendingPromptRequest, 'expiresAt'>) => void,
-  removePendingPromptRequest: (sessionId: string, requestId: string) => void,
+  relayDeviceLeases: Map<string, ConnectorLease>,
+  connectorGenerationOf: (connectorId: string) => number | undefined,
+  latestConnectorGeneration: () => number,
   onRemotePresenceChanged: () => void,
 ): Promise<void> {
   await metadata.ready
@@ -1285,11 +1246,22 @@ async function handleHttp(
     if (connectorId.length === 0 || connectorId.length > 256) {
       throw new HttpError(400, 'connectorId is required')
     }
+    const generation = connectorGenerationOf(connectorId)
+    if (generation === undefined) {
+      // A delayed presence request from a Connector whose Bridge socket has
+      // already gone away must not resurrect its lease.  The replacement will
+      // report again after its own socket is established.
+      throw new HttpError(409, 'connector is no longer connected')
+    }
     if (body.online === true) {
-      relayDeviceLeases.set(deviceId, connectorId)
-      relayDevices.add(deviceId)
+      const newestGeneration = latestConnectorGeneration()
+      if (generation === newestGeneration) {
+        relayDeviceLeases.set(deviceId, { connectorId, generation })
+        relayDevices.add(deviceId)
+      }
     } else if (body.online === false) {
-      if (relayDeviceLeases.get(deviceId) === connectorId) {
+      const lease = relayDeviceLeases.get(deviceId)
+      if (lease?.connectorId === connectorId && lease.generation === generation) {
         relayDeviceLeases.delete(deviceId)
         relayDevices.delete(deviceId)
       }
@@ -1459,16 +1431,6 @@ async function handleHttp(
           ...declaredContent,
         ]
     const sessionId = decodeURIComponent(promptMatch[1]!)
-    const correlationText = text.length > 0
-      ? text
-      : content.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
-        .map((part) => part.text).join('').trim()
-    registerPendingPromptRequest({
-      requestId,
-      sessionId,
-      text: correlationText,
-      receiptIds: content.flatMap((part) => part.type === 'file' ? [part.receiptId] : []),
-    })
     let result: { accepted: true }
     try {
       result = await ctx.sessionController.prompt({
@@ -1479,13 +1441,13 @@ async function handleHttp(
         ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
       }, AbortSignal.timeout(15_000))
     } catch (error) {
-      // A timeout is ambiguous: the Harness may have accepted the prompt just
-      // before the local deadline and emit the durable user/message later.
-      // Keep that registration for correlation. Definite validation or
-      // transport failures cannot produce an accepted message and should not
-      // shadow a later identical prompt.
       const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
-      if (!timedOut) removePendingPromptRequest(sessionId, requestId)
+      if (!timedOut) {
+        // A prompt rejection before Harness reports acceptance is safe to try
+        // again with the same request id. Timeouts stay unknown because the
+        // native call may have crossed its acceptance boundary already.
+        throw new RetryableHttpError(503, error instanceof Error ? error.message : String(error))
+      }
       throw error
     }
     json(res, 202, { ...result, requestId })

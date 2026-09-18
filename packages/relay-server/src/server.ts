@@ -34,8 +34,10 @@ const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
  * 8: added transient assistant-stream discard events, opt-in session opens,
  *    and the optional completion replacement id used to reconcile a live
  *    bubble with its durable assistant message.
+ * 9: added targeted `prompt.accepted` request receipts so a lost prompt
+ *    acknowledgement can be replayed without inferring identity from text.
  */
-const RELAY_SCHEMA_REVISION = 8;
+const RELAY_SCHEMA_REVISION = 9;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day
@@ -187,6 +189,12 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   };
 
   const handleSocketMessage = (source: RelayConnection, raw: RawData): void => {
+    // `ws.close()` starts an asynchronous closing handshake.  A peer can still
+    // deliver a queued frame during that window, and a superseded connection's
+    // message listener remains attached until its close event.  Membership in
+    // the live connection set is the Relay's synchronous authorization bit;
+    // check it before parsing or routing anything from the old socket.
+    if (!connections.has(source) || source.ws.readyState !== WebSocket.OPEN) return;
     let decoded: unknown;
     try {
       decoded = JSON.parse(raw.toString());
@@ -207,6 +215,11 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   };
 
   const routePayload = (source: RelayConnection, payload: RelayPayloadMessage): void => {
+    // Keep the guard at the routing boundary as well as the message entry.  This
+    // prevents a frame already queued in the event loop from being forwarded if
+    // device revocation or lease replacement removed the source in between the
+    // two callbacks.
+    if (!connections.has(source) || source.ws.readyState !== WebSocket.OPEN) return;
     const { principal } = source;
     if (payload.machineId !== principal.machineId) {
       sendError(source, "machine_mismatch", "The token is not authorized for this machine.", payload.machineId, payload.messageId);
@@ -375,6 +388,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       // happens to drop.
       for (const connection of connections) {
         if (connection.principal.role === "device" && connection.principal.deviceId === deviceId) {
+          // Invalidate the source synchronously before beginning the WebSocket
+          // close handshake.  The close callback sees the connection already
+          // removed and therefore does not emit a second offline edge.
+          if (connections.delete(connection)) broadcastPresence(connection.principal, false);
           connection.ws.close(4401, "device revoked");
         }
       }

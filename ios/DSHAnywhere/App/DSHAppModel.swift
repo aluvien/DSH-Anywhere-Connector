@@ -807,10 +807,12 @@ final class DSHAppModel: ObservableObject {
             pendingMessageAttachmentsBySession[sessionID, default: []].append(messageAttachments)
         }
         let requestId = requestedRequestID ?? UUID().uuidString
+        let attempt = (sendAttemptGenerations[requestId] ?? 0) + 1
+        sendAttemptGenerations[requestId] = attempt
         pendingSendsByRequestID[requestId] = DSHPendingSend(
             id: requestId, text: trimmed, receipts: attachments,
-            sessionID: sessionID, mode: mode, sentAt: .now)
-        armSendAckTimeout(requestId: requestId)
+            sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt)
+        armSendAckTimeout(requestId: requestId, attempt: attempt)
         let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
         send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
                                    sessionId: sessionID, text: trimmed, attachments: parts,
@@ -826,6 +828,7 @@ final class DSHAppModel: ObservableObject {
         let sessionID: String
         let mode: String
         let sentAt: Date
+        let attempt: Int
     }
 
     enum DSHSendFailure: Sendable, Equatable {
@@ -845,6 +848,9 @@ final class DSHAppModel: ObservableObject {
     }
 
     private var pendingSendsByRequestID: [String: DSHPendingSend] = [:]
+    /// Monotonic per-request attempt generations keep an old timeout task from
+    /// settling a retried send that reuses the same idempotency key.
+    private var sendAttemptGenerations: [String: Int] = [:]
     @Published var failedSend: DSHFailedSend?
     /// Acceptance window before a send is declared lost. Internal for tests.
     var sendAckTimeout: TimeInterval = 15
@@ -853,15 +859,25 @@ final class DSHAppModel: ObservableObject {
         pendingSendsByRequestID.values.filter { $0.sessionID == sessionID }.count
     }
 
-    private func armSendAckTimeout(requestId: String) {
+    private func armSendAckTimeout(requestId: String, attempt: Int) {
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(self?.sendAckTimeout ?? 15))
-            self?.timeoutPendingSend(requestId: requestId)
+            do {
+                try await Task.sleep(for: .seconds(self?.sendAckTimeout ?? 15))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.timeoutPendingSend(requestId: requestId, attempt: attempt)
         }
     }
 
     func timeoutPendingSend(requestId: String) {
+        timeoutPendingSend(requestId: requestId, attempt: nil)
+    }
+
+    private func timeoutPendingSend(requestId: String, attempt: Int?) {
         guard let pending = pendingSendsByRequestID[requestId] else { return }
+        if let attempt, pending.attempt != attempt { return }
         pendingSendsByRequestID.removeValue(forKey: requestId)
         let failure: DSHSendFailure
         if let detail = state.protocolErrorsByRequestID[requestId], !detail.isEmpty {
@@ -876,17 +892,15 @@ final class DSHAppModel: ObservableObject {
                                    sessionID: pending.sessionID, mode: pending.mode, failure: failure)
     }
 
-    /// An accepted user message acknowledges the matching send (by request id
-    /// when available, with text matching for older Bridges) and heals a stale
-    /// failure banner.
+    /// A request id is authoritative.  A message with an id that does not match
+    /// this phone's pending operation must not fall back to text matching: it
+    /// may be a broadcast or historical message from another operation.
     func confirmPendingSend(text: String, sessionID: String, requestID: String? = nil) {
         if let requestID {
-            let removed = pendingSendsByRequestID.removeValue(forKey: requestID) != nil
+            pendingSendsByRequestID.removeValue(forKey: requestID)
             let clearedFailure = failedSend?.id == requestID
-            if removed || clearedFailure {
-                if clearedFailure { failedSend = nil }
-                return
-            }
+            if clearedFailure { failedSend = nil }
+            return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -1088,17 +1102,12 @@ final class DSHAppModel: ObservableObject {
         matchQueuedPrompt(text: message.markdown, sessionID: sessionId)
     }
 
-    /// An accepted user message is the send acknowledgment: the matching
-    /// outbound prompt made it to the Mac.
-    private func confirmSendAccepted(_ event: DSHEvent) {
-        guard case .userMessageAccepted(let message) = event.kind,
-              let sessionId = event.envelope.sessionId else { return }
-        // The Bridge carries the originating prompt request id in the event
-        // envelope. This is the only reliable acknowledgement for a pure
-        // attachment prompt, whose markdown is legitimately empty; text
-        // matching remains as a compatibility fallback for older Bridges.
-        confirmPendingSend(text: message.markdown, sessionID: sessionId,
-                          requestID: event.envelope.messageId)
+    /// A prompt acceptance is a request-scoped receipt, not a transcript row.
+    /// Durable user messages are broadcast/history data and intentionally do
+    /// not settle pending sends by matching their text.
+    private func confirmPromptAccepted(_ event: DSHEvent) {
+        guard case .promptAccepted(let receipt) = event.kind else { return }
+        confirmPendingSend(text: "", sessionID: receipt.sessionId, requestID: receipt.requestId)
     }
 
     /// When a turn settles, fire the oldest locally held prompt (FIFO — the
@@ -1367,7 +1376,7 @@ final class DSHAppModel: ObservableObject {
             handleRemoteRequestCompletion(event)
             requestRemoteCatalogsWhenConnected(event)
             retireQueuedPrompt(event)
-            confirmSendAccepted(event)
+            confirmPromptAccepted(event)
             flushQueueOnSettle(event)
             surfaceProtocolError(event)
             trackHistoryBatch(event)

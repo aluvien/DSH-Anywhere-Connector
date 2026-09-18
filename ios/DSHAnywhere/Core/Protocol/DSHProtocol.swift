@@ -1147,6 +1147,20 @@ public struct DSHUploadedAttachment: Codable, Sendable, Equatable, Identifiable 
     }
 }
 
+/// A request-scoped receipt that the Harness accepted a prompt.  It is kept
+/// separate from the durable user-message event because that transcript event
+/// can be broadcast or replayed from history and therefore cannot identify the
+/// phone request by itself.
+public struct DSHPromptAccepted: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let requestId: String
+
+    public init(sessionId: String, requestId: String) {
+        self.sessionId = sessionId
+        self.requestId = requestId
+    }
+}
+
 public struct DSHAssistantDelta: Codable, Sendable, Equatable {
     public let messageId: String
     public let text: String
@@ -1430,6 +1444,7 @@ public enum DSHEventKind: Sendable, Equatable {
     case modelChanged(DSHModelChangeNotice)
     case commandResult(DSHCommandResult)
     case attachmentUploaded(DSHUploadedAttachment)
+    case promptAccepted(DSHPromptAccepted)
     case assistantReasoning(DSHReasoning)
     case questionAsked(DSHQuestionRequest)
     case questionResolved(DSHQuestionResolution)
@@ -1492,6 +1507,7 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "session.model.changed": return decode(DSHModelChangeNotice.self, payload).map(DSHEventKind.modelChanged) ?? .unknown
         case "command.result": return decode(DSHCommandResult.self, payload).map(DSHEventKind.commandResult) ?? .unknown
         case "attachment.uploaded": return decode(DSHUploadedAttachment.self, payload).map(DSHEventKind.attachmentUploaded) ?? .unknown
+        case "prompt.accepted": return decode(DSHPromptAccepted.self, payload).map(DSHEventKind.promptAccepted) ?? .unknown
         case "assistant.reasoning": return decode(DSHReasoning.self, payload).map(DSHEventKind.assistantReasoning) ?? .unknown
         case "question.asked": return decode(DSHQuestionRequest.self, payload).map(DSHEventKind.questionAsked) ?? .unknown
         case "question.resolved": return decode(DSHQuestionResolution.self, payload).map(DSHEventKind.questionResolved) ?? .unknown

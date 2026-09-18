@@ -69,4 +69,42 @@ describe('bridge idempotency cache', () => {
     await expect(cache.respond('same', 'b'.repeat(64), request(), response().value, async () => undefined))
       .rejects.toMatchObject<HttpError>({ status: 409 })
   })
+
+  it('allows a same-id retry after an explicit no-side-effect failure', async () => {
+    const cache = new IdempotentHttpResponses()
+    let executions = 0
+    const first = response()
+    await cache.respond('recoverable', 'c'.repeat(64), request(), first.value, async (capture) => {
+      executions += 1
+      capture.writeHead(503, { 'x-dsh-idempotency-outcome': 'retryable' })
+      capture.end('try again')
+    })
+    const second = response()
+    await cache.respond('recoverable', 'c'.repeat(64), request(), second.value, async (capture) => {
+      executions += 1
+      capture.writeHead(202)
+      capture.end('accepted')
+    })
+    expect(executions).toBe(2)
+    expect(second.result.body).toBe('accepted')
+  })
+
+  it('replays an unknown failure instead of repeating an ambiguous side effect', async () => {
+    const cache = new IdempotentHttpResponses()
+    let executions = 0
+    const first = response()
+    await cache.respond('unknown', 'd'.repeat(64), request(), first.value, async (capture) => {
+      executions += 1
+      capture.writeHead(500)
+      capture.end('unknown')
+    })
+    const second = response()
+    await cache.respond('unknown', 'd'.repeat(64), request(), second.value, async (capture) => {
+      executions += 1
+      capture.writeHead(201)
+      capture.end('duplicated')
+    })
+    expect(executions).toBe(1)
+    expect(second.result.body).toBe('unknown')
+  })
 })

@@ -931,6 +931,38 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.failedSend)
     }
 
+    @MainActor
+    func testOldPromptTimeoutCannotFailAReusedRequestId() async {
+        let sid = "retry-timer-\(UUID().uuidString)"
+        let requestID = "retry-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        model.sendAckTimeout = 0.05
+        model.sendPrompt("first", attachments: [], to: sid, requestId: requestID)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        model.sendPrompt("second", attachments: [], to: sid, requestId: requestID)
+
+        // The first timer fires during the second attempt's acceptance window;
+        // its generation must not remove the replacement pending send.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 1)
+        XCTAssertNil(model.failedSend)
+        model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
+        XCTAssertEqual(model.pendingSendCount(for: sid), 0)
+    }
+
+    func testPromptAcceptanceReceiptDecodesAsRequestScopedEvent() {
+        let event = DSHEvent(envelope: DSHEnvelope(
+            messageId: "prompt-1", deviceId: "phone-1", machineId: "machine-1",
+            sessionId: "session-1", sequence: 1, type: "prompt.accepted",
+            payload: .object(["sessionId": .string("session-1"), "requestId": .string("prompt-1")])
+        ))
+        guard case .promptAccepted(let receipt) = event.kind else {
+            return XCTFail("prompt.accepted should decode as a request receipt")
+        }
+        XCTAssertEqual(receipt.sessionId, "session-1")
+        XCTAssertEqual(receipt.requestId, "prompt-1")
+    }
+
     func testToolsFoldIntoPrecedingAssistantTurn() {
         let entries: [DSHTranscriptEntry] = [
             .turn(DSHTranscriptBlock(id: "q", messages: [

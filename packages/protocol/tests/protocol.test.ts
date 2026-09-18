@@ -37,6 +37,20 @@ describe("DSH Anywhere wire protocol", () => {
     }
   });
 
+  it("parses a targeted prompt acceptance receipt", () => {
+    const parsed = EventEnvelopeSchema.parse({
+      ...envelopeFields,
+      sessionId: "session-1",
+      type: "prompt.accepted",
+      payload: { sessionId: "session-1", requestId: "prompt-1" },
+    });
+
+    expect(parsed.type).toBe("prompt.accepted");
+    if (parsed.type === "prompt.accepted") {
+      expect(parsed.payload.requestId).toBe("prompt-1");
+    }
+  });
+
   it("keeps transient streaming controls explicit and opt-in", () => {
     const open = CommandEnvelopeSchema.parse({
       version: PROTOCOL_VERSION,

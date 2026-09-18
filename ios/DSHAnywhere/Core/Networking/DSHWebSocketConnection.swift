@@ -518,6 +518,16 @@ public actor DSHWebSocketConnection {
         guard command.type == "session.list" else { return nil }
         latestSessionSnapshotRequestGeneration += 1
         let generation = latestSessionSnapshotRequestGeneration
+        // A newer explicit query supersedes every older one immediately. Keep
+        // the old ids in the table so a late response can still be rejected,
+        // but do not let an abandoned older request block unsolicited refreshes
+        // if the newest query later fails.
+        let supersededRequestIDs = sessionSnapshotRequests.compactMap { requestID, request in
+            request.status == .pending ? requestID : nil
+        }
+        for requestID in supersededRequestIDs {
+            sessionSnapshotRequests[requestID]?.status = .expired
+        }
         sessionSnapshotRequests[command.requestId] = SessionSnapshotRequest(generation: generation, status: .pending)
         // A timed-out response must not turn an unrelated future event into a
         // reset. The bounded set also preserves the most recent refreshes when

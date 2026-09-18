@@ -325,6 +325,16 @@ export const AttachmentUploadedPayloadSchema = StrictObject({
 });
 export type AttachmentUploadedPayload = z.infer<typeof AttachmentUploadedPayloadSchema>;
 
+/** A prompt was accepted by the local Harness.  This is deliberately separate
+ * from the durable `user.message.accepted` transcript event: the latter may be
+ * broadcast or arrive from history, while this request receipt is targeted and
+ * safe to replay when the original acknowledgement was lost. */
+export const PromptAcceptedPayloadSchema = StrictObject({
+  sessionId: IdentifierSchema,
+  requestId: IdentifierSchema,
+});
+export type PromptAcceptedPayload = z.infer<typeof PromptAcceptedPayloadSchema>;
+
 /**
  * Model reasoning is deliberately kept out of the answer markdown: the phone
  * transcript stays readable, and a client that wants the chain-of-thought can
@@ -406,6 +416,7 @@ export const EventEnvelopeSchema = z.discriminatedUnion("type", [
   EventEnvelope("session.model.changed", SessionModelChangedPayloadSchema),
   EventEnvelope("command.result", CommandResultPayloadSchema),
   EventEnvelope("attachment.uploaded", AttachmentUploadedPayloadSchema),
+  EventEnvelope("prompt.accepted", PromptAcceptedPayloadSchema),
   EventEnvelope("assistant.reasoning", AssistantReasoningPayloadSchema),
   EventEnvelope("history.started", HistoryBatchPayloadSchema),
   EventEnvelope("history.completed", HistoryBatchPayloadSchema),
