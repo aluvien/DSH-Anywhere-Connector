@@ -566,6 +566,26 @@ describe('native bridge mutations', () => {
     expect(creates).toBe(1)
   })
 
+  it('does not execute a create whose durable operation identity is still pending', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-pending-'))
+    const key = `${CONNECTOR_DEVICE_ID}\u0000pending-create`
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      sessionCreations: { [key]: { pending: true } },
+    }))
+    let creates = 0
+    const request = mount({
+      dataDir,
+      create: async () => {
+        creates += 1
+        return { sessionId: 'should-not-run' }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'pending-create',
+    )).resolves.toMatchObject({ status: 503 })
+    expect(creates).toBe(0)
+  })
+
   it('does not let unauthenticated request ids consume trusted idempotency slots', async () => {
     const request = mount()
     for (let index = 0; index < 2_000; index += 1) {

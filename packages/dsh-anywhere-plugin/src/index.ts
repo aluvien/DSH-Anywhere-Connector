@@ -365,7 +365,8 @@ class SessionMetadataStore {
    * remain queryable after that cache expires or the Bridge restarts. */
   private sessionCreationResults = new Map<string, {
     fingerprint: string | undefined
-    response: JsonObject
+    response?: JsonObject
+    pending?: boolean
   }>()
   private persistQueue: Promise<void> = Promise.resolve()
   readonly ready: Promise<void>
@@ -400,7 +401,19 @@ class SessionMetadataStore {
     if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
       throw new HttpError(409, 'idempotency key was reused with different request data')
     }
+    if (entry.response === undefined) {
+      // A previous Bridge process recorded the operation before invoking the
+      // native create but died before it could learn the session id. Never
+      // execute that request a second time; let the client refresh/query the
+      // authoritative session list instead.
+      throw new HttpError(503, 'session creation result is still unknown', 'unknown')
+    }
     return entry.response
+  }
+
+  async setSessionCreationPending(key: string, fingerprint: string | undefined): Promise<void> {
+    this.sessionCreationResults.set(key, { fingerprint, pending: true })
+    await this.persist()
   }
 
   async setSessionCreationResult(key: string, fingerprint: string | undefined,
@@ -476,6 +489,8 @@ class SessionMetadataStore {
           const response = raw.response
           if (typeof response === 'object' && response !== null && !Array.isArray(response)) {
             this.sessionCreationResults.set(key, { fingerprint, response: response as JsonObject })
+          } else if (raw.pending === true) {
+            this.sessionCreationResults.set(key, { fingerprint, pending: true })
           }
         }
       }
@@ -1530,6 +1545,12 @@ async function handleHttp(
       : permissionModeOf(body.permissionMode)
     if (permissionMode !== undefined && !isPermissionPreset(permissionMode)) {
       throw new HttpError(400, 'Harness permission presets are read-only, workspace-write and danger-full-access')
+    }
+    if (durableKey !== undefined) {
+      // Record the operation identity before invoking Harness.  If this
+      // process dies while native creation is in flight, a restarted Bridge
+      // has a durable tombstone and will refuse a duplicate execution.
+      await metadata.setSessionCreationPending(durableKey, fingerprint)
     }
     const result = await ctx.sessionController.create({
       ...(cwd === undefined ? {} : { cwd }),
