@@ -6,6 +6,8 @@ import Foundation
 protocol DSHAppTransport: Sendable {
     func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile
     func connect() async -> AsyncThrowingStream<DSHEvent, Error>
+    /// Keeps the handshake/resume snapshot aligned with the visible archive filter.
+    func setIncludeArchived(_ value: Bool) async
     func send(_ command: DSHCommand) async throws
     func disconnect() async
     func forgetPairing() async throws
@@ -28,6 +30,7 @@ actor DSHRemoteTransport: DSHAppTransport {
     private let store: DSHProfileStore
     private var connection: DSHWebSocketConnection?
     private var relaySchema: (url: URL, revision: Int)?
+    private var includeArchivedSessions = false
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -65,8 +68,14 @@ actor DSHRemoteTransport: DSHAppTransport {
         let socket = DSHWebSocketConnection(configuration: .init(
             url: relayURL, bearerToken: token, deviceId: profile.deviceId, machineId: profile.machineId
         ))
+        await socket.setIncludeArchived(includeArchivedSessions)
         connection = socket
         return await socket.connect()
+    }
+
+    func setIncludeArchived(_ value: Bool) async {
+        includeArchivedSessions = value
+        await connection?.setIncludeArchived(value)
     }
 
     func send(_ command: DSHCommand) async throws {
@@ -181,6 +190,8 @@ actor DSHPreviewTransport: DSHAppTransport {
         emit(type: "connection.ready", payload: .object([:]))
         return pair.stream
     }
+
+    func setIncludeArchived(_ value: Bool) async {}
 
     func send(_ command: DSHCommand) async throws {
         switch command.type {

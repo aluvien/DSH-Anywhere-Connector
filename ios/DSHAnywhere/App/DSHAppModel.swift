@@ -133,6 +133,8 @@ final class DSHAppModel: ObservableObject {
     /// token. This is what keeps live output responsive without a hot CPU.
     private var pendingEvents: [DSHEvent] = []
     private var eventFlushTask: Task<Void, Never>?
+    /// Invalidates delayed callbacks when the active machine/socket changes.
+    private var machineStateGeneration = 0
     private static let eventBatchNanoseconds: UInt64 = 50_000_000
     /// A prompt upload completes before the Harness emits its accepted user
     /// message. Queue the local thumbnails so that event can attach them to the
@@ -182,10 +184,16 @@ final class DSHAppModel: ObservableObject {
     /// the previous machine's socket, so their timeouts die here too (the
     /// state reset already drops any carried-over rows).
     private func resetTransientRequestState() {
+        machineStateGeneration += 1
         pendingEvents.removeAll(keepingCapacity: false)
         transcriptEntriesCache.removeAll(keepingCapacity: false)
         transcriptSectionsCache.removeAll(keepingCapacity: false)
         pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
+        pendingMessageAttachmentsBySession.removeAll(keepingCapacity: false)
+        pendingSendsByRequestID.removeAll(keepingCapacity: false)
+        sendAttemptGenerations.removeAll(keepingCapacity: false)
+        uploadWaitRequestIDs.removeAll(keepingCapacity: false)
+        failedSend = nil
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
         lastOpenSessionAt.removeAll(keepingCapacity: false)
@@ -487,12 +495,14 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        resetTransientRequestState()
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
             self.machineName = machine.machineName
             self.machineID = machine.machineId
+            // Restore only after the active identity changes. Restoring before
+            // this point reads A's key and can later overwrite B's queue.
+            self.resetTransientRequestState()
             self.state = DSHStoreState()
             self.refreshMachines()
             self.connect()
@@ -554,6 +564,7 @@ final class DSHAppModel: ObservableObject {
         state.bridgeReachable = nil
         eventTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.transport.setIncludeArchived(self.showArchivedSessions)
             let stream = await transport.connect()
             do {
                 for try await event in stream {
@@ -720,6 +731,7 @@ final class DSHAppModel: ObservableObject {
 
     func setShowArchived(_ value: Bool) {
         showArchivedSessions = value
+        Task { await transport.setIncludeArchived(value) }
         refreshSessions(includeArchived: value)
     }
 
@@ -917,7 +929,11 @@ final class DSHAppModel: ObservableObject {
     /// retry instead of only flashing an alert, and drop its staged
     /// thumbnails so they cannot attach to a later, unrelated message.
     /// Internal for tests.
-    func parkFailedPromptSend(_ command: DSHCommand, error: Error) {
+    func parkFailedPromptSend(_ command: DSHCommand, error: Error,
+                              attempt: Int? = nil, machineGeneration: Int? = nil) {
+        if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
+        if let attempt, pendingSendsByRequestID[command.requestId]?.attempt != attempt { return }
+        if attempt != nil && pendingSendsByRequestID[command.requestId] == nil { return }
         pendingSendsByRequestID.removeValue(forKey: command.requestId)
         var receipts: [String] = []
         var text = ""
@@ -977,14 +993,18 @@ final class DSHAppModel: ObservableObject {
         var text: String
         let mode: String
         let sentAt: Date
+        /// Request identity for entries sent directly to the server queue.
+        /// Older persisted entries have no identity and are never retired by
+        /// an unrelated history event.
+        let requestId: String?
         /// False = held locally (editable, cancellable, sendable). True =
         /// already sent to the server queue (bubble mirror only).
         let sent: Bool
 
         init(id: String = UUID().uuidString, text: String, mode: String,
-             sentAt: Date = .now, sent: Bool = false) {
+             sentAt: Date = .now, sent: Bool = false, requestId: String? = nil) {
             self.id = id; self.text = text; self.mode = mode
-            self.sentAt = sentAt; self.sent = sent
+            self.sentAt = sentAt; self.sent = sent; self.requestId = requestId
         }
     }
 
@@ -1001,16 +1021,16 @@ final class DSHAppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         queuedPromptsBySession[sessionID, default: []].append(
-            DSHQueuedPrompt(text: String(trimmed.prefix(2000)), mode: "queue"))
+            DSHQueuedPrompt(text: trimmed, mode: "queue"))
         persistQueuedPrompts()
     }
 
     /// Mirrors an attachment send that went straight to the server queue.
-    func noteQueuedPrompt(text: String, mode: String, for sessionID: String) {
+    func noteQueuedPrompt(text: String, mode: String, requestId: String, for sessionID: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         queuedPromptsBySession[sessionID, default: []].append(
-            DSHQueuedPrompt(text: String(trimmed.prefix(500)), mode: mode, sent: true))
+            DSHQueuedPrompt(text: trimmed, mode: mode, sent: true, requestId: requestId))
         persistQueuedPrompts()
     }
 
@@ -1029,7 +1049,7 @@ final class DSHAppModel: ObservableObject {
         guard !trimmed.isEmpty,
               var queue = queuedPromptsBySession[sessionID],
               let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return }
-        queue[index].text = String(trimmed.prefix(2000))
+        queue[index].text = trimmed
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
     }
@@ -1084,11 +1104,17 @@ final class DSHAppModel: ObservableObject {
 
     /// Retires the oldest queued entry whose text matches an accepted user
     /// message (the queued prompt surfacing for its turn).
-    func matchQueuedPrompt(text: String, sessionID: String) {
+    func matchQueuedPrompt(text: String, sessionID: String, requestID: String?) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard var queue = queuedPromptsBySession[sessionID],
-              let index = queue.firstIndex(where: { $0.text == trimmed }) else { return }
+              // Only entries that were already submitted to the server can be
+              // retired, and a modern entry must match its request identity.
+              // Legacy entries without an identity are intentionally retained
+              // rather than guessed away by a history or other-device event.
+              let index = queue.firstIndex(where: {
+                  $0.sent && $0.requestId != nil && $0.requestId == requestID && $0.text == trimmed
+              }) else { return }
         queue.remove(at: index)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
@@ -1099,7 +1125,16 @@ final class DSHAppModel: ObservableObject {
     private func retireQueuedPrompt(_ event: DSHEvent) {
         guard case .userMessageAccepted(let message) = event.kind,
               let sessionId = event.envelope.sessionId else { return }
-        matchQueuedPrompt(text: message.markdown, sessionID: sessionId)
+        matchQueuedPrompt(text: message.markdown, sessionID: sessionId,
+                          requestID: event.envelope.messageId)
+    }
+
+    private func retireQueuedPrompt(requestID: String, sessionID: String) {
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.sent && $0.requestId == requestID }) else { return }
+        queue.remove(at: index)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
     }
 
     /// A prompt acceptance is a request-scoped receipt, not a transcript row.
@@ -1108,6 +1143,7 @@ final class DSHAppModel: ObservableObject {
     private func confirmPromptAccepted(_ event: DSHEvent) {
         guard case .promptAccepted(let receipt) = event.kind else { return }
         confirmPendingSend(text: "", sessionID: receipt.sessionId, requestID: receipt.requestId)
+        retireQueuedPrompt(requestID: receipt.requestId, sessionID: receipt.sessionId)
     }
 
     /// When a turn settles, fire the oldest locally held prompt (FIFO — the
@@ -1298,6 +1334,8 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func send(_ command: DSHCommand) {
+        let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
+        let machineGeneration = self.machineStateGeneration
         Task { @MainActor [weak self] in
             do { try await self?.transport.send(command) }
             catch {
@@ -1307,7 +1345,8 @@ final class DSHAppModel: ObservableObject {
                 // its text intact) instead of only flashing an alert while
                 // the draft is already gone.
                 if command.type == "prompt.send" {
-                    self.parkFailedPromptSend(command, error: error)
+                    self.parkFailedPromptSend(command, error: error, attempt: attempt,
+                                               machineGeneration: machineGeneration)
                 } else {
                     self.errorMessage = error.localizedDescription
                 }

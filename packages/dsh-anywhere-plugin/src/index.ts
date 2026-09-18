@@ -228,6 +228,8 @@ export const CONNECTOR_DEVICE_NAME = 'DSH Anywhere Connector'
 interface ConnectorLease {
   readonly connectorId: string
   readonly generation: number
+  readonly relayGeneration: number
+  readonly relayEpoch: string
 }
 
 export class PairingRateLimiter {
@@ -732,6 +734,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   /** Each Connector process owns a lease on the Relay presence it reports.
    * A superseded process must not be able to clear the replacement's state. */
   const relayDeviceLeases = new Map<string, ConnectorLease>()
+  /** Highest Relay machine lease observed for each phone. Bridge socket
+   * ordering is only a tie-breaker; the Relay lease is the ownership source. */
+  const latestRelayGenerations = new Map<string, { epoch: string; generation: number }>()
+  const retiredRelayEpochs = new Set<string>()
   const clientConnectorIds = new Map<WebSocket, string>()
   const connectorGenerations = new Map<string, number>()
   const clientConnectorGenerations = new Map<WebSocket, number>()
@@ -741,7 +747,6 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     return generation !== undefined && [...clientConnectorGenerations.values()].includes(generation)
       ? generation : undefined
   }
-  const latestConnectorGeneration = (): number => Math.max(0, ...[...connectorGenerations.values()])
   const hasActiveConnector = (connectorId: string): boolean =>
     [...clientConnectorIds.entries()].some(([client, value]) => value === connectorId && client.readyState === WebSocket.OPEN)
   const hasRemoteDecisionClient = (): boolean => relayDevices.size > 0 ||
@@ -780,8 +785,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             questions,
             relayDevices,
             relayDeviceLeases,
+            latestRelayGenerations,
+            retiredRelayEpochs,
             connectorGenerationOf,
-            latestConnectorGeneration,
             () => {
               if (!hasRemoteDecisionClient()) {
                 approvals.rejectAll()
@@ -1194,8 +1200,9 @@ async function handleHttp(
   questions: PendingQuestions,
   relayDevices: Set<string>,
   relayDeviceLeases: Map<string, ConnectorLease>,
+  latestRelayGenerations: Map<string, { epoch: string; generation: number }>,
+  retiredRelayEpochs: Set<string>,
   connectorGenerationOf: (connectorId: string) => number | undefined,
-  latestConnectorGeneration: () => number,
   onRemotePresenceChanged: () => void,
 ): Promise<void> {
   await metadata.ready
@@ -1253,15 +1260,38 @@ async function handleHttp(
       // report again after its own socket is established.
       throw new HttpError(409, 'connector is no longer connected')
     }
+    const relayGeneration = typeof body.relayGeneration === 'number' ? body.relayGeneration : undefined
+    const relayEpoch = stringOf(body.relayEpoch)
+    if (relayGeneration === undefined || !Number.isSafeInteger(relayGeneration) || relayGeneration < 1) {
+      throw new HttpError(400, 'relayGeneration is required')
+    }
+    if (relayEpoch.length === 0 || relayEpoch.length > 256) {
+      throw new HttpError(400, 'relayEpoch is required')
+    }
     if (body.online === true) {
-      const newestGeneration = latestConnectorGeneration()
-      if (generation === newestGeneration) {
-        relayDeviceLeases.set(deviceId, { connectorId, generation })
-        relayDevices.add(deviceId)
+      if (retiredRelayEpochs.has(relayEpoch)) {
+        throw new HttpError(409, 'Relay connector epoch is stale')
       }
+      const latestRelayLease = latestRelayGenerations.get(deviceId)
+      if (latestRelayLease?.epoch === relayEpoch && relayGeneration < latestRelayLease.generation) {
+        throw new HttpError(409, 'Relay connector lease is stale')
+      }
+      const currentLease = relayDeviceLeases.get(deviceId)
+      const sameRelayLease = currentLease?.relayEpoch === relayEpoch &&
+        currentLease.relayGeneration === relayGeneration
+      const bridgeIsCurrent = currentLease === undefined || !sameRelayLease || generation >= currentLease.generation
+      if (bridgeIsCurrent) {
+        if (latestRelayLease !== undefined && latestRelayLease.epoch !== relayEpoch) {
+          retiredRelayEpochs.add(latestRelayLease.epoch)
+        }
+        latestRelayGenerations.set(deviceId, { epoch: relayEpoch, generation: relayGeneration })
+        relayDeviceLeases.set(deviceId, { connectorId, generation, relayGeneration, relayEpoch })
+        relayDevices.add(deviceId)
+      } else throw new HttpError(409, 'Bridge connector lease is stale')
     } else if (body.online === false) {
       const lease = relayDeviceLeases.get(deviceId)
-      if (lease?.connectorId === connectorId && lease.generation === generation) {
+      if (lease?.connectorId === connectorId && lease.generation === generation &&
+          lease.relayGeneration === relayGeneration && lease.relayEpoch === relayEpoch) {
         relayDeviceLeases.delete(deviceId)
         relayDevices.delete(deviceId)
       }
@@ -2293,9 +2323,12 @@ export function normalizeSessionEvents(
     const source = recordOf(data.source)
     if (source.kind !== 'user') return []
     const attachments = contentAttachments(data.content)
+    const requestId = typeof data.requestId === 'string' && data.requestId.length > 0
+      ? data.requestId : undefined
     return [{
       type: 'user.message.accepted',
       sessionId,
+      ...(requestId === undefined ? {} : { messageId: requestId }),
       payload: {
         id: stringOr(data.id, randomUUID()),
         role: 'user',

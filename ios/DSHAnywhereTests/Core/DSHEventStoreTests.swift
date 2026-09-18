@@ -871,15 +871,34 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(model.queuedPrompts(for: sid).first?.text, "first-edited")
         XCTAssertTrue(model.cancelQueuedPrompt(id: first.id, sessionID: sid))
         XCTAssertEqual(model.queuedPrompts(for: sid).map(\.text), ["second"])
+        // A broadcast/history message with the same text cannot consume an
+        // entry that has not been sent yet.
+        model.holdQueuedPrompt(text: "server", for: sid)
+        model.matchQueuedPrompt(text: "server", sessionID: sid, requestID: "other-request")
+        XCTAssertTrue(model.queuedPrompts(for: sid).contains(where: { !$0.sent && $0.text == "server" }))
         // Server-sent mirrors refuse local cancel; acceptance still retires.
-        model.noteQueuedPrompt(text: "server", mode: "queue", for: sid)
+        let queuedRequestID = "queued-\(UUID().uuidString)"
+        model.noteQueuedPrompt(text: "server", mode: "queue", requestId: queuedRequestID, for: sid)
         let server = model.queuedPrompts(for: sid).first(where: { $0.text == "server" })!
         XCTAssertTrue(server.sent)
         XCTAssertFalse(model.cancelQueuedPrompt(id: server.id, sessionID: sid))
-        model.matchQueuedPrompt(text: "server", sessionID: sid)
+        model.matchQueuedPrompt(text: "server", sessionID: sid, requestID: queuedRequestID)
         let second = model.queuedPrompts(for: sid).first(where: { $0.text == "second" })!
         XCTAssertEqual(model.takeQueuedPrompt(id: second.id, sessionID: sid)?.text, "second")
+        let heldServer = model.queuedPrompts(for: sid).first(where: { !$0.sent && $0.text == "server" })!
+        XCTAssertTrue(model.cancelQueuedPrompt(id: heldServer.id, sessionID: sid))
         XCTAssertTrue(model.queuedPrompts(for: sid).isEmpty)
+    }
+
+    @MainActor
+    func testQueuedPromptPreservesFullBodyBeyondPreviewLength() {
+        let sid = "q-long-\(UUID().uuidString)"
+        let body = String(repeating: "界", count: 2_001)
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        model.holdQueuedPrompt(text: body, for: sid)
+        XCTAssertEqual(model.queuedPrompts(for: sid).first?.text, body)
+        let item = model.queuedPrompts(for: sid).first!
+        XCTAssertEqual(model.takeQueuedPrompt(id: item.id, sessionID: sid)?.text, body)
     }
 
     @MainActor
@@ -948,6 +967,20 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.failedSend)
         model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
         XCTAssertEqual(model.pendingSendCount(for: sid), 0)
+    }
+
+    @MainActor
+    func testLateFailureFromOlderPromptAttemptCannotOverwriteRetry() {
+        let sid = "retry-error-\(UUID().uuidString)"
+        let requestID = "retry-error-request-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        model.sendPrompt("first", attachments: [], to: sid, requestId: requestID)
+        let first = DSHCommand.sendPrompt(deviceId: "ios-device", machineId: "machine",
+                                          sessionId: sid, text: "first", requestId: requestID)
+        model.sendPrompt("second", attachments: [], to: sid, requestId: requestID)
+        model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
+        model.parkFailedPromptSend(first, error: NSError(domain: "late", code: 1), attempt: 1)
+        XCTAssertNil(model.failedSend)
     }
 
     func testPromptAcceptanceReceiptDecodesAsRequestScopedEvent() {
@@ -1300,6 +1333,8 @@ private actor CorrelationTransport: DSHAppTransport {
         continuation = stream.continuation
         return stream.stream
     }
+
+    func setIncludeArchived(_ value: Bool) async {}
 
     func send(_ command: DSHCommand) async throws {
         commands.append(command)

@@ -16,6 +16,8 @@ export interface DeviceRecord {
   readonly name: string;
   readonly tokenHash: string;
   readonly createdAt: number;
+  /** A persisted tombstone makes a failed final delete safe to retry. */
+  revokedAt?: number;
 }
 
 interface RegistryFile {
@@ -187,7 +189,7 @@ export class Registry {
   /** Devices paired to one machine, oldest first. Never exposes token hashes. */
   public listDevices(machineId: string): readonly DeviceSummary[] {
     return Object.values(this.state.devices)
-      .filter((device) => device.machineId === machineId)
+      .filter((device) => device.machineId === machineId && device.revokedAt === undefined)
       .sort((left, right) => left.createdAt - right.createdAt)
       .map((device) => ({ deviceId: device.id, name: device.name, createdAt: device.createdAt }));
   }
@@ -199,15 +201,31 @@ export class Registry {
   public async revokeDevice(machineId: string, deviceId: string): Promise<boolean> {
     const device = this.state.devices[deviceId];
     if (device === undefined || device.machineId !== machineId) return false;
+    // Persist a tombstone before removing the record. If either write fails,
+    // the in-memory and (when the first write succeeded) on-disk record stays
+    // non-authenticating, while a later DELETE can retry the unfinished step.
+    if (device.revokedAt === undefined) {
+      device.revokedAt = Date.now();
+      await this.persist();
+    }
     delete this.state.devices[deviceId];
-    await this.persist();
+    try {
+      await this.persist();
+    } catch (error) {
+      // Keep the tombstone in memory so the token remains unusable and the
+      // next revoke call can retry the final removal.
+      this.state.devices[deviceId] = device;
+      throw error;
+    }
     return true;
   }
 
-  public authenticate(token: string): RelayPrincipal | undefined {    for (const machine of Object.values(this.state.machines)) {
+  public authenticate(token: string): RelayPrincipal | undefined {
+    for (const machine of Object.values(this.state.machines)) {
       if (secretEquals(machine.tokenHash, token)) return { role: "machine", machineId: machine.id };
     }
     for (const device of Object.values(this.state.devices)) {
+      if (device.revokedAt !== undefined) continue;
       if (secretEquals(device.tokenHash, token)) {
         return { role: "device", machineId: device.machineId, deviceId: device.id };
       }
@@ -240,7 +258,8 @@ const isMachine = (value: unknown): value is MachineRecord =>
 
 const isDevice = (value: unknown): value is DeviceRecord =>
   isRecord(value) && typeof value.id === "string" && typeof value.machineId === "string" && typeof value.name === "string" &&
-  typeof value.tokenHash === "string" && typeof value.createdAt === "number";
+  typeof value.tokenHash === "string" && typeof value.createdAt === "number" &&
+  (value.revokedAt === undefined || typeof value.revokedAt === "number");
 
 const isRegistryFile = (value: unknown): value is RegistryFile => {
   if (!isRecord(value) || value.version !== 1 || !isRecord(value.machines) || !isRecord(value.devices)) return false;

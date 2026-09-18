@@ -110,7 +110,8 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertEqual(commands[0].type, "connection.resume")
         XCTAssertEqual(commands[0].deviceId, "device")
         XCTAssertEqual(commands[0].machineId, "machine")
-        XCTAssertEqual(commands[0].payload, .object(["lastSequence": .number(7)]))
+        XCTAssertEqual(commands[0].payload, .object(["lastSequence": .number(7),
+                                                      "includeArchived": .bool(false)]))
         XCTAssertEqual(commands[1].type, "session.list")
         XCTAssertEqual(commands[1].deviceId, "device")
         XCTAssertEqual(commands[1].machineId, "machine")

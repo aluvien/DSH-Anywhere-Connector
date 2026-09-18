@@ -99,6 +99,11 @@ export class DSHAnywhereConnector {
   /** A new Bridge socket gets a new lease identity.  Presence requests from a
    * dead socket must not be mistaken for requests from its replacement. */
   private bridgeConnectorId: string | undefined;
+  /** Server-issued monotonic lease for the current Relay machine socket. */
+  private relayLeaseGeneration: number | undefined;
+  private relayEpoch: string | undefined;
+  /** Last Bridge event cursor acknowledged by this Connector. */
+  private bridgeAfterSequence = 0;
   private relay: WebSocketLike | undefined;
   private bridge: WebSocketLike | undefined;
   private relayTimer: NodeJS.Timeout | undefined;
@@ -143,6 +148,8 @@ export class DSHAnywhereConnector {
   private readonly commandExecutions = new Map<string, {
     promise: Promise<CommandExecutionOutcome>
     expiresAt: number
+    /** Unbounded only for one active request; survives transport queue eviction. */
+    events: EventEnvelope[]
   }>();
   /** Keeps correlated results for the same lifetime as command dedupe. A
    * replay receives a fresh transport sequence so iOS does not discard it as
@@ -190,6 +197,9 @@ export class DSHAnywhereConnector {
     this.relay = undefined;
     this.bridge = undefined;
     this.bridgeConnectorId = undefined;
+    this.relayLeaseGeneration = undefined;
+    this.relayEpoch = undefined;
+    this.bridgeAfterSequence = 0;
     this.pendingEvents.length = 0;
     this.recentEvents.length = 0;
     this.pendingEventBytes = 0;
@@ -215,6 +225,10 @@ export class DSHAnywhereConnector {
       if (this.relay !== socket || !this.running) return;
       this.relayAttempts = 0;
       this.state = "connected";
+      // Compatibility with Relays that predate leaseGeneration. A current
+      // Relay replaces this fallback with its server-issued value at ready.
+      if (this.relayLeaseGeneration === undefined) this.relayLeaseGeneration = 1;
+      if (this.relayEpoch === undefined) this.relayEpoch = "legacy";
       this.startHeartbeat(socket);
       this.flushPendingEvents();
       this.log("info", "Relay connected");
@@ -228,9 +242,16 @@ export class DSHAnywhereConnector {
       if (this.relay !== socket) return;
       this.stopHeartbeat();
       this.relay = undefined;
+      const relayGeneration = this.relayLeaseGeneration;
+      const relayEpoch = this.relayEpoch;
+      const bridgeConnectorId = this.bridgeConnectorId;
+      this.relayLeaseGeneration = undefined;
+      this.relayEpoch = undefined;
       const disconnectedDevices = [...this.onlineRelayDevices];
       this.onlineRelayDevices.clear();
-      for (const deviceId of disconnectedDevices) void this.reportDevicePresence(deviceId, false);
+      for (const deviceId of disconnectedDevices) {
+        void this.reportDevicePresence(deviceId, false, bridgeConnectorId, relayGeneration, relayEpoch);
+      }
       if (code === 4001) {
         // Relay uses 4001 when another Connector with the same machine lease
         // takes over. Reconnecting here would make two processes continuously
@@ -248,7 +269,7 @@ export class DSHAnywhereConnector {
     const connectorId = randomUUID();
     this.bridgeConnectorId = connectorId;
     const socket = this.webSocketFactory(
-      bridgeEventsURL(this.config.bridgeBaseURL, connectorId),
+      bridgeEventsURL(this.config.bridgeBaseURL, connectorId, this.bridgeAfterSequence),
       authorization(this.config.bridgeToken),
     );
     this.bridge = socket;
@@ -256,7 +277,13 @@ export class DSHAnywhereConnector {
       if (this.bridge !== socket || !this.running) return;
       this.bridgeAttempts = 0;
       this.log("info", "Local DSH bridge connected");
-      for (const deviceId of this.onlineRelayDevices) void this.reportDevicePresence(deviceId, true, connectorId);
+      for (const deviceId of this.onlineRelayDevices) {
+        void this.reportDevicePresence(deviceId, true, connectorId, this.relayLeaseGeneration, this.relayEpoch);
+        // A Bridge greeting may contain a snapshot from before the Relay or
+        // Bridge reconnect. Refresh every currently-online device from the
+        // authoritative HTTP list instead of forwarding that stale greeting.
+        void this.pushSessionSnapshot(deviceId);
+      }
     });
     socket.on("message", (raw: RawData) => this.onBridgeMessage(socket, raw));
     socket.on("error", (error: Error) => this.log("warn", `Bridge socket error: ${safeError(error, this.config)}`));
@@ -276,6 +303,7 @@ export class DSHAnywhereConnector {
       this.log("warn", "Ignored invalid event from local DSH bridge");
       return;
     }
+    if (event.data.sequence > this.bridgeAfterSequence) this.bridgeAfterSequence = event.data.sequence;
     // The bridge socket is owned by the connector, not by one phone. Its
     // connection greeting includes an unfiltered session snapshot which can
     // race a device's current archive/list query and replace the UI with an
@@ -304,11 +332,24 @@ export class DSHAnywhereConnector {
       this.log("warn", `Relay error ${message.data.code}: ${message.data.message}`);
       return;
     }
+    if (message.data.type === "relay.ready") {
+      // Older Relays do not send the lease counter. Their server time is still
+      // a useful monotonic-ish fallback for this compatibility path; current
+      // Relays always provide the strict connection generation.
+      this.relayLeaseGeneration = message.data.leaseGeneration ?? message.data.serverTime;
+      this.relayEpoch = message.data.relayEpoch ?? "legacy";
+      for (const deviceId of this.onlineRelayDevices) {
+        void this.reportDevicePresence(deviceId, true, this.bridgeConnectorId,
+                                       this.relayLeaseGeneration, this.relayEpoch);
+      }
+      return;
+    }
     if (message.data.type === "relay.presence") {
       if (message.data.role === "device" && message.data.deviceId !== undefined) {
         if (message.data.online) this.onlineRelayDevices.add(message.data.deviceId);
         else this.onlineRelayDevices.delete(message.data.deviceId);
-        void this.reportDevicePresence(message.data.deviceId, message.data.online);
+        void this.reportDevicePresence(message.data.deviceId, message.data.online,
+                                       this.bridgeConnectorId, this.relayLeaseGeneration, this.relayEpoch);
         if (message.data.online) void this.pushSessionSnapshot(message.data.deviceId);
       }
       return;
@@ -354,7 +395,7 @@ export class DSHAnywhereConnector {
     }
     this.commandResults.delete(key);
     const promise = this.executeCommand(command);
-    this.commandExecutions.set(key, { promise, expiresAt: now + COMMAND_DEDUP_TTL_MS });
+    this.commandExecutions.set(key, { promise, expiresAt: now + COMMAND_DEDUP_TTL_MS, events: [] });
     void promise;
   }
 
@@ -363,6 +404,7 @@ export class DSHAnywhereConnector {
       // The Connector owns the Relay-side replay window. This lets a device
       // connect after the bridge has already emitted its initial snapshot.
       if (command.type === "connection.resume") {
+        this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
         this.replayAfter(command.payload.lastSequence, command.deviceId);
         // Resume is the one command every released iOS build reliably sends.
         // Follow it with an authoritative list so session discovery does not
@@ -434,15 +476,18 @@ export class DSHAnywhereConnector {
     return contentType.includes("application/json") ? response.json() : undefined;
   }
 
-  private reportDevicePresence(deviceId: string, online: boolean, connectorId = this.bridgeConnectorId): Promise<void> {
-    if (connectorId === undefined) return Promise.resolve();
+  private reportDevicePresence(deviceId: string, online: boolean,
+                               connectorId = this.bridgeConnectorId,
+                               relayGeneration = this.relayLeaseGeneration,
+                               relayEpoch = this.relayEpoch): Promise<void> {
+    if (connectorId === undefined || relayGeneration === undefined || relayEpoch === undefined) return Promise.resolve();
     const previous = this.presenceUpdates.get(deviceId) ?? Promise.resolve();
     const update = previous.catch(() => undefined).then(async () => {
       try {
         await this.callBridge({
           method: "POST",
           path: `/devices/${encodeURIComponent(deviceId)}/presence`,
-          body: { online, connectorId },
+          body: { online, connectorId, relayGeneration, relayEpoch },
         });
       } catch (error) {
         this.log("warn", `Could not report device presence to local bridge: ${safeError(error, this.config)}`);
@@ -563,7 +608,11 @@ export class DSHAnywhereConnector {
           this.deferredSessionSnapshotDevices.add(command.deviceId);
           return;
         }
-        this.sendSessionSnapshot(items, command.deviceId, undefined, command.requestId);
+        // A list is a mutable projection, not an immutable command result.
+        // Do not associate this snapshot with the mutation's idempotency cache;
+        // a duplicate mutation will query the current list instead of replaying
+        // an old snapshot with a fresh transport sequence.
+        this.sendSessionSnapshot(items, command.deviceId);
       } finally {
         const remaining = (this.inFlightSessionMutations.get(command.deviceId) ?? 1) - 1;
         if (remaining <= 0) this.inFlightSessionMutations.delete(command.deviceId);
@@ -697,13 +746,20 @@ export class DSHAnywhereConnector {
   private replayCommandResult(command: CommandEnvelope): void {
     const key = commandKey(command.machineId, command.deviceId, command.requestId);
     const cached = this.commandResults.get(key);
-    const events = cached?.events ?? this.recentEvents.filter((event) =>
+    const execution = this.commandExecutions.get(key);
+    const events = cached?.events ?? execution?.events ?? this.recentEvents.filter((event) =>
       event.messageId === command.requestId && event.deviceId === command.deviceId);
     // Reissue through sendEvent so the result receives a fresh monotonic
     // transport sequence. Reusing the original sequence is silently filtered
     // by the iOS reducer after it has processed later events.
-    for (const event of events) {
+    for (const event of events.filter((candidate) => candidate.type !== "session.snapshot")) {
       this.sendEvent({ ...event, timestamp: Date.now() }, command.deviceId, command.requestId);
+    }
+    if (isSessionProjectionMutation(command)) {
+      // Snapshots change as other clients mutate the Mac. Re-query after a
+      // duplicate instead of replaying the historical projection cached by the
+      // first execution.
+      void this.pushSessionSnapshot(command.deviceId);
     }
   }
 
@@ -849,11 +905,6 @@ export class DSHAnywhereConnector {
   }
 
   private sendEvent(event: EventEnvelope, targetDeviceId?: string, commandRequestId?: string): void {
-    const relay = this.relay;
-    if (relay === undefined || relay.readyState !== WebSocket.OPEN) {
-      this.queueEvent(event);
-      return;
-    }
     const payload = event.type === "connection.ready"
       ? { ...event.payload, machineId: this.config.machineId }
       : event.payload;
@@ -866,6 +917,14 @@ export class DSHAnywhereConnector {
     this.rememberEvent(body);
     if (commandRequestId !== undefined) {
       this.rememberCommandResult(commandKey(body.machineId, body.deviceId, commandRequestId), body);
+    }
+    const relay = this.relay;
+    if (relay === undefined || relay.readyState !== WebSocket.OPEN) {
+      // Cache the canonical event before placing it in the bounded transport
+      // queue. A request result must remain replayable even if unrelated
+      // offline events later evict their wire copies.
+      this.queueEvent(body);
+      return;
     }
     // A bridge/command response carries its intended recipient in the event
     // envelope. Preserve that address through offline queueing too; otherwise
@@ -911,6 +970,10 @@ export class DSHAnywhereConnector {
     const now = Date.now();
     for (const [entryKey, entry] of this.commandResults) {
       if (entry.expiresAt <= now && !this.commandExecutions.has(entryKey)) this.commandResults.delete(entryKey);
+    }
+    const execution = this.commandExecutions.get(key);
+    if (execution !== undefined && !execution.events.some((candidate) => candidate.messageId === event.messageId)) {
+      execution.events.push(event);
     }
     let entry = this.commandResults.get(key);
     if (entry === undefined) {
@@ -981,7 +1044,9 @@ export class DSHAnywhereConnector {
     const dropped = this.pendingEventsDropped;
     this.pendingEventBytes = 0;
     this.pendingEventsDropped = false;
-    for (const event of pending) this.sendEvent(event);
+    for (const event of pending) {
+      this.sendRelayEvent(event, event.deviceId === "broadcast" ? undefined : event.deviceId);
+    }
     if (dropped) {
       this.sendEvent({
         version: PROTOCOL_VERSION,
@@ -1230,10 +1295,12 @@ export function relayConnectURL(relayURL: string): string {
   return new URL("v1/connect", trailingSlash(relayURL)).toString();
 }
 
-export function bridgeEventsURL(bridgeBaseURL: string, connectorInstanceId?: string): string {
+export function bridgeEventsURL(bridgeBaseURL: string, connectorInstanceId?: string,
+                                afterSequence = 0): string {
   const url = new URL("events", trailingSlash(bridgeBaseURL));
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   if (connectorInstanceId !== undefined) url.searchParams.set("connectorId", connectorInstanceId);
+  if (afterSequence > 0) url.searchParams.set("after", String(afterSequence));
   return url.toString();
 }
 
@@ -1284,6 +1351,12 @@ function eventBytes(event: EventEnvelope): number {
 
 function commandKey(machineId: string, deviceId: string, requestId: string): string {
   return `${machineId}\u0000${deviceId}\u0000${requestId}`;
+}
+
+function isSessionProjectionMutation(command: CommandEnvelope): boolean {
+  return command.type === "session.archive" || command.type === "session.model"
+    || command.type === "permission.set" || command.type === "workspace.rename"
+    || command.type === "workspace.delete" || command.type === "session.rename";
 }
 
 function trailingSlash(value: string): string {

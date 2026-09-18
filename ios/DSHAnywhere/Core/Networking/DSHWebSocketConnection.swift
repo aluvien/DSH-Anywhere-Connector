@@ -109,6 +109,7 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
     case unauthorizedRelayRole
     case authenticationRequired
     case eventBufferOverflow
+    case messageTooLarge
     case relay(code: String, message: String)
     case closed
 
@@ -120,6 +121,7 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
         case .unauthorizedRelayRole: return "The Relay authenticated this connection with an unexpected role."
         case .authenticationRequired: return "The Relay credentials are no longer valid. Pair this iPhone again."
         case .eventBufferOverflow: return "The Relay event buffer overflowed; reconnecting to resynchronize."
+        case .messageTooLarge: return "This message is too large for the Relay connection."
         case .relay(let code, let message): return "Relay error \(code): \(message)"
         case .closed: return "The Relay WebSocket connection is closed."
         }
@@ -160,6 +162,7 @@ public actor DSHWebSocketConnection {
     private var activeStream: AsyncThrowingStream<DSHEvent, Error>?
     private var stopped = false
     private var streamBufferOverflowed = false
+    private var includeArchivedSessions = false
     private var _state: DSHConnectionState = .disconnected
     private var _lastSequence: Int64
     /// A restart resets Connector sequence numbers. Only a snapshot that
@@ -193,6 +196,12 @@ public actor DSHWebSocketConnection {
 
     public var state: DSHConnectionState { _state }
     public var lastSequence: Int64 { _lastSequence }
+
+    /// The UI owns the archive filter; keep reconnect/resume snapshots in the
+    /// same projection instead of silently forcing the default false value.
+    public func setIncludeArchived(_ value: Bool) {
+        includeArchivedSessions = value
+    }
 
     /// Starts one receive stream. Calling connect again returns the existing
     /// stream while a connection is active.
@@ -344,7 +353,7 @@ public actor DSHWebSocketConnection {
         case .notConnected, .closed:
             return true
         case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole,
-             .authenticationRequired, .relay:
+             .authenticationRequired, .relay, .messageTooLarge:
             // Retrying unchanged credentials or an incompatible wire message
             // cannot heal the connection and otherwise becomes a tight loop.
             return false
@@ -394,13 +403,15 @@ public actor DSHWebSocketConnection {
             sessionSnapshotRequests.removeAll(keepingCapacity: false)
             yieldControl(type: "transport.state", value: _state)
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
-                                        lastSequence: _lastSequence), over: task)
+                                        lastSequence: _lastSequence,
+                                        includeArchived: includeArchivedSessions), over: task)
             // A Relay handshake is the only readiness signal guaranteed on
             // every connection. Request the authoritative session list here,
             // rather than relying on SwiftUI onAppear or on a replayed local
             // connection.ready event that may no longer be buffered.
             let list = DSHCommand.listSessions(deviceId: configuration.deviceId,
-                                               machineId: configuration.machineId)
+                                               machineId: configuration.machineId,
+                                               includeArchived: includeArchivedSessions)
             let generation = rememberSessionSnapshotRequestIfNeeded(list)
             do {
                 try await sendRelay(list, over: task)
@@ -510,7 +521,13 @@ public actor DSHWebSocketConnection {
     private func sendRelay(_ command: DSHCommand, over task: any DSHWebSocketTasking) async throws {
         let payload = try DSHRelayPayloadMessage.wrapping(machineId: configuration.machineId,
                                                            sender: .device, body: command)
-        try await task.send(.data(try JSONEncoder().encode(payload)))
+        var encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let data = try encoder.encode(payload)
+        // Check the bytes that will actually cross the socket. In particular,
+        // slash escaping can nearly double a high-0xFF Base64 attachment.
+        guard data.count <= 16 * 1024 * 1024 else { throw DSHWebSocketError.messageTooLarge }
+        try await task.send(.data(data))
     }
 
     @discardableResult

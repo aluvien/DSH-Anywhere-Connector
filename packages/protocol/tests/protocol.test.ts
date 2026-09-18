@@ -51,6 +51,19 @@ describe("DSH Anywhere wire protocol", () => {
     }
   });
 
+  it("accepts a prompt whose content is supplied only in attachments", () => {
+    const parsed = CommandEnvelopeSchema.parse({
+      version: PROTOCOL_VERSION,
+      requestId: "prompt-attachments",
+      machineId: "mac-1",
+      deviceId: "iphone-1",
+      timestamp: 1_735_000_000_000,
+      type: "prompt.send",
+      payload: { attachments: [{ type: "file", receiptId: "receipt-1" }] },
+    });
+    expect(parsed.type).toBe("prompt.send");
+  });
+
   it("keeps transient streaming controls explicit and opt-in", () => {
     const open = CommandEnvelopeSchema.parse({
       version: PROTOCOL_VERSION,

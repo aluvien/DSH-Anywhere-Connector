@@ -2009,9 +2009,7 @@ struct ConversationView: View {
             model.draft = ""
             return
         }
-        if wasRunning && mode == "queue" {
-            model.noteQueuedPrompt(text: trimmed, mode: mode, for: sessionID)
-        }
+        let requestId = UUID().uuidString
 
         // Clear the editor immediately so a double tap cannot send the same
         // draft twice. If an upload fails, restore the not-yet-uploaded chips
@@ -2045,9 +2043,12 @@ struct ConversationView: View {
                                                                     receiptId: receipt))
                     uploadedCount += 1
                 }
+                if wasRunning && mode == "queue" {
+                    model.noteQueuedPrompt(text: trimmed, mode: mode, requestId: requestId, for: sessionID)
+                }
                 model.sendPrompt(text, attachments: receipts,
                                  messageAttachments: messageAttachments, to: sessionID,
-                                 mode: mode)
+                                 mode: mode, requestId: requestId)
             } catch {
                 model.draft = text
                 draftAttachments = Array(staged.dropFirst(uploadedCount))

@@ -462,7 +462,10 @@ export const SessionOpenPayloadSchema = StrictObject({
   /** Opt in to transient assistant-stream events for this session only. */
   streaming: z.boolean().optional(),
 });
-export const ConnectionResumePayloadSchema = StrictObject({ lastSequence: z.number().int().nonnegative() });
+export const ConnectionResumePayloadSchema = StrictObject({
+  lastSequence: z.number().int().nonnegative(),
+  includeArchived: z.boolean().optional(),
+});
 /**
  * A reference to a file that was already uploaded. The Harness resolves these
  * receipt ids out of the prompt content and binds them to the message, which is
@@ -497,7 +500,10 @@ export const PromptSendPayloadSchema = StrictObject({
 }).superRefine((value, context) => {
   const hasText = typeof value.text === "string" && value.text.trim().length > 0;
   const hasContent = value.content?.some((part) => part.type !== "text" || part.text.trim().length > 0) ?? false;
-  if (!hasText && !hasContent) context.addIssue({ code: z.ZodIssueCode.custom, message: "prompt requires text or an attachment" });
+  const hasAttachments = (value.attachments?.length ?? 0) > 0;
+  if (!hasText && !hasContent && !hasAttachments) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "prompt requires text or an attachment" });
+  }
 });
 export const TurnCancelPayloadSchema = StrictObject({});
 export const ApprovalDecidePayloadSchema = StrictObject({
@@ -653,6 +659,10 @@ export const RelayReadyMessageSchema = StrictObject({
   role: RelayRoleSchema,
   connectionId: IdentifierSchema,
   serverTime: TimestampSchema,
+  /** Monotonic lease generation for a machine connection. Older relays omit it. */
+  leaseGeneration: z.number().int().positive().optional(),
+  /** Changes when the Relay process is restarted, resetting generations. */
+  relayEpoch: IdentifierSchema.optional(),
 });
 export type RelayReadyMessage = z.infer<typeof RelayReadyMessageSchema>;
 

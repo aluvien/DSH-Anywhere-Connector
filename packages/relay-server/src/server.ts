@@ -36,8 +36,10 @@ const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
  *    bubble with its durable assistant message.
  * 9: added targeted `prompt.accepted` request receipts so a lost prompt
  *    acknowledgement can be replayed without inferring identity from text.
+ * 10: added Relay lease generation/epoch metadata for Bridge presence
+ *     ownership and Bridge reconnect cursor recovery.
  */
-const RELAY_SCHEMA_REVISION = 9;
+const RELAY_SCHEMA_REVISION = 10;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day
@@ -126,6 +128,8 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const registry = new Registry(options.registryPath);
   await registry.load();
   const connections = new Set<RelayConnection>();
+  const machineLeaseGenerations = new Map<string, number>();
+  const relayEpoch = randomUUID();
   const pairAttempts = new Map<string, PairAttempt>();
   const pairIpAttempts = new Map<string, PairAttempt>();
   const pairRateLimit = options.pairRateLimit ?? 5;
@@ -158,6 +162,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
 
   const connect = (ws: WebSocket, principal: RelayPrincipal): void => {
     const connection: RelayConnection = { id: randomUUID(), ws, principal };
+    const leaseGeneration = principal.role === "machine"
+      ? (machineLeaseGenerations.get(principal.machineId) ?? 0) + 1
+      : undefined;
+    if (leaseGeneration !== undefined) machineLeaseGenerations.set(principal.machineId, leaseGeneration);
     // Each credential represents one active lease. Replacing the old socket
     // before publishing the new one prevents duplicate local execution and
     // avoids a stale mobile socket later emitting a false offline edge.
@@ -173,6 +181,8 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       role: principal.role,
       connectionId: connection.id,
       serverTime: Date.now(),
+      ...(leaseGeneration === undefined ? {} : { leaseGeneration }),
+      relayEpoch,
     });
     for (const existing of connections) {
       if (existing === connection || existing.principal.machineId !== principal.machineId) continue;
@@ -380,20 +390,18 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         });
         return;
       }
-      if (!await registry.revokeDevice(machineId, deviceId)) {
-        respondJson(response, 404, { error: "unknown_device" });
-        return;
-      }
-      // A revoked credential must stop working at once, not whenever the socket
-      // happens to drop.
+      // Invalidate matching sockets before touching disk. Registry persistence
+      // may fail; a revoked connection must never remain authorized during the
+      // write or its asynchronous close handshake.
       for (const connection of connections) {
         if (connection.principal.role === "device" && connection.principal.deviceId === deviceId) {
-          // Invalidate the source synchronously before beginning the WebSocket
-          // close handshake.  The close callback sees the connection already
-          // removed and therefore does not emit a second offline edge.
           if (connections.delete(connection)) broadcastPresence(connection.principal, false);
           connection.ws.close(4401, "device revoked");
         }
+      }
+      if (!await registry.revokeDevice(machineId, deviceId)) {
+        respondJson(response, 404, { error: "unknown_device" });
+        return;
       }
       respondJson(response, 200, { revoked: true, deviceId });
       return;

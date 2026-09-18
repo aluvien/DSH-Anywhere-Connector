@@ -131,9 +131,11 @@ public struct DSHCommand: Codable, Sendable, Equatable {
         try container.encode(payload, forKey: .payload)
     }
 
-    public static func resume(deviceId: String, machineId: String, lastSequence: Int64) -> DSHCommand {
+    public static func resume(deviceId: String, machineId: String, lastSequence: Int64,
+                              includeArchived: Bool = false) -> DSHCommand {
         DSHCommand(deviceId: deviceId, machineId: machineId, type: "connection.resume",
-                    payload: .object(["lastSequence": .number(Double(lastSequence))]))
+                    payload: .object(["lastSequence": .number(Double(lastSequence)),
+                                      "includeArchived": .bool(includeArchived)]))
     }
 
     public static func sendPrompt(deviceId: String, machineId: String, sessionId: String,
