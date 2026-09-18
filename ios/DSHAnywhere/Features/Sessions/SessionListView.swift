@@ -738,14 +738,14 @@ struct NewSessionSheet: View {
             model: selectedModel,
             reasoningEffort: selectedReasoningEffort
         )
-        model.createSession(in: selectedWorkspace,
-                            workingDirectory: workingDirectory,
-                            branch: branch,
-                            mode: sessionMode,
-                            model: selection,
-                            permissionMode: permissionMode,
-                            initialPrompt: initialPrompt,
-                            initialAttachments: initialAttachments)
+        guard model.createSession(in: selectedWorkspace,
+                                  workingDirectory: workingDirectory,
+                                  branch: branch,
+                                  mode: sessionMode,
+                                  model: selection,
+                                  permissionMode: permissionMode,
+                                  initialPrompt: initialPrompt,
+                                  initialAttachments: initialAttachments) else { return }
         dismiss()
     }
 }

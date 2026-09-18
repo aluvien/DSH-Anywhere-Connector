@@ -24,6 +24,10 @@ interface RegistryFile {
   readonly version: 1;
   readonly machines: Record<string, MachineRecord>;
   readonly devices: Record<string, DeviceRecord>;
+  /** Machine lease counters survive a Relay restart. A random process epoch
+   * alone cannot tell the Bridge which of two delayed presence reports is
+   * newer. */
+  readonly machineLeaseGenerations?: Record<string, number>;
 }
 
 export type RelayPrincipal =
@@ -73,7 +77,12 @@ function newPairingCode(): string {
   return code;
 }
 
-const emptyRegistry = (): RegistryFile => ({ version: 1, machines: {}, devices: {} });
+const emptyRegistry = (): RegistryFile => ({
+  version: 1,
+  machines: {},
+  devices: {},
+  machineLeaseGenerations: {},
+});
 
 export const hashSecret = (value: string): string =>
   createHash("sha256").update(value, "utf8").digest("hex");
@@ -108,6 +117,22 @@ export class Registry {
       }
       throw new Error(`unable to load relay registry: ${error instanceof Error ? error.message : String(error)}`);
     }
+    if (this.state.machineLeaseGenerations === undefined) {
+      this.state = { ...this.state, machineLeaseGenerations: {} };
+    }
+  }
+
+  /** Allocate a machine connection lease that remains ordered across Relay
+   * process restarts. Presence consumers can therefore fence an old random
+   * relay epoch without guessing from wall-clock timestamps. */
+  public async nextMachineLeaseGeneration(machineId: string): Promise<number> {
+    if (this.state.machines[machineId] === undefined) throw new Error("unknown machine");
+    const counters = this.state.machineLeaseGenerations ?? {};
+    const next = (counters[machineId] ?? 0) + 1;
+    counters[machineId] = next;
+    this.state = { ...this.state, machineLeaseGenerations: counters };
+    await this.persist();
+    return next;
   }
 
   public async registerMachine(name: string): Promise<MachineRegistration> {
@@ -263,5 +288,9 @@ const isDevice = (value: unknown): value is DeviceRecord =>
 
 const isRegistryFile = (value: unknown): value is RegistryFile => {
   if (!isRecord(value) || value.version !== 1 || !isRecord(value.machines) || !isRecord(value.devices)) return false;
+  if (value.machineLeaseGenerations !== undefined &&
+      (!isRecord(value.machineLeaseGenerations) ||
+       !Object.values(value.machineLeaseGenerations).every((generation) =>
+         typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 0))) return false;
   return Object.values(value.machines).every(isMachine) && Object.values(value.devices).every(isDevice);
 };

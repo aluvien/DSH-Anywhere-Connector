@@ -143,6 +143,19 @@ final class DSHAppModel: ObservableObject {
     func isCurrentMachineGeneration(_ generation: Int) -> Bool {
         machineStateGeneration == generation
     }
+    /// The shared protocol measures prompt strings in UTF-16 code units (the
+    /// JavaScript `String.length` semantics). Validate before clearing the
+    /// editor so a rejected request leaves the user's complete draft intact.
+    static let maxPromptUTF16Length = 100_000
+
+    @discardableResult
+    func validatePromptText(_ text: String) -> Bool {
+        guard text.utf16.count <= Self.maxPromptUTF16Length else {
+            errorMessage = "消息内容不能超过 100,000 个字符。"
+            return false
+        }
+        return true
+    }
     private static let eventBatchNanoseconds: UInt64 = 50_000_000
     /// A prompt upload completes before the Harness emits its accepted user
     /// message. Queue the local thumbnails so that event can attach them to the
@@ -540,16 +553,23 @@ final class DSHAppModel: ObservableObject {
                 self.isPaired = !self.machines.isEmpty
                 return
             }
-            self.resetTransientRequestState()
-            self.state = DSHStoreState()
             self.selectedSessionID = nil
             if let active = self.profiles.activeProfile {
+                // ProfileStore selects the remaining profile while removing
+                // the active one. Change the identity first: resetTransient-
+                // RequestState restores the queue using the current machine's
+                // persistence key, and restoring it while machineID still
+                // names the deleted Mac would load A into B's memory.
                 self.machineName = active.machineName
                 self.machineID = active.machineId
+                self.resetTransientRequestState()
+                self.state = DSHStoreState()
                 self.connect()
             } else {
                 self.machineName = ""
                 self.machineID = ""
+                self.resetTransientRequestState()
+                self.state = DSHStoreState()
             }
             self.isPaired = !self.machines.isEmpty
         }
@@ -590,6 +610,7 @@ final class DSHAppModel: ObservableObject {
 
     func connect() {
         guard isPaired, eventTask == nil else { return }
+        let connectionGeneration = machineStateGeneration
         state.connectionState = .connecting
         state.transportState = .connecting
         state.machineOnline = false
@@ -598,11 +619,14 @@ final class DSHAppModel: ObservableObject {
             guard let self else { return }
             await self.transport.setIncludeArchived(self.showArchivedSessions)
             let stream = await transport.connect()
+            guard self.machineStateGeneration == connectionGeneration else { return }
             do {
                 for try await event in stream {
+                    guard self.machineStateGeneration == connectionGeneration else { return }
                     self.enqueue(event)
                 }
             } catch {
+                guard self.machineStateGeneration == connectionGeneration else { return }
                 self.flushPendingEvents()
                 self.errorMessage = error.localizedDescription
                 self.state.transportState = .failed(error.localizedDescription)
@@ -610,6 +634,7 @@ final class DSHAppModel: ObservableObject {
                 self.state.bridgeReachable = nil
                 self.state.connectionState = .failed(error.localizedDescription)
             }
+            guard self.machineStateGeneration == connectionGeneration else { return }
             self.flushPendingEvents()
             self.eventTask = nil
         }
@@ -652,6 +677,7 @@ final class DSHAppModel: ObservableObject {
 
     /// Starts a session, optionally inside a workspace.
     ///
+    @discardableResult
     func createSession(in workspace: DSHWorkspaceOption? = nil,
                        title: String? = nil,
                        workingDirectory: String? = nil,
@@ -660,7 +686,8 @@ final class DSHAppModel: ObservableObject {
                        model: DSHModelSelection? = nil,
                        permissionMode: String = "workspace-write",
                        initialPrompt: String? = nil,
-                       initialAttachments: [DSHStagedAttachment] = []) {
+                       initialAttachments: [DSHStagedAttachment] = []) -> Bool {
+        if let initialPrompt, !validatePromptText(initialPrompt) { return false }
         let requestId = UUID().uuidString
         pendingSessionCreationRequestIDs.insert(requestId)
         var payload: [String: DSHJSONValue] = [:]
@@ -706,6 +733,7 @@ final class DSHAppModel: ObservableObject {
                                   type: "session.create",
                                   payload: .object(payload))
         send(command)
+        return true
     }
 
     func refreshSessions(includeArchived: Bool? = nil) {
@@ -844,9 +872,15 @@ final class DSHAppModel: ObservableObject {
 
     func sendPrompt(_ text: String, attachments: [String],
                     messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
-                    mode: String = "queue", requestId requestedRequestID: String? = nil) {
+                    mode: String = "queue", requestId requestedRequestID: String? = nil,
+                    expectedMachineGeneration: Int? = nil,
+                    expectedMachineID: String? = nil) {
+        if let expectedMachineGeneration,
+           expectedMachineGeneration != machineStateGeneration { return }
+        if let expectedMachineID, expectedMachineID != machineID { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        guard validatePromptText(trimmed) else { return }
         if !messageAttachments.isEmpty {
             pendingMessageAttachmentsBySession[sessionID, default: []].append(messageAttachments)
         }
@@ -1003,6 +1037,7 @@ final class DSHAppModel: ObservableObject {
 
     func retryFailedSend() {
         guard let failed = failedSend else { return }
+        guard validatePromptText(failed.text) else { return }
         failedSend = nil
         // A timeout means the Mac may already have accepted the side effect.
         // Reuse the complete original command identity and mode so Connector
@@ -1052,6 +1087,7 @@ final class DSHAppModel: ObservableObject {
     func holdQueuedPrompt(text: String, for sessionID: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard validatePromptText(trimmed) else { return }
         queuedPromptsBySession[sessionID, default: []].append(
             DSHQueuedPrompt(text: trimmed, mode: "queue"))
         persistQueuedPrompts()
@@ -1061,6 +1097,7 @@ final class DSHAppModel: ObservableObject {
     func noteQueuedPrompt(text: String, mode: String, requestId: String, for sessionID: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard validatePromptText(trimmed) else { return }
         queuedPromptsBySession[sessionID, default: []].append(
             DSHQueuedPrompt(text: trimmed, mode: mode, sent: true, requestId: requestId))
         persistQueuedPrompts()
@@ -1081,6 +1118,7 @@ final class DSHAppModel: ObservableObject {
         guard !trimmed.isEmpty,
               var queue = queuedPromptsBySession[sessionID],
               let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return }
+        guard validatePromptText(trimmed) else { return }
         queue[index].text = trimmed
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
@@ -1114,6 +1152,7 @@ final class DSHAppModel: ObservableObject {
     private func flushQueuedPrompt(for sessionID: String) -> Bool {
         guard var queue = queuedPromptsBySession[sessionID],
               let index = queue.firstIndex(where: { !$0.sent }) else { return false }
+        guard validatePromptText(queue[index].text) else { return false }
         let item = queue.remove(at: index)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()

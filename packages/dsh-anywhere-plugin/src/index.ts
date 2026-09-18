@@ -66,13 +66,13 @@ export class IdempotentHttpResponses {
     let entry = this.entries.get(key)
     if (entry === undefined) {
       if (this.entries.size >= MAX_IDEMPOTENCY_ENTRIES) {
-        // Never evict an in-flight request: doing so lets a duplicate execute
-        // the same side effect a second time while the original is still
-        // running. Completed results are safe to evict; if every slot is
-        // active, reject new mutations until one settles.
-        const completed = [...this.entries].find(([, value]) => value.completed)
-        if (completed === undefined) throw new HttpError(503, 'idempotency capacity is busy')
-        this.entries.delete(completed[0])
+        // Never evict an in-flight request, and never evict an unexpired
+        // terminal record: the latter is the request-id tombstone that keeps
+        // a lost response from executing the side effect a second time. If
+        // all slots are inside their promised window, reject new mutations
+        // until capacity is available rather than silently weakening
+        // idempotency.
+        throw new HttpError(503, 'idempotency capacity is busy')
       }
       const pending: IdempotencyEntry = {
         expiresAt: Number.POSITIVE_INFINITY,
@@ -750,7 +750,6 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     relayGeneration: number
     generation: number
   }>()
-  const retiredRelayEpochs = new Set<string>()
   const clientConnectorIds = new Map<WebSocket, string>()
   const connectorGenerations = new Map<string, number>()
   const clientConnectorGenerations = new Map<WebSocket, number>()
@@ -801,7 +800,6 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             latestRelayGenerations,
             latestBridgeLeases,
             bridgeEpoch,
-            retiredRelayEpochs,
             connectorGenerationOf,
             () => {
               if (!hasRemoteDecisionClient()) {
@@ -858,13 +856,18 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       wss.handleUpgrade(req, socket, head, (client) => {
         clients.add(client)
         clientDeviceIds.set(client, device.id)
+        const requestedConnectorId = device.id === CONNECTOR_DEVICE_ID
+          ? new URL(req.url ?? '/', 'http://localhost').searchParams.get('connectorId')
+          : null
+        const bridgeConnectionId = device.id === CONNECTOR_DEVICE_ID
+          ? (requestedConnectorId !== null && requestedConnectorId.length > 0 && requestedConnectorId.length <= 256
+            ? requestedConnectorId : randomUUID())
+          : undefined
         if (device.id === CONNECTOR_DEVICE_ID) {
-          const connectorId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('connectorId')
-          const id = connectorId ?? randomUUID()
           const generation = ++nextConnectorGeneration
-          clientConnectorIds.set(client, id)
+          clientConnectorIds.set(client, bridgeConnectionId!)
           clientConnectorGenerations.set(client, generation)
-          connectorGenerations.set(id, generation)
+          connectorGenerations.set(bridgeConnectionId!, generation)
         }
         const after = parseAfter(req.url)
         const oldest = replay.after(0)[0]?.sequence
@@ -879,6 +882,11 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             machineId,
             deviceId: device.id,
             serverTime: Date.now(),
+            // The current handshake is also stored in the replay buffer.  A
+            // Connector must be able to distinguish this socket's greeting
+            // from an older greeting that happens to have a larger sequence
+            // than the replay entries already buffered for the socket.
+            ...(bridgeConnectionId === undefined ? {} : { bridgeConnectionId }),
             capabilities: [
             'sessions', 'workspaces', 'archive', 'prompt', 'attachments',
             'cancel', 'approval', 'permissions', 'models', 'commands', 'usage', 'replay', 'questions',
@@ -1227,7 +1235,6 @@ async function handleHttp(
     generation: number
   }>,
   bridgeEpoch: string,
-  retiredRelayEpochs: Set<string>,
   connectorGenerationOf: (connectorId: string) => number | undefined,
   onRemotePresenceChanged: () => void,
 ): Promise<void> {
@@ -1295,35 +1302,44 @@ async function handleHttp(
       throw new HttpError(400, 'relayEpoch is required')
     }
     if (body.online === true) {
-      if (retiredRelayEpochs.has(relayEpoch)) {
-        throw new HttpError(409, 'Relay connector epoch is stale')
-      }
       const latestRelayLease = latestRelayGenerations.get(deviceId)
-      if (latestRelayLease?.epoch === relayEpoch && relayGeneration < latestRelayLease.generation) {
+      if (latestRelayLease !== undefined &&
+          (relayGeneration < latestRelayLease.generation ||
+           (relayGeneration === latestRelayLease.generation && relayEpoch !== latestRelayLease.epoch))) {
         throw new HttpError(409, 'Relay connector lease is stale')
       }
       const latestBridgeLease = latestBridgeLeases.get(deviceId)
-      const sameRelayLease = latestBridgeLease?.relayEpoch === relayEpoch &&
-        latestBridgeLease.relayGeneration === relayGeneration
-      if (sameRelayLease && generation < latestBridgeLease!.generation) {
+      // Bridge generations fence delayed HTTP requests independently of the
+      // Relay epoch.  A random Relay epoch has no ordering semantics, so an
+      // older socket must not become authoritative merely because its epoch
+      // string differs from the current one.
+      if (latestBridgeLease !== undefined &&
+          (generation < latestBridgeLease.generation ||
+           (generation === latestBridgeLease.generation &&
+            (relayGeneration < latestBridgeLease.relayGeneration ||
+             (relayGeneration === latestBridgeLease.relayGeneration &&
+              latestBridgeLease.relayEpoch !== relayEpoch))))) {
         throw new HttpError(409, 'Bridge connector lease is stale')
       }
       const currentLease = relayDeviceLeases.get(deviceId)
       const currentRelayLease = currentLease?.relayEpoch === relayEpoch &&
         currentLease.relayGeneration === relayGeneration
-      const bridgeIsCurrent = currentLease === undefined || !currentRelayLease || generation >= currentLease.generation
+      const bridgeIsCurrent = currentLease === undefined ||
+        !currentRelayLease || generation >= currentLease.generation
       if (bridgeIsCurrent) {
-        if (latestRelayLease !== undefined && latestRelayLease.epoch !== relayEpoch) {
-          retiredRelayEpochs.add(latestRelayLease.epoch)
-        }
-        latestRelayGenerations.set(deviceId, { epoch: relayEpoch, generation: relayGeneration })
+        latestRelayGenerations.set(deviceId, {
+          epoch: relayEpoch,
+          generation: relayGeneration,
+        })
         latestBridgeLeases.set(deviceId, {
           bridgeEpoch,
           relayEpoch,
           relayGeneration,
           generation,
         })
-        relayDeviceLeases.set(deviceId, { connectorId, generation, relayGeneration, relayEpoch })
+        relayDeviceLeases.set(deviceId, {
+          connectorId, generation, relayGeneration, relayEpoch,
+        })
         relayDevices.add(deviceId)
       } else throw new HttpError(409, 'Bridge connector lease is stale')
     } else if (body.online === false) {

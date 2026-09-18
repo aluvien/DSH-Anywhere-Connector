@@ -81,6 +81,12 @@ public struct DSHEventReducer: Sendable {
             state.machineOnline = online
             state.connectionState = online ? .connected : .disconnected
             return true
+        case .protocolError(let error) where event.envelope.sequence == 0:
+            // Relay validation errors can be request-scoped without consuming
+            // a Connector replay sequence. Keep the socket healthy and still
+            // surface the error to the matching waiter/alert.
+            state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
+            return true
         default:
             break
         }

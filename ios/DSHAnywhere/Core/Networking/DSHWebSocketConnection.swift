@@ -155,6 +155,14 @@ public actor DSHWebSocketConnection {
     public typealias TaskFactory = @Sendable (URLRequest) -> any DSHWebSocketTasking
     private static let maxBufferedEvents = 512
     private static let unsolicitedSessionSnapshotPrefix = "snapshot-push-"
+    /// These errors describe one malformed or unauthorized payload. They do
+    /// not invalidate the already-authenticated WebSocket, so report them as
+    /// out-of-band protocol events instead of ending the receive stream.
+    private static let requestScopedRelayErrorCodes: Set<String> = [
+        "invalid_message", "unsupported_message", "machine_mismatch",
+        "sender_mismatch", "target_not_allowed", "body_machine_mismatch",
+        "body_device_mismatch",
+    ]
 
     private let configuration: DSHWebSocketConfiguration
     private let makeTask: TaskFactory
@@ -439,6 +447,10 @@ public actor DSHWebSocketConnection {
                 yieldControl(type: "machine.presence", value: false)
                 return false
             }
+            if Self.requestScopedRelayErrorCodes.contains(error.code) {
+                yieldRelayProtocolError(error)
+                return false
+            }
             throw DSHWebSocketError.relay(code: error.code, message: error.message)
         case .payload(let payload):
             // The Relay may notify this device about control messages. Only
@@ -591,6 +603,25 @@ public actor DSHWebSocketConnection {
             // A dropped control event still means the consumer may have
             // missed an adjacent durable event, so force a replay from the
             // last accepted sequence on the next connection.
+            streamBufferOverflowed = true
+        }
+    }
+
+    private func yieldRelayProtocolError(_ error: DSHRelayErrorMessage) {
+        let messageId = error.messageId ?? UUID().uuidString
+        let event = DSHEvent(envelope: DSHEnvelope(
+            messageId: messageId,
+            deviceId: configuration.deviceId,
+            machineId: configuration.machineId,
+            sequence: 0,
+            type: "protocol.error",
+            payload: .object([
+                "code": .string(error.code),
+                "message": .string(error.message),
+                "retryable": .bool(false),
+            ])))
+        let delivered = continuation?.yield(event)
+        if let delivered, case .dropped = delivered {
             streamBufferOverflowed = true
         }
     }

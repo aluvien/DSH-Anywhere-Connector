@@ -141,7 +141,18 @@ export class DSHAnywhereConnector {
   /** Explicit list requests must not be silently superseded by an automatic
    * refresh. Defer that refresh until the caller's pending request settles. */
   private readonly pendingSessionListRequests = new Map<string, { requestId: string; generation: number }>();
+  /** The most recent explicit list identity remains after its response settles
+   * so a late duplicate cannot change the device's archive preference. */
+  private readonly latestSessionListCommands = new Map<string, {
+    requestId: string;
+    generation: number;
+    includeArchived: boolean;
+  }>();
   private readonly deferredSessionSnapshotDevices = new Set<string>();
+  /** Workspace mutations and session projections are separate resources. A
+   * stale session query must not suppress the catalog refresh that follows a
+   * successful workspace rename/delete. */
+  private readonly deferredWorkspaceCatalogDevices = new Set<string>();
   /** Mutation-triggered refreshes remain authoritative until their own
    * post-mutation read has settled. A list request that starts in the middle
    * of that window must receive one more refresh afterwards. */
@@ -221,7 +232,9 @@ export class DSHAnywhereConnector {
     this.presenceUpdates.clear();
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
+    this.latestSessionListCommands.clear();
     this.deferredSessionSnapshotDevices.clear();
+    this.deferredWorkspaceCatalogDevices.clear();
     this.inFlightSessionMutations.clear();
   }
 
@@ -234,10 +247,6 @@ export class DSHAnywhereConnector {
       if (this.relay !== socket || !this.running) return;
       this.relayAttempts = 0;
       this.state = "connected";
-      // Compatibility with Relays that predate leaseGeneration. A current
-      // Relay replaces this fallback with its server-issued value at ready.
-      if (this.relayLeaseGeneration === undefined) this.relayLeaseGeneration = 1;
-      if (this.relayEpoch === undefined) this.relayEpoch = "legacy";
       this.startHeartbeat(socket);
       this.flushPendingEvents();
       this.log("info", "Relay connected");
@@ -315,14 +324,22 @@ export class DSHAnywhereConnector {
       return;
     }
     if (event.data.type === "connection.ready") {
-      const maxBufferedSequence = this.bridgeBufferedEvents.reduce(
-        (maximum, bufferedEvent) => Math.max(maximum, bufferedEvent.sequence), 0,
-      );
-      // The Bridge sends retained replay entries (including an older ready
-      // envelope) before publishing the ready envelope for this socket. Only
-      // the latter is beyond every buffered sequence and may authorize the
-      // replay cursor.
-      if (event.data.sequence <= maxBufferedSequence) {
+      // Current Bridges stamp the greeting with the connector id from this
+      // socket's query string. Replayed greetings carry the id of the socket
+      // that originally produced them, so sequence ordering is not needed to
+      // distinguish history from the current handshake.
+      const connectionId = event.data.payload.bridgeConnectionId;
+      if (connectionId === undefined) {
+        // A Bridge without the per-socket identity cannot safely distinguish a
+        // replayed greeting from the current handshake. Refuse that mixed
+        // version instead of guessing from sequence numbers and risking a
+        // stale cursor or replayTruncated flag changing the live connection.
+        this.log("warn", "Bridge greeting is missing its connection identity");
+        this.bridgeBufferedEvents = [];
+        socket.close(1002, "Bridge handshake identity required");
+        return;
+      }
+      if (connectionId !== this.bridgeConnectorId) {
         if (this.bridgeBufferedEvents.length < MAX_REPLAY_EVENTS) {
           this.bridgeBufferedEvents.push(event.data);
         }
@@ -349,18 +366,13 @@ export class DSHAnywhereConnector {
       this.bridgeBufferedEvents = [];
       for (const bufferedEvent of buffered) this.handleBridgeEvent(bufferedEvent);
       // Forward the handshake that authorized this socket after any retained
-      // replay entries, preserving the legacy phone-visible ready signal.
-      this.sendEvent(event.data);
-      return;
-    }
-    // Older Bridges did not advertise an epoch (and some emit live events
-    // without any greeting). A fresh Connector has no persisted cursor to
-    // protect in that case, so retain the legacy forwarding behavior. Once a
-    // Bridge epoch has been observed, all subsequent sockets use the guarded
-    // replay path above.
-    if (!this.bridgeReady && this.bridgeEpoch === undefined) {
-      this.bridgeReady = true;
-      this.handleBridgeEvent(event.data);
+      // replay entries, preserving the legacy phone-visible ready signal. The
+      // Bridge epoch and socket id are local replay-control metadata; strip
+      // them before forwarding so an older Relay can still validate the public
+      // event schema.
+      const { bridgeEpoch: _bridgeEpoch, bridgeConnectionId: _bridgeConnectionId,
+        replayTruncated: _replayTruncated, ...publicReadyPayload } = event.data.payload;
+      this.sendEvent({ ...event.data, payload: publicReadyPayload });
       return;
     }
     if (!this.bridgeReady) {
@@ -407,11 +419,20 @@ export class DSHAnywhereConnector {
       return;
     }
     if (message.data.type === "relay.ready") {
-      // Older Relays do not send the lease counter. Their server time is still
-      // a useful monotonic-ish fallback for this compatibility path; current
-      // Relays always provide the strict connection generation.
-      this.relayLeaseGeneration = message.data.leaseGeneration ?? message.data.serverTime;
-      this.relayEpoch = message.data.relayEpoch ?? "legacy";
+      // Presence fencing needs the Relay-issued monotonic lease. A wall-clock
+      // timestamp or a made-up legacy epoch cannot order delayed reports after
+      // a Relay restart, so keep the transport connected but do not announce
+      // any phone as online until the current Relay supplies both fields.
+      const leaseGeneration = message.data.leaseGeneration;
+      const relayEpoch = message.data.relayEpoch;
+      if (leaseGeneration === undefined || relayEpoch === undefined) {
+        this.relayLeaseGeneration = undefined;
+        this.relayEpoch = undefined;
+        this.log("warn", "Relay is missing machine lease metadata; presence remains offline");
+        return;
+      }
+      this.relayLeaseGeneration = leaseGeneration;
+      this.relayEpoch = relayEpoch;
       for (const deviceId of this.onlineRelayDevices) {
         void this.reportDevicePresence(deviceId, true, this.bridgeConnectorId,
                                        this.relayLeaseGeneration, this.relayEpoch);
@@ -489,10 +510,17 @@ export class DSHAnywhereConnector {
       // Record the selected archive view before waiting for the bridge. An
       // older, slower list response must not overwrite a newer user choice
       // and make the following archive mutation refresh the wrong projection.
-      const sessionSnapshotGeneration = command.type === "session.list"
-        ? this.beginSessionSnapshotQuery(command.deviceId, command.payload.includeArchived === true)
+      const isSessionList = command.type === "session.list";
+      const includeArchived = isSessionList && command.payload.includeArchived === true;
+      const sessionSnapshotGeneration = isSessionList
+        ? this.beginSessionSnapshotQuery(command.deviceId, includeArchived)
         : undefined;
       if (sessionSnapshotGeneration !== undefined) {
+        this.latestSessionListCommands.set(command.deviceId, {
+          requestId: command.requestId,
+          generation: sessionSnapshotGeneration,
+          includeArchived,
+        });
         if (this.inFlightSessionMutations.has(command.deviceId)) {
           this.deferredSessionSnapshotDevices.add(command.deviceId);
         }
@@ -682,6 +710,7 @@ export class DSHAnywhereConnector {
           // final post-mutation read queued instead of silently accepting the
           // older projection.
           this.deferredSessionSnapshotDevices.add(command.deviceId);
+          if (workspaceMutation) this.deferredWorkspaceCatalogDevices.add(command.deviceId);
           return;
         }
         // A list is a mutable projection, not an immutable command result.
@@ -696,6 +725,7 @@ export class DSHAnywhereConnector {
         else this.inFlightSessionMutations.set(command.deviceId, remaining);
         if (!this.inFlightSessionMutations.has(command.deviceId)) {
           this.flushDeferredSessionSnapshot(command.deviceId);
+          this.flushDeferredWorkspaceCatalog(command.deviceId);
         }
       }
       return;
@@ -851,15 +881,52 @@ export class DSHAnywhereConnector {
   }
 
   private async replaySessionList(command: Extract<CommandEnvelope, { type: "session.list" }>): Promise<void> {
+    const latest = this.latestSessionListCommands.get(command.deviceId);
+    if (latest !== undefined && latest.requestId !== command.requestId) {
+      this.sendSupersededSessionList(command);
+      return;
+    }
+    const generation = this.beginSessionSnapshotQuery(command.deviceId, command.payload.includeArchived === true);
+    this.latestSessionListCommands.set(command.deviceId, {
+      requestId: command.requestId,
+      generation,
+      includeArchived: command.payload.includeArchived === true,
+    });
+    this.pendingSessionListRequests.set(command.deviceId, {
+      requestId: command.requestId,
+      generation,
+    });
     try {
-      this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
       const data = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(command.deviceId) }));
       const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
+      const pending = this.pendingSessionListRequests.get(command.deviceId);
+      if (!this.isCurrentSessionSnapshotQuery(command.deviceId, generation) ||
+          pending?.requestId !== command.requestId || pending.generation !== generation) return;
+      this.pendingSessionListRequests.delete(command.deviceId);
       this.sendSessionSnapshot(items, command.deviceId, command.requestId, command.requestId);
+      this.flushDeferredSessionSnapshot(command.deviceId);
     } catch (error) {
       this.log("warn", `Failed to replay session list for device ${shortID(command.deviceId)}: ${safeError(error, this.config)}`);
+      this.finishSessionListRequest(command, generation);
       this.sendProtocolError(command, error);
     }
+  }
+
+  private sendSupersededSessionList(command: Extract<CommandEnvelope, { type: "session.list" }>): void {
+    this.sendEvent({
+      version: PROTOCOL_VERSION,
+      messageId: command.requestId,
+      machineId: this.config.machineId,
+      deviceId: command.deviceId,
+      sequence: ++this.sequence,
+      timestamp: Date.now(),
+      type: "protocol.error",
+      payload: {
+        code: "request-superseded",
+        message: "A newer session list request already established the current filter.",
+        retryable: false,
+      },
+    }, command.deviceId, command.requestId);
   }
 
   private sendProtocolError(command: CommandEnvelope, error: unknown): boolean {
@@ -982,6 +1049,11 @@ export class DSHAnywhereConnector {
     if (this.pendingSessionListRequests.has(deviceId) || this.inFlightSessionMutations.has(deviceId)) return;
     if (!this.deferredSessionSnapshotDevices.delete(deviceId)) return;
     void this.pushSessionSnapshot(deviceId);
+  }
+
+  private flushDeferredWorkspaceCatalog(deviceId: string): void {
+    if (!this.deferredWorkspaceCatalogDevices.delete(deviceId)) return;
+    void this.pushWorkspaceCatalog(deviceId);
   }
 
   private setStreamingPreference(sessionId: string, deviceId: string, enabled: boolean): void {

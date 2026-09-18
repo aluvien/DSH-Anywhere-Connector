@@ -121,6 +121,8 @@ export const ConnectionReadyPayloadSchema = StrictObject({
   resumedFrom: SequenceSchema.optional(),
   /** A new value identifies a Bridge process/replay epoch. */
   bridgeEpoch: IdentifierSchema.optional(),
+  /** Identifies the current Bridge WebSocket, not a replayed handshake. */
+  bridgeConnectionId: IdentifierSchema.optional(),
   /** True when the requested cursor predates the retained Bridge buffer. */
   replayTruncated: z.boolean().optional(),
 });

@@ -128,7 +128,6 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const registry = new Registry(options.registryPath);
   await registry.load();
   const connections = new Set<RelayConnection>();
-  const machineLeaseGenerations = new Map<string, number>();
   const relayEpoch = randomUUID();
   const pairAttempts = new Map<string, PairAttempt>();
   const pairIpAttempts = new Map<string, PairAttempt>();
@@ -145,7 +144,18 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_MESSAGE_BYTES });
 
   httpServer.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url ?? "/", "http://relay.invalid");
+    let url: URL;
+    try {
+      // Upgrade events bypass the ordinary HTTP handler's promise boundary.
+      // Parse untrusted request targets inside this connection's boundary so a
+      // malformed URL cannot escape as an uncaught exception and terminate the
+      // Relay process before authentication has even run.
+      url = new URL(request.url ?? "/", "http://relay.invalid");
+    } catch {
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     if (url.pathname !== "/v1/connect") {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
@@ -157,15 +167,39 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(request, socket, head, (ws) => connect(ws, principal));
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      void connect(ws, principal);
+    });
   });
 
-  const connect = (ws: WebSocket, principal: RelayPrincipal): void => {
+  const connect = async (ws: WebSocket, principal: RelayPrincipal): Promise<void> => {
     const connection: RelayConnection = { id: randomUUID(), ws, principal };
-    const leaseGeneration = principal.role === "machine"
-      ? (machineLeaseGenerations.get(principal.machineId) ?? 0) + 1
-      : undefined;
-    if (leaseGeneration !== undefined) machineLeaseGenerations.set(principal.machineId, leaseGeneration);
+    const pendingMessages: RawData[] = [];
+    let initialized = false;
+    // The lease counter is persisted asynchronously. Attach the message and
+    // close handlers before waiting for that write, otherwise a client can
+    // send its first frame immediately after the WebSocket upgrade and have
+    // it disappear before the connection enters the Relay set.
+    ws.on("message", (raw) => {
+      if (!initialized) pendingMessages.push(raw);
+      else handleSocketMessage(connection, raw);
+    });
+    ws.once("close", () => {
+      // A superseded machine was removed before it was closed. Do not publish
+      // a false offline edge after its replacement is already online.
+      if (connections.delete(connection)) broadcastPresence(principal, false);
+    });
+    ws.once("error", () => undefined);
+    let leaseGeneration: number | undefined;
+    if (principal.role === "machine") {
+      try {
+        leaseGeneration = await registry.nextMachineLeaseGeneration(principal.machineId);
+      } catch {
+        ws.close(1011, "unable to allocate machine lease");
+        return;
+      }
+      if (ws.readyState !== WebSocket.OPEN) return;
+    }
     // Each credential represents one active lease. Replacing the old socket
     // before publishing the new one prevents duplicate local execution and
     // avoids a stale mobile socket later emitting a false offline edge.
@@ -175,6 +209,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       existing.ws.close(4001, "superseded by a newer connection");
     }
     connections.add(connection);
+    initialized = true;
     send(connection, {
       type: "relay.ready",
       machineId: principal.machineId,
@@ -189,13 +224,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       send(connection, presence(existing.principal, true));
     }
     broadcastPresence(principal, true);
-    ws.on("message", (raw) => handleSocketMessage(connection, raw));
-    ws.once("close", () => {
-      // A superseded machine was removed before it was closed. Do not publish
-      // a false offline edge after its replacement is already online.
-      if (connections.delete(connection)) broadcastPresence(principal, false);
-    });
-    ws.once("error", () => undefined);
+    for (const raw of pendingMessages) handleSocketMessage(connection, raw);
   };
 
   const handleSocketMessage = (source: RelayConnection, raw: RawData): void => {

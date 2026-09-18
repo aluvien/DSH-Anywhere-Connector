@@ -121,6 +121,10 @@ describe("Relay and bridge forwarding", () => {
     });
     connector.start(); relay.emit("open"); bridge.emit("open");
     relay.emit("message", JSON.stringify({
+      type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1",
+      serverTime: 1, leaseGeneration: 1, relayEpoch: "relay-1",
+    }));
+    relay.emit("message", JSON.stringify({
       type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: true, serverTime: 1,
     }));
     await vi.waitFor(() => expect(calls.some((call) => call.url.endsWith("/devices/phone-1/presence")
@@ -428,8 +432,13 @@ describe("Relay and bridge forwarding", () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();
     let calls = 0;
+    let bridgeConnectionId = "";
     const connector = new DSHAnywhereConnector(config, {
-      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      webSocketFactory: (url) => {
+        if (++calls === 1) return relay as unknown as import("../src/connector.js").WebSocketLike;
+        bridgeConnectionId = new URL(url).searchParams.get("connectorId") ?? "";
+        return bridge as unknown as import("../src/connector.js").WebSocketLike;
+      },
       logger: { info: () => undefined, warn: () => undefined },
       heartbeatMs: 60_000,
     });
@@ -438,7 +447,8 @@ describe("Relay and bridge forwarding", () => {
     bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "event-1", machineId: "local-hostname-machine", deviceId: "broadcast", sequence: 1, timestamp: 1,
-      type: "connection.ready", payload: { machineId: "local-hostname-machine", deviceId: "bridge-device", serverTime: 1, capabilities: [] },
+      type: "connection.ready", payload: { machineId: "local-hostname-machine", deviceId: "bridge-device", serverTime: 1,
+        capabilities: [], bridgeConnectionId },
     }));
 
     relay.emit("message", JSON.stringify({
@@ -465,9 +475,14 @@ describe("Relay and bridge forwarding", () => {
     const bridge = new FakeSocket();
     const fetchMock = vi.fn(async (_input: RequestInfo | URL) => new Response("forbidden bridge-secret", { status: 401 }));
     let calls = 0;
+    let bridgeConnectionId = "";
     const connector = new DSHAnywhereConnector(config, {
       fetch: fetchMock as unknown as typeof fetch,
-      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      webSocketFactory: (url) => {
+        if (++calls === 1) return relay as unknown as import("../src/connector.js").WebSocketLike;
+        bridgeConnectionId = new URL(url).searchParams.get("connectorId") ?? "";
+        return bridge as unknown as import("../src/connector.js").WebSocketLike;
+      },
       logger: { info: () => undefined, warn: () => undefined },
       heartbeatMs: 60_000,
     });
@@ -476,7 +491,8 @@ describe("Relay and bridge forwarding", () => {
     bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "event-1", machineId: "local-hostname-machine", deviceId: "broadcast", sequence: 1, timestamp: 1,
-      type: "connection.ready", payload: { machineId: "local-hostname-machine", deviceId: "bridge-device", serverTime: 1, capabilities: [] },
+      type: "connection.ready", payload: { machineId: "local-hostname-machine", deviceId: "bridge-device", serverTime: 1,
+        capabilities: [], bridgeConnectionId },
     }));
     expect(JSON.parse(relay.sent[0]!)).toMatchObject({
       type: "relay.payload",
@@ -541,12 +557,23 @@ describe("Relay and bridge forwarding", () => {
       status: 202, headers: { "content-type": "application/json" },
     }));
     let calls = 0;
+    let bridgeConnectionId = "";
     const connector = new DSHAnywhereConnector(config, {
       fetch: fetchMock as unknown as typeof fetch,
-      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      webSocketFactory: (url) => {
+        if (++calls === 1) return relay as unknown as import("../src/connector.js").WebSocketLike;
+        bridgeConnectionId = new URL(url).searchParams.get("connectorId") ?? "";
+        return bridge as unknown as import("../src/connector.js").WebSocketLike;
+      },
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
     connector.start(); relay.emit("open"); bridge.emit("open");
+    bridge.emit("message", JSON.stringify({
+      version: PROTOCOL_VERSION, messageId: "ready", machineId: "mac", deviceId: "broadcast", sequence: 1, timestamp: 1,
+      type: "connection.ready", payload: { machineId: "mac", deviceId: "bridge-device", serverTime: 1,
+        capabilities: [], bridgeConnectionId },
+    }));
+    relay.sent.length = 0;
 
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "open-stream", sender: "device",

@@ -39,7 +39,10 @@ describe('bridge idempotency cache', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    for (let index = 0; index < 2_000; index += 1) {
+    // One slot is intentionally occupied by the in-flight request. Fill the
+    // remaining slots without asking the cache to weaken an unexpired result
+    // just to admit one more mutation.
+    for (let index = 0; index < 1_999; index += 1) {
       const next = response()
       await cache.respond(`other-${index}`, 'b'.repeat(64), request(), next.value, async (capture) => {
         capture.writeHead(200)

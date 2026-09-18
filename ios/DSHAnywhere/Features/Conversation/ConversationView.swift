@@ -1997,6 +1997,10 @@ struct ConversationView: View {
         let staged = draftAttachments
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !staged.isEmpty else { return }
+        // Validate before clearing either editor. The Relay schema rejects an
+        // overlong prompt, but that is a request-level error and must not make
+        // the user lose a draft that can still be edited locally.
+        guard model.validatePromptText(trimmed) else { return }
         let wasRunning = isRunning
         // Text-only queue while busy stays on the device (editable,
         // cancellable, auto-fired when the turn settles). Anything with
@@ -2025,7 +2029,13 @@ struct ConversationView: View {
         draftAttachments = []
         isSending = true
         let machineGeneration = model.currentMachineGeneration
+        let expectedMachineID = model.machineID
         Task { @MainActor in
+            guard model.isCurrentMachineGeneration(machineGeneration),
+                  model.machineID == expectedMachineID else {
+                isSending = false
+                return
+            }
             do {
                 var receipts: [String] = []
                 var messageAttachments: [DSHMessageAttachment] = []
@@ -2043,20 +2053,36 @@ struct ConversationView: View {
                                                                     mediaType: mediaType,
                                                                     receiptId: receipt))
                 }
+                guard model.isCurrentMachineGeneration(machineGeneration),
+                      model.machineID == expectedMachineID else {
+                    isSending = false
+                    return
+                }
                 if wasRunning && mode == "queue" {
                     model.noteQueuedPrompt(text: trimmed, mode: mode, requestId: requestId, for: sessionID)
                 }
                 model.sendPrompt(text, attachments: receipts,
                                  messageAttachments: messageAttachments, to: sessionID,
-                                 mode: mode, requestId: requestId)
+                                 mode: mode, requestId: requestId,
+                                 expectedMachineGeneration: machineGeneration,
+                                 expectedMachineID: expectedMachineID)
             } catch {
                 guard model.isCurrentMachineGeneration(machineGeneration) else {
+                    isSending = false
+                    return
+                }
+                guard model.machineID == expectedMachineID else {
                     isSending = false
                     return
                 }
                 model.draft = text
                 draftAttachments = staged
                 model.errorMessage = error.localizedDescription
+            }
+            guard model.isCurrentMachineGeneration(machineGeneration),
+                  model.machineID == expectedMachineID else {
+                isSending = false
+                return
             }
             isSending = false
         }

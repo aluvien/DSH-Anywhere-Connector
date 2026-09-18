@@ -474,4 +474,18 @@ describe("Relay server", () => {
     expect(await registry.pairDeviceWithCode(machine.machineId, fresh.code, "iPhone", 3_100)).toBeDefined();
     expect(await registry.pairDeviceWithCode(machine.machineId, fresh.code, "iPhone 2", 3_200)).toBeUndefined();
   });
+
+  it("persists machine lease generations across Relay restarts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-registry-"));
+    directories.push(directory);
+    const path = join(directory, "registry.json");
+    const first = new Registry(path);
+    await first.load();
+    const machine = await first.registerMachine("Mac");
+    await expect(first.nextMachineLeaseGeneration(machine.machineId)).resolves.toBe(1);
+
+    const restarted = new Registry(path);
+    await restarted.load();
+    await expect(restarted.nextMachineLeaseGeneration(machine.machineId)).resolves.toBe(2);
+  });
 });
