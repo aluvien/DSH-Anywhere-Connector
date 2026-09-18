@@ -1518,9 +1518,16 @@ async function handleHttp(
   }
   if (req.method === 'POST' && path === '/sessions') {
     const requestId = header(req, 'x-dsh-request-id')
+    if (requestId !== undefined && requestId.length > 256) {
+      throw new HttpError(400, 'request id must be at most 256 characters')
+    }
     const suppliedHash = header(req, 'x-dsh-request-hash')
     const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
       ? suppliedHash.toLowerCase() : undefined
+    // Keep the durable key bounded in the same way as the in-memory
+    // idempotency layer and the protocol identifier schema.  Without this
+    // guard an authenticated caller could make the on-disk session creation
+    // map grow with arbitrarily large request-id headers.
     const durableKey = requestId === undefined || requestId.length === 0
       ? undefined : `${device.id}\0${requestId}`
     if (durableKey !== undefined) {

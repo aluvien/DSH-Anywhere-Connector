@@ -586,6 +586,20 @@ describe('native bridge mutations', () => {
     expect(creates).toBe(0)
   })
 
+  it('rejects oversized session request ids before native creation', async () => {
+    let creates = 0
+    const request = mount({
+      create: async () => {
+        creates += 1
+        return { sessionId: 'should-not-run' }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'x'.repeat(257),
+    )).resolves.toMatchObject({ status: 400 })
+    expect(creates).toBe(0)
+  })
+
   it('does not let unauthenticated request ids consume trusted idempotency slots', async () => {
     const request = mount()
     for (let index = 0; index < 2_000; index += 1) {
