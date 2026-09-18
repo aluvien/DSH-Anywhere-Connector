@@ -117,6 +117,13 @@ final class DSHAppModel: ObservableObject {
 
     private let transport: any DSHAppTransport
     private let reducer = DSHEventReducer()
+    /// Building transcript sections sorts and folds the entire local history.
+    /// Live deltas change only one session, but SwiftUI asks several derived
+    /// transcript properties during every body pass.  Keep one snapshot per
+    /// session until an event for that session arrives, so a 20 Hz stream does
+    /// not repeatedly rebuild the same history in a single frame.
+    private var transcriptEntriesCache: [String: [DSHTranscriptEntry]] = [:]
+    private var transcriptSectionsCache: [String: [DSHTranscriptSection]] = [:]
     private var eventTask: Task<Void, Never>?
     /// WebSocket deltas can arrive much faster than a phone needs to redraw.
     /// Keep the reducer authoritative, but publish one state snapshot per
@@ -174,6 +181,8 @@ final class DSHAppModel: ObservableObject {
     /// state reset already drops any carried-over rows).
     private func resetTransientRequestState() {
         pendingEvents.removeAll(keepingCapacity: false)
+        transcriptEntriesCache.removeAll(keepingCapacity: false)
+        transcriptSectionsCache.removeAll(keepingCapacity: false)
         pendingInitialMessagesByRequestID.removeAll(keepingCapacity: false)
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
@@ -281,18 +290,24 @@ final class DSHAppModel: ObservableObject {
     /// The transcript in the order things actually happened: messages and tool
     /// calls interleaved by arrival sequence.
     func transcriptEntries(for sessionID: String) -> [DSHTranscriptEntry] {
-        messages(for: sessionID)
+        if let cached = transcriptEntriesCache[sessionID] { return cached }
+        let entries = messages(for: sessionID)
             .filter { !hiddenMessageKeys.contains(messageKey(sessionID: sessionID, messageID: $0.id)) }
             .transcriptEntries(
             with: tools(for: sessionID),
             commandResults: commandResults(for: sessionID),
             modelChanges: modelChanges(for: sessionID)
         )
+        transcriptEntriesCache[sessionID] = entries
+        return entries
     }
 
     /// Render units: assistant turns with their tool calls folded in.
     func transcriptSections(for sessionID: String) -> [DSHTranscriptSection] {
-        transcriptEntries(for: sessionID).groupedTurns()
+        if let cached = transcriptSectionsCache[sessionID] { return cached }
+        let sections = transcriptEntries(for: sessionID).groupedTurns()
+        transcriptSectionsCache[sessionID] = sections
+        return sections
     }
 
     /// Hides one message on this device. Per-message deletion is not currently
@@ -300,7 +315,32 @@ final class DSHAppModel: ObservableObject {
     /// not pretend to mutate the Mac's source history.
     func hideMessage(_ messageID: String, in sessionID: String) {
         hiddenMessageKeys.insert(messageKey(sessionID: sessionID, messageID: messageID))
+        invalidateTranscriptCaches(for: [sessionID])
         UserDefaults.standard.set(Array(hiddenMessageKeys), forKey: Self.hiddenMessagesKey)
+    }
+
+    private func invalidateTranscriptCaches(for sessionIDs: Set<String>) {
+        for sessionID in sessionIDs {
+            transcriptEntriesCache.removeValue(forKey: sessionID)
+            transcriptSectionsCache.removeValue(forKey: sessionID)
+        }
+    }
+
+    /// Transcript events normally carry their session in the envelope.  The
+    /// history brackets also contain it in their payload because they can be
+    /// delivered as control messages.  Keep that fallback so completing a
+    /// replay can never leave a cached pre-replay transcript on screen.
+    private func transcriptSessionIDs(affectedBy events: [DSHEvent]) -> Set<String> {
+        var sessionIDs = Set(events.compactMap(\.envelope.sessionId))
+        for event in events {
+            switch event.kind {
+            case .historyStarted(let batch), .historyCompleted(let batch):
+                sessionIDs.insert(batch.sessionId)
+            default:
+                break
+            }
+        }
+        return sessionIDs
     }
 
     private func messageKey(sessionID: String, messageID: String) -> String {
@@ -1289,6 +1329,7 @@ final class DSHAppModel: ObservableObject {
             reducer.reduce(event, into: &next)
         }
         attachPendingMessageThumbnails(to: &next, events: acceptedEvents)
+        invalidateTranscriptCaches(for: transcriptSessionIDs(affectedBy: acceptedEvents))
         // Do not compare the entire transcript here: that equality check would
         // walk every message/tool on every frame and cost more than the
         // notification we are trying to avoid. A batch always represents one
@@ -1401,6 +1442,7 @@ final class DSHAppModel: ObservableObject {
                 guard let self, self.state.historyCarryOverBySession[batch.sessionId] != nil else { return }
                 var next = self.state
                 self.reducer.completeHistory(sessionId: batch.sessionId, batchId: nil, into: &next)
+                self.invalidateTranscriptCaches(for: [batch.sessionId])
                 self.state = next
                 self.historyTimeoutTasks.removeValue(forKey: batch.sessionId)
             }

@@ -100,6 +100,37 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.messagesBySession["s"]?.first?.markdown, "Hel")
     }
 
+    @MainActor
+    func testStreamingMarkdownRendererMatchesFullParserAcrossBlockBoundaries() {
+        let chunks = [
+            "Hello", " world", " with `inline", " code`", "\n\n# Heading", "\n",
+            "\n- first", "\n- second", "\n\n```swift", "\nlet value = 1", "\n```",
+            "\n\n| left | right |", "\n| --- | --- |", "\n| 1 | 2 |", " tail"
+        ]
+        var text = ""
+        let renderer = DSHMarkdownBlockRenderer(text: text)
+
+        for chunk in chunks {
+            text += chunk
+            renderer.update(text: text)
+            XCTAssertEqual(renderer.blocks, DSHMarkdown.blocks(from: text),
+                           "Incremental rendering diverged after chunk: \(chunk)")
+        }
+
+        let parseCountAfterChanges = renderer.parseCount
+        renderer.update(text: text)
+        XCTAssertEqual(renderer.parseCount, parseCountAfterChanges,
+                       "An unchanged body pass must reuse its parsed blocks")
+
+        // A stream's durable completion replaces the temporary text in the
+        // same rendered row.  Its document must be parsed from the canonical
+        // value, not a stale partial prefix.
+        let canonical = "# Final\n\n```swift\nlet done = true\n```"
+        renderer.update(text: canonical)
+        XCTAssertEqual(renderer.blocks, DSHMarkdown.blocks(from: canonical))
+        XCTAssertEqual(renderer.parseCount, parseCountAfterChanges + 1)
+    }
+
     func testUnknownEventsAreRetained() {
         var state = DSHStoreState()
         let event = DSHEvent(envelope: DSHEnvelope(messageId: "u", deviceId: "d", machineId: "m",
@@ -1084,6 +1115,37 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(model.directoryListing?.path, "/Users/me/New")
         XCTAssertEqual(model.directoryListing?.directories.map(\.name), ["Current"])
         XCTAssertFalse(model.isLoadingDirectory)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testTranscriptCacheRefreshesForLiveDeltaAndLocalHide() async {
+        UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey)
+        defer { UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey) }
+
+        var state = DSHStoreState()
+        state.messagesBySession["s"] = [
+            DSHChatMessage(id: "question", role: .user, markdown: "Hello", sequence: 1),
+        ]
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: state, isPaired: true)
+
+        // Prime both caches before the live event arrives.
+        XCTAssertEqual(model.transcriptEntries(for: "s").map(\.id), ["turn-question"])
+        XCTAssertEqual(model.transcriptSections(for: "s").map(\.id), ["section-turn-question"])
+
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(30))
+        await transport.emit(DSHEvent(envelope: DSHEnvelope(
+            messageId: "delta", deviceId: "device", machineId: "machine", sessionId: "s",
+            sequence: 2, type: "assistant.message.delta",
+            payload: .object(["messageId": .string("partial"), "text": .string("Live")])
+        )))
+        try? await Task.sleep(for: .milliseconds(90))
+
+        XCTAssertEqual(model.transcriptEntries(for: "s").map(\.id), ["turn-question", "turn-partial"])
+        model.hideMessage("partial", in: "s")
+        XCTAssertEqual(model.transcriptEntries(for: "s").map(\.id), ["turn-question"])
         model.disconnect()
     }
 

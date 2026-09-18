@@ -682,6 +682,37 @@ import SwiftUI
 
 @MainActor
 final class DSHConversationViewportTests: XCTestCase {
+    func testHeaderFrostedTextAppearance() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView:
+            ZStack(alignment: .top) {
+                Color(.systemBackground).ignoresSafeArea()
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(0..<18) { _ in
+                        Text("这是一段经过顶部的聊天文字 ABC 123")
+                            .font(.system(size: 20))
+                    }
+                }.padding(.horizontal, 16)
+                DSHHeaderBackdrop(frosted: true, contentUnderneath: true)
+                    .frame(height: 110)
+            })
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            window.overrideUserInterfaceStyle = style
+            try await Task.sleep(for: .milliseconds(400))
+            window.layoutIfNeeded()
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = style == .dark ? "header-frosted-dark" : "header-frosted-light"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
     private func settle() async {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async { continuation.resume() }

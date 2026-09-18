@@ -3107,6 +3107,36 @@ private struct MessageImageThumbnail: View {
 
 /// Renders markdown block by block.
 ///
+/// Holds parsed blocks for one visible message.  SwiftUI reconstructs value
+/// views whenever any live event arrives; parsing every old message on every
+/// 50 ms stream batch made a long transcript increasingly expensive.  A state
+/// object is retained by the message's stable identity, so only the changing
+/// message is parsed again.  Markdown is deliberately reparsed in full for
+/// that one message: syntax can become a heading, list or fence without a
+/// newline (`#` + ` title`, for example), so speculative incremental parsing
+/// would eventually render a different document from the source.
+@MainActor
+final class DSHMarkdownBlockRenderer: ObservableObject {
+    @Published private(set) var blocks: [DSHMarkdownBlock]
+    private var source: String
+    /// Observable in tests only; it also documents that unchanged SwiftUI
+    /// body passes cannot trigger another parse.
+    private(set) var parseCount = 0
+
+    init(text: String) {
+        source = text
+        blocks = DSHMarkdown.blocks(from: text)
+        parseCount = 1
+    }
+
+    func update(text: String) {
+        guard text != source else { return }
+        source = text
+        blocks = DSHMarkdown.blocks(from: text)
+        parseCount += 1
+    }
+}
+
 /// `AttributedString(markdown:)` interprets inline syntax only, so headings,
 /// fenced code, lists and tables reached the reader as their literal markers —
 /// `#`, ``` ``` ``` and `|` included. Block structure is recognised first
@@ -3114,12 +3144,21 @@ private struct MessageImageThumbnail: View {
 /// still left to `AttributedString`.
 private struct MarkdownBlockText: View {
     let text: String
+    @StateObject private var renderer: DSHMarkdownBlockRenderer
+
+    init(text: String) {
+        self.text = text
+        _renderer = StateObject(wrappedValue: DSHMarkdownBlockRenderer(text: text))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(DSHMarkdown.blocks(from: text)) { block in
+            ForEach(renderer.blocks) { block in
                 MarkdownBlockView(block: block)
             }
+        }
+        .onChange(of: text) { _, updatedText in
+            renderer.update(text: updatedText)
         }
     }
 }
