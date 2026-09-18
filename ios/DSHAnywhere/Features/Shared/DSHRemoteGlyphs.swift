@@ -1,62 +1,13 @@
 import SwiftUI
 import UIKit
 
-/// Keep secondary screens unchanged; scrolling home/conversation headers use
-/// a lighter native blur, without an extra tinted page-color wash.
+/// Page-colored translucency without a blur or material tint.
 struct DSHHeaderBackdrop: View {
-    var frosted = false
-    var contentUnderneath = true
+    var opacity = 0.5
     var body: some View {
-        Group {
-            if frosted {
-                if contentUnderneath {
-                    DSHHeaderBlur()
-                } else {
-                    Color(.systemBackground)
-                }
-            } else {
-                Color(.systemBackground).opacity(0.5)
-            }
-        }
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
-    }
-}
-
-/// Interpolate the native effect itself: lowering the opacity of a material
-/// mixes sharp original text back in and looks like a gray transparent sheet.
-private struct DSHHeaderBlur: UIViewRepresentable {
-    func makeUIView(context: Context) -> BlurView { BlurView() }
-    func updateUIView(_ view: BlurView, context: Context) {}
-    static func dismantleUIView(_ view: BlurView, coordinator: ()) { view.stop() }
-
-    final class BlurView: UIVisualEffectView {
-        private var animator: UIViewPropertyAnimator?
-        init() {
-            super.init(effect: nil)
-            isUserInteractionEnabled = false
-        }
-        required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            if window == nil { stop() }
-            setNeedsDisplay()
-        }
-        override func draw(_ rect: CGRect) {
-            super.draw(rect)
-            guard animator == nil, window != nil else { return }
-            effect = nil
-            let animator = UIViewPropertyAnimator(duration: 1, curve: .linear) { [weak self] in
-                self?.effect = UIBlurEffect(style: .regular)
-            }
-            self.animator = animator
-            animator.fractionComplete = 0.08
-        }
-        func stop() {
-            animator?.stopAnimation(true)
-            animator = nil
-            effect = nil
-        }
+        Color(.systemBackground).opacity(opacity)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
     }
 }
 

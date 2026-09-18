@@ -1369,7 +1369,7 @@ struct DSHRemoteHomeView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop(frosted: true, contentUnderneath: headerOverlapsContent))
+        .background(DSHHeaderBackdrop(opacity: 0.75))
         .overlay(alignment: .bottom) {
             if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }

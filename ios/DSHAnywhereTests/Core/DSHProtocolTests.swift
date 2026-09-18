@@ -682,7 +682,7 @@ import SwiftUI
 
 @MainActor
 final class DSHConversationViewportTests: XCTestCase {
-    func testHeaderFrostedTextAppearance() async throws {
+    func testHeaderTranslucentTextAppearance() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)
         let host = UIHostingController(rootView:
@@ -694,7 +694,7 @@ final class DSHConversationViewportTests: XCTestCase {
                             .font(.system(size: 20))
                     }
                 }.padding(.horizontal, 16)
-                DSHHeaderBackdrop(frosted: true, contentUnderneath: true)
+                DSHHeaderBackdrop(opacity: 0.75)
                     .frame(height: 110)
             })
         window.rootViewController = host
@@ -707,7 +707,7 @@ final class DSHConversationViewportTests: XCTestCase {
             let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
                 window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
             })
-            attachment.name = style == .dark ? "header-frosted-dark" : "header-frosted-light"
+            attachment.name = style == .dark ? "header-translucent-dark" : "header-translucent-light"
             attachment.lifetime = .keepAlways
             add(attachment)
         }

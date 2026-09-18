@@ -2,6 +2,68 @@ import XCTest
 @testable import DSHAnywhere
 
 final class DSHEventStoreTests: XCTestCase {
+    func testStreamingHeadroomConsumesMeasuredGrowthBeforeRefilling() {
+        var plan = DSHStreamingHeadroomPlan()
+        plan.record(streamID: "stream-live", size: CGSize(width: 320, height: 50))
+        let stableShell = try! XCTUnwrap(plan.reservedReplyHeight)
+        XCTAssertEqual(plan.reservedHeight, 80, accuracy: 0.01)
+
+        // A real 24pt wrap consumes the capacity.  The rendered outer row
+        // remains the same height instead of making the scroll view advance.
+        plan.record(streamID: "stream-live", size: CGSize(width: 320, height: 74))
+        XCTAssertEqual(try! XCTUnwrap(plan.reservedReplyHeight), stableShell, accuracy: 0.01)
+        let remaining = plan.reservedHeight
+        plan.prepareForNextChunk(streamID: "stream-live")
+        XCTAssertEqual(plan.reservedHeight, remaining, accuracy: 0.01,
+                       "Do not refill after every wrapped line")
+
+        // A transient Markdown reflow can shrink content; its capacity is
+        // returned, keeping the outer shell stable and bounded.
+        plan.record(streamID: "stream-live", size: CGSize(width: 320, height: 62))
+        XCTAssertEqual(try! XCTUnwrap(plan.reservedReplyHeight), stableShell, accuracy: 0.01)
+
+        // Completion clears all artificial height, even if the turn has not
+        // yet emitted its final state update.
+        plan.begin(streamID: nil)
+        XCTAssertNil(plan.reservedReplyHeight)
+        XCTAssertEqual(plan.reservedHeight, 0)
+
+        // A rotation / Dynamic Type relayout starts a fresh measurement rather
+        // than carrying a portrait estimate into the new width.  Very tall
+        // content remains capped so no blank page can appear.
+        plan.record(streamID: "stream-live", size: CGSize(width: 320, height: 50))
+        plan.record(streamID: "stream-live", size: CGSize(width: 480, height: 20))
+        XCTAssertEqual(plan.reservedHeight, 32, accuracy: 0.01)
+        plan.record(streamID: "stream-next", size: CGSize(width: 480, height: 20))
+        XCTAssertEqual(plan.streamID, "stream-next")
+        XCTAssertEqual(plan.reservedHeight, 32, accuracy: 0.01,
+                       "A new delta ID must not inherit the previous reply's capacity")
+        var capped = DSHStreamingHeadroomPlan()
+        capped.record(streamID: "stream-tall", size: CGSize(width: 320, height: 500))
+        XCTAssertLessThanOrEqual(capped.reservedHeight, 96)
+    }
+
+    func testOnlyCurrentTransientStreamMessageCanReserveHeadroom() {
+        let user = DSHChatMessage(id: "user", role: .user, markdown: "go", sequence: 10)
+        let legacy = DSHChatMessage(id: "assistant-final", role: .assistant,
+                                    markdown: "already durable", sequence: 11)
+        XCTAssertNil(DSHStreamingMessageProjection.active(messages: [user, legacy], turnState: "running"))
+
+        let oldTransient = DSHChatMessage(id: "stream-old", role: .assistant,
+                                          markdown: "old", sequence: 9)
+        XCTAssertNil(DSHStreamingMessageProjection.active(messages: [user, oldTransient], turnState: "running"))
+
+        let live = DSHChatMessage(id: "stream-live", role: .assistant,
+                                  markdown: "partial", sequence: 12)
+        XCTAssertEqual(DSHStreamingMessageProjection.active(messages: [user, live], turnState: "running")?.streamID,
+                       "stream-live")
+
+        let completed = DSHChatMessage(id: "canonical", role: .assistant,
+                                       markdown: "final", sequence: 12,
+                                       replacesMessageId: "stream-live")
+        XCTAssertNil(DSHStreamingMessageProjection.active(messages: [user, completed], turnState: "running"))
+    }
+
     @MainActor
     func testStreamingCompletionKeepsCanonicalIDAndDoesNotResurrectPartialOnReplay() {
         var state = DSHStoreState()

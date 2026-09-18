@@ -108,6 +108,146 @@ enum DSHLiveTurnStatusProjection {
     }
 }
 
+/// A small tail capacity for a live assistant reply.  The capacity is based on
+/// the real rendered reply, rather than an arbitrary number of lines: when a
+/// chunk makes the reply taller, the same amount is released from the tail so
+/// the transcript's total height stays almost unchanged.  The next chunk tops
+/// the capacity back up from the observed growth rate.  Completion removes it
+/// altogether.
+///
+/// This intentionally models only one temporary delta message.  A durable
+/// completion has `replacesMessageId`, so it must never acquire a new reserve
+/// during the brief interval before `turn.state.changed` settles.
+struct DSHStreamingHeadroomPlan: Equatable {
+    private(set) var streamID: String?
+    private(set) var reservedHeight: CGFloat = 0
+    private var measuredHeight: CGFloat?
+    private var measuredWidth: CGFloat?
+    private var recentGrowth: CGFloat = 0
+
+    private static let minimumCapacity: CGFloat = 24
+    private static let maximumCapacity: CGFloat = 96
+
+    /// The outer bubble's stable height while its intrinsic Markdown content
+    /// grows.  Keeping the capacity inside that row avoids the one-layout-pass
+    /// grow/shrink cycle a trailing spacer would cause in the scroll view.
+    var reservedReplyHeight: CGFloat? {
+        guard let measuredHeight else { return nil }
+        return measuredHeight + reservedHeight
+    }
+
+    mutating func begin(streamID: String?) {
+        guard self.streamID != streamID else { return }
+        self.streamID = streamID
+        reservedHeight = 0
+        measuredHeight = nil
+        measuredWidth = nil
+        recentGrowth = 0
+    }
+
+    /// Reserve the next observed amount before the next visual update.  The
+    /// first size measurement seeds this from the actual reply height; later
+    /// chunks use recent real vertical growth, with a deliberately tight cap.
+    mutating func prepareForNextChunk(streamID: String?) {
+        guard streamID != nil, streamID == self.streamID,
+              let measuredHeight else { return }
+        let target = targetCapacity(for: measuredHeight)
+        // Do not refill after every wrapped line.  Doing that merely trades
+        // tiny per-line jumps for a spacer that grows continuously.  Refill
+        // only once the measured reservoir is almost exhausted.
+        let lowWater = max(6, min(target * 0.2, recentGrowth * 0.4))
+        if reservedHeight <= lowWater {
+            reservedHeight = target
+        }
+    }
+
+    /// Feed the rendered bubble's measured size.  Positive growth consumes
+    /// exactly that much tail capacity; a temporary Markdown reflow that
+    /// shrinks the row gives the capacity back.  This keeps the bottom stable
+    /// through ordinary wrapping without guessing future paragraph length.
+    mutating func record(streamID: String, size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        guard self.streamID == streamID else {
+            begin(streamID: streamID)
+            measuredHeight = size.height
+            measuredWidth = size.width
+            reservedHeight = targetCapacity(for: size.height)
+            return
+        }
+
+        guard let previousHeight = measuredHeight,
+              let previousWidth = measuredWidth,
+              abs(previousWidth - size.width) <= 0.5 else {
+            measuredHeight = size.height
+            measuredWidth = size.width
+            recentGrowth = 0
+            reservedHeight = targetCapacity(for: size.height)
+            return
+        }
+
+        let delta = size.height - previousHeight
+        measuredHeight = size.height
+        measuredWidth = size.width
+        if delta > 0 {
+            recentGrowth = recentGrowth == 0 ? delta : (recentGrowth * 0.6 + delta * 0.4)
+        }
+        // `-delta` deliberately handles a temporary Markdown block reflow;
+        // clamp so a malformed/large block can never create a blank screen.
+        reservedHeight = min(Self.maximumCapacity, max(0, reservedHeight - delta))
+    }
+
+    private func targetCapacity(for height: CGFloat) -> CGFloat {
+        // The first measured line is the only honest estimate before we have
+        // an observed wrap.  Keeping roughly 1.6× that real row height gives
+        // the next one or two wraps room without a fixed "N lines" rule.
+        let fromRenderedReply = recentGrowth == 0 ? height * 1.6 : height * 0.4
+        let fromObservedGrowth = recentGrowth * 2.2
+        return min(Self.maximumCapacity,
+                   max(Self.minimumCapacity, fromRenderedReply, fromObservedGrowth))
+    }
+}
+
+private struct DSHStreamMessageMeasurement: Equatable {
+    let streamID: String
+    let size: CGSize
+}
+
+private struct DSHStreamMessageMeasurementKey: PreferenceKey {
+    static let defaultValue: DSHStreamMessageMeasurement? = nil
+
+    static func reduce(value: inout DSHStreamMessageMeasurement?,
+                       nextValue: () -> DSHStreamMessageMeasurement?) {
+        if let next = nextValue() { value = next }
+    }
+}
+
+struct DSHActiveStreamingMessage: Equatable {
+    /// The transient delta ID is stable through the final canonical replace.
+    let streamID: String
+    /// The row currently rendered on screen; it changes only at completion.
+    let renderedMessageID: String
+}
+
+enum DSHStreamingMessageProjection {
+    static func active(messages: [DSHChatMessage], turnState: String) -> DSHActiveStreamingMessage? {
+        guard turnState.lowercased() == "running",
+              let message = messages.last,
+              message.role == .assistant,
+              message.id.hasPrefix("stream-"),
+              !message.markdown.isEmpty,
+              message.replacesMessageId == nil else { return nil }
+        // A transient frame is always emitted after the accepted user turn.
+        // Retaining this boundary prevents an old, pre-stream legacy reply
+        // from reserving space merely because another tool starts later.
+        if let latestUserSequence = messages.filter({ $0.role == .user })
+            .compactMap(\.sequence).max(),
+           (message.sequence ?? Int64.min) <= latestUserSequence {
+            return nil
+        }
+        return DSHActiveStreamingMessage(streamID: message.id, renderedMessageID: message.id)
+    }
+}
+
 
 /// Remote's editor has two native-looking states: a quiet single-line capsule
 /// while resting, and a taller two-row editor while the field is active.  The
@@ -689,6 +829,7 @@ private struct ConversationObservers: ViewModifier {
     let sessionUpdatedAt: Int64??
     let entriesCount: Int
     let streamingSignature: String
+    let streamingMessageID: String?
     let isRunning: Bool
     let sessionID: String
     let initialVisibleLimit: Int
@@ -696,6 +837,8 @@ private struct ConversationObservers: ViewModifier {
     @Binding var selectedPhotos: [PhotosPickerItem]
     let model: DSHAppModel
     let pinToBottom: () -> Void
+    let prepareStreamingHeadroom: (String?) -> Void
+    let resetStreamingHeadroom: () -> Void
     let runningChanged: (Bool) -> Void
     let stagePhotos: ([PhotosPickerItem]) -> Void
 
@@ -716,7 +859,15 @@ private struct ConversationObservers: ViewModifier {
                 // appending a new one. This observer keeps a reader at the
                 // bottom during a live answer while the pin still respects
                 // the manual-scroll guard.
+                prepareStreamingHeadroom(streamingMessageID)
                 pinToBottom()
+            }
+            .onChange(of: streamingMessageID) { _, activeID in
+                // The durable final message keeps the old delta ID in
+                // `replacesMessageId`, but it is no longer stream content.
+                // Drop the tail immediately even if its turn has another
+                // tool step still running.
+                if activeID == nil { resetStreamingHeadroom() }
             }
             .onChange(of: isRunning) { _, running in
                 runningChanged(running)
@@ -774,6 +925,9 @@ struct ConversationView: View {
     /// False once the reader scrolls away from the newest output, so auto-follow
     /// never fights a manual scroll.
     @State private var isFollowingLatest = true
+    /// A measured, temporary capacity after the live reply.  It is consumed as
+    /// the reply wraps and removed as soon as the durable answer replaces it.
+    @State private var streamingHeadroom = DSHStreamingHeadroomPlan()
     /// When this device first saw the current turn run. Drives the live
     /// elapsed clock above the composer; cleared when the turn settles.
     @State private var turnStartedAt: Date?
@@ -821,6 +975,14 @@ struct ConversationView: View {
         let reasoning = message.reasoning ?? ""
         let reasoningTail = String(reasoning.suffix(64))
         return "\(message.id)|\(message.markdown.count)|\(markdownTail)|\(reasoning.count)|\(reasoningTail)"
+    }
+
+    /// Only a delta message is eligible.  A completed canonical message can
+    /// arrive a fraction before the turn-state event, and must not restart the
+    /// spacer while a later Harness tool is still running.
+    private var activeStreamingMessage: DSHActiveStreamingMessage? {
+        DSHStreamingMessageProjection.active(messages: model.messages(for: sessionID),
+                                             turnState: model.turnState(for: sessionID))
     }
 
     private var conversationTitle: String {
@@ -882,6 +1044,9 @@ struct ConversationView: View {
                 AssistantTurnView(sessionID: sessionID,
                                   block: block,
                                   tools: tools,
+                                  streamingMessage: activeStreamingMessage,
+                                  streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
+                                    ? streamingHeadroom.reservedReplyHeight : nil,
                                   onBranch: createBranchSession).id(section.id)
             }
         case .row(let entry):
@@ -893,6 +1058,9 @@ struct ConversationView: View {
                     AssistantTurnView(sessionID: sessionID,
                                       block: block,
                                       tools: [],
+                                      streamingMessage: activeStreamingMessage,
+                                      streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
+                                        ? streamingHeadroom.reservedReplyHeight : nil,
                                       onBranch: createBranchSession).id(section.id)
                 }
             case .tool(let tool):
@@ -1024,6 +1192,10 @@ struct ConversationView: View {
         // it tracks force/velocity and can be cancelled mid-swipe.
         .scrollDismissesKeyboard(.interactively)
         .scrollBounceBehavior(.always)
+        .onPreferenceChange(DSHStreamMessageMeasurementKey.self) { measurement in
+            guard let measurement else { return }
+            updateStreamingHeadroom(with: measurement)
+        }
     }
 
     var body: some View {
@@ -1060,6 +1232,7 @@ struct ConversationView: View {
                                             sessionUpdatedAt: session?.updatedAt,
                                             entriesCount: transcriptEntries.count,
                                             streamingSignature: latestStreamingSignature,
+                                            streamingMessageID: activeStreamingMessage?.streamID,
                                             isRunning: isRunning,
                                             sessionID: sessionID,
                                             initialVisibleLimit: Self.transcriptInitialLimit,
@@ -1067,6 +1240,8 @@ struct ConversationView: View {
                                             selectedPhotos: $selectedPhotos,
                                             model: model,
                                             pinToBottom: { self.scrollToLatest(proxy) },
+                                            prepareStreamingHeadroom: { self.prepareStreamingHeadroom(for: $0) },
+                                            resetStreamingHeadroom: { self.resetStreamingHeadroom() },
                                             runningChanged: { self.handleRunningChange($0, proxy: proxy) },
                                             stagePhotos: { self.stageSelectedPhotos($0) }))
             .modifier(ConversationModals(showCommandMenu: $showCommandMenu,
@@ -1175,8 +1350,7 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        // Blur scrolling content beneath the header and status area.
-        .background(DSHHeaderBackdrop(frosted: true, contentUnderneath: headerOverlapsContent))
+        .background(DSHHeaderBackdrop(opacity: 0.75))
         .overlay(alignment: .bottom) {
             if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }
@@ -1774,6 +1948,33 @@ struct ConversationView: View {
         scrollCoordinator.schedulePin()
     }
 
+    private func prepareStreamingHeadroom(for streamID: String?) {
+        var plan = streamingHeadroom
+        if plan.streamID != streamID { plan.begin(streamID: streamID) }
+        plan.prepareForNextChunk(streamID: streamID)
+        guard plan != streamingHeadroom else { return }
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) { streamingHeadroom = plan }
+    }
+
+    private func updateStreamingHeadroom(with measurement: DSHStreamMessageMeasurement) {
+        guard activeStreamingMessage?.streamID == measurement.streamID else { return }
+        var plan = streamingHeadroom
+        plan.record(streamID: measurement.streamID, size: measurement.size)
+        guard plan != streamingHeadroom else { return }
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) { streamingHeadroom = plan }
+    }
+
+    private func resetStreamingHeadroom() {
+        guard streamingHeadroom.streamID != nil || streamingHeadroom.reservedHeight > 0 else { return }
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) { streamingHeadroom.begin(streamID: nil) }
+    }
+
     /// Turn-state flips drive the live clock and re-anchor the transcript.
     /// Extracted from `body` so the repin closures don't share its
     /// type-check budget.
@@ -1782,6 +1983,7 @@ struct ConversationView: View {
             if turnStartedAt == nil { turnStartedAt = .now }
         } else {
             turnStartedAt = nil
+            resetStreamingHeadroom()
         }
         scrollToLatest(proxy)
     }
@@ -2821,13 +3023,21 @@ private struct MessageBubble: View {
     let sessionID: String
     let message: DSHChatMessage
     let onBranch: (() -> Void)?
+    /// Present only for the current transient assistant delta.  The
+    /// measurement happens before the outer min-height is applied, so it
+    /// remains the intrinsic Markdown layout rather than the reserved shell.
+    let streamingMeasurementID: String?
+    let streamingMinimumHeight: CGFloat?
     @State private var showActions = false
     @State private var didCopy = false
 
-    init(sessionID: String, message: DSHChatMessage, onBranch: (() -> Void)? = nil) {
+    init(sessionID: String, message: DSHChatMessage, onBranch: (() -> Void)? = nil,
+         streamingMeasurementID: String? = nil, streamingMinimumHeight: CGFloat? = nil) {
         self.sessionID = sessionID
         self.message = message
         self.onBranch = onBranch
+        self.streamingMeasurementID = streamingMeasurementID
+        self.streamingMinimumHeight = streamingMinimumHeight
     }
 
     var body: some View {
@@ -2919,6 +3129,18 @@ private struct MessageBubble: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .background {
+            if let streamingMeasurementID {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: DSHStreamMessageMeasurementKey.self,
+                        value: DSHStreamMessageMeasurement(streamID: streamingMeasurementID,
+                                                           size: proxy.size)
+                    )
+                }
+            }
+        }
+        .frame(minHeight: streamingMinimumHeight ?? 0, alignment: .top)
     }
 
     /// Reply timestamp ("Tuesday 17:56" / "星期二 17:56"), stamped from the
@@ -3329,6 +3551,8 @@ private struct AssistantTurnView: View {
     let sessionID: String
     let block: DSHTranscriptBlock
     let tools: [DSHToolActivity]
+    let streamingMessage: DSHActiveStreamingMessage?
+    let streamingMinimumHeight: CGFloat?
     let onBranch: () -> Void
 
     @State private var isExpanded = false
@@ -3358,7 +3582,13 @@ private struct AssistantTurnView: View {
                     .padding(.top, 8)
             }
             ForEach(block.visibleMessages) { message in
-                MessageBubble(sessionID: sessionID, message: message, onBranch: onBranch)
+                MessageBubble(sessionID: sessionID,
+                              message: message,
+                              onBranch: onBranch,
+                              streamingMeasurementID: message.id == streamingMessage?.renderedMessageID
+                                ? streamingMessage?.streamID : nil,
+                              streamingMinimumHeight: message.id == streamingMessage?.renderedMessageID
+                                ? streamingMinimumHeight : nil)
                     .padding(.top, 12)
             }
         }
