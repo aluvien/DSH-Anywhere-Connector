@@ -80,6 +80,10 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func send(_ command: DSHCommand) async throws {
         guard let connection else { throw DSHWebSocketError.notConnected }
+        guard let activeProfile = store.activeProfile,
+              command.machineId == activeProfile.machineId else {
+            throw DSHWebSocketError.machineMismatch
+        }
         if ["workspace.catalog", "workspace.create", "mode.catalog", "directory.list", "session.rename"].contains(command.type) {
             try await verifyCatalogRelay()
         }

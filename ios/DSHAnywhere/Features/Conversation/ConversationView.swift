@@ -2024,8 +2024,8 @@ struct ConversationView: View {
         model.draft = ""
         draftAttachments = []
         isSending = true
+        let machineGeneration = model.currentMachineGeneration
         Task { @MainActor in
-            var uploadedCount = 0
             do {
                 var receipts: [String] = []
                 var messageAttachments: [DSHMessageAttachment] = []
@@ -2033,7 +2033,8 @@ struct ConversationView: View {
                 for attachment in staged {
                     let receipt = try await model.uploadAttachmentAndWait(name: attachment.name,
                                                                            data: attachment.data,
-                                                                           for: sessionID)
+                                                                           for: sessionID,
+                                                                           machineGeneration: machineGeneration)
                     receipts.append(receipt)
                     let mediaType = attachment.isImage ? "image/jpeg" : nil
                     model.cacheAttachmentData(attachment.data, for: receipt)
@@ -2041,7 +2042,6 @@ struct ConversationView: View {
                                                                     name: attachment.name,
                                                                     mediaType: mediaType,
                                                                     receiptId: receipt))
-                    uploadedCount += 1
                 }
                 if wasRunning && mode == "queue" {
                     model.noteQueuedPrompt(text: trimmed, mode: mode, requestId: requestId, for: sessionID)
@@ -2050,8 +2050,12 @@ struct ConversationView: View {
                                  messageAttachments: messageAttachments, to: sessionID,
                                  mode: mode, requestId: requestId)
             } catch {
+                guard model.isCurrentMachineGeneration(machineGeneration) else {
+                    isSending = false
+                    return
+                }
                 model.draft = text
-                draftAttachments = Array(staged.dropFirst(uploadedCount))
+                draftAttachments = staged
                 model.errorMessage = error.localizedDescription
             }
             isSending = false

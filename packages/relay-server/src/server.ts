@@ -394,7 +394,9 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       // may fail; a revoked connection must never remain authorized during the
       // write or its asynchronous close handshake.
       for (const connection of connections) {
-        if (connection.principal.role === "device" && connection.principal.deviceId === deviceId) {
+        if (connection.principal.role === "device" &&
+            connection.principal.machineId === machineId &&
+            connection.principal.deviceId === deviceId) {
           if (connections.delete(connection)) broadcastPresence(connection.principal, false);
           connection.ws.close(4401, "device revoked");
         }

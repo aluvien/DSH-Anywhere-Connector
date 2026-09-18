@@ -108,6 +108,7 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
     case unsupportedProtocolVersion(Int)
     case unauthorizedRelayRole
     case authenticationRequired
+    case machineMismatch
     case eventBufferOverflow
     case messageTooLarge
     case relay(code: String, message: String)
@@ -120,6 +121,7 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
         case .unsupportedProtocolVersion(let version): return "Unsupported protocol version \(version)."
         case .unauthorizedRelayRole: return "The Relay authenticated this connection with an unexpected role."
         case .authenticationRequired: return "The Relay credentials are no longer valid. Pair this iPhone again."
+        case .machineMismatch: return "This request belongs to a different Mac."
         case .eventBufferOverflow: return "The Relay event buffer overflowed; reconnecting to resynchronize."
         case .messageTooLarge: return "This message is too large for the Relay connection."
         case .relay(let code, let message): return "Relay error \(code): \(message)"
@@ -260,6 +262,9 @@ public actor DSHWebSocketConnection {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         guard !stopped, let socket else { throw DSHWebSocketError.notConnected }
+        guard command.machineId == configuration.machineId else {
+            throw DSHWebSocketError.machineMismatch
+        }
         let normalized = normalized(command)
         let generation = rememberSessionSnapshotRequestIfNeeded(normalized)
         do {
@@ -353,7 +358,7 @@ public actor DSHWebSocketConnection {
         case .notConnected, .closed:
             return true
         case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole,
-             .authenticationRequired, .relay, .messageTooLarge:
+             .authenticationRequired, .machineMismatch, .relay, .messageTooLarge:
             // Retrying unchanged credentials or an incompatible wire message
             // cannot heal the connection and otherwise becomes a tight loop.
             return false

@@ -724,6 +724,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     config.pairingRateLimitWindowMs ?? 60_000,
   )
   const replay = new ReplayBuffer<EventEnvelope>(config.eventBufferSize ?? 2_000)
+  // A Bridge restart creates a new sequence space. Connectors persist their
+  // cursor across socket reconnects, so the epoch makes that cursor scoped to
+  // this Bridge process rather than accidentally to a later process.
+  const bridgeEpoch = randomUUID()
   const approvals = new PendingApprovals()
   const questions = new PendingQuestions()
   const idempotentResponses = new IdempotentHttpResponses()
@@ -737,6 +741,15 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   /** Highest Relay machine lease observed for each phone. Bridge socket
    * ordering is only a tie-breaker; the Relay lease is the ownership source. */
   const latestRelayGenerations = new Map<string, { epoch: string; generation: number }>()
+  /** Highest Bridge socket generation accepted for each device/Relay lease.
+   * Keep it after an offline edge so a delayed old `online` cannot resurrect
+   * the device once the current lease has been removed. */
+  const latestBridgeLeases = new Map<string, {
+    bridgeEpoch: string
+    relayEpoch: string
+    relayGeneration: number
+    generation: number
+  }>()
   const retiredRelayEpochs = new Set<string>()
   const clientConnectorIds = new Map<WebSocket, string>()
   const connectorGenerations = new Map<string, number>()
@@ -786,6 +799,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             relayDevices,
             relayDeviceLeases,
             latestRelayGenerations,
+            latestBridgeLeases,
+            bridgeEpoch,
             retiredRelayEpochs,
             connectorGenerationOf,
             () => {
@@ -852,6 +867,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           connectorGenerations.set(id, generation)
         }
         const after = parseAfter(req.url)
+        const oldest = replay.after(0)[0]?.sequence
+        const replayTruncated = after > 0 && oldest !== undefined && oldest > after + 1
         for (const entry of replay.after(after)) {
           client.send(JSON.stringify({ ...entry.event, sequence: entry.sequence }))
         }
@@ -862,11 +879,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             machineId,
             deviceId: device.id,
             serverTime: Date.now(),
-          capabilities: [
+            capabilities: [
             'sessions', 'workspaces', 'archive', 'prompt', 'attachments',
             'cancel', 'approval', 'permissions', 'models', 'commands', 'usage', 'replay', 'questions',
-          ],
+            ],
             ...(after > 0 ? { resumedFrom: after } : {}),
+            bridgeEpoch,
+            ...(replayTruncated ? { replayTruncated: true } : {}),
           },
         }, [client])
         void (async () => {
@@ -1201,6 +1220,13 @@ async function handleHttp(
   relayDevices: Set<string>,
   relayDeviceLeases: Map<string, ConnectorLease>,
   latestRelayGenerations: Map<string, { epoch: string; generation: number }>,
+  latestBridgeLeases: Map<string, {
+    bridgeEpoch: string
+    relayEpoch: string
+    relayGeneration: number
+    generation: number
+  }>,
+  bridgeEpoch: string,
   retiredRelayEpochs: Set<string>,
   connectorGenerationOf: (connectorId: string) => number | undefined,
   onRemotePresenceChanged: () => void,
@@ -1276,15 +1302,27 @@ async function handleHttp(
       if (latestRelayLease?.epoch === relayEpoch && relayGeneration < latestRelayLease.generation) {
         throw new HttpError(409, 'Relay connector lease is stale')
       }
+      const latestBridgeLease = latestBridgeLeases.get(deviceId)
+      const sameRelayLease = latestBridgeLease?.relayEpoch === relayEpoch &&
+        latestBridgeLease.relayGeneration === relayGeneration
+      if (sameRelayLease && generation < latestBridgeLease!.generation) {
+        throw new HttpError(409, 'Bridge connector lease is stale')
+      }
       const currentLease = relayDeviceLeases.get(deviceId)
-      const sameRelayLease = currentLease?.relayEpoch === relayEpoch &&
+      const currentRelayLease = currentLease?.relayEpoch === relayEpoch &&
         currentLease.relayGeneration === relayGeneration
-      const bridgeIsCurrent = currentLease === undefined || !sameRelayLease || generation >= currentLease.generation
+      const bridgeIsCurrent = currentLease === undefined || !currentRelayLease || generation >= currentLease.generation
       if (bridgeIsCurrent) {
         if (latestRelayLease !== undefined && latestRelayLease.epoch !== relayEpoch) {
           retiredRelayEpochs.add(latestRelayLease.epoch)
         }
         latestRelayGenerations.set(deviceId, { epoch: relayEpoch, generation: relayGeneration })
+        latestBridgeLeases.set(deviceId, {
+          bridgeEpoch,
+          relayEpoch,
+          relayGeneration,
+          generation,
+        })
         relayDeviceLeases.set(deviceId, { connectorId, generation, relayGeneration, relayEpoch })
         relayDevices.add(deviceId)
       } else throw new HttpError(409, 'Bridge connector lease is stale')

@@ -879,7 +879,7 @@ final class DSHEventStoreTests: XCTestCase {
         // Server-sent mirrors refuse local cancel; acceptance still retires.
         let queuedRequestID = "queued-\(UUID().uuidString)"
         model.noteQueuedPrompt(text: "server", mode: "queue", requestId: queuedRequestID, for: sid)
-        let server = model.queuedPrompts(for: sid).first(where: { $0.text == "server" })!
+        let server = model.queuedPrompts(for: sid).first(where: { $0.sent && $0.requestId == queuedRequestID })!
         XCTAssertTrue(server.sent)
         XCTAssertFalse(model.cancelQueuedPrompt(id: server.id, sessionID: sid))
         model.matchQueuedPrompt(text: "server", sessionID: sid, requestID: queuedRequestID)

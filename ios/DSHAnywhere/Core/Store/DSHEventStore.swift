@@ -63,7 +63,8 @@ public struct DSHHistoryCarryOver: Codable, Sendable, Equatable {
 public struct DSHEventReducer: Sendable {
     public init() {}
 
-    public func reduce(_ event: DSHEvent, into state: inout DSHStoreState) {
+    @discardableResult
+    public func reduce(_ event: DSHEvent, into state: inout DSHStoreState) -> Bool {
         // Transport controls are local, out-of-band signals and therefore do
         // not participate in the Connector event sequence/replay window.
         switch event.kind {
@@ -74,12 +75,12 @@ public struct DSHEventReducer: Sendable {
                 state.bridgeReachable = nil
                 state.connectionState = value
             }
-            return
+            return true
         case .machinePresence(let online):
             if !online || !state.machineOnline { state.bridgeReachable = nil }
             state.machineOnline = online
             state.connectionState = online ? .connected : .disconnected
-            return
+            return true
         default:
             break
         }
@@ -93,7 +94,7 @@ public struct DSHEventReducer: Sendable {
         }
         // Sequence numbers are monotonic at the transport boundary. Replaying
         // an old event must not duplicate a message or roll state backwards.
-        guard event.sequence > state.lastSequence else { return }
+        guard event.sequence > state.lastSequence else { return false }
         state.lastSequence = event.sequence
 
         switch event.kind {
@@ -356,6 +357,7 @@ public struct DSHEventReducer: Sendable {
         case .unknown:
             state.unknownEvents.append(event.envelope)
         }
+        return true
     }
 
     private func upsert(_ session: DSHSessionSummary, into sessions: inout [DSHSessionSummary]) {

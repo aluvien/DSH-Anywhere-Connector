@@ -104,6 +104,12 @@ export class DSHAnywhereConnector {
   private relayEpoch: string | undefined;
   /** Last Bridge event cursor acknowledged by this Connector. */
   private bridgeAfterSequence = 0;
+  /** Identifies the Bridge process that owns the replay cursor. */
+  private bridgeEpoch: string | undefined;
+  /** Bridge replays events before its ready envelope; hold them until the
+   * epoch/cursor contract has been checked. */
+  private bridgeReady = false;
+  private bridgeBufferedEvents: EventEnvelope[] = [];
   private relay: WebSocketLike | undefined;
   private bridge: WebSocketLike | undefined;
   private relayTimer: NodeJS.Timeout | undefined;
@@ -200,6 +206,9 @@ export class DSHAnywhereConnector {
     this.relayLeaseGeneration = undefined;
     this.relayEpoch = undefined;
     this.bridgeAfterSequence = 0;
+    this.bridgeEpoch = undefined;
+    this.bridgeReady = false;
+    this.bridgeBufferedEvents = [];
     this.pendingEvents.length = 0;
     this.recentEvents.length = 0;
     this.pendingEventBytes = 0;
@@ -268,6 +277,8 @@ export class DSHAnywhereConnector {
     if (!this.running) return;
     const connectorId = randomUUID();
     this.bridgeConnectorId = connectorId;
+    this.bridgeReady = false;
+    this.bridgeBufferedEvents = [];
     const socket = this.webSocketFactory(
       bridgeEventsURL(this.config.bridgeBaseURL, connectorId, this.bridgeAfterSequence),
       authorization(this.config.bridgeToken),
@@ -303,22 +314,85 @@ export class DSHAnywhereConnector {
       this.log("warn", "Ignored invalid event from local DSH bridge");
       return;
     }
-    if (event.data.sequence > this.bridgeAfterSequence) this.bridgeAfterSequence = event.data.sequence;
+    if (event.data.type === "connection.ready") {
+      const maxBufferedSequence = this.bridgeBufferedEvents.reduce(
+        (maximum, bufferedEvent) => Math.max(maximum, bufferedEvent.sequence), 0,
+      );
+      // The Bridge sends retained replay entries (including an older ready
+      // envelope) before publishing the ready envelope for this socket. Only
+      // the latter is beyond every buffered sequence and may authorize the
+      // replay cursor.
+      if (event.data.sequence <= maxBufferedSequence) {
+        if (this.bridgeBufferedEvents.length < MAX_REPLAY_EVENTS) {
+          this.bridgeBufferedEvents.push(event.data);
+        }
+        return;
+      }
+      const nextEpoch = event.data.payload.bridgeEpoch;
+      const epochChanged = this.bridgeEpoch !== undefined && nextEpoch !== undefined && nextEpoch !== this.bridgeEpoch;
+      if (epochChanged || event.data.payload.replayTruncated === true) {
+        // The cursor belongs to the previous Bridge process, or its retained
+        // buffer no longer reaches that cursor. Restart the socket from zero
+        // so the Bridge's authoritative snapshot/history can establish a new
+        // sequence epoch instead of silently dropping every new low sequence.
+        this.bridgeEpoch = nextEpoch;
+        this.bridgeAfterSequence = 0;
+        this.bridgeReady = false;
+        this.bridgeBufferedEvents = [];
+        socket.close(1000, "Bridge replay epoch changed");
+        return;
+      }
+      if (nextEpoch !== undefined) this.bridgeEpoch = nextEpoch;
+      if (event.data.sequence > this.bridgeAfterSequence) this.bridgeAfterSequence = event.data.sequence;
+      this.bridgeReady = true;
+      const buffered = this.bridgeBufferedEvents;
+      this.bridgeBufferedEvents = [];
+      for (const bufferedEvent of buffered) this.handleBridgeEvent(bufferedEvent);
+      // Forward the handshake that authorized this socket after any retained
+      // replay entries, preserving the legacy phone-visible ready signal.
+      this.sendEvent(event.data);
+      return;
+    }
+    // Older Bridges did not advertise an epoch (and some emit live events
+    // without any greeting). A fresh Connector has no persisted cursor to
+    // protect in that case, so retain the legacy forwarding behavior. Once a
+    // Bridge epoch has been observed, all subsequent sockets use the guarded
+    // replay path above.
+    if (!this.bridgeReady && this.bridgeEpoch === undefined) {
+      this.bridgeReady = true;
+      this.handleBridgeEvent(event.data);
+      return;
+    }
+    if (!this.bridgeReady) {
+      // The Bridge deliberately sends replay entries before connection.ready.
+      // Do not expose them until the ready envelope confirms that their epoch
+      // is compatible with the cursor we persisted across reconnects.
+      if (this.bridgeBufferedEvents.length < MAX_REPLAY_EVENTS) {
+        this.bridgeBufferedEvents.push(event.data);
+      }
+      return;
+    }
+    this.handleBridgeEvent(event.data);
+  }
+
+  private handleBridgeEvent(event: EventEnvelope): void {
+    if (event.sequence > this.bridgeAfterSequence) this.bridgeAfterSequence = event.sequence;
+    if (event.type === "connection.ready") return;
     // The bridge socket is owned by the connector, not by one phone. Its
     // connection greeting includes an unfiltered session snapshot which can
     // race a device's current archive/list query and replace the UI with an
     // old projection. Lists travel through correlated HTTP commands below;
     // retain live created/title events but never forward this bridge greeting.
-    if (event.data.type === "session.snapshot") return;
-    if (isTransientStreamingEvent(event.data)) {
-      this.sendStreamingEvent(event.data);
+    if (event.type === "session.snapshot") return;
+    if (isTransientStreamingEvent(event)) {
+      this.sendStreamingEvent(event);
       return;
     }
-    if (event.data.type === "assistant.message.completed" && event.data.payload.replacesMessageId !== undefined) {
-      this.sendStreamingCompletion(event.data);
+    if (event.type === "assistant.message.completed" && event.payload.replacesMessageId !== undefined) {
+      this.sendStreamingCompletion(event);
       return;
     }
-    this.sendEvent(event.data);
+    this.sendEvent(event);
   }
 
   private onRelayMessage(socket: WebSocketLike, raw: RawData): void {
@@ -578,6 +652,7 @@ export class DSHAnywhereConnector {
         || command.type === "permission.set"
         || command.type === "workspace.rename" || command.type === "workspace.delete"
         || command.type === "session.rename") {
+      const workspaceMutation = command.type === "workspace.rename" || command.type === "workspace.delete";
       // These operations mutate native Harness metadata. Refresh the same
       // filtered list used by the live bridge so archived sessions disappear
       // immediately while model/workspace labels update in place.
@@ -591,6 +666,7 @@ export class DSHAnywhereConnector {
         // current list; a deferred refresh below supplies the authoritative
         // post-mutation projection without orphaning the pending request.
         this.deferredSessionSnapshotDevices.add(command.deviceId);
+        if (workspaceMutation) void this.pushWorkspaceCatalog(command.deviceId);
         return;
       }
       const generation = this.beginSessionSnapshotQuery(command.deviceId);
@@ -613,6 +689,7 @@ export class DSHAnywhereConnector {
         // a duplicate mutation will query the current list instead of replaying
         // an old snapshot with a fresh transport sequence.
         this.sendSessionSnapshot(items, command.deviceId);
+        if (workspaceMutation) await this.pushWorkspaceCatalog(command.deviceId);
       } finally {
         const remaining = (this.inFlightSessionMutations.get(command.deviceId) ?? 1) - 1;
         if (remaining <= 0) this.inFlightSessionMutations.delete(command.deviceId);
@@ -749,6 +826,13 @@ export class DSHAnywhereConnector {
     const execution = this.commandExecutions.get(key);
     const events = cached?.events ?? execution?.events ?? this.recentEvents.filter((event) =>
       event.messageId === command.requestId && event.deviceId === command.deviceId);
+    if (command.type === "session.list") {
+      // A list has no durable side effect to cache. Re-read the authoritative
+      // projection and correlate the fresh snapshot to the duplicate request;
+      // replaying the old snapshot would either be stale or be filtered out.
+      void this.replaySessionList(command);
+      return;
+    }
     // Reissue through sendEvent so the result receives a fresh monotonic
     // transport sequence. Reusing the original sequence is silently filtered
     // by the iOS reducer after it has processed later events.
@@ -760,6 +844,21 @@ export class DSHAnywhereConnector {
       // duplicate instead of replaying the historical projection cached by the
       // first execution.
       void this.pushSessionSnapshot(command.deviceId);
+      if (command.type === "workspace.rename" || command.type === "workspace.delete") {
+        void this.pushWorkspaceCatalog(command.deviceId);
+      }
+    }
+  }
+
+  private async replaySessionList(command: Extract<CommandEnvelope, { type: "session.list" }>): Promise<void> {
+    try {
+      this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
+      const data = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(command.deviceId) }));
+      const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
+      this.sendSessionSnapshot(items, command.deviceId, command.requestId, command.requestId);
+    } catch (error) {
+      this.log("warn", `Failed to replay session list for device ${shortID(command.deviceId)}: ${safeError(error, this.config)}`);
+      this.sendProtocolError(command, error);
     }
   }
 
@@ -814,6 +913,24 @@ export class DSHAnywhereConnector {
       this.sendSessionSnapshot(items, deviceId);
     } catch (error) {
       this.log("warn", `Failed to push session snapshot to device ${shortID(deviceId)}: ${safeError(error, this.config)}`);
+    }
+  }
+
+  private async pushWorkspaceCatalog(deviceId: string): Promise<void> {
+    try {
+      const data = asRecord(await this.callBridge({ method: "GET", path: "/workspaces" }));
+      this.sendEvent({
+        version: PROTOCOL_VERSION,
+        messageId: `workspace-push-${randomUUID()}`,
+        machineId: this.config.machineId,
+        deviceId,
+        sequence: ++this.sequence,
+        timestamp: Date.now(),
+        type: "workspace.catalog",
+        payload: WorkspaceCatalogPayloadSchema.parse(data),
+      }, deviceId);
+    } catch (error) {
+      this.log("warn", `Failed to push workspace catalog to device ${shortID(deviceId)}: ${safeError(error, this.config)}`);
     }
   }
 

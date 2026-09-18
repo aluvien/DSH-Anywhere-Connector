@@ -135,6 +135,14 @@ final class DSHAppModel: ObservableObject {
     private var eventFlushTask: Task<Void, Never>?
     /// Invalidates delayed callbacks when the active machine/socket changes.
     private var machineStateGeneration = 0
+    /// A send or upload task captures this token before its first suspension.
+    /// Views use it to discard stale attachment callbacks without changing
+    /// machine state themselves.
+    var currentMachineGeneration: Int { machineStateGeneration }
+
+    func isCurrentMachineGeneration(_ generation: Int) -> Bool {
+        machineStateGeneration == generation
+    }
     private static let eventBatchNanoseconds: UInt64 = 50_000_000
     /// A prompt upload completes before the Harness emits its accepted user
     /// message. Queue the local thumbnails so that event can attach them to the
@@ -510,14 +518,38 @@ final class DSHAppModel: ObservableObject {
     }
 
     func removeMachine(_ machine: DSHRemoteProfile) {
+        let wasActive = machine.machineId == activeMachine?.machineId
+        if wasActive {
+            eventTask?.cancel()
+            eventTask = nil
+            eventFlushTask?.cancel()
+            eventFlushTask = nil
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            do { try await self.transport.removeMachine(machine.machineId) }
-            catch { self.errorMessage = error.localizedDescription }
+            do {
+                try await self.transport.removeMachine(machine.machineId)
+            } catch {
+                self.errorMessage = error.localizedDescription
+                self.refreshMachines()
+                self.isPaired = !self.machines.isEmpty
+                return
+            }
             self.refreshMachines()
+            guard wasActive else {
+                self.isPaired = !self.machines.isEmpty
+                return
+            }
+            self.resetTransientRequestState()
+            self.state = DSHStoreState()
+            self.selectedSessionID = nil
             if let active = self.profiles.activeProfile {
                 self.machineName = active.machineName
                 self.machineID = active.machineId
+                self.connect()
+            } else {
+                self.machineName = ""
+                self.machineID = ""
             }
             self.isPaired = !self.machines.isEmpty
         }
@@ -1219,8 +1251,12 @@ final class DSHAppModel: ObservableObject {
     /// returned its receipt. The receipt is the only safe value to put into a
     /// subsequent prompt, so the composer can now defer all network work until
     /// the user taps Send.
-    func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String) async throws -> String {
+    func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String,
+                                 machineGeneration: Int? = nil) async throws -> String {
         guard data.count <= 10 * 1024 * 1024 else { throw DSHAttachmentUploadError.tooLarge }
+        if let machineGeneration, machineGeneration != self.machineStateGeneration {
+            throw CancellationError()
+        }
         let requestId = UUID().uuidString
         uploadWaitRequestIDs.insert(requestId)
         defer { uploadWaitRequestIDs.remove(requestId) }
@@ -1234,6 +1270,9 @@ final class DSHAppModel: ObservableObject {
         // legitimate upload deadline, leaving the user with a false timeout.
         for _ in 0..<3_000 {
             try Task.checkCancellation()
+            if let machineGeneration, machineGeneration != self.machineStateGeneration {
+                throw CancellationError()
+            }
             if let message = state.protocolErrorsByRequestID[requestId] {
                 throw DSHRemoteCommandError(message: message)
             }
@@ -1336,8 +1375,14 @@ final class DSHAppModel: ObservableObject {
     private func send(_ command: DSHCommand) {
         let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
         let machineGeneration = self.machineStateGeneration
+        let expectedMachineID = self.machineID
         Task { @MainActor [weak self] in
-            do { try await self?.transport.send(command) }
+            do {
+                guard let self,
+                      self.machineStateGeneration == machineGeneration,
+                      self.machineID == expectedMachineID else { return }
+                try await self.transport.send(command)
+            }
             catch {
                 guard let self else { return }
                 self.clearFailedRemoteRequest(command.requestId)
@@ -1397,10 +1442,12 @@ final class DSHAppModel: ObservableObject {
 
         // Mutate a local copy and assign once. `state` is @Published, so this
         // turns a burst of assistant deltas/tool events into one UI update.
-        let acceptedEvents = events.filter(shouldReduce)
+        var acceptedEvents: [DSHEvent] = []
         var next = state
-        for event in acceptedEvents {
-            reducer.reduce(event, into: &next)
+        for event in events where shouldReduce(event) {
+            if reducer.reduce(event, into: &next) {
+                acceptedEvents.append(event)
+            }
         }
         attachPendingMessageThumbnails(to: &next, events: acceptedEvents)
         invalidateTranscriptCaches(for: transcriptSessionIDs(affectedBy: acceptedEvents))
@@ -1581,8 +1628,9 @@ final class DSHAppModel: ObservableObject {
         pendingSessionCreationRequestIDs.remove(requestID)
         selectedSessionID = session.id
         guard let pending = pendingInitialMessagesByRequestID.removeValue(forKey: requestID) else { return }
+        let machineGeneration = self.machineStateGeneration
         Task { @MainActor [weak self] in
-            await self?.sendInitialMessage(pending, to: session.id)
+            await self?.sendInitialMessage(pending, to: session.id, machineGeneration: machineGeneration)
         }
     }
 
@@ -1633,17 +1681,23 @@ final class DSHAppModel: ObservableObject {
         requestModes()
     }
 
-    private func sendInitialMessage(_ pending: DSHPendingInitialMessage, to sessionID: String) async {
+    private func sendInitialMessage(_ pending: DSHPendingInitialMessage, to sessionID: String,
+                                    machineGeneration: Int? = nil) async {
         guard !pending.attachments.isEmpty else { return }
+        if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         do {
             var receipts: [String] = []
             var messageAttachments: [DSHMessageAttachment] = []
             receipts.reserveCapacity(pending.attachments.count)
             messageAttachments.reserveCapacity(pending.attachments.count)
             for attachment in pending.attachments {
+                if let machineGeneration, machineGeneration != self.machineStateGeneration {
+                    throw CancellationError()
+                }
                 let receipt = try await uploadAttachmentAndWait(name: attachment.name,
                                                                  data: attachment.data,
-                                                                 for: sessionID)
+                                                                 for: sessionID,
+                                                                 machineGeneration: machineGeneration)
                 receipts.append(receipt)
                 let mediaType = attachment.isImage ? "image/jpeg" : nil
                 cacheAttachmentData(attachment.data, for: receipt)
@@ -1652,9 +1706,11 @@ final class DSHAppModel: ObservableObject {
                                                                 mediaType: mediaType,
                                                                 receiptId: receipt))
             }
+            if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
             sendPrompt(pending.text, attachments: receipts,
                        messageAttachments: messageAttachments, to: sessionID)
         } catch {
+            if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
             errorMessage = error.localizedDescription
         }
     }

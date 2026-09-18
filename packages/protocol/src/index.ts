@@ -119,6 +119,10 @@ export const ConnectionReadyPayloadSchema = StrictObject({
   serverTime: TimestampSchema,
   capabilities: z.array(IdentifierSchema).max(100),
   resumedFrom: SequenceSchema.optional(),
+  /** A new value identifies a Bridge process/replay epoch. */
+  bridgeEpoch: IdentifierSchema.optional(),
+  /** True when the requested cursor predates the retained Bridge buffer. */
+  replayTruncated: z.boolean().optional(),
 });
 export type ConnectionReadyPayload = z.infer<typeof ConnectionReadyPayloadSchema>;
 
