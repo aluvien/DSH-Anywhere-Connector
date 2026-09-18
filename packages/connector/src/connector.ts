@@ -595,7 +595,9 @@ export class DSHAnywhereConnector {
       // projection. Do not surface the older timeout as a user error or retry
       // it into an outdated archive/catalog response.
       if (staleSessionList || staleWorkspaceCatalog) return { state: "completed" };
-      return { state: "failed", retryable: this.sendProtocolError(command, error) };
+      const retryable = this.sendProtocolError(command, error);
+      if (command.type === "session.list") this.flushDeferredSessionSnapshot(command.deviceId);
+      return { state: "failed", retryable };
     }
   }
 
@@ -966,6 +968,7 @@ export class DSHAnywhereConnector {
       this.finishSessionListRequest(command, generation);
       if (!this.isCurrentSessionSnapshotQuery(command.deviceId, generation)) return;
       this.sendProtocolError(command, error);
+      this.flushDeferredSessionSnapshot(command.deviceId);
     }
   }
 
@@ -1189,7 +1192,6 @@ export class DSHAnywhereConnector {
     if (pending === undefined || pending.requestId !== command.requestId ||
         (generation !== undefined && pending.generation !== generation)) return;
     this.pendingSessionListRequests.delete(command.deviceId);
-    this.flushDeferredSessionSnapshot(command.deviceId);
   }
 
   private flushDeferredSessionSnapshot(deviceId: string): void {

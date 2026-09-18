@@ -38,6 +38,9 @@ actor DSHRemoteTransport: DSHAppTransport {
     /// A later machine choice supersedes an earlier choice even when the
     /// earlier socket's asynchronous cleanup finishes last.
     private var machineSelectionGeneration = 0
+    /// The target of the currently suspended machine switch. Deleting an
+    /// unrelated profile must not cancel it, but deleting this target must.
+    private var pendingMachineSelectionID: String?
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -150,6 +153,7 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func disconnect() async {
         machineSelectionGeneration &+= 1
+        pendingMachineSelectionID = nil
         await disconnectConnection()
     }
 
@@ -172,12 +176,18 @@ actor DSHRemoteTransport: DSHAppTransport {
         // The socket carries the old machine's identity, so it cannot be reused.
         machineSelectionGeneration &+= 1
         let selection = machineSelectionGeneration
+        pendingMachineSelectionID = machineId
         await disconnectConnection()
         guard selection == machineSelectionGeneration else { return }
         store.setActive(machineId)
+        pendingMachineSelectionID = nil
     }
 
     func removeMachine(_ machineId: String) async throws {
+        if pendingMachineSelectionID == machineId {
+            machineSelectionGeneration &+= 1
+            pendingMachineSelectionID = nil
+        }
         if store.activeMachineId == machineId { await disconnect() }
         if let profile = store.profiles.first(where: { $0.machineId == machineId }) {
             try tokenStore.delete(account: profile.deviceId)

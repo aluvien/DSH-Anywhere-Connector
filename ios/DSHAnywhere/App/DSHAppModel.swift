@@ -139,6 +139,10 @@ final class DSHAppModel: ObservableObject {
     /// Transport cleanup. This is separate from the connection generation:
     /// two valid choices can race even when both sockets are already gone.
     private var machineSelectionGeneration = 0
+    /// The target of the currently suspended machine-picker action. Removing
+    /// an unrelated profile must not cancel that action, while removing its
+    /// target must invalidate it just like removing the active machine.
+    private var pendingMachineSelectionID: String?
     /// A send or upload task captures this token before its first suspension.
     /// Views use it to discard stale attachment callbacks without changing
     /// machine state themselves.
@@ -526,6 +530,7 @@ final class DSHAppModel: ObservableObject {
         guard machine.machineId != activeMachine?.machineId else { return }
         machineSelectionGeneration &+= 1
         let selection = machineSelectionGeneration
+        pendingMachineSelectionID = machine.machineId
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -534,6 +539,7 @@ final class DSHAppModel: ObservableObject {
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
             guard self.machineSelectionGeneration == selection else { return }
+            self.pendingMachineSelectionID = nil
             self.machineName = machine.machineName
             self.machineID = machine.machineId
             // Restore only after the active identity changes. Restoring before
@@ -546,8 +552,12 @@ final class DSHAppModel: ObservableObject {
     }
 
     func removeMachine(_ machine: DSHRemoteProfile) {
-        machineSelectionGeneration &+= 1
         let wasActive = machine.machineId == activeMachine?.machineId
+        let isPendingSelection = machine.machineId == pendingMachineSelectionID
+        if wasActive || isPendingSelection {
+            machineSelectionGeneration &+= 1
+            if isPendingSelection { pendingMachineSelectionID = nil }
+        }
         if wasActive {
             eventTask?.cancel()
             eventTask = nil
@@ -658,6 +668,7 @@ final class DSHAppModel: ObservableObject {
 
     func disconnect() {
         machineSelectionGeneration &+= 1
+        pendingMachineSelectionID = nil
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -672,6 +683,7 @@ final class DSHAppModel: ObservableObject {
 
     func forgetPairing() {
         machineSelectionGeneration &+= 1
+        pendingMachineSelectionID = nil
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
@@ -1522,15 +1534,10 @@ final class DSHAppModel: ObservableObject {
         // transport tick, so one assignment is the bounded publication point.
         state = next
 
-        // A history bracket and its terminal turn events commonly arrive in
-        // the same UI batch. Register every opening bracket before walking
-        // side effects so an unusual event ordering cannot make a replayed
-        // terminal state release a local queue before its marker is seen.
-        for event in acceptedEvents {
-            if case .historyStarted(let batch) = event.kind {
-                beginHistoryReplay(batch)
-            }
-        }
+        // Walk history markers in the same order as their accepted events.
+        // Registering every marker up front would let a later history.started
+        // retroactively suppress an earlier real-time terminal event merely
+        // because both events happened to share one UI flush window.
         for event in acceptedEvents {
             let historyEvent: Bool
             switch event.kind {
