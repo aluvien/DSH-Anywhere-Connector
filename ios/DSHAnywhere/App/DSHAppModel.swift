@@ -2231,7 +2231,8 @@ final class DSHAppModel: ObservableObject {
     func retrySessionCreation(requestID: String) {
         guard let command = pendingSessionCreationCommandsByRequestID[requestID],
               pendingSessionCreationRequestIDs.contains(requestID) else { return }
-        if sessionCreationRetryExpired(for: requestID) {
+        if failedSessionCreations[requestID]?.resultUnknown == true,
+           sessionCreationRetryExpired(for: requestID) {
             let deadline = sessionCreationRetryDeadlines[requestID]
                 ?? Date().addingTimeInterval(sessionCreationRetryWindow)
             failedSessionCreations[requestID] = DSHSessionCreationFailure(
