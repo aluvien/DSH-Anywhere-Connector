@@ -83,6 +83,23 @@ describe("bridge command mapping", () => {
     expect(bridgeTimeoutFor(execute)).toBe(125_000);
     expect(bridgeTimeoutFor(command("session.list"))).toBe(15_000);
   });
+
+  it("stops instead of reclaiming a Relay lease after supersession", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, reconnectBaseMs: 1, heartbeatMs: 60_000,
+    });
+    connector.start();
+    relay.emit("open");
+    bridge.emit("open");
+    relay.emit("close", 4001);
+    await vi.waitFor(() => expect(connector.status).toBe("stopped"));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(sockets).toBe(2);
+  });
 });
 
 describe("Relay and bridge forwarding", () => {
@@ -138,6 +155,20 @@ describe("Relay and bridge forwarding", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const requestInit = (fetchMock.mock.calls as unknown as [unknown, RequestInit?][])[0]![1];
     expect(new Headers(requestInit?.headers).get("x-dsh-request-id")).toBe("request-1");
+    await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw))
+      .some((message) => message.body?.type === "session.created")).toBe(true));
+    const firstResult = relay.sent.map((raw) => JSON.parse(raw)).find((message) => message.body?.type === "session.created")!;
+    for (let index = 0; index < 4; index += 1) {
+      bridge.emit("message", JSON.stringify({
+        version: PROTOCOL_VERSION, messageId: `later-${index}`, machineId: "mac", deviceId: "broadcast",
+        sequence: index + 1, timestamp: index + 1, type: "connection.ready",
+        payload: { machineId: "mac", deviceId: "dsh-anywhere-connector", serverTime: index + 1, capabilities: [] },
+      }));
+    }
+    relay.emit("message", duplicate);
+    await vi.waitFor(() => expect(relay.sent.filter((raw) => JSON.parse(raw).body?.type === "session.created")).toHaveLength(2));
+    const replayedResult = relay.sent.map((raw) => JSON.parse(raw)).filter((message) => message.body?.type === "session.created")[1];
+    expect(replayedResult.body.sequence).toBeGreaterThan(firstResult.body.sequence);
     await connector.stop();
   });
 
@@ -177,6 +208,46 @@ describe("Relay and bridge forwarding", () => {
       type: "session.snapshot", messageId: "request-1",
       payload: [{ id: "session-1", workspaceId: "workspace-1", workspaceName: "Code" }],
     });
+    await connector.stop();
+  });
+
+  it("does not let an older presence refresh overwrite a newer archive query", async () => {
+    const relay = new FakeSocket();
+    const bridge = new FakeSocket();
+    const pending: Array<(response: Response) => void> = [];
+    let calls = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions") || url.endsWith("/sessions?includeArchived=true")) {
+        return new Promise<Response>((resolve) => pending.push(resolve));
+      }
+      return Promise.resolve(new Response(JSON.stringify({ accepted: true }), { headers: { "content-type": "application/json" } }));
+    });
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as unknown as typeof fetch,
+      webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); relay.emit("open"); bridge.emit("open");
+    relay.emit("message", JSON.stringify({
+      type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: true, serverTime: 1,
+    }));
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    const archive = { ...command("session.list"), requestId: "archive-list", payload: { includeArchived: true } };
+    relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archive", sender: "device", body: archive }));
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1]!(new Response(JSON.stringify({ items: [{ id: "archived", title: "Archived", updatedAt: 2 }] }),
+      { headers: { "content-type": "application/json" } }));
+    await vi.waitFor(() => expect(relay.sent.some((raw) => {
+      const message = JSON.parse(raw);
+      return message.body?.type === "session.snapshot" && message.body?.messageId === "archive-list";
+    })).toBe(true));
+    pending[0]!(new Response(JSON.stringify({ items: [{ id: "active", title: "Active", updatedAt: 1 }] }),
+      { headers: { "content-type": "application/json" } }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const snapshots = relay.sent.map((raw) => JSON.parse(raw)).filter((message) => message.body?.type === "session.snapshot");
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0].body.payload[0].id).toBe("archived");
     await connector.stop();
   });
 

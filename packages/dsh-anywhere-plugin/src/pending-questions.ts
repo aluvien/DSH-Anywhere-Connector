@@ -104,6 +104,7 @@ export class PendingQuestions {
 export async function firstAnswered<T>(
   phone: Promise<T | undefined>,
   browser: Promise<T>,
+  isAnswer: (value: T) => boolean = () => true,
 ): Promise<T | undefined> {
   return await new Promise<T | undefined>((resolve) => {
     let phoneOpen = true
@@ -114,7 +115,7 @@ export async function firstAnswered<T>(
     phone.then(
       (answer) => {
         phoneOpen = false
-        if (answer === undefined) resolveIfBothClosed()
+        if (answer === undefined || !isAnswer(answer)) resolveIfBothClosed()
         else resolve(answer)
       },
       () => {
@@ -125,7 +126,8 @@ export async function firstAnswered<T>(
     browser.then(
       (answer) => {
         browserOpen = false
-        resolve(answer)
+        if (isAnswer(answer)) resolve(answer)
+        else resolveIfBothClosed()
       },
       () => {
         browserOpen = false

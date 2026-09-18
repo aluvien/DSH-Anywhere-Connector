@@ -321,6 +321,24 @@ describe("Relay server", () => {
     expect(await attempt("203.0.113.11", machine.pairingSecret)).toBe(201);
   });
 
+  it("uses the right-most proxy-appended address instead of a forged XFF prefix", async () => {
+    const server = await relay(1, ["127.0.0.1"]);
+    const machine = await register(server.url, "Mac");
+    const attempt = async (forwarded: string, pairingSecret: string) => {
+      const response = await fetch(`${server.url}/v1/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": forwarded },
+        body: JSON.stringify({ machineId: machine.machineId, pairingSecret, deviceName: "iPhone" }),
+      });
+      return response.status;
+    };
+
+    expect(await attempt("198.51.100.1, 203.0.113.10", "incorrect")).toBe(401);
+    // Changing a caller-controlled prefix must not create a fresh bucket for
+    // the same source address appended by the trusted proxy.
+    expect(await attempt("198.51.100.99, 203.0.113.10", machine.pairingSecret)).toBe(429);
+  });
+
   async function devices(base: string, machineId: string, token: string) {
     const response = await fetch(`${base}/v1/machines/${machineId}/devices`, {
       headers: { authorization: `Bearer ${token}` },

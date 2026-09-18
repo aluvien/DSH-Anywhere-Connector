@@ -41,33 +41,67 @@ interface CapturedHttpResponse {
   readonly body: string | Buffer
 }
 
+interface IdempotencyEntry {
+  expiresAt: number
+  completed: boolean
+  fingerprint: string | undefined
+  result: Promise<CapturedHttpResponse>
+}
+
 /** Shared by every Connector socket attached to this Bridge process. */
-class IdempotentHttpResponses {
-  private readonly entries = new Map<string, { expiresAt: number; result: Promise<CapturedHttpResponse> }>()
+export class IdempotentHttpResponses {
+  private readonly entries = new Map<string, IdempotencyEntry>()
 
   async respond(
     key: string,
+    fingerprint: string | undefined,
     req: IncomingMessage,
     res: ServerResponse,
     handler: (capture: ServerResponse) => Promise<void>,
   ): Promise<void> {
     const now = Date.now()
     for (const [entryKey, entry] of this.entries) {
-      if (entry.expiresAt <= now) this.entries.delete(entryKey)
+      if (entry.completed && entry.expiresAt <= now) this.entries.delete(entryKey)
     }
     let entry = this.entries.get(key)
     if (entry === undefined) {
-      while (this.entries.size >= MAX_IDEMPOTENCY_ENTRIES) {
-        const oldest = this.entries.keys().next().value as string | undefined
-        if (oldest === undefined) break
-        this.entries.delete(oldest)
+      if (this.entries.size >= MAX_IDEMPOTENCY_ENTRIES) {
+        // Never evict an in-flight request: doing so lets a duplicate execute
+        // the same side effect a second time while the original is still
+        // running. Completed results are safe to evict; if every slot is
+        // active, reject new mutations until one settles.
+        const completed = [...this.entries].find(([, value]) => value.completed)
+        if (completed === undefined) throw new HttpError(503, 'idempotency capacity is busy')
+        this.entries.delete(completed[0])
       }
-      entry = { expiresAt: now + IDEMPOTENCY_TTL_MS, result: captureHttpResponse(handler) }
+      const pending: IdempotencyEntry = {
+        expiresAt: Number.POSITIVE_INFINITY,
+        completed: false,
+        fingerprint,
+        result: Promise.resolve({ status: 500, headers: {}, body: '' }),
+      }
+      pending.result = captureHttpResponse(handler)
+      entry = pending
       this.entries.set(key, entry)
+      void entry.result.then(
+        () => {
+          if (this.entries.get(key) === entry) {
+            entry!.completed = true
+            entry!.expiresAt = Date.now() + IDEMPOTENCY_TTL_MS
+          }
+        },
+        () => {
+          // A handler that truly rejects did not produce a replayable result.
+          if (this.entries.get(key) === entry) this.entries.delete(key)
+        },
+      )
     } else {
       // The winning handler consumes its own request body. Drain duplicate
       // bodies as well so their keep-alive connections remain reusable.
       req.resume()
+      if (entry.fingerprint !== fingerprint) {
+        throw new HttpError(409, 'idempotency key was reused with different request data')
+      }
     }
     const captured = await entry.result
     res.writeHead(captured.status, captured.headers)
@@ -727,7 +761,16 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         const key = createHash('sha256')
           .update(`${authorization}\0${req.method}\0${pathname}\0${requestId}`)
           .digest('hex')
-        await idempotentResponses.respond(key, req, res, serve)
+        const suppliedHash = header(req, 'x-dsh-request-hash')
+        const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+          ? suppliedHash.toLowerCase()
+          : undefined
+        try {
+          await idempotentResponses.respond(key, fingerprint, req, res, serve)
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          json(res, status, { error: error instanceof Error ? error.message : String(error) })
+        }
         return
       }
       await serve(res)
@@ -970,6 +1013,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       const decision = await firstAnswered<ApprovalOutcome>(
         pending.result.then<ApprovalOutcome>((value) => value).catch(() => undefined),
         next(),
+        (value) => value === 'allowed-once' || value === 'rejected',
       )
       approvals.discard(pending.id)
       publish({

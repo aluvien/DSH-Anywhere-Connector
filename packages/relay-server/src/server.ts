@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 import {
   PROTOCOL_VERSION,
   RelayErrorMessageSchema,
@@ -471,8 +471,18 @@ const clientIp = (request: IncomingMessage, trustedProxies: ReadonlySet<string>)
   if (!trustedProxies.has(peer)) return peer;
   const forwarded = request.headers["x-forwarded-for"];
   const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  const first = value?.split(",", 1)[0]?.trim();
-  return first && first.length <= 128 ? first : peer;
+  const chain = value?.split(",").map((item) => item.trim()).filter((item) => item.length > 0) ?? [];
+  // A trusted proxy must append the address it actually observed. Walk from
+  // the right, discard any explicitly trusted proxy hops, and use the first
+  // remaining valid IP. Taking the left-most value would preserve a caller's
+  // forged prefix when the proxy uses `$proxy_add_x_forwarded_for`.
+  for (let index = chain.length - 1; index >= 0; index -= 1) {
+    const candidate = chain[index]!;
+    if (isIP(candidate) === 0) continue;
+    if (trustedProxies.has(candidate)) continue;
+    return candidate;
+  }
+  return peer;
 };
 
 const sweepPairAttempts = (attempts: Map<string, PairAttempt>, now: number, windowMs: number): void => {

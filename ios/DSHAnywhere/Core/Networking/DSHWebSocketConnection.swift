@@ -66,13 +66,26 @@ public struct DSHExponentialBackoff: Sendable, Equatable {
 }
 
 public protocol DSHWebSocketTasking: AnyObject, Sendable {
+    /// URLSession exposes these after a failed handshake or remote close.
+    /// Test doubles may leave them nil; ordinary transport errors remain
+    /// retryable unless the server gives us an explicit auth signal.
+    var responseStatusCode: Int? { get }
+    var closeCodeRawValue: Int? { get }
     func resume()
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
 }
 
+public extension DSHWebSocketTasking {
+    var responseStatusCode: Int? { nil }
+    var closeCodeRawValue: Int? { nil }
+}
+
 extension URLSessionWebSocketTask: DSHWebSocketTasking {
+    public var responseStatusCode: Int? { (response as? HTTPURLResponse)?.statusCode }
+    public var closeCodeRawValue: Int? { closeCode.rawValue }
+
     public func send(_ message: URLSessionWebSocketTask.Message) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.send(message) { error in
@@ -94,6 +107,8 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
     case invalidMessage
     case unsupportedProtocolVersion(Int)
     case unauthorizedRelayRole
+    case authenticationRequired
+    case eventBufferOverflow
     case relay(code: String, message: String)
     case closed
 
@@ -103,6 +118,8 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
         case .invalidMessage: return "The Relay WebSocket message is not valid protocol JSON."
         case .unsupportedProtocolVersion(let version): return "Unsupported protocol version \(version)."
         case .unauthorizedRelayRole: return "The Relay authenticated this connection with an unexpected role."
+        case .authenticationRequired: return "The Relay credentials are no longer valid. Pair this iPhone again."
+        case .eventBufferOverflow: return "The Relay event buffer overflowed; reconnecting to resynchronize."
         case .relay(let code, let message): return "Relay error \(code): \(message)"
         case .closed: return "The Relay WebSocket connection is closed."
         }
@@ -142,6 +159,7 @@ public actor DSHWebSocketConnection {
     private var continuation: AsyncThrowingStream<DSHEvent, Error>.Continuation?
     private var activeStream: AsyncThrowingStream<DSHEvent, Error>?
     private var stopped = false
+    private var streamBufferOverflowed = false
     private var _state: DSHConnectionState = .disconnected
     private var _lastSequence: Int64
     /// A restart resets Connector sequence numbers. Only a snapshot that
@@ -181,10 +199,11 @@ public actor DSHWebSocketConnection {
     public func connect() -> AsyncThrowingStream<DSHEvent, Error> {
         if let activeStream { return activeStream }
         stopped = false
+        streamBufferOverflowed = false
         let stream = AsyncThrowingStream<DSHEvent, Error>(bufferingPolicy: .bufferingOldest(Self.maxBufferedEvents)) { continuation in
             self.continuation = continuation
             continuation.onTermination = { [weak self] _ in
-                Task { await self?.disconnect() }
+                Task { await self?.streamDidTerminate() }
             }
         }
         activeStream = stream
@@ -193,13 +212,27 @@ public actor DSHWebSocketConnection {
     }
 
     public func disconnect() {
+        disconnect(preserveFailure: false)
+    }
+
+    private func streamDidTerminate() {
+        let preserveFailure: Bool
+        if case .failed = _state { preserveFailure = true }
+        else { preserveFailure = false }
+        disconnect(preserveFailure: preserveFailure)
+    }
+
+    private func disconnect(preserveFailure: Bool) {
         stopped = true
+        streamBufferOverflowed = false
         runner?.cancel()
         runner = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
-        _state = .disconnected
-        yieldControl(type: "transport.state", value: _state)
+        if !preserveFailure {
+            _state = .disconnected
+            yieldControl(type: "transport.state", value: _state)
+        }
         continuation?.finish()
         continuation = nil
         activeStream = nil
@@ -233,11 +266,13 @@ public actor DSHWebSocketConnection {
         while !stopped && !Task.isCancelled {
             _state = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
             yieldControl(type: "transport.state", value: _state)
+            var activeTask: (any DSHWebSocketTasking)?
             do {
                 var request = URLRequest(url: configuration.url)
                 request.setValue("Bearer \(configuration.bearerToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("dsh-anywhere/1", forHTTPHeaderField: "User-Agent")
                 let task = makeTask(request)
+                activeTask = task
                 socket = task
                 defer {
                     // Every receive-loop exit owns and closes exactly the task
@@ -252,6 +287,7 @@ public actor DSHWebSocketConnection {
                 task.resume()
                 var didReceiveReady = false
                 while !stopped && !Task.isCancelled {
+                    if streamBufferOverflowed { throw DSHWebSocketError.eventBufferOverflow }
                     let message = try await task.receive()
                     if try await consume(message, over: task) { didReceiveReady = true; attempt = 0 }
                 }
@@ -259,19 +295,24 @@ public actor DSHWebSocketConnection {
             } catch is CancellationError {
                 break
             } catch {
+                let classifiedError = classifyTransportError(error, task: activeTask)
                 guard !stopped && !Task.isCancelled else { break }
-                if !shouldReconnect(after: error) {
-                    _state = .failed(error.localizedDescription)
+                if let socketError = classifiedError as? DSHWebSocketError,
+                   case .eventBufferOverflow = socketError {
+                    streamBufferOverflowed = false
+                }
+                if !shouldReconnect(after: classifiedError) {
+                    _state = .failed(classifiedError.localizedDescription)
                     yieldControl(type: "transport.state", value: _state)
-                    continuation?.finish(throwing: error)
+                    continuation?.finish(throwing: classifiedError)
                     continuation = nil
                     return
                 }
                 attempt += 1
                 if let maximum = configuration.maximumReconnectAttempts, attempt > maximum {
-                    _state = .failed(error.localizedDescription)
+                    _state = .failed(classifiedError.localizedDescription)
                     yieldControl(type: "transport.state", value: _state)
-                    continuation?.finish(throwing: error)
+                    continuation?.finish(throwing: classifiedError)
                     continuation = nil
                     return
                 }
@@ -293,17 +334,34 @@ public actor DSHWebSocketConnection {
         switch socketError {
         case .notConnected, .closed:
             return true
-        case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole, .relay:
+        case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole,
+             .authenticationRequired, .relay:
             // Retrying unchanged credentials or an incompatible wire message
             // cannot heal the connection and otherwise becomes a tight loop.
             return false
+        case .eventBufferOverflow:
+            return true
         }
+    }
+
+    private func classifyTransportError(_ error: Error, task: (any DSHWebSocketTasking)?) -> Error {
+        if let status = task?.responseStatusCode, status == 401 || status == 403 {
+            return DSHWebSocketError.authenticationRequired
+        }
+        if let closeCode = task?.closeCodeRawValue, closeCode == 4401 || closeCode == 4403 {
+            return DSHWebSocketError.authenticationRequired
+        }
+        if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
+            return DSHWebSocketError.authenticationRequired
+        }
+        return error
     }
 
     /// Returns true for the Relay handshake, which is the point at which a
     /// resume command can be safely routed to a connected Mac.
     private func consume(_ message: URLSessionWebSocketTask.Message,
                          over task: any DSHWebSocketTasking) async throws -> Bool {
+        if streamBufferOverflowed { throw DSHWebSocketError.eventBufferOverflow }
         let data: Data
         switch message {
         case .data(let value): data = value
@@ -407,21 +465,25 @@ public actor DSHWebSocketConnection {
             }
             let establishesEpoch = event.startsNewSequenceEpoch(comparedTo: _lastSequence,
                                                                   matchingSessionListRequest: isCorrelatedSnapshot)
-            if establishesEpoch {
-                // A Connector restart resets its in-memory replay sequence.  A
-                // full session snapshot is also authoritative: it is sent in
-                // direct response to a user refresh, and may be the first
-                // event seen after the Connector has restarted before it can
-                // replay connection.ready.
-                _lastSequence = 0
-            }
-            if event.sequence > _lastSequence { _lastSequence = event.sequence }
             let delivered = continuation?.yield(DSHEvent(envelope: event.envelope,
                                                           establishesSequenceEpoch: establishesEpoch))
-            if let delivered, case .dropped = delivered {
-                // Bound UI backpressure. Closing this attempt lets Connector
-                // replay durable events after the consumer catches up.
-                task.cancel(with: .goingAway, reason: nil)
+            guard let delivered else { throw DSHWebSocketError.closed }
+            switch delivered {
+            case .enqueued:
+                // Advance the resume cursor only after the event was accepted
+                // by the bounded stream. Advancing before `yield` would make
+                // a dropped event unrecoverable on the next connection.
+                if establishesEpoch { _lastSequence = 0 }
+                if event.sequence > _lastSequence { _lastSequence = event.sequence }
+            case .dropped:
+                // Keep the previous cursor and reconnect. Connector replay
+                // will then resend the first event that did not fit.
+                streamBufferOverflowed = true
+                throw DSHWebSocketError.eventBufferOverflow
+            case .terminated:
+                throw DSHWebSocketError.closed
+            @unknown default:
+                throw DSHWebSocketError.closed
             }
             return false
         }
@@ -482,7 +544,11 @@ public actor DSHWebSocketConnection {
             payload: payload
         )))
         if let delivered, case .dropped = delivered {
-            socket?.cancel(with: .goingAway, reason: nil)
+            // Control events share the bounded stream with business events.
+            // A dropped control event still means the consumer may have
+            // missed an adjacent durable event, so force a replay from the
+            // last accepted sequence on the next connection.
+            streamBufferOverflowed = true
         }
     }
 }

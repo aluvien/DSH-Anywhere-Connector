@@ -132,9 +132,12 @@ struct SettingsView: View {
                 .listRowBackground(settingsSectionBackground)
 
                 Section {
-                    Picker("Language", selection: Binding(
+                    Picker("Language", selection: Binding<DSHLanguage>(
                         get: { model.language },
-                        set: model.setLanguage
+                        // Keep the setter as an explicit closure. Newer
+                        // Swift compilers have crashed while lowering a
+                        // method reference here during CI's IR generation.
+                        set: { value in model.setLanguage(value) }
                     )) {
                         ForEach(DSHLanguage.allCases) { language in
                             Text(language.displayName).tag(language)

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   CommandEnvelopeSchema,
   AttachmentUploadedPayloadSchema,
@@ -27,6 +27,7 @@ const MAX_PENDING_EVENTS = 1_000;
 const MAX_PENDING_BYTES = 8 * 1024 * 1024;
 const MAX_RELAY_BUFFERED_BYTES = 32 * 1024 * 1024;
 const COMMAND_DEDUP_TTL_MS = 10 * 60_000;
+const MAX_COMMAND_RESULT_ENTRIES = 2_000;
 const LONG_BRIDGE_TIMEOUT_MS = 125_000;
 const UNSOLICITED_SESSION_SNAPSHOT_PREFIX = "snapshot-push-";
 /** Comfortably inside the relay's 10-minute code lifetime. */
@@ -44,7 +45,8 @@ export interface WebSocketLike {
   close(code?: number, reason?: string): void;
   terminate?(): void;
   ping?(): void;
-  on(event: "open" | "close" | "pong", listener: () => void): this;
+  on(event: "open" | "pong", listener: () => void): this;
+  on(event: "close", listener: (code?: number, reason?: string) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
   on(event: "message", listener: (raw: RawData) => void): this;
 }
@@ -114,12 +116,19 @@ export class DSHAnywhereConnector {
   private pendingEventsDropped = false;
   /** Each device's archive view is a query choice, never a global cache. */
   private readonly includeArchivedByDevice = new Map<string, boolean>();
+  /** Monotonic query generations prevent a slow presence refresh from
+   * overwriting a newer archive/filter selection on the same device. */
+  private readonly sessionSnapshotGenerationByDevice = new Map<string, number>();
   /** Devices explicitly opted in to transient output for one open session.
    * This state belongs to the Connector (which knows device identity), not the
    * Bridge (which has one trusted Connector socket). */
   private readonly streamingDevicesBySession = new Map<string, Set<string>>();
   /** Coalesces duplicate Relay delivery/retry by the caller's stable id. */
   private readonly commandExecutions = new Map<string, { promise: Promise<void>; expiresAt: number }>();
+  /** Keeps correlated results for the same lifetime as command dedupe. A
+   * replay receives a fresh transport sequence so iOS does not discard it as
+   * an old event after a reconnect. */
+  private readonly commandResults = new Map<string, { events: EventEnvelope[]; expiresAt: number }>();
   private readonly onlineRelayDevices = new Set<string>();
   private readonly presenceUpdates = new Map<string, Promise<void>>();
 
@@ -168,8 +177,10 @@ export class DSHAnywhereConnector {
     this.pendingEventsDropped = false;
     this.streamingDevicesBySession.clear();
     this.commandExecutions.clear();
+    this.commandResults.clear();
     this.onlineRelayDevices.clear();
     this.presenceUpdates.clear();
+    this.sessionSnapshotGenerationByDevice.clear();
   }
 
   private connectRelay(): void {
@@ -190,13 +201,21 @@ export class DSHAnywhereConnector {
       if (this.relay === socket) this.awaitingPong = false;
     });
     socket.on("error", (error: Error) => this.log("warn", `Relay socket error: ${safeError(error, this.config)}`));
-    socket.on("close", () => {
+    socket.on("close", (code?: number) => {
       if (this.relay !== socket) return;
       this.stopHeartbeat();
       this.relay = undefined;
       const disconnectedDevices = [...this.onlineRelayDevices];
       this.onlineRelayDevices.clear();
       for (const deviceId of disconnectedDevices) void this.reportDevicePresence(deviceId, false);
+      if (code === 4001) {
+        // Relay uses 4001 when another Connector with the same machine lease
+        // takes over. Reconnecting here would make two processes continuously
+        // evict one another and would flap every remote-device presence edge.
+        this.log("warn", "Relay connection was superseded by another Connector; stopping this instance");
+        void this.stop();
+        return;
+      }
       if (this.running) this.scheduleRelayReconnect();
     });
   }
@@ -280,7 +299,10 @@ export class DSHAnywhereConnector {
     for (const [key, execution] of this.commandExecutions) {
       if (execution.expiresAt <= now) this.commandExecutions.delete(key);
     }
-    const key = `${command.machineId}\u0000${command.deviceId}\u0000${command.requestId}`;
+    for (const [key, result] of this.commandResults) {
+      if (result.expiresAt <= now && !this.commandExecutions.has(key)) this.commandResults.delete(key);
+    }
+    const key = commandKey(command.machineId, command.deviceId, command.requestId);
     const existing = this.commandExecutions.get(key);
     if (existing !== undefined) {
       // The original result may have crossed just before a reconnect. Once the
@@ -309,9 +331,9 @@ export class DSHAnywhereConnector {
       // Record the selected archive view before waiting for the bridge. An
       // older, slower list response must not overwrite a newer user choice
       // and make the following archive mutation refresh the wrong projection.
-      if (command.type === "session.list") {
-        this.includeArchivedByDevice.set(command.deviceId, command.payload.includeArchived === true);
-      }
+      const sessionSnapshotGeneration = command.type === "session.list"
+        ? this.beginSessionSnapshotQuery(command.deviceId, command.payload.includeArchived === true)
+        : undefined;
       if (command.type === "session.open") {
         this.setStreamingPreference(command.sessionId ?? command.payload.sessionId,
                                     command.deviceId, command.payload.streaming === true);
@@ -325,21 +347,28 @@ export class DSHAnywhereConnector {
         bridgeTimeoutFor(command),
         command.requestId,
       );
-      await this.emitCommandResult(command, response);
+      await this.emitCommandResult(command, response, sessionSnapshotGeneration);
     } catch (error) {
       this.sendProtocolError(command, error);
     }
   }
 
   private async callBridge(request: BridgeRequest, timeoutMs = 15_000, idempotencyKey?: string): Promise<unknown> {
+    const encodedBody = request.body === undefined ? undefined : JSON.stringify(request.body);
+    const bodyHash = encodedBody === undefined
+      ? undefined
+      : createHash("sha256").update(encodedBody).digest("hex");
     const response = await this.request(bridgeAPIURL(this.config.bridgeBaseURL, request.path), {
       method: request.method,
       headers: {
         ...authorization(this.config.bridgeToken),
         ...(idempotencyKey === undefined ? {} : { "x-dsh-request-id": idempotencyKey }),
-        ...(request.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(encodedBody === undefined ? {} : {
+          "content-type": "application/json",
+          "x-dsh-request-hash": bodyHash!,
+        }),
       },
-      ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+      ...(encodedBody === undefined ? {} : { body: encodedBody }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) throw new BridgeRequestError(response.status);
@@ -367,7 +396,8 @@ export class DSHAnywhereConnector {
     return update;
   }
 
-  private async emitCommandResult(command: CommandEnvelope, response: unknown): Promise<void> {
+  private async emitCommandResult(command: CommandEnvelope, response: unknown,
+                                  sessionSnapshotGeneration?: number): Promise<void> {
     if (command.type === "session.open") {
       // The bridge publishes the requested historical events over its existing
       // event socket. There is no extra command-result card for opening a
@@ -377,6 +407,8 @@ export class DSHAnywhereConnector {
     if (command.type === "session.list") {
       const data = asRecord(response);
       const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
+      if (sessionSnapshotGeneration === undefined ||
+          !this.isCurrentSessionSnapshotQuery(command.deviceId, sessionSnapshotGeneration)) return;
       this.log("info", `Sending session snapshot (${items.length} sessions) to device ${shortID(command.deviceId)}`);
       this.sendSessionSnapshot(items, command.deviceId, command.requestId);
       return;
@@ -424,11 +456,13 @@ export class DSHAnywhereConnector {
       // command.result card) because its effect already arrives as
       // `permission.updated`: a "Command completed" card would be noise, and
       // failures still surface through `protocol.error`.
+      const generation = this.beginSessionSnapshotQuery(command.deviceId);
       const refreshed = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(command.deviceId) }));
       const items = Array.isArray(refreshed.items)
         ? refreshed.items.map((item) => SessionSummarySchema.parse(item))
         : [];
-      this.sendSessionSnapshot(items, command.deviceId);
+      if (!this.isCurrentSessionSnapshotQuery(command.deviceId, generation)) return;
+      this.sendSessionSnapshot(items, command.deviceId, undefined, command.requestId);
       return;
     }
     if (command.type === "model.catalog") {
@@ -552,10 +586,15 @@ export class DSHAnywhereConnector {
   }
 
   private replayCommandResult(command: CommandEnvelope): void {
-    for (const event of this.recentEvents) {
-      if (event.messageId === command.requestId && event.deviceId === command.deviceId) {
-        this.sendRelayEvent(event, command.deviceId);
-      }
+    const key = commandKey(command.machineId, command.deviceId, command.requestId);
+    const cached = this.commandResults.get(key);
+    const events = cached?.events ?? this.recentEvents.filter((event) =>
+      event.messageId === command.requestId && event.deviceId === command.deviceId);
+    // Reissue through sendEvent so the result receives a fresh monotonic
+    // transport sequence. Reusing the original sequence is silently filtered
+    // by the iOS reducer after it has processed later events.
+    for (const event of events) {
+      this.sendEvent({ ...event, timestamp: Date.now() }, command.deviceId, command.requestId);
     }
   }
 
@@ -587,9 +626,11 @@ export class DSHAnywhereConnector {
   }
 
   private async pushSessionSnapshot(deviceId: string): Promise<void> {
+    const generation = this.beginSessionSnapshotQuery(deviceId);
     try {
       const data = asRecord(await this.callBridge({ method: "GET", path: this.sessionListPath(deviceId) }));
       const items = Array.isArray(data.items) ? data.items.map((item) => SessionSummarySchema.parse(item)) : [];
+      if (!this.isCurrentSessionSnapshotQuery(deviceId, generation)) return;
       this.log("info", `Device ${shortID(deviceId)} online; pushing session snapshot (${items.length} sessions)`);
       this.sendSessionSnapshot(items, deviceId);
     } catch (error) {
@@ -601,6 +642,7 @@ export class DSHAnywhereConnector {
     items: SessionSummary[],
     deviceId: string,
     messageId: string = `${UNSOLICITED_SESSION_SNAPSHOT_PREFIX}${randomUUID()}`,
+    commandRequestId?: string,
   ): void {
     // One full snapshot is authoritative. The old compatibility pre-snapshot
     // briefly replaced current rows with stale stripped data, causing the
@@ -614,11 +656,22 @@ export class DSHAnywhereConnector {
       timestamp: Date.now(),
       type: "session.snapshot",
       payload: items,
-    }, deviceId);
+    }, deviceId, commandRequestId);
   }
 
   private sessionListPath(deviceId: string): string {
     return this.includeArchivedByDevice.get(deviceId) === true ? "/sessions?includeArchived=true" : "/sessions";
+  }
+
+  private beginSessionSnapshotQuery(deviceId: string, includeArchived?: boolean): number {
+    if (includeArchived !== undefined) this.includeArchivedByDevice.set(deviceId, includeArchived);
+    const generation = (this.sessionSnapshotGenerationByDevice.get(deviceId) ?? 0) + 1;
+    this.sessionSnapshotGenerationByDevice.set(deviceId, generation);
+    return generation;
+  }
+
+  private isCurrentSessionSnapshotQuery(deviceId: string, generation: number): boolean {
+    return this.sessionSnapshotGenerationByDevice.get(deviceId) === generation;
   }
 
   private setStreamingPreference(sessionId: string, deviceId: string, enabled: boolean): void {
@@ -658,7 +711,7 @@ export class DSHAnywhereConnector {
     this.sendEvent({ ...event, payload: canonicalPayload });
   }
 
-  private sendEvent(event: EventEnvelope, targetDeviceId?: string): void {
+  private sendEvent(event: EventEnvelope, targetDeviceId?: string, commandRequestId?: string): void {
     const relay = this.relay;
     if (relay === undefined || relay.readyState !== WebSocket.OPEN) {
       this.queueEvent(event);
@@ -674,6 +727,9 @@ export class DSHAnywhereConnector {
       sequence: ++this.sequence,
     });
     this.rememberEvent(body);
+    if (commandRequestId !== undefined) {
+      this.rememberCommandResult(commandKey(body.machineId, body.deviceId, commandRequestId), body);
+    }
     // A bridge/command response carries its intended recipient in the event
     // envelope. Preserve that address through offline queueing too; otherwise
     // one phone's folder picker or archive snapshot is broadcast to every
@@ -708,6 +764,31 @@ export class DSHAnywhereConnector {
     if (bytes > MAX_REPLAY_BYTES) return;
     this.recentEvents.push(event);
     this.recentEventBytes += bytes;
+    if (event.deviceId !== "broadcast") {
+      const key = commandKey(event.machineId, event.deviceId, event.messageId);
+      if (this.commandExecutions.has(key)) this.rememberCommandResult(key, event);
+    }
+  }
+
+  private rememberCommandResult(key: string, event: EventEnvelope): void {
+    const now = Date.now();
+    for (const [entryKey, entry] of this.commandResults) {
+      if (entry.expiresAt <= now && !this.commandExecutions.has(entryKey)) this.commandResults.delete(entryKey);
+    }
+    let entry = this.commandResults.get(key);
+    if (entry === undefined) {
+      if (this.commandResults.size >= MAX_COMMAND_RESULT_ENTRIES) {
+        const evictable = [...this.commandResults].find(([entryKey]) => !this.commandExecutions.has(entryKey));
+        if (evictable === undefined) return;
+        this.commandResults.delete(evictable[0]);
+      }
+      entry = { events: [], expiresAt: now + COMMAND_DEDUP_TTL_MS };
+      this.commandResults.set(key, entry);
+    }
+    const existingIndex = entry.events.findIndex((candidate) => candidate.messageId === event.messageId);
+    if (existingIndex >= 0) entry.events[existingIndex] = event;
+    else entry.events.push(event);
+    entry.expiresAt = now + COMMAND_DEDUP_TTL_MS;
   }
 
   private replayAfter(lastSequence: number, targetDeviceId: string): void {
@@ -1056,6 +1137,10 @@ function parseJson(raw: RawData): unknown {
 
 function eventBytes(event: EventEnvelope): number {
   return Buffer.byteLength(JSON.stringify(event));
+}
+
+function commandKey(machineId: string, deviceId: string, requestId: string): string {
+  return `${machineId}\u0000${deviceId}\u0000${requestId}`;
 }
 
 function trailingSlash(value: string): string {

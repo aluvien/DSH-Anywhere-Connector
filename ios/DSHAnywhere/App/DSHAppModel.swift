@@ -800,16 +800,16 @@ final class DSHAppModel: ObservableObject {
 
     func sendPrompt(_ text: String, attachments: [String],
                     messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
-                    mode: String = "queue") {
+                    mode: String = "queue", requestId requestedRequestID: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         if !messageAttachments.isEmpty {
             pendingMessageAttachmentsBySession[sessionID, default: []].append(messageAttachments)
         }
-        let requestId = UUID().uuidString
+        let requestId = requestedRequestID ?? UUID().uuidString
         pendingSendsByRequestID[requestId] = DSHPendingSend(
             id: requestId, text: trimmed, receipts: attachments,
-            sessionID: sessionID, sentAt: .now)
+            sessionID: sessionID, mode: mode, sentAt: .now)
         armSendAckTimeout(requestId: requestId)
         let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
         send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
@@ -824,6 +824,7 @@ final class DSHAppModel: ObservableObject {
         let text: String
         let receipts: [String]
         let sessionID: String
+        let mode: String
         let sentAt: Date
     }
 
@@ -839,6 +840,7 @@ final class DSHAppModel: ObservableObject {
         let text: String
         let receipts: [String]
         let sessionID: String
+        let mode: String
         let failure: DSHSendFailure
     }
 
@@ -871,7 +873,7 @@ final class DSHAppModel: ObservableObject {
         }
         failedSend = DSHFailedSend(id: requestId, text: pending.text,
                                    receipts: pending.receipts,
-                                   sessionID: pending.sessionID, failure: failure)
+                                   sessionID: pending.sessionID, mode: pending.mode, failure: failure)
     }
 
     /// An accepted user message acknowledges the matching send (and heals a
@@ -897,9 +899,11 @@ final class DSHAppModel: ObservableObject {
         var receipts: [String] = []
         var text = ""
         var sessionID = ""
+        var mode = "queue"
         if case .object(let payload) = command.payload {
             if case .string(let value) = payload["text"] { text = value }
             if let sid = command.sessionId { sessionID = sid }
+            if case .string(let value) = payload["mode"], !value.isEmpty { mode = value }
             for key in ["attachments", "content"] {
                 if let value = payload[key] { receipts += receiptIds(in: value) }
             }
@@ -911,7 +915,7 @@ final class DSHAppModel: ObservableObject {
             pendingMessageAttachmentsBySession[sessionID] = queues
         }
         failedSend = DSHFailedSend(id: command.requestId, text: text, receipts: receipts,
-                                   sessionID: sessionID, failure: .local(error.localizedDescription))
+                                   sessionID: sessionID, mode: mode, failure: .local(error.localizedDescription))
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -929,7 +933,12 @@ final class DSHAppModel: ObservableObject {
     func retryFailedSend() {
         guard let failed = failedSend else { return }
         failedSend = nil
-        sendPrompt(failed.text, attachments: failed.receipts, to: failed.sessionID)
+        // A timeout means the Mac may already have accepted the side effect.
+        // Reuse the complete original command identity and mode so Connector
+        // and Bridge idempotency coalesce the retry instead of executing it
+        // a second time (a genuinely new submission still gets a new UUID).
+        sendPrompt(failed.text, attachments: failed.receipts, to: failed.sessionID,
+                   mode: failed.mode, requestId: failed.id)
     }
 
     func dismissFailedSend() {

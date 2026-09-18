@@ -82,4 +82,16 @@ describe('user question answering', () => {
     phone.resolve(undefined)
     await expect(settled).resolves.toBeUndefined()
   })
+
+  it('does not treat a non-decision approval result as the winner', async () => {
+    const phone = deferred<'allowed-once' | 'rejected' | undefined>()
+    const browser = deferred<'allowed-once' | 'rejected' | 'unavailable'>()
+    const settled = firstAnswered(phone.promise, browser.promise,
+      (value) => value === 'allowed-once' || value === 'rejected')
+
+    browser.resolve('unavailable')
+    await flush()
+    phone.resolve('allowed-once')
+    await expect(settled).resolves.toBe('allowed-once')
+  })
 })

@@ -24,6 +24,72 @@ final class DSHWebSocketConnectionTests: XCTestCase {
             .delayNanoseconds(for: 2), UInt64.max)
     }
 
+    func testHandshakeAuthenticationFailureStopsReconnect() async throws {
+        let fake = RecordingWebSocketTask()
+        fake.responseStatusCode = 401
+        fake.receiveError = URLError(.badServerResponse)
+        XCTAssertEqual((fake as any DSHWebSocketTasking).responseStatusCode, 401)
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "expired", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1))
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        _ = await connection.connect()
+        let state = try await waitForFailure(connection)
+        if case .failed(let message) = state {
+            XCTAssertTrue(message.contains("credentials"))
+        } else {
+            XCTFail("authentication failure must stop reconnecting (state: \(state))")
+        }
+        XCTAssertEqual(fake.resumeCount, 1)
+        await connection.disconnect()
+    }
+
+    func testRevokedRelayCloseStopsReconnect() async throws {
+        let fake = RecordingWebSocketTask()
+        fake.closeCodeRawValue = 4401
+        fake.receiveError = DSHWebSocketError.closed
+        XCTAssertEqual((fake as any DSHWebSocketTasking).closeCodeRawValue, 4401)
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "revoked", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1))
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        _ = await connection.connect()
+        let state = try await waitForFailure(connection)
+        if case .failed(let message) = state {
+            XCTAssertTrue(message.contains("credentials"))
+        } else {
+            XCTFail("revoked credentials must stop reconnecting (state: \(state))")
+        }
+        XCTAssertEqual(fake.resumeCount, 1)
+        await connection.disconnect()
+    }
+
+    func testDroppedEventDoesNotAdvanceResumeCursorPastTheGap() async throws {
+        let fake = RecordingWebSocketTask()
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                                bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                                backoff: .init(initialNanoseconds: 1, maximumNanoseconds: 1),
+                                                maximumReconnectAttempts: 0)
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
+        _ = await connection.connect()
+        for sequence in 1...600 {
+            fake.enqueue(try relaySnapshot(messageID: "event-\(sequence)", sequence: Int64(sequence), title: "Event"))
+        }
+        let state = try await waitForFailure(connection)
+
+        // The bounded stream is intentionally not consumed. Once it fills, the
+        // connection fails and keeps the last accepted cursor; the next resume
+        // can therefore request the dropped event instead of skipping it.
+        let cursor = await connection.lastSequence
+        XCTAssertLessThan(cursor, 600)
+        if case .failed = state {
+            // Expected terminal state with maximumReconnectAttempts = 0.
+        } else {
+            XCTFail("buffer overflow should stop this bounded test connection (state: \(state))")
+        }
+        await connection.disconnect()
+    }
+
     func testBearerRequestAndRelayResumeAreSentAfterReady() async throws {
         let fake = RecordingWebSocketTask()
         let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
@@ -50,6 +116,15 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         XCTAssertEqual(commands[1].machineId, "machine")
         XCTAssertEqual(commands[1].payload, .object(["includeArchived": .bool(false)]))
         await connection.disconnect()
+    }
+
+    private func waitForFailure(_ connection: DSHWebSocketConnection) async throws -> DSHConnectionState {
+        for _ in 0..<200 {
+            let state = await connection.state
+            if case .failed = state { return state }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return await connection.state
     }
 
     func testSendWaitsForRelayHandshakeDuringReconnect() async throws {
@@ -194,8 +269,9 @@ final class DSHWebSocketConnectionTests: XCTestCase {
     private func relaySnapshot(messageID: String, sequence: Int64, title: String) throws -> URLSessionWebSocketTask.Message {
         let event = DSHEvent(envelope: DSHEnvelope(
             messageId: messageID, deviceId: "device", machineId: "machine", sequence: sequence,
-            type: "session.snapshot", payload: .array([
-                .object(["id": .string(title.lowercased()), "title": .string(title), "updatedAt": .number(Double(sequence))]),
+            type: "session.created", payload: .object([
+                "id": .string(title.lowercased()), "title": .string(title),
+                "updatedAt": .number(Double(sequence)),
             ])
         ))
         let relay = try DSHRelayPayloadMessage.wrapping(machineId: "machine", sender: .machine, body: event)
@@ -206,6 +282,9 @@ final class DSHWebSocketConnectionTests: XCTestCase {
 private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Sendable {
     private(set) var resumeCount = 0
     private(set) var sentCommands: [DSHCommand] = []
+    var responseStatusCode: Int?
+    var closeCodeRawValue: Int?
+    var receiveError: Error?
     private var receiveContinuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
     private var sentReady = false
     private var additionalMessages: [URLSessionWebSocketTask.Message]
@@ -228,6 +307,7 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
         sentCommands.append(try payload.decodeBody(DSHCommand.self))
     }
     func receive() async throws -> URLSessionWebSocketTask.Message {
+        if let receiveError { throw receiveError }
         if !sentReady {
             sentReady = true
             let ready = DSHRelayReadyMessage(type: "relay.ready", machineId: "machine", role: .device,
