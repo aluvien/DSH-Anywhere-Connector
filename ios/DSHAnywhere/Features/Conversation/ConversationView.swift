@@ -1512,8 +1512,7 @@ struct ConversationView: View {
                 .accessibilityLabel("\(failedSendTitle(failed))：\(failed.text)")
             }
 
-            if let failedInitial = model.failedInitialMessage,
-               failedInitial.sessionID == sessionID {
+            if let failedInitial = model.failedInitialMessage(for: sessionID) {
                 HStack(spacing: 8) {
                     Image(systemName: "paperclip.circle.fill")
                         .foregroundStyle(.red)
@@ -1528,10 +1527,10 @@ struct ConversationView: View {
                             .truncationMode(.middle)
                     }
                     Spacer(minLength: 4)
-                    Button("重试") { model.retryFailedInitialMessage() }
+                    Button("重试") { model.retryFailedInitialMessage(failedInitial) }
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Color.accentColor)
-                    Button { model.dismissFailedInitialMessage() } label: {
+                    Button { model.dismissFailedInitialMessage(failedInitial) } label: {
                         Image(systemName: "xmark")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)

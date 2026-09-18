@@ -28,6 +28,7 @@ struct NewSessionSheet: View {
     @State private var showInitialContextPopover = false
     @State private var showInitialCommandMenu = false
     @State private var isModelConfigurationPresented = false
+    @State private var pendingCreationRequestID: String?
 
     init(initialWorkspaceID: String? = nil, initialPrompt: String = "") {
         self.initialWorkspaceID = initialWorkspaceID
@@ -53,13 +54,18 @@ struct NewSessionSheet: View {
                 VStack(alignment: .leading, spacing: 26) {
                     compactConfiguration
                         .padding(.horizontal, 6)
+                        .disabled(pendingCreationRequestID != nil)
+
+                    creationStatus
 
                     if !initialAttachments.isEmpty {
                         initialAttachmentStrip
                             .padding(.horizontal, 6)
+                            .disabled(pendingCreationRequestID != nil)
                     }
 
                     initialPromptEditor
+                        .disabled(pendingCreationRequestID != nil)
                 }
                 .frame(maxWidth: 560)
                 .padding(.horizontal, 12)
@@ -75,6 +81,7 @@ struct NewSessionSheet: View {
                                 .dshFloatingChrome(Circle())
                     }
                     .buttonStyle(.plain)
+                    .disabled(pendingCreationRequestID != nil)
                     .accessibilityLabel("返回")
                     Text("新建任务")
                         .font(.system(size: 17, weight: .semibold))
@@ -103,6 +110,7 @@ struct NewSessionSheet: View {
                 }
         )
         .presentationBackground(Color(.systemBackground))
+        .interactiveDismissDisabled(pendingCreationRequestID != nil)
         .sheet(isPresented: $showInitialCommandMenu) {
             CommandMenuSheet(
                 onCommand: { command in
@@ -201,10 +209,21 @@ struct NewSessionSheet: View {
             }
             selectDefaultModeIfNeeded()
         }
+        .onChange(of: model.completedSessionCreationRequestID) { _, requestID in
+            guard requestID == pendingCreationRequestID else { return }
+            pendingCreationRequestID = nil
+            dismiss()
+        }
         .onChange(of: model.machineID) { _, _ in
             workspaceID = ""
             workingDirectory = ""
             branch = "main"
+            // Provider/model/reasoning choices belong to the selected Mac.
+            // Never carry a valid choice from Mac A into Mac B while B's
+            // catalog is still loading.
+            selectedProvider = ""
+            selectedModel = ""
+            selectedReasoningEffort = nil
         }
         .onChange(of: model.workspaces) { _, workspaces in
             if workspaceID.isEmpty, let first = workspaces.first {
@@ -212,7 +231,13 @@ struct NewSessionSheet: View {
             }
         }
         .onChange(of: model.modelCatalog) { _, catalog in
-            guard selectedModel.isEmpty, let catalog else { return }
+            guard let catalog else {
+                selectedProvider = ""
+                selectedModel = ""
+                selectedReasoningEffort = nil
+                return
+            }
+            guard selectedModel.isEmpty || !selectionIsValid(in: catalog) else { return }
             selectedProvider = catalog.default.provider
             selectedModel = catalog.default.model
             selectedReasoningEffort = catalog.default.reasoningEffort
@@ -230,6 +255,47 @@ struct NewSessionSheet: View {
     /// reference: machine and project. The project menu also contains the
     /// branch/worktree and mode sections, keeping those choices available
     /// without adding rows that are absent from the Remote compose surface.
+    @ViewBuilder
+    private var creationStatus: some View {
+        if let requestID = pendingCreationRequestID,
+           let failure = model.sessionCreationFailure(for: requestID) {
+            HStack(spacing: 9) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("创建任务失败")
+                        .font(.subheadline.weight(.semibold))
+                    Text(failure.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 4)
+                Button("重试") { model.retrySessionCreation(requestID: requestID) }
+                    .font(.subheadline.weight(.semibold))
+                Button("返回编辑") {
+                    model.cancelSessionCreation(requestID: requestID)
+                    pendingCreationRequestID = nil
+                }
+                .font(.caption.weight(.semibold))
+            }
+            .padding(10)
+            .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("创建任务失败：\(failure.detail)")
+        } else if pendingCreationRequestID != nil {
+            HStack(spacing: 9) {
+                ProgressView()
+                Text("正在 Mac 上创建任务…")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
     private var compactConfiguration: some View {
         VStack(alignment: .leading, spacing: 20) {
             machineSelector
@@ -664,6 +730,20 @@ struct NewSessionSheet: View {
             .first
     }
 
+    private func selectionIsValid(in catalog: DSHModelCatalog) -> Bool {
+        guard !selectedProvider.isEmpty, !selectedModel.isEmpty else { return false }
+        if catalog.groups.isEmpty {
+            return selectedProvider == catalog.default.provider
+                && selectedModel == catalog.default.model
+        }
+        return catalog.groups.contains { group in
+            group.id == selectedProvider
+                && group.models.contains { item in
+                    item.id == selectedModel || item.name == selectedModel
+                }
+        }
+    }
+
     /// The new-session composer keeps the same model picker state shape as a
     /// live conversation.  The selection stays local until Create is pressed,
     /// because there is no session to notify yet.
@@ -732,7 +812,14 @@ struct NewSessionSheet: View {
     }
 
     private func createSession() {
+        guard pendingCreationRequestID == nil else { return }
         guard !model.workspaces.isEmpty else { return }
+        if !selectedModel.isEmpty,
+           let catalog = model.modelCatalog,
+           !selectionIsValid(in: catalog) {
+            model.errorMessage = "所选模型不属于当前 Mac，请重新选择。"
+            return
+        }
         let selection = selectedModel.isEmpty ? nil : DSHModelSelection(
             provider: selectedProvider.isEmpty ? "deepseek" : selectedProvider,
             model: selectedModel,
@@ -746,7 +833,7 @@ struct NewSessionSheet: View {
                                   permissionMode: permissionMode,
                                   initialPrompt: initialPrompt,
                                   initialAttachments: initialAttachments) else { return }
-        dismiss()
+        pendingCreationRequestID = model.lastSessionCreationRequestID
     }
 }
 

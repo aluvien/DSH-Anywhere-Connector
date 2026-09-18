@@ -815,6 +815,41 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(state.historyCarryOverBySession["s"])
     }
 
+    func testHistoricalPermissionAndMetadataDoNotRollBackLiveProjection() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func event(type: String, sequence: Int64, historyBatchId: String?,
+                   payload: [String: DSHJSONValue]) -> DSHEvent {
+            DSHEvent(envelope: DSHEnvelope(
+                messageId: "config-(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: historyBatchId, sequence: sequence,
+                type: type, payload: .object(payload)))
+        }
+
+        reducer.reduce(event(type: "permission.updated", sequence: 1, historyBatchId: nil,
+                             payload: ["sessionId": .string("s"),
+                                       "mode": .string("danger-full-access")]), into: &state)
+        reducer.reduce(event(type: "session.metadata.updated", sequence: 2, historyBatchId: nil,
+                             payload: ["sessionId": .string("s"),
+                                       "provider": .string("provider-b"),
+                                       "model": .string("model-b"),
+                                       "reasoningEffort": .string("high")]), into: &state)
+
+        reducer.reduce(event(type: "permission.updated", sequence: 3, historyBatchId: "old-batch",
+                             payload: ["sessionId": .string("s"),
+                                       "mode": .string("read-only")]), into: &state)
+        reducer.reduce(event(type: "session.metadata.updated", sequence: 4, historyBatchId: "old-batch",
+                             payload: ["sessionId": .string("s"),
+                                       "provider": .string("provider-a"),
+                                       "model": .string("model-a"),
+                                       "reasoningEffort": .string("low")]), into: &state)
+
+        XCTAssertEqual(state.permissionBySession["s"]?.mode, "danger-full-access")
+        XCTAssertEqual(state.metadataBySession["s"]?.provider, "provider-b")
+        XCTAssertEqual(state.metadataBySession["s"]?.model, "model-b")
+        XCTAssertEqual(state.metadataBySession["s"]?.reasoningEffort, "high")
+    }
+
     func testOverlappingReplaysDoNotLoseRows() {
         // A second open while the first replay still streams must fold into
         // the open carry, not replace it: replacing discards rows outside
@@ -925,6 +960,30 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.failedSend)
         XCTAssertEqual(model.pendingSendCount(for: sid), 1)
         model.dismissFailedSend()
+    }
+
+    @MainActor
+    func testSessionCreationFailureRetainsRequestIdentityForRetry() async {
+        let transport = CorrelationTransport(failingTypes: ["session.create"])
+        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let workspace = DSHWorkspaceOption(id: "workspace", name: "Workspace")
+
+        XCTAssertTrue(model.createSession(in: workspace, mode: "standard",
+                                          initialPrompt: "keep this draft"))
+        try? await Task.sleep(for: .milliseconds(60))
+
+        let requestID = try! XCTUnwrap(model.lastSessionCreationRequestID)
+        XCTAssertEqual(model.sessionCreationFailure(for: requestID)?.id, requestID)
+        XCTAssertEqual(model.sessionCreationFailure(for: requestID)?.detail,
+                       "The Relay WebSocket is not connected.")
+        let firstCommand = await transport.lastCommand(ofType: "session.create")
+        XCTAssertEqual(firstCommand?.requestId, requestID)
+
+        model.retrySessionCreation(requestID: requestID)
+        try? await Task.sleep(for: .milliseconds(60))
+        let retryCommand = await transport.lastCommand(ofType: "session.create")
+        XCTAssertEqual(retryCommand?.requestId, requestID,
+                       "Retry must reuse the original create identity")
     }
 
     @MainActor

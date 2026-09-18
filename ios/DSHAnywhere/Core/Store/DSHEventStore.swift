@@ -263,11 +263,19 @@ public struct DSHEventReducer: Sendable {
                 state.sessions[index].usage = update.usage
             }
         case .permissionUpdated(let update):
+            // Historical replay carries the permission that was in effect
+            // for an older turn. It is useful to the history renderer but
+            // must never roll the current session's live safety indicator
+            // back after the user changed it.
+            guard event.envelope.historyBatchId == nil else { break }
             state.permissionBySession[update.sessionId] = update
             if let index = state.sessions.firstIndex(where: { $0.id == update.sessionId }) {
                 state.sessions[index].permissionMode = update.mode
             }
         case .sessionMetadataUpdated(let update):
+            // As with permission, history metadata describes the old turn,
+            // not the current provider/model selection.
+            guard event.envelope.historyBatchId == nil else { break }
             state.metadataBySession[update.sessionId] = update
             if let index = state.sessions.firstIndex(where: { $0.id == update.sessionId }) {
                 if let provider = update.provider { state.sessions[index].provider = provider }
