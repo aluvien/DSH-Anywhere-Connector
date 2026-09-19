@@ -396,8 +396,13 @@ interface AttachmentUploadRecord {
    * staged receipt after the Bridge died before persisting the response. */
   readonly nativeOperationId?: string
   readonly pending?: boolean
+  /** A pending record that outlived the client recovery contract.  It stays
+   * as a permanent tombstone until an adapter/operator reconciles it. */
+  readonly expired?: boolean
   readonly response?: JsonObject
+  readonly createdAt?: number
   readonly completedAt?: number
+  readonly expiredAt?: number
 }
 
 const MAX_SESSION_CREATION_RECORDS = 4096
@@ -487,6 +492,9 @@ class SessionMetadataStore {
     if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
       throw new HttpError(409, 'idempotency key was reused with different request data')
     }
+    if (entry.expired === true) {
+      throw new HttpError(409, 'attachment upload recovery expired; reconcile the native operation before retrying')
+    }
     if (entry.response === undefined) {
       throw new HttpError(503, 'attachment upload result is still unknown', 'unknown')
     }
@@ -502,7 +510,24 @@ class SessionMetadataStore {
     if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
       throw new HttpError(409, 'idempotency key was reused with different request data')
     }
-    return entry.response === undefined && entry.pending === true ? entry : undefined
+    const stale = entry.pending === true && entry.createdAt !== undefined &&
+      entry.createdAt < Date.now() - ATTACHMENT_UPLOAD_RETENTION_MS
+    return entry.response === undefined && entry.pending === true &&
+      entry.expired !== true && !stale ? entry : undefined
+  }
+
+  attachmentUploadExpiredEntry(key: string, fingerprint: string | undefined): AttachmentUploadRecord | undefined {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.attachmentUploadResults.get(key)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    const stale = entry.pending === true && entry.createdAt !== undefined &&
+      entry.createdAt < Date.now() - ATTACHMENT_UPLOAD_RETENTION_MS
+    return entry.expired === true || stale ? entry : undefined
   }
 
   async setAttachmentUploadPending(key: string, fingerprint: string | undefined,
@@ -510,22 +535,38 @@ class SessionMetadataStore {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
-    const cutoff = Date.now() - ATTACHMENT_UPLOAD_RETENTION_MS
+    const now = Date.now()
+    const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
     let pruned = false
     for (const [entryKey, entry] of this.attachmentUploadResults) {
       if (entry.response !== undefined && entry.completedAt !== undefined && entry.completedAt < cutoff) {
         this.attachmentUploadResults.delete(entryKey)
         pruned = true
+      } else if (entry.pending === true && entry.createdAt !== undefined && entry.createdAt < cutoff) {
+        // The phone refuses to resume an attachment after the same 30-day
+        // window, so an unknown pending marker must become an explicit,
+        // fail-closed reconciliation tombstone instead of occupying an active
+        // idempotency slot forever.  Keep the operation identity so a later
+        // adapter lookup can recover the receipt or prove non-commitment.
+        this.attachmentUploadResults.set(entryKey, {
+          fingerprint: entry.fingerprint,
+          ...(entry.nativeOperationId === undefined ? {} : { nativeOperationId: entry.nativeOperationId }),
+          expired: true,
+          expiredAt: now,
+        })
+        pruned = true
       }
     }
     if (pruned) await this.persist()
-    if (!this.attachmentUploadResults.has(key) &&
-        this.attachmentUploadResults.size >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
+    const activeCount = [...this.attachmentUploadResults.values()]
+      .filter((entry) => entry.expired !== true).length
+    if (!this.attachmentUploadResults.has(key) && activeCount >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
       throw new HttpError(503, 'attachment upload idempotency capacity is full', 'unknown')
     }
     this.attachmentUploadResults.set(key, {
       fingerprint,
       pending: true,
+      createdAt: now,
       ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
     await this.persist()
@@ -705,7 +746,7 @@ class SessionMetadataStore {
   }
 
   private async load(): Promise<void> {
-    let migratedAttachmentTimestamps = false
+    let migratedAttachmentMetadata = false
     try {
       const parsedValue: unknown = JSON.parse(await readFile(this.path, 'utf8'))
       if (typeof parsedValue !== 'object' || parsedValue === null || Array.isArray(parsedValue)) {
@@ -830,9 +871,7 @@ class SessionMetadataStore {
         throw new Error('attachment upload metadata must be an object')
       }
       if (typeof attachmentUploads === 'object' && attachmentUploads !== null && !Array.isArray(attachmentUploads)) {
-        if (Object.keys(attachmentUploads).length > MAX_ATTACHMENT_UPLOAD_RECORDS) {
-          throw new Error('attachment upload metadata exceeds its safety capacity')
-        }
+        let activeAttachmentRecordCount = 0
         for (const [key, raw] of Object.entries(attachmentUploads)) {
           if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
             throw new Error('attachment upload metadata contains an invalid record')
@@ -846,28 +885,59 @@ class SessionMetadataStore {
           if (raw.pending !== undefined && typeof raw.pending !== 'boolean') {
             throw new Error('attachment upload pending metadata is invalid')
           }
+          if (raw.expired !== undefined && typeof raw.expired !== 'boolean') {
+            throw new Error('attachment upload expiration metadata is invalid')
+          }
+          if (raw.createdAt !== undefined &&
+              (typeof raw.createdAt !== 'number' || !Number.isFinite(raw.createdAt) || raw.createdAt < 0)) {
+            throw new Error('attachment upload creation timestamp is invalid')
+          }
           if (raw.completedAt !== undefined &&
               (typeof raw.completedAt !== 'number' || !Number.isFinite(raw.completedAt) || raw.completedAt < 0)) {
             throw new Error('attachment upload completion timestamp is invalid')
+          }
+          if (raw.expiredAt !== undefined &&
+              (typeof raw.expiredAt !== 'number' || !Number.isFinite(raw.expiredAt) || raw.expiredAt < 0)) {
+            throw new Error('attachment upload expiration timestamp is invalid')
           }
           const response = raw.response
           if (response !== undefined &&
               (typeof response !== 'object' || response === null || Array.isArray(response))) {
             throw new Error('attachment upload response metadata is invalid')
           }
-          if (response === undefined && raw.pending !== true) {
+          if (raw.expired === true && (raw.pending === true || response !== undefined)) {
+            throw new Error('expired attachment upload metadata is inconsistent')
+          }
+          if (response === undefined && raw.pending !== true && raw.expired !== true) {
             throw new Error('attachment upload metadata contains an incomplete record')
           }
+          if (raw.expired !== true) activeAttachmentRecordCount += 1
           const completedAt = typeof raw.completedAt === 'number'
             ? raw.completedAt
             : response === undefined ? undefined : Date.now()
-          if (response !== undefined && raw.completedAt === undefined) migratedAttachmentTimestamps = true
+          const createdAt = typeof raw.createdAt === 'number'
+            ? raw.createdAt
+            : raw.pending === true ? Date.now() : undefined
+          const expiredAt = typeof raw.expiredAt === 'number'
+            ? raw.expiredAt
+            : raw.expired === true ? Date.now() : undefined
+          if ((response !== undefined && raw.completedAt === undefined) ||
+              (raw.pending === true && raw.createdAt === undefined) ||
+              (raw.expired === true && raw.expiredAt === undefined)) {
+            migratedAttachmentMetadata = true
+          }
+          if (activeAttachmentRecordCount > MAX_ATTACHMENT_UPLOAD_RECORDS) {
+            throw new Error('attachment upload metadata exceeds its active safety capacity')
+          }
           this.attachmentUploadResults.set(key, {
             fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
             ...(typeof raw.nativeOperationId === 'string' ? { nativeOperationId: raw.nativeOperationId } : {}),
             ...(raw.pending === true ? { pending: true } : {}),
+            ...(raw.expired === true ? { expired: true } : {}),
             ...(response === undefined ? {} : { response: response as JsonObject }),
+            ...(createdAt === undefined ? {} : { createdAt }),
             ...(completedAt === undefined ? {} : { completedAt }),
+            ...(expiredAt === undefined ? {} : { expiredAt }),
           })
         }
       }
@@ -879,7 +949,7 @@ class SessionMetadataStore {
         this.warn('Session presentation metadata is unreadable; refusing durable session creation until it is repaired')
       }
     }
-    if (migratedAttachmentTimestamps && !this.persistenceUnavailable) {
+    if (migratedAttachmentMetadata && !this.persistenceUnavailable) {
       try { await this.persist() } catch { /* persistenceUnavailable is set by persist */ }
     }
   }
@@ -2421,6 +2491,40 @@ async function handleHttp(
     const nativeOperationId = durableKey === undefined
       ? undefined : nativeOperationIdFor(`attachment\0${durableKey}`)
     if (durableKey !== undefined) {
+      const expired = metadata.attachmentUploadExpiredEntry(durableKey, fingerprint)
+      if (expired !== undefined) {
+        // An expired marker is no longer an automatic retry.  Give an adapter
+        // that supports reconciliation one explicit lookup opportunity; only
+        // a receipt or authoritative non-commitment may release the permanent
+        // tombstone.  Without that proof, keep failing closed so a late phone
+        // retry cannot create a second native file.
+        const findAttachmentByRequestId = ctx.sessionController.findAttachmentByRequestId
+        if (findAttachmentByRequestId === undefined || expired.nativeOperationId === undefined) {
+          throw new HttpError(409, 'attachment upload recovery expired; reconcile the native operation before retrying')
+        }
+        let recovery: AttachmentUploadRecoveryResult
+        try {
+          recovery = attachmentUploadRecoveryResultOf(await findAttachmentByRequestId(
+            expired.nativeOperationId, AbortSignal.timeout(15_000)))
+        } catch {
+          recovery = { state: 'unknown' }
+        }
+        if (recovery.state === 'found') {
+          const response = attachmentUploadResponseOf(recovery.response, body.name)
+          if (response === undefined) {
+            throw new HttpError(409, 'attachment upload recovery returned no receipt; operator reconciliation required')
+          }
+          await metadata.setAttachmentUploadResult(
+            durableKey, fingerprint, response, expired.nativeOperationId)
+          json(res, 200, response)
+          return
+        }
+        if (recovery.state === 'not-committed') {
+          await metadata.markAttachmentUploadNotCommitted(durableKey, fingerprint)
+        } else {
+          throw new HttpError(409, 'attachment upload recovery expired; native operation is still unknown')
+        }
+      }
       const pending = metadata.attachmentUploadPendingEntry(durableKey, fingerprint)
       if (pending !== undefined) {
         // A Bridge restart can happen after the native file service committed

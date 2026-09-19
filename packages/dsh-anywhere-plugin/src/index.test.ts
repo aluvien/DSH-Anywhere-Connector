@@ -808,6 +808,42 @@ describe('native bridge mutations', () => {
     )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-after-negative-recovery' } })
     expect(uploads).toBe(1)
   })
+
+  it('ages unknown pending uploads into permanent tombstones without exhausting active capacity', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-expired-'))
+    const requestId = 'attachment-expired'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000${requestId}`
+    const nativeOperationId = createHash('sha256')
+      .update(`attachment\0${key}`).digest('hex')
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      attachmentUploads: {
+        [key]: {
+          pending: true,
+          nativeOperationId,
+          createdAt: Date.now() - (31 * 24 * 60 * 60_000),
+        },
+      },
+    }))
+    let uploads = 0
+    const request = mount({
+      dataDir,
+      invoke: async () => {
+        uploads += 1
+        return { ok: true, value: { receiptId: `receipt-${uploads}`, file: { size: 3 } } }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, requestId,
+    )).resolves.toMatchObject({ status: 409 })
+    expect(uploads).toBe(0)
+
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'b.txt', data: 'YWJj' }, 'attachment-after-expired',
+    )).resolves.toMatchObject({ status: 201 })
+    expect(uploads).toBe(1)
+  })
 })
 
 describe('pairing page material', () => {

@@ -1014,17 +1014,49 @@ final class DSHAppModel: ObservableObject {
             }
         }
         pendingTransactionStoreLoaded = true
-        restoreSessionCreationTransactions(for: machineID)
-        // A profile can be written by transport.pair before the AppModel has
-        // finished its journal/fence transaction. Never reconnect a profile
-        // that is still fenced after a failed lifecycle commit.
-        if isPaired && !removedMachineIDs.contains(machineID) {
+        let loadedMachineID = machineID
+        restoreSessionCreationTransactions(for: loadedMachineID)
+        // A fence is durable lifecycle intent.  If the process died after a
+        // remove/forget (or a failed pair rollback) wrote that fence but before
+        // the profile/token deletion finished, do the local deletion on the
+        // next launch.  Otherwise the fenced profile remains selectable and
+        // can block the healthy profiles that should have become active.
+        await reconcileFencedProfiles()
+        if let active = activeMachine, !removedMachineIDs.contains(active.machineId) {
+            if active.machineId != loadedMachineID {
+                machineName = active.machineName
+                machineID = active.machineId
+                resetTransientRequestState()
+                state = DSHStoreState()
+                restoreSessionCreationTransactions(for: active.machineId)
+            } else {
+                machineName = active.machineName
+            }
+            isPaired = true
             connect()
-        } else if removedMachineIDs.contains(machineID) {
+        } else {
+            machineName = ""
+            machineID = ""
             isPaired = false
             state.connectionState = .disconnected
             state.transportState = .disconnected
         }
+    }
+
+    /// A removal/forget operation fences before deleting local credentials so
+    /// a crash cannot resurrect queued side effects.  Reconcile that intent on
+    /// startup by deleting every still-present fenced profile and letting the
+    /// profile store choose the next active machine.
+    private func reconcileFencedProfiles() async {
+        let fencedProfiles = profiles.profiles.filter { removedMachineIDs.contains($0.machineId) }
+        guard !fencedProfiles.isEmpty else {
+            refreshMachines()
+            return
+        }
+        for profile in fencedProfiles {
+            await transport.rollbackPairing(machineId: profile.machineId)
+        }
+        refreshMachines()
     }
 
     private func makePendingTransactionSnapshot() throws -> DSHPendingTransactionSnapshot {
@@ -4451,7 +4483,12 @@ final class DSHAppModel: ObservableObject {
     }
 
     func dismissFailedInitialMessage(_ failure: DSHInitialMessageFailure) {
+        // Dismissing an expired/unrecoverable initial message is a terminal
+        // disposition.  Remove both the visible failure and the staged
+        // payload; the next journal snapshot then drops its attachment blobs
+        // because no transaction references them anymore.
         failedInitialMessages.removeValue(forKey: failure.id)
+        pendingInitialMessagesByRequestID.removeValue(forKey: failure.id)
         persistCurrentTransactionsLater(for: machineID)
     }
 
