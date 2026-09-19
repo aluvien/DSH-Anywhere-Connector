@@ -1158,7 +1158,7 @@ class SessionMetadataStore {
             if (expiredAttachmentRecordCount > MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
               throw new Error('attachment upload metadata exceeds its tombstone safety capacity')
             }
-          } else {
+          } else if (raw.expired !== true) {
             activeAttachmentRecordCount += 1
           }
           const completedAt = typeof raw.completedAt === 'number'

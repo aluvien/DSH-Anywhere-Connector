@@ -898,6 +898,36 @@ describe('native bridge mutations', () => {
     )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-admin' } })
   })
 
+  it('does not count reconciled expired receipts against active capacity after restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-reconciled-cap-'))
+    const uploads: Record<string, Record<string, unknown>> = {}
+    for (let index = 0; index < 8192; index += 1) {
+      const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000active-${index}`
+      uploads[key] = { response: { receiptId: `receipt-${index}` } }
+    }
+    const requestId = 'attachment-reconciled-cap'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000${requestId}`
+    uploads[key] = {
+      expired: true,
+      reconciled: true,
+      response: { receiptId: 'receipt-reconciled' },
+    }
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({ attachmentUploads: uploads }))
+    let uploadsInvoked = 0
+    const request = mount({
+      dataDir,
+      invoke: async () => {
+        uploadsInvoked += 1
+        return { ok: true, value: { receiptId: 'duplicate' } }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, requestId,
+    )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-reconciled' } })
+    expect(uploadsInvoked).toBe(0)
+  })
+
   it('round-robins bounded attachment reconciliation so unknown tombstones do not starve later records', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-admin-cursor-'))
     const uploads: Record<string, Record<string, unknown>> = {}
