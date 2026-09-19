@@ -360,6 +360,10 @@ private struct DSHLoadedPendingTransactionStore: Sendable {
 /// silently reconnecting it.
 private struct DSHPendingTransactionStoreLoadError: Error, Sendable {
     let fencedMachineIDs: Set<String>
+    /// A sidecar that exists but cannot be read is not equivalent to an empty
+    /// fence.  Keep this bit separate so startup can fail closed instead of
+    /// reconnecting an old profile with unknown removal state.
+    let fenceUnavailable: Bool
 }
 
 /// Serializes transaction files away from the `@MainActor`.  The model still
@@ -432,11 +436,15 @@ private actor DSHPendingTransactionFileStore {
         // is the durable completion marker for a re-pair and must not be merged
         // with a stale removedMachineIDs value left in the old journal.
         let sidecarMachineIDs: Set<String>?
-        if FileManager.default.fileExists(atPath: removedMachineIDsURL.path) {
-            let data = try Data(contentsOf: removedMachineIDsURL)
-            sidecarMachineIDs = try JSONDecoder().decode(Set<String>.self, from: data)
-        } else {
-            sidecarMachineIDs = nil
+        do {
+            if FileManager.default.fileExists(atPath: removedMachineIDsURL.path) {
+                let data = try Data(contentsOf: removedMachineIDsURL)
+                sidecarMachineIDs = try JSONDecoder().decode(Set<String>.self, from: data)
+            } else {
+                sidecarMachineIDs = nil
+            }
+        } catch {
+            throw DSHPendingTransactionStoreLoadError(fencedMachineIDs: [], fenceUnavailable: true)
         }
         // A first launch has no journal yet.  Treat that absence as an empty
         // store instead of converting the normal ENOENT variant returned by
@@ -511,7 +519,8 @@ private actor DSHPendingTransactionFileStore {
             // Preserve a valid sidecar fence even when the journal or one of
             // its blobs is corrupt. The caller marks persistence unavailable,
             // but still deletes/reconciles fenced profiles on this launch.
-            throw DSHPendingTransactionStoreLoadError(fencedMachineIDs: fallbackFence)
+            throw DSHPendingTransactionStoreLoadError(fencedMachineIDs: fallbackFence,
+                                                       fenceUnavailable: false)
         }
     }
 }
@@ -604,6 +613,10 @@ final class DSHAppModel: ObservableObject {
     @Published private(set) var state: DSHStoreState
     @Published private(set) var isPaired: Bool
     @Published private(set) var isPairing = false
+    /// Monotonic success marker used by the optional Add Mac sheet. A failed
+    /// attempt must not dismiss a sheet merely because another Mac is already
+    /// paired.
+    @Published private(set) var pairingSuccessRevision = 0
     @Published var machineID = ""
     @Published var pairingSecret = ""
     @Published var serverAddress = UserDefaults.standard.string(forKey: "dsh-anywhere.server-address") ?? ""
@@ -848,6 +861,9 @@ final class DSHAppModel: ObservableObject {
     /// clears the tombstone. This prevents old queue/journal data from
     /// resurfacing if local cleanup was interrupted.
     private var removedMachineIDs: Set<String> = []
+    /// A present-but-unreadable fence must never be treated as an empty set.
+    /// Keep every profile offline until the sidecar can be read again.
+    private var removedMachineFenceUnavailable = false
 
     /// A transaction that cannot be written must never be sent again: after
     /// an app kill there would be no request identity left to coalesce the
@@ -1040,11 +1056,14 @@ final class DSHAppModel: ObservableObject {
         } catch {
             if let loadError = error as? DSHPendingTransactionStoreLoadError {
                 removedMachineIDs = loadError.fencedMachineIDs
+                removedMachineFenceUnavailable = loadError.fenceUnavailable
             }
             let nsError = error as NSError
             if !(nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) {
                 pendingTransactionPersistenceUnavailable = true
-                errorMessage = "未能读取待处理请求，已停止自动重试。"
+                errorMessage = removedMachineFenceUnavailable
+                    ? "未能读取本机删除记录，已停止连接以保护待处理请求。"
+                    : "未能读取待处理请求，已停止自动重试。"
             }
         }
         pendingTransactionStoreLoaded = true
@@ -1082,6 +1101,12 @@ final class DSHAppModel: ObservableObject {
     /// startup by deleting every still-present fenced profile and letting the
     /// profile store choose the next active machine.
     private func reconcileFencedProfiles() async {
+        guard !removedMachineFenceUnavailable else {
+            // A corrupt sidecar cannot be safely interpreted. Do not delete
+            // or reconnect any profile until the authoritative fence is
+            // readable again.
+            return
+        }
         let fencedProfiles = profiles.profiles.filter { removedMachineIDs.contains($0.machineId) }
         guard !fencedProfiles.isEmpty else {
             refreshMachines()
@@ -1844,6 +1869,21 @@ final class DSHAppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isPairing = false }
+            let previousProfile = self.activeMachine
+            let previousMachineID = previousProfile?.machineId ?? ""
+            let hadActivePair = self.isPaired && !previousMachineID.isEmpty
+            if hadActivePair {
+                await self.awaitPendingTransactionStoreLoaded()
+                guard await self.persistCurrentTransactions(for: previousMachineID) else {
+                    self.errorMessage = "无法安全保存当前 Mac 的待处理请求，暂不切换配对。"
+                    return
+                }
+                self.eventTask?.cancel()
+                self.eventTask = nil
+                self.state.connectionState = .disconnected
+                self.state.transportState = .disconnected
+                await self.transport.disconnect()
+            }
             do {
                 let profile = try await self.transport.pair(
                     serverAddress: address, machineId: trimmedMachineID,
@@ -1882,8 +1922,20 @@ final class DSHAppModel: ObservableObject {
                 }
                 self.refreshMachines()
                 self.isPaired = true
+                self.pairingSuccessRevision &+= 1
                 self.connect()
-            } catch { self.errorMessage = error.localizedDescription }
+            } catch {
+                // Pairing is additive. If the new Mac fails, restore the
+                // previous active profile and reconnect it rather than leaving
+                // the home screen detached from a healthy machine.
+                if hadActivePair, let previousProfile {
+                    self.machineID = previousProfile.machineId
+                    self.machineName = previousProfile.machineName
+                    self.isPaired = true
+                    self.connect()
+                }
+                self.errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -2094,6 +2146,8 @@ final class DSHAppModel: ObservableObject {
 
     func connect() {
         guard pendingTransactionStoreLoaded, isPaired, eventTask == nil,
+              !removedMachineFenceUnavailable,
+              !pendingTransactionPersistenceUnavailable,
               !machineID.isEmpty, !removedMachineIDs.contains(machineID) else { return }
         if suspendingTransactions {
             reconnectAfterSuspension = true
@@ -2256,12 +2310,10 @@ final class DSHAppModel: ObservableObject {
                        permissionMode: String = "workspace-write",
                        initialPrompt: String? = nil,
                        initialAttachments: [DSHStagedAttachment] = []) -> Bool {
-        guard !removedMachineIDs.contains(machineID), !machineID.isEmpty else {
+        guard !removedMachineFenceUnavailable,
+              !pendingTransactionPersistenceUnavailable,
+              !removedMachineIDs.contains(machineID), !machineID.isEmpty else {
             errorMessage = "当前 Mac 配对事务尚未完成，请重新配对后再试。"
-            return false
-        }
-        guard !pendingTransactionPersistenceUnavailable else {
-            errorMessage = "待处理请求存储不可用，已停止创建以避免重复会话。"
             return false
         }
         if let initialPrompt, !validatePromptText(initialPrompt) { return false }
@@ -3593,7 +3645,9 @@ final class DSHAppModel: ObservableObject {
                                  machineGeneration: Int? = nil,
                                  requestID requestedRequestID: String? = nil,
                                  attachmentRecoveryDeadline: Date? = nil) async throws -> String {
-        guard !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
+        guard !removedMachineFenceUnavailable,
+              !pendingTransactionPersistenceUnavailable,
+              !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
             throw DSHWebSocketError.machineMismatch
         }
         guard data.count <= Self.maxAttachmentBytes else { throw DSHAttachmentUploadError.tooLarge }
@@ -3726,7 +3780,9 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func send(_ command: DSHCommand) {
-        guard !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
+        guard !removedMachineFenceUnavailable,
+              !pendingTransactionPersistenceUnavailable,
+              !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
             errorMessage = "当前 Mac 配对事务尚未完成，请重新配对后再试。"
             return
         }
@@ -4532,11 +4588,32 @@ final class DSHAppModel: ObservableObject {
     func dismissFailedInitialMessage(_ failure: DSHInitialMessageFailure) {
         // Dismissing an expired/unrecoverable initial message is a terminal
         // disposition.  Remove both the visible failure and the staged
-        // payload; the next journal snapshot then drops its attachment blobs
-        // because no transaction references them anymore.
-        failedInitialMessages.removeValue(forKey: failure.id)
-        pendingInitialMessagesByRequestID.removeValue(forKey: failure.id)
-        persistCurrentTransactionsLater(for: machineID)
+        // payload only after the journal confirms the deletion.  If the app
+        // is killed before that write, the failure remains visible and the
+        // staged bytes are still recoverable on the next launch.
+        let machineID = self.machineID
+        let generation = machineStateGeneration
+        let previousFailure = failedInitialMessages[failure.id]
+        let previousPending = pendingInitialMessagesByRequestID[failure.id]
+        guard previousFailure != nil || previousPending != nil else { return }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.machineStateGeneration == generation,
+                  self.failedInitialMessages[failure.id] != nil
+                    || self.pendingInitialMessagesByRequestID[failure.id] != nil else { return }
+            self.failedInitialMessages.removeValue(forKey: failure.id)
+            self.pendingInitialMessagesByRequestID.removeValue(forKey: failure.id)
+            guard await self.persistCurrentTransactions(for: machineID) else {
+                if let previousFailure {
+                    self.failedInitialMessages[failure.id] = previousFailure
+                }
+                if let previousPending {
+                    self.pendingInitialMessagesByRequestID[failure.id] = previousPending
+                }
+                self.errorMessage = "无法保存初始消息的关闭状态，请稍后重试。"
+                return
+            }
+        }
     }
 
     func dismissFailedInitialMessage() {

@@ -7,6 +7,7 @@ struct SettingsView: View {
     @EnvironmentObject private var model: DSHAppModel
     @Environment(\.dismiss) private var dismiss
     @State private var showForgetConfirmation = false
+    @State private var showAddMac = false
 
     var body: some View {
         NavigationStack {
@@ -46,6 +47,11 @@ struct SettingsView: View {
                 .listRowBackground(settingsSectionBackground)
 
                 Section {
+                    Button {
+                        showAddMac = true
+                    } label: {
+                        Label("Add Mac", systemImage: "plus.circle")
+                    }
                     if model.machines.isEmpty {
                         Text("No paired Macs yet.")
                             .foregroundStyle(.secondary)
@@ -207,6 +213,10 @@ struct SettingsView: View {
                 }
             } message: {
                 Text("You will need the Mac's machine ID and pairing secret to pair again.")
+            }
+            .sheet(isPresented: $showAddMac) {
+                PairingView()
+                    .environmentObject(model)
             }
         }
     }

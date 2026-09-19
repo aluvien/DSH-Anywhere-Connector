@@ -44,6 +44,11 @@ const ATTACHMENT_UPLOAD_RETENTION_MS = 30 * 24 * 60 * 60_000
  */
 const MAX_ATTACHMENT_UPLOAD_TOMBSTONES = 8_192
 const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
+// A file larger than the normal write budget can still be repaired by
+// deleting records, but an unbounded read would turn a corrupt path into a
+// memory-exhaustion vector.
+const MAX_SESSION_METADATA_LOAD_BYTES = 64 * 1024 * 1024
+const MAX_ATTACHMENT_RECONCILIATION_BATCH = 128
 
 interface CapturedHttpResponse {
   readonly status: number
@@ -400,6 +405,8 @@ interface SessionCreationRecord {
 
 interface AttachmentUploadRecord {
   readonly fingerprint: string | undefined
+  /** Original filename used when an operator reconstructs a receipt. */
+  readonly name?: string
   /** Stable operation identity understood by adapters that can reconcile a
    * staged receipt after the Bridge died before persisting the response. */
   readonly nativeOperationId?: string
@@ -442,6 +449,10 @@ class SessionMetadataStore {
   /** A corrupt metadata file must never make the create dedupe layer forget
    * an already committed session and execute the same request again. */
   private persistenceUnavailable = false
+  /** The metadata file was valid but exceeded the normal write budget.  This
+   * is recoverable: allow only shrink/reconciliation writes until it fits. */
+  private persistenceCapacityExceeded = false
+  private metadataByteLength = 0
   private persistQueue: Promise<void> = Promise.resolve()
   readonly ready: Promise<void>
 
@@ -450,6 +461,12 @@ class SessionMetadataStore {
     private readonly warn: (message: string) => void = () => undefined,
   ) {
     this.ready = this.load()
+  }
+
+  private rejectGrowthWhileOverCapacity(message: string): void {
+    if (this.persistenceCapacityExceeded) {
+      throw new HttpError(503, `${message}; reconcile or compact session-metadata.json first`, 'unknown')
+    }
   }
 
   isArchived(sessionId: string, registry?: NativeContext['workspaceRegistry']): boolean {
@@ -539,10 +556,11 @@ class SessionMetadataStore {
   }
 
   async setAttachmentUploadPending(key: string, fingerprint: string | undefined,
-                                   nativeOperationId?: string): Promise<void> {
+                                   nativeOperationId?: string, name?: string): Promise<void> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    this.rejectGrowthWhileOverCapacity('attachment upload metadata capacity is full')
     const now = Date.now()
     const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
     let expiredCount = [...this.attachmentUploadResults.values()]
@@ -567,6 +585,7 @@ class SessionMetadataStore {
         }
         this.attachmentUploadResults.set(entryKey, {
           fingerprint: entry.fingerprint,
+          ...(entry.name === undefined ? {} : { name: entry.name }),
           ...(entry.nativeOperationId === undefined ? {} : { nativeOperationId: entry.nativeOperationId }),
           expired: true,
           expiredAt: now,
@@ -593,6 +612,7 @@ class SessionMetadataStore {
     }
     this.attachmentUploadResults.set(key, {
       fingerprint,
+      ...(name === undefined ? {} : { name }),
       pending: true,
       createdAt: now,
       ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
@@ -606,14 +626,24 @@ class SessionMetadataStore {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     const previous = this.attachmentUploadResults.get(key)
+    if (this.persistenceCapacityExceeded && previous?.expired !== true) {
+      throw new HttpError(503, 'attachment upload metadata capacity is full; reconcile or compact session-metadata.json first', 'unknown')
+    }
     const operationId = nativeOperationId ?? previous?.nativeOperationId
     this.attachmentUploadResults.set(key, {
       fingerprint,
+      ...(previous?.name === undefined ? {} : { name: previous.name }),
       response,
       completedAt: Date.now(),
       ...(operationId === undefined ? {} : { nativeOperationId: operationId }),
     })
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.attachmentUploadResults.delete(key)
+      else this.attachmentUploadResults.set(key, previous)
+      throw error
+    }
   }
 
   async markAttachmentUploadNotCommitted(key: string, fingerprint: string | undefined): Promise<void> {
@@ -630,7 +660,74 @@ class SessionMetadataStore {
     // the local capability is restored instead of remaining permanently
     // stuck in the fail-closed pending state.
     this.attachmentUploadResults.delete(key)
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      this.attachmentUploadResults.set(key, entry)
+      throw error
+    }
+  }
+
+  /**
+   * Reconcile expired upload tombstones without requiring the original phone
+   * request body. This is intentionally an operator/Connector operation: an
+   * authoritative native lookup may either return the original receipt or
+   * prove that no upload was committed.
+   */
+  async reconcileExpiredAttachmentUploads(
+    findAttachmentByRequestId: ((operationId: string, signal: AbortSignal) =>
+      Promise<unknown | undefined | AttachmentUploadRecoveryResult>) | undefined,
+    limit = MAX_ATTACHMENT_RECONCILIATION_BATCH,
+  ): Promise<{ scanned: number; found: number; notCommitted: number; unknown: number }> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const boundedLimit = Number.isSafeInteger(limit)
+      ? Math.min(Math.max(limit, 1), MAX_ATTACHMENT_RECONCILIATION_BATCH)
+      : MAX_ATTACHMENT_RECONCILIATION_BATCH
+    let scanned = 0
+    let found = 0
+    let notCommitted = 0
+    let unknown = 0
+    for (const [key, entry] of [...this.attachmentUploadResults.entries()]) {
+      if (scanned >= boundedLimit || entry.expired !== true) continue
+      scanned += 1
+      if (findAttachmentByRequestId === undefined || entry.nativeOperationId === undefined) {
+        unknown += 1
+        continue
+      }
+      let recovery: AttachmentUploadRecoveryResult
+      try {
+        recovery = attachmentUploadRecoveryResultOf(await findAttachmentByRequestId(
+          entry.nativeOperationId, AbortSignal.timeout(15_000)))
+      } catch {
+        unknown += 1
+        continue
+      }
+      if (recovery.state === 'found') {
+        const response = attachmentUploadResponseOf(recovery.response, entry.name ?? '')
+        if (response === undefined) {
+          unknown += 1
+          continue
+        }
+        try {
+          await this.setAttachmentUploadResult(key, entry.fingerprint, response, entry.nativeOperationId)
+          found += 1
+        } catch {
+          unknown += 1
+        }
+      } else if (recovery.state === 'not-committed') {
+        try {
+          await this.markAttachmentUploadNotCommitted(key, entry.fingerprint)
+          notCommitted += 1
+        } catch {
+          unknown += 1
+        }
+      } else {
+        unknown += 1
+      }
+    }
+    return { scanned, found, notCommitted, unknown }
   }
 
   /**
@@ -689,6 +786,7 @@ class SessionMetadataStore {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    this.rejectGrowthWhileOverCapacity('session creation metadata capacity is full')
     if (!this.sessionCreationResults.has(key) && this.sessionCreationResults.size >= MAX_SESSION_CREATION_RECORDS) {
       // Completed records are permanent at-most-once tombstones. Evicting a
       // response after an arbitrary retention period would let a phone that
@@ -710,6 +808,7 @@ class SessionMetadataStore {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    this.rejectGrowthWhileOverCapacity('session creation metadata capacity is full')
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint,
@@ -726,6 +825,7 @@ class SessionMetadataStore {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    this.rejectGrowthWhileOverCapacity('session creation metadata capacity is full')
     const sessionId = typeof response.sessionId === 'string' ? response.sessionId : undefined
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
@@ -777,9 +877,11 @@ class SessionMetadataStore {
     let migratedAttachmentMetadata = false
     try {
       const metadataStats = await stat(this.path)
-      if (metadataStats.size > MAX_SESSION_METADATA_BYTES) {
-        throw new Error('session presentation metadata exceeds its safety size')
+      if (metadataStats.size > MAX_SESSION_METADATA_LOAD_BYTES) {
+        throw new Error('session presentation metadata exceeds its load safety size')
       }
+      this.metadataByteLength = metadataStats.size
+      this.persistenceCapacityExceeded = metadataStats.size > MAX_SESSION_METADATA_BYTES
       const parsedValue: unknown = JSON.parse(await readFile(this.path, 'utf8'))
       if (typeof parsedValue !== 'object' || parsedValue === null || Array.isArray(parsedValue)) {
         throw new Error('session metadata root must be an object')
@@ -912,6 +1014,9 @@ class SessionMetadataStore {
           if (raw.fingerprint !== undefined && typeof raw.fingerprint !== 'string') {
             throw new Error('attachment upload fingerprint metadata is invalid')
           }
+          if (raw.name !== undefined && typeof raw.name !== 'string') {
+            throw new Error('attachment upload name metadata is invalid')
+          }
           if (raw.nativeOperationId !== undefined && typeof raw.nativeOperationId !== 'string') {
             throw new Error('attachment upload operation metadata is invalid')
           }
@@ -971,6 +1076,7 @@ class SessionMetadataStore {
           }
           this.attachmentUploadResults.set(key, {
             fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
+            ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
             ...(typeof raw.nativeOperationId === 'string' ? { nativeOperationId: raw.nativeOperationId } : {}),
             ...(raw.pending === true ? { pending: true } : {}),
             ...(raw.expired === true ? { expired: true } : {}),
@@ -1011,9 +1117,19 @@ class SessionMetadataStore {
       sessionCreations: Object.fromEntries(this.sessionCreationResults),
       attachmentUploads: Object.fromEntries(this.attachmentUploadResults),
     }, null, 2)
-    if (Buffer.byteLength(snapshot, 'utf8') > MAX_SESSION_METADATA_BYTES) {
-      this.persistenceUnavailable = true
-      return Promise.reject(new Error('session presentation metadata exceeds its safety size'))
+    const snapshotBytes = Buffer.byteLength(snapshot, 'utf8')
+    if (snapshotBytes > MAX_SESSION_METADATA_BYTES) {
+      // A pre-existing oversized file is repairable only through shrink-only
+      // writes. Reject growth, but do not poison the store so an operator can
+      // reconcile expired attachment tombstones and compact it below the cap.
+      if (!this.persistenceCapacityExceeded || snapshotBytes >= this.metadataByteLength) {
+        // There may be no file yet (for example the very first oversized
+        // request). Use the rejected snapshot as the recovery baseline so a
+        // later deletion can still shrink it into a writable range.
+        if (this.metadataByteLength === 0) this.metadataByteLength = snapshotBytes
+        this.persistenceCapacityExceeded = true
+        return Promise.reject(new Error('session presentation metadata exceeds its safety size'))
+      }
     }
     this.persistQueue = this.persistQueue.catch(() => undefined).then(async () => {
       if (this.persistenceUnavailable) throw new Error('session presentation metadata is unavailable')
@@ -1023,6 +1139,8 @@ class SessionMetadataStore {
       const temporaryPath = `${this.path}.${randomUUID()}.tmp`
       await writeFile(temporaryPath, `${snapshot}\n`, { encoding: 'utf8', mode: 0o600 })
       await rename(temporaryPath, this.path)
+      this.metadataByteLength = snapshotBytes
+      this.persistenceCapacityExceeded = snapshotBytes > MAX_SESSION_METADATA_BYTES
     }).catch((error: unknown) => {
       this.persistenceUnavailable = true
       throw error
@@ -1955,6 +2073,22 @@ async function handleHttp(
   const device = pairing.authenticate(header(req, 'authorization'))
   if (device === undefined) throw new HttpError(401, 'unauthorized')
 
+  if (req.method === 'POST' && path === '/admin/attachments/reconcile') {
+    if (device.id !== CONNECTOR_DEVICE_ID) {
+      throw new HttpError(403, 'only the Connector may reconcile attachment uploads')
+    }
+    const body = objectOf(await readJson(req))
+    const requestedLimit = body.limit === undefined ? MAX_ATTACHMENT_RECONCILIATION_BATCH : body.limit
+    if (typeof requestedLimit !== 'number' || !Number.isSafeInteger(requestedLimit) ||
+        requestedLimit < 1 || requestedLimit > MAX_ATTACHMENT_RECONCILIATION_BATCH) {
+      throw new HttpError(400, `limit must be an integer between 1 and ${MAX_ATTACHMENT_RECONCILIATION_BATCH}`)
+    }
+    const result = await metadata.reconcileExpiredAttachmentUploads(
+      ctx.sessionController.findAttachmentByRequestId, requestedLimit)
+    json(res, 200, result)
+    return
+  }
+
   const presenceMatch = /^\/devices\/([^/]+)\/presence$/.exec(path)
   if (req.method === 'POST' && presenceMatch !== null) {
     if (device.id !== CONNECTOR_DEVICE_ID) throw new HttpError(403, 'only the Connector may report Relay presence')
@@ -2619,7 +2753,7 @@ async function handleHttp(
       // Commit a fail-closed marker before invoking the native file service.
       // If the response is lost after the upload side effect, a later retry
       // will see the pending marker instead of uploading a second file.
-      await metadata.setAttachmentUploadPending(durableKey, fingerprint, nativeOperationId)
+      await metadata.setAttachmentUploadPending(durableKey, fingerprint, nativeOperationId, body.name)
     }
     let result: Record<string, unknown>
     try {

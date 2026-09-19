@@ -69,6 +69,10 @@ actor DSHRemoteTransport: DSHAppTransport {
         let result = try await DSHAPIClient(relayBaseURL: baseURL).pair(
             machineId: machineId, credential: credential, deviceName: deviceName
         )
+        // Pairing a second Mac makes the returned profile active. Tear down
+        // the old machine socket before committing that profile so no event
+        // or command can cross the lifecycle boundary.
+        await disconnect()
         try tokenStore.save(result.token, account: result.profile.deviceId)
         // Adds to the machine list rather than replacing it, so pairing a second
         // Mac no longer makes the first one unreachable.

@@ -844,6 +844,35 @@ describe('native bridge mutations', () => {
     )).resolves.toMatchObject({ status: 201 })
     expect(uploads).toBe(1)
   })
+
+  it('reconciles expired attachment tombstones through the Connector admin route', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-admin-reconcile-'))
+    const requestId = 'attachment-admin-reconcile'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000${requestId}`
+    const nativeOperationId = createHash('sha256')
+      .update(`attachment\0${key}`).digest('hex')
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      attachmentUploads: {
+        [key]: {
+          fingerprint: 'a'.repeat(64), name: 'a.txt', nativeOperationId,
+          expired: true, expiredAt: Date.now(),
+        },
+      },
+    }))
+    const request = mount({
+      dataDir,
+      findAttachmentByRequestId: async (operationId) => {
+        expect(operationId).toBe(nativeOperationId)
+        return { receiptId: 'receipt-admin', file: { size: 3 } }
+      },
+    })
+    await expect(request('POST', '/dsh-anywhere/v1/admin/attachments/reconcile', { limit: 1 }))
+      .resolves.toEqual({ status: 200, body: { scanned: 1, found: 1, notCommitted: 0, unknown: 0 } })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, requestId,
+    )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-admin' } })
+  })
 })
 
 describe('pairing page material', () => {

@@ -3,7 +3,10 @@ import VisionKit
 
 struct PairingView: View {
     @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
     @State private var showScanner = false
+    @State private var pairingWasInProgress = false
+    @State private var pairingRevisionAtStart = 0
 
     var body: some View {
         NavigationStack {
@@ -95,12 +98,31 @@ struct PairingView: View {
                     model.pair()
                 }
             }
+            .onChange(of: model.isPairing) { _, isPairing in
+                if isPairing {
+                    pairingWasInProgress = true
+                    pairingRevisionAtStart = model.pairingSuccessRevision
+                } else if pairingWasInProgress &&
+                            model.pairingSuccessRevision != pairingRevisionAtStart {
+                    dismiss()
+                }
+            }
         }
     }
 
     private var pairingHeader: some View {
         HStack(spacing: 8) {
-            Color.clear.frame(width: 44, height: 44)
+            if model.isPaired {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close pairing")
+            } else {
+                Color.clear.frame(width: 44, height: 44)
+            }
             Spacer(minLength: 0)
             Text("DSH Anywhere")
                 .font(.system(size: 17, weight: .semibold))
