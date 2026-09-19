@@ -681,6 +681,8 @@ class SessionMetadataStore {
       throw new HttpError(503, 'attachment upload metadata capacity is full; reconcile or compact session-metadata.json first', 'unknown')
     }
     const operationId = nativeOperationId ?? previous?.nativeOperationId
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.attachmentUploadResults.set(key, {
       fingerprint,
       ...(previous?.name === undefined ? {} : { name: previous.name }),
@@ -694,6 +696,8 @@ class SessionMetadataStore {
     } catch (error) {
       if (previous === undefined) this.attachmentUploadResults.delete(key)
       else this.attachmentUploadResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
@@ -711,11 +715,15 @@ class SessionMetadataStore {
     // service. Remove the marker so the same stable request id can retry after
     // the local capability is restored instead of remaining permanently
     // stuck in the fail-closed pending state.
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.attachmentUploadResults.delete(key)
     try {
       await this.persist()
     } catch (error) {
       this.attachmentUploadResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
@@ -877,6 +885,8 @@ class SessionMetadataStore {
     if (keys.length > 128) throw new HttpError(400, 'at most 128 session creation records may be compacted at once')
     const uniqueKeys = [...new Set(keys)]
     const removed = new Map<string, SessionCreationRecord>()
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     for (const key of uniqueKeys) {
       const entry = this.sessionCreationResults.get(key)
       if (entry === undefined) continue
@@ -891,6 +901,8 @@ class SessionMetadataStore {
       await this.persist()
     } catch (error) {
       for (const [key, entry] of removed) this.sessionCreationResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
     return removed.size
@@ -1056,6 +1068,8 @@ class SessionMetadataStore {
     }
     if (keys.length > 128) throw new HttpError(400, 'at most 128 remote mutation records may be compacted at once')
     const removed = new Map<string, RemoteMutationRecord>()
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     for (const key of [...new Set(keys)]) {
       const entry = this.remoteMutationResults.get(key)
       if (entry === undefined) continue
@@ -1070,6 +1084,8 @@ class SessionMetadataStore {
       await this.persist()
     } catch (error) {
       for (const [key, entry] of removed) this.remoteMutationResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
     return removed.size
@@ -1078,6 +1094,8 @@ class SessionMetadataStore {
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
     const wasArchived = this.archived.has(sessionId)
     const wasUnarchived = this.unarchived.has(sessionId)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     if (archived) {
       this.archived.add(sessionId)
       this.unarchived.delete(sessionId)
@@ -1096,18 +1114,24 @@ class SessionMetadataStore {
       else this.archived.delete(sessionId)
       if (wasUnarchived) this.unarchived.add(sessionId)
       else this.unarchived.delete(sessionId)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
 
   async setPermission(sessionId: string, mode: PermissionMode): Promise<void> {
     const previous = this.permissions.get(sessionId)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.permissions.set(sessionId, mode)
     try {
       await this.persist()
     } catch (error) {
       if (previous === undefined) this.permissions.delete(sessionId)
       else this.permissions.set(sessionId, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
@@ -1116,12 +1140,16 @@ class SessionMetadataStore {
     const trimmed = title.trim().slice(0, 512)
     if (trimmed.length === 0) return
     const previous = this.titles.get(sessionId)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.titles.set(sessionId, trimmed)
     try {
       await this.persist()
     } catch (error) {
       if (previous === undefined) this.titles.delete(sessionId)
       else this.titles.set(sessionId, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
@@ -1130,12 +1158,16 @@ class SessionMetadataStore {
     const trimmed = branch.trim().slice(0, 512)
     if (trimmed.length === 0) return
     const previous = this.branches.get(sessionId)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.branches.set(sessionId, trimmed)
     try {
       await this.persist()
     } catch (error) {
       if (previous === undefined) this.branches.delete(sessionId)
       else this.branches.set(sessionId, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
       throw error
     }
   }
