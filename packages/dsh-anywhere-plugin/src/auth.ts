@@ -74,6 +74,13 @@ export class PairingAuthority {
     return undefined
   }
 
+  hasDevice(deviceId: string): boolean {
+    for (const device of this.devicesByToken.values()) {
+      if (device.id === deviceId) return true
+    }
+    return false
+  }
+
   revoke(deviceId: string): boolean {
     for (const [token, device] of this.devicesByToken) {
       if (device.id !== deviceId) continue

@@ -2051,6 +2051,14 @@ struct ConversationView: View {
         // overlong prompt, but that is a request-level error and must not make
         // the user lose a draft that can still be edited locally.
         guard model.validatePromptText(trimmed) else { return }
+        guard staged.count <= 16 else {
+            model.errorMessage = "一条消息最多包含 16 个附件。"
+            return
+        }
+        guard staged.allSatisfy({ $0.data.count <= 10 * 1024 * 1024 }) else {
+            model.errorMessage = "附件必须不超过 10 MiB，请移除过大的文件后重试。"
+            return
+        }
         let wasRunning = isRunning
         // Text-only queue while busy stays on the device (editable,
         // cancellable, auto-fired when the turn settles). Anything with
@@ -2065,24 +2073,24 @@ struct ConversationView: View {
         }
         let requestId = UUID().uuidString
 
-        // Clear the editor immediately so a double tap cannot send the same
-        // draft twice. If an upload fails, restore the not-yet-uploaded chips
-        // below so the user can retry without selecting the files again.
-        // The keyboard goes away with the send so the fresh answer is
-        // visible. Both paths are needed: the expanded editor binds the
-        // parent focus state, while the compact editor owns its focus
-        // inside DSHRemoteComposer.
+        // Keep the editor's contents until the prompt transaction is durably
+        // accepted. `isSending` prevents a double tap while uploads are in
+        // flight; clearing earlier would lose the draft if the journal cannot
+        // be written.
         isDraftFocused = false
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
                                         to: nil, from: nil, for: nil)
-        model.draft = ""
-        draftAttachments = []
         isSending = true
         let machineGeneration = model.currentMachineGeneration
         let expectedMachineID = model.machineID
         Task { @MainActor in
             guard model.isCurrentMachineGeneration(machineGeneration),
                   model.machineID == expectedMachineID else {
+                isSending = false
+                return
+            }
+            guard await model.preparePromptPersistence(expectedMachineGeneration: machineGeneration,
+                                                       expectedMachineID: expectedMachineID) else {
                 isSending = false
                 return
             }
@@ -2108,14 +2116,20 @@ struct ConversationView: View {
                     isSending = false
                     return
                 }
+                let sent = await model.sendPromptPersisted(
+                    text, attachments: receipts, messageAttachments: messageAttachments,
+                    to: sessionID, mode: mode, requestId: requestId,
+                    expectedMachineGeneration: machineGeneration,
+                    expectedMachineID: expectedMachineID)
+                guard sent else {
+                    isSending = false
+                    return
+                }
                 if wasRunning && mode == "queue" {
                     model.noteQueuedPrompt(text: trimmed, mode: mode, requestId: requestId, for: sessionID)
                 }
-                model.sendPrompt(text, attachments: receipts,
-                                 messageAttachments: messageAttachments, to: sessionID,
-                                 mode: mode, requestId: requestId,
-                                 expectedMachineGeneration: machineGeneration,
-                                 expectedMachineID: expectedMachineID)
+                model.draft = ""
+                draftAttachments = []
             } catch {
                 guard model.isCurrentMachineGeneration(machineGeneration) else {
                     isSending = false
@@ -2927,8 +2941,7 @@ private struct QueuedPromptsSheet: View {
     }
 
     private func sendNow(_ item: DSHAppModel.DSHQueuedPrompt) {
-        guard model.takeQueuedPrompt(id: item.id, sessionID: sessionID) != nil else { return }
-        model.sendPrompt(item.text, to: sessionID)
+        model.sendQueuedPrompt(id: item.id, sessionID: sessionID)
     }
 }
 

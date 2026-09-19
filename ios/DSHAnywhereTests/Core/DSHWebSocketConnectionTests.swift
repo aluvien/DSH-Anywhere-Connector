@@ -120,7 +120,10 @@ final class DSHWebSocketConnectionTests: XCTestCase {
     }
 
     private func waitForFailure(_ connection: DSHWebSocketConnection) async throws -> DSHConnectionState {
-        for _ in 0..<200 {
+        // A simulator can spend several seconds draining a deliberately
+        // oversized 600-event burst while the bounded stream reports its
+        // first dropped item. Keep the assertion deterministic under load.
+        for _ in 0..<1_000 {
             let state = await connection.state
             if case .failed = state { return state }
             try await Task.sleep(for: .milliseconds(10))
@@ -270,10 +273,10 @@ final class DSHWebSocketConnectionTests: XCTestCase {
     private func relaySnapshot(messageID: String, sequence: Int64, title: String) throws -> URLSessionWebSocketTask.Message {
         let event = DSHEvent(envelope: DSHEnvelope(
             messageId: messageID, deviceId: "device", machineId: "machine", sequence: sequence,
-            type: "session.created", payload: .object([
+            type: "session.snapshot", payload: .array([.object([
                 "id": .string(title.lowercased()), "title": .string(title),
                 "updatedAt": .number(Double(sequence)),
-            ])
+            ])])
         ))
         let relay = try DSHRelayPayloadMessage.wrapping(machineId: "machine", sender: .machine, body: event)
         return .data(try JSONEncoder().encode(relay))

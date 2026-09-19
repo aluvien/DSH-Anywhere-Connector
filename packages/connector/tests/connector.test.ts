@@ -38,12 +38,18 @@ describe("bridge command mapping", () => {
       type: "session.list", payload: { includeArchived: true },
     } satisfies CommandEnvelope)).toEqual({ method: "GET", path: "/sessions?includeArchived=true&deviceId=phone-1" });
     expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: { deviceId: "phone-1" } });
-    expect(bridgeRequestFor(command("session.create"))).toEqual({ method: "POST", path: "/sessions", body: { cwd: "/tmp" } });
+    expect(bridgeRequestFor(command("session.create"))).toEqual({
+      method: "POST", path: "/sessions",
+      headers: { "x-dsh-origin-device-id": "phone-1" },
+      body: { deviceId: "phone-1", cwd: "/tmp" },
+    });
     expect(bridgeRequestFor({
       version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
       type: "session.create", payload: { workingDirectory: "/tmp", initialPrompt: "hello", permissionMode: "danger-full-access" },
     } satisfies CommandEnvelope)).toEqual({
-      method: "POST", path: "/sessions", body: { cwd: "/tmp", permissionMode: "danger-full-access" },
+      method: "POST", path: "/sessions",
+      headers: { "x-dsh-origin-device-id": "phone-1" },
+      body: { deviceId: "phone-1", cwd: "/tmp", permissionMode: "danger-full-access" },
     });
     expect(bridgeRequestFor(command("prompt.send"))).toEqual({
       method: "POST", path: "/sessions/session-1/prompt",

@@ -410,11 +410,9 @@ public actor DSHWebSocketConnection {
             guard ready.machineId == configuration.machineId, ready.role == .device else {
                 throw DSHWebSocketError.unauthorizedRelayRole
             }
-            _state = .connected
             // Requests from a dead socket can never receive a useful reply.
             // The fresh handshake list below becomes the only list authority.
             sessionSnapshotRequests.removeAll(keepingCapacity: false)
-            yieldControl(type: "transport.state", value: _state)
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
                                         lastSequence: _lastSequence,
                                         includeArchived: includeArchivedSessions), over: task)
@@ -432,6 +430,13 @@ public actor DSHWebSocketConnection {
                 revokeSessionSnapshotRequest(list.requestId, generation: generation)
                 throw error
             }
+            // Publish connected only after the handshake's resume and
+            // authoritative list are registered and sent.  Otherwise a
+            // concurrent user command can install a newer list generation
+            // while this handshake is still recording its own request, and
+            // the later handshake request would incorrectly supersede it.
+            _state = .connected
+            yieldControl(type: "transport.state", value: _state)
             return true
         case .presence(let presence):
             if presence.machineId == configuration.machineId, presence.role == .machine {

@@ -21,7 +21,7 @@ private struct DSHRemoteCommandError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-private struct DSHPendingInitialMessage: Codable {
+private struct DSHPendingInitialMessage: Codable, Sendable {
     let promptRequestID: String
     let text: String
     let attachments: [DSHStagedAttachment]
@@ -31,7 +31,7 @@ private struct DSHPendingInitialMessage: Codable {
     var uploadedAttachments: [String: DSHMessageAttachment] = [:]
 }
 
-struct DSHInitialMessageFailure: Identifiable, Equatable, Codable {
+struct DSHInitialMessageFailure: Identifiable, Equatable, Codable, Sendable {
     let id: String
     let sessionID: String
     let text: String
@@ -42,7 +42,7 @@ struct DSHInitialMessageFailure: Identifiable, Equatable, Codable {
 /// correlated `session.created` acknowledgement. The original command and
 /// staged first message remain in the pending maps so a retry can reuse the
 /// same request identity instead of silently creating a second session.
-struct DSHSessionCreationFailure: Identifiable, Equatable, Codable {
+struct DSHSessionCreationFailure: Identifiable, Equatable, Codable, Sendable {
     let id: String
     let detail: String
     /// `true` means the request may have reached the Mac but did not produce
@@ -63,7 +63,7 @@ struct DSHSessionCreationFailure: Identifiable, Equatable, Codable {
     }
 }
 
-private struct DSHSessionCreationTransaction: Codable {
+private struct DSHSessionCreationTransaction: Codable, Sendable {
     let command: DSHCommand
     let initialMessage: DSHPendingInitialMessage?
     let failure: DSHSessionCreationFailure?
@@ -71,12 +71,12 @@ private struct DSHSessionCreationTransaction: Codable {
     let retryDeadline: Date
 }
 
-private struct DSHInitialMessageTransaction: Codable {
+private struct DSHInitialMessageTransaction: Codable, Sendable {
     let pending: DSHPendingInitialMessage
     let failure: DSHInitialMessageFailure?
 }
 
-private struct DSHStoredAttachment: Codable {
+private struct DSHStoredAttachment: Codable, Sendable {
     let id: UUID
     let name: String
     let isImage: Bool
@@ -111,7 +111,7 @@ private struct DSHStoredAttachment: Codable {
     }
 }
 
-private struct DSHStoredInitialMessage: Codable {
+private struct DSHStoredInitialMessage: Codable, Sendable {
     let promptRequestID: String
     let text: String
     let attachments: [DSHStoredAttachment]
@@ -119,7 +119,7 @@ private struct DSHStoredInitialMessage: Codable {
     let uploadedAttachments: [String: DSHMessageAttachment]
 }
 
-private struct DSHStoredSessionCreationTransaction: Codable {
+private struct DSHStoredSessionCreationTransaction: Codable, Sendable {
     let command: DSHCommand
     let initialMessage: DSHStoredInitialMessage?
     let failure: DSHSessionCreationFailure?
@@ -127,17 +127,17 @@ private struct DSHStoredSessionCreationTransaction: Codable {
     let retryDeadline: Date
 }
 
-private struct DSHStoredInitialMessageTransaction: Codable {
+private struct DSHStoredInitialMessageTransaction: Codable, Sendable {
     let pending: DSHStoredInitialMessage
     let failure: DSHInitialMessageFailure?
 }
 
-private enum DSHStoredSendFailure: Codable, Equatable {
+private enum DSHStoredSendFailure: Codable, Equatable, Sendable {
     case local(String)
     case server(String)
 }
 
-private struct DSHStoredPendingSend: Codable {
+private struct DSHStoredPendingSend: Codable, Sendable {
     let id: String
     let text: String
     let receipts: [String]
@@ -148,7 +148,7 @@ private struct DSHStoredPendingSend: Codable {
     let messageAttachments: [DSHMessageAttachment]
 }
 
-private struct DSHStoredFailedSend: Codable {
+private struct DSHStoredFailedSend: Codable, Sendable {
     let id: String
     let text: String
     let receipts: [String]
@@ -158,7 +158,104 @@ private struct DSHStoredFailedSend: Codable {
     let failure: DSHStoredSendFailure
 }
 
-private struct DSHPendingTransactionStore: Codable {
+private struct DSHPendingTransactionSnapshot: Sendable {
+    let metadata: Data
+    let blobs: [String: Data]
+    let referencedBlobNames: Set<String>
+    let generation: Int
+}
+
+private struct DSHLoadedPendingTransactionStore: Sendable {
+    let store: DSHPendingTransactionStore
+    let blobs: [String: Data]
+}
+
+/// Serializes transaction files away from the `@MainActor`.  The model still
+/// builds a small metadata snapshot on the main actor, but blob writes,
+/// directory scans, and atomic replacement all run on this independent
+/// executor.  Generations prevent an older fire-and-forget save from
+/// overwriting a newer snapshot when machine switching and event handling race.
+private actor DSHPendingTransactionFileStore {
+    private let metadataURL: URL
+    private let attachmentDirectoryURL: URL
+    private var latestGeneration = 0
+
+    init(metadataURL: URL, attachmentDirectoryURL: URL) {
+        self.metadataURL = metadataURL
+        self.attachmentDirectoryURL = attachmentDirectoryURL
+    }
+
+    func write(_ snapshot: DSHPendingTransactionSnapshot) throws {
+        guard snapshot.generation >= latestGeneration else { return }
+        latestGeneration = snapshot.generation
+        try FileManager.default.createDirectory(at: attachmentDirectoryURL,
+                                                 withIntermediateDirectories: true)
+        for (fileName, data) in snapshot.blobs {
+            let blobURL = attachmentDirectoryURL.appendingPathComponent(fileName)
+            try data.write(to: blobURL, options: [.atomic, .completeFileProtection])
+        }
+        let directory = metadataURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temporaryURL = directory.appendingPathComponent("pending-transactions-\(UUID().uuidString).tmp")
+        try snapshot.metadata.write(to: temporaryURL, options: [.atomic, .completeFileProtection])
+        if FileManager.default.fileExists(atPath: metadataURL.path) {
+            _ = try FileManager.default.replaceItemAt(metadataURL, withItemAt: temporaryURL)
+        } else {
+            try FileManager.default.moveItem(at: temporaryURL, to: metadataURL)
+        }
+        if let files = try? FileManager.default.contentsOfDirectory(at: attachmentDirectoryURL,
+                                                                       includingPropertiesForKeys: nil) {
+            for file in files where file.pathExtension == "blob" &&
+                !snapshot.referencedBlobNames.contains(file.lastPathComponent) {
+                try FileManager.default.removeItem(at: file)
+            }
+        }
+    }
+
+    func load() throws -> DSHLoadedPendingTransactionStore {
+        // A first launch has no journal yet.  Treat that absence as an empty
+        // store instead of converting the normal ENOENT variant returned by
+        // a simulator/device into a fail-closed persistence error.
+        guard FileManager.default.fileExists(atPath: metadataURL.path) else {
+            return DSHLoadedPendingTransactionStore(
+                store: DSHPendingTransactionStore(
+                    sessionCreationTransactionsByMachine: [:],
+                    lastSessionCreationRequestIDsByMachine: [:],
+                    initialMessageTransactionsByMachine: [:]),
+                blobs: [:])
+        }
+        let metadata = try Data(contentsOf: metadataURL)
+        let store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: metadata)
+        var names = Set<String>()
+        func collect(_ value: DSHStoredInitialMessage) throws {
+            for attachment in value.attachments {
+                if let fileName = attachment.fileName,
+                   fileName == URL(fileURLWithPath: fileName).lastPathComponent,
+                   fileName.hasSuffix(".blob") {
+                    names.insert(fileName)
+                } else if attachment.legacyData == nil {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+            }
+        }
+        for transactions in store.sessionCreationTransactionsByMachine.values {
+            for transaction in transactions.values {
+                if let initialMessage = transaction.initialMessage { try collect(initialMessage) }
+            }
+        }
+        for transactions in store.initialMessageTransactionsByMachine.values {
+            for transaction in transactions.values { try collect(transaction.pending) }
+        }
+        var blobs: [String: Data] = [:]
+        blobs.reserveCapacity(names.count)
+        for fileName in names {
+            blobs[fileName] = try Data(contentsOf: attachmentDirectoryURL.appendingPathComponent(fileName))
+        }
+        return DSHLoadedPendingTransactionStore(store: store, blobs: blobs)
+    }
+}
+
+private struct DSHPendingTransactionStore: Codable, Sendable {
     var sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]]
     var lastSessionCreationRequestIDsByMachine: [String: String]
     var initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]]
@@ -454,6 +551,11 @@ final class DSHAppModel: ObservableObject {
             .appendingPathComponent("DSH Anywhere/pending-attachments", isDirectory: true)
     }
 
+    private lazy var pendingTransactionFileStore = DSHPendingTransactionFileStore(
+        metadataURL: pendingTransactionStoreURL,
+        attachmentDirectoryURL: pendingAttachmentDirectoryURL)
+    private var pendingPersistenceGeneration = 0
+
     private static let maxPendingAttachmentCount = 16
     private static let maxPendingAttachmentBytes = 192 * 1024 * 1024
     private static let maxAttachmentBytes = 10 * 1024 * 1024
@@ -466,8 +568,15 @@ final class DSHAppModel: ObservableObject {
     /// side effect. Keep recovery fail-closed until the next launch can read
     /// or recreate the store.
     private var pendingTransactionPersistenceUnavailable = false
+    private var pendingTransactionStoreLoaded = false
+    /// A disconnect suspends durable state asynchronously so file I/O never
+    /// runs on the main actor.  Keep the UI transition observable immediately
+    /// and let a connect request wait for the snapshot to finish.
+    private var suspendingTransactions = false
+    private var reconnectAfterSuspension = false
 
-    private func materializeInitialMessage(_ stored: DSHStoredInitialMessage) throws -> DSHPendingInitialMessage {
+    private func materializeInitialMessage(_ stored: DSHStoredInitialMessage,
+                                           blobs: [String: Data]) throws -> DSHPendingInitialMessage {
         guard stored.attachments.count <= Self.maxPendingAttachmentCount else {
             throw DSHAttachmentUploadError.tooLarge
         }
@@ -480,7 +589,10 @@ final class DSHAppModel: ObservableObject {
             } else if let fileName = attachment.fileName,
                       fileName == URL(fileURLWithPath: fileName).lastPathComponent,
                       fileName.hasSuffix(".blob") {
-                data = try Data(contentsOf: pendingAttachmentDirectoryURL.appendingPathComponent(fileName))
+                guard let storedData = blobs[fileName] else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                data = storedData
             } else {
                 throw CocoaError(.fileReadCorruptFile)
             }
@@ -496,131 +608,197 @@ final class DSHAppModel: ObservableObject {
             uploadedAttachments: stored.uploadedAttachments)
     }
 
-    private func loadPendingTransactionStore() {
-        let url = pendingTransactionStoreURL
-        let data: Data
+    private func loadPendingTransactionStore() async {
         do {
-            data = try Data(contentsOf: url)
-        } catch let error as NSError
-            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
-            return
-        } catch {
-            pendingTransactionPersistenceUnavailable = true
-            errorMessage = "未能读取待处理请求，已停止自动重试。"
-            return
-        }
-        do {
-            let store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: data)
+            let loaded = try await pendingTransactionFileStore.load()
+            let store = loaded.store
             var creations: [String: [String: DSHSessionCreationTransaction]] = [:]
             for (machineID, transactions) in store.sessionCreationTransactionsByMachine {
                 var next: [String: DSHSessionCreationTransaction] = [:]
                 for (requestID, transaction) in transactions {
                     next[requestID] = DSHSessionCreationTransaction(
                         command: transaction.command,
-                        initialMessage: try transaction.initialMessage.map(materializeInitialMessage),
+                        initialMessage: try transaction.initialMessage.map {
+                            try materializeInitialMessage($0, blobs: loaded.blobs)
+                        },
                         failure: transaction.failure,
                         detached: transaction.detached,
                         retryDeadline: transaction.retryDeadline)
                 }
                 creations[machineID] = next
             }
+            // A user can submit or retry a request while this first-launch
+            // load is still reading the journal.  Merge the freshly loaded
+            // disk view instead of replacing those live maps and losing the
+            // request before its first send.  Live entries win on collision;
+            // their request identity is the newest authority in this process.
+            for (activeMachineID, current) in sessionCreationTransactionsByMachine {
+                var merged = creations[activeMachineID] ?? [:]
+                merged.merge(current) { _, current in current }
+                creations[activeMachineID] = merged
+            }
+            if !pendingSessionCreationRequestIDs.isEmpty {
+                var current = creations[machineID] ?? [:]
+                for requestID in pendingSessionCreationRequestIDs {
+                    guard let command = pendingSessionCreationCommandsByRequestID[requestID] else { continue }
+                    current[requestID] = DSHSessionCreationTransaction(
+                        command: command,
+                        initialMessage: pendingInitialMessagesByRequestID[requestID],
+                        failure: failedSessionCreations[requestID],
+                        detached: detachedSessionCreationRequestIDs.contains(requestID),
+                        retryDeadline: sessionCreationRetryDeadlines[requestID]
+                            ?? Date().addingTimeInterval(sessionCreationRetryWindow))
+                }
+                creations[machineID] = current
+            }
             sessionCreationTransactionsByMachine = creations
-            lastSessionCreationRequestIDsByMachine = store.lastSessionCreationRequestIDsByMachine
+            var lastIDs = store.lastSessionCreationRequestIDsByMachine
+            for (activeMachineID, requestID) in lastSessionCreationRequestIDsByMachine {
+                lastIDs[activeMachineID] = requestID
+            }
+            if let lastSessionCreationRequestID,
+               !machineID.isEmpty {
+                lastIDs[machineID] = lastSessionCreationRequestID
+            }
+            lastSessionCreationRequestIDsByMachine = lastIDs
             var initialMessages: [String: [String: DSHInitialMessageTransaction]] = [:]
             for (machineID, transactions) in store.initialMessageTransactionsByMachine {
                 var next: [String: DSHInitialMessageTransaction] = [:]
                 for (requestID, transaction) in transactions {
                     next[requestID] = DSHInitialMessageTransaction(
-                        pending: try materializeInitialMessage(transaction.pending),
+                        pending: try materializeInitialMessage(transaction.pending, blobs: loaded.blobs),
                         failure: transaction.failure)
                 }
                 initialMessages[machineID] = next
             }
+            for (activeMachineID, current) in initialMessageTransactionsByMachine {
+                var merged = initialMessages[activeMachineID] ?? [:]
+                merged.merge(current) { _, current in current }
+                initialMessages[activeMachineID] = merged
+            }
+            if !pendingInitialMessagesByRequestID.isEmpty {
+                var current = initialMessages[machineID] ?? [:]
+                for (requestID, pending) in pendingInitialMessagesByRequestID {
+                    guard let sessionID = pending.sessionID else { continue }
+                    current[requestID] = DSHInitialMessageTransaction(
+                        pending: pending,
+                        failure: failedInitialMessages[requestID]
+                            ?? DSHInitialMessageFailure(
+                                id: requestID, sessionID: sessionID, text: pending.text,
+                                detail: "连接已断开，首条消息待重试。"))
+                }
+                initialMessages[machineID] = current
+            }
             initialMessageTransactionsByMachine = initialMessages
-            pendingPromptTransactionsByMachine = store.pendingPromptTransactionsByMachine
-            failedPromptTransactionsByMachine = store.failedPromptTransactionsByMachine
+            var pendingPrompts = store.pendingPromptTransactionsByMachine
+            for (activeMachineID, current) in pendingPromptTransactionsByMachine {
+                var merged = pendingPrompts[activeMachineID] ?? [:]
+                merged.merge(current) { _, current in current }
+                pendingPrompts[activeMachineID] = merged
+            }
+            if !pendingSendsByRequestID.isEmpty {
+                var current = pendingPrompts[machineID] ?? [:]
+                current.merge(pendingSendsByRequestID.mapValues(storedPendingSend)) { _, current in current }
+                pendingPrompts[machineID] = current
+            }
+            pendingPromptTransactionsByMachine = pendingPrompts
+            var failedPrompts = store.failedPromptTransactionsByMachine
+            for (activeMachineID, current) in failedPromptTransactionsByMachine {
+                var merged = failedPrompts[activeMachineID] ?? [:]
+                merged.merge(current) { _, current in current }
+                failedPrompts[activeMachineID] = merged
+            }
+            if !failedSendsByRequestID.isEmpty {
+                var current = failedPrompts[machineID] ?? [:]
+                current.merge(failedSendsByRequestID.mapValues(storedFailedSend)) { _, current in current }
+                failedPrompts[machineID] = current
+            }
+            failedPromptTransactionsByMachine = failedPrompts
         } catch {
-            pendingTransactionPersistenceUnavailable = true
-            errorMessage = "未能读取待处理请求，已停止自动重试。"
+            let nsError = error as NSError
+            if !(nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) {
+                pendingTransactionPersistenceUnavailable = true
+                errorMessage = "未能读取待处理请求，已停止自动重试。"
+            }
         }
+        pendingTransactionStoreLoaded = true
+        restoreSessionCreationTransactions(for: machineID)
+        if isPaired { connect() }
+    }
+
+    private func makePendingTransactionSnapshot() throws -> DSHPendingTransactionSnapshot {
+        var referencedBlobNames = Set<String>()
+        var blobs: [String: Data] = [:]
+        var attachmentBytes = 0
+        func storedInitialMessage(_ pending: DSHPendingInitialMessage) throws -> DSHStoredInitialMessage {
+            guard pending.attachments.count <= Self.maxPendingAttachmentCount else {
+                throw DSHAttachmentUploadError.tooLarge
+            }
+            var attachments: [DSHStoredAttachment] = []
+            attachments.reserveCapacity(pending.attachments.count)
+            for attachment in pending.attachments {
+                guard attachment.data.count <= Self.maxAttachmentBytes else {
+                    throw DSHAttachmentUploadError.tooLarge
+                }
+                attachmentBytes += attachment.data.count
+                guard attachmentBytes <= Self.maxPendingAttachmentBytes else {
+                    throw DSHAttachmentUploadError.tooLarge
+                }
+                let fileName = "\(attachment.id.uuidString).blob"
+                referencedBlobNames.insert(fileName)
+                blobs[fileName] = attachment.data
+                attachments.append(DSHStoredAttachment(id: attachment.id, name: attachment.name,
+                                                        isImage: attachment.isImage, fileName: fileName))
+            }
+            return DSHStoredInitialMessage(
+                promptRequestID: pending.promptRequestID,
+                text: pending.text,
+                attachments: attachments,
+                sessionID: pending.sessionID,
+                uploadedAttachments: pending.uploadedAttachments)
+        }
+        var storedCreations: [String: [String: DSHStoredSessionCreationTransaction]] = [:]
+        for (machineID, transactions) in sessionCreationTransactionsByMachine {
+            var next: [String: DSHStoredSessionCreationTransaction] = [:]
+            for (requestID, transaction) in transactions {
+                next[requestID] = DSHStoredSessionCreationTransaction(
+                    command: transaction.command,
+                    initialMessage: try transaction.initialMessage.map(storedInitialMessage),
+                    failure: transaction.failure,
+                    detached: transaction.detached,
+                    retryDeadline: transaction.retryDeadline)
+            }
+            storedCreations[machineID] = next
+        }
+        var storedInitialMessages: [String: [String: DSHStoredInitialMessageTransaction]] = [:]
+        for (machineID, transactions) in initialMessageTransactionsByMachine {
+            var next: [String: DSHStoredInitialMessageTransaction] = [:]
+            for (requestID, transaction) in transactions {
+                next[requestID] = DSHStoredInitialMessageTransaction(
+                    pending: try storedInitialMessage(transaction.pending),
+                    failure: transaction.failure)
+            }
+            storedInitialMessages[machineID] = next
+        }
+        let store = DSHPendingTransactionStore(
+            sessionCreationTransactionsByMachine: storedCreations,
+            lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
+            initialMessageTransactionsByMachine: storedInitialMessages,
+            pendingPromptTransactionsByMachine: pendingPromptTransactionsByMachine,
+            failedPromptTransactionsByMachine: failedPromptTransactionsByMachine)
+        pendingPersistenceGeneration += 1
+        return DSHPendingTransactionSnapshot(metadata: try JSONEncoder().encode(store),
+                                              blobs: blobs,
+                                              referencedBlobNames: referencedBlobNames,
+                                              generation: pendingPersistenceGeneration)
     }
 
     @discardableResult
-    private func persistPendingTransactionStore() -> Bool {
+    private func persistPendingTransactionStore() async -> Bool {
         guard !pendingTransactionPersistenceUnavailable else { return false }
         do {
-            let attachmentDirectory = pendingAttachmentDirectoryURL
-            try FileManager.default.createDirectory(at: attachmentDirectory, withIntermediateDirectories: true)
-            var referencedBlobNames = Set<String>()
-            var attachmentBytes = 0
-            func storedInitialMessage(_ pending: DSHPendingInitialMessage) throws -> DSHStoredInitialMessage {
-                guard pending.attachments.count <= Self.maxPendingAttachmentCount else {
-                    throw DSHAttachmentUploadError.tooLarge
-                }
-                var attachments: [DSHStoredAttachment] = []
-                attachments.reserveCapacity(pending.attachments.count)
-                for attachment in pending.attachments {
-                    guard attachment.data.count <= Self.maxAttachmentBytes else {
-                        throw DSHAttachmentUploadError.tooLarge
-                    }
-                    attachmentBytes += attachment.data.count
-                    guard attachmentBytes <= Self.maxPendingAttachmentBytes else {
-                        throw DSHAttachmentUploadError.tooLarge
-                    }
-                    let fileName = "\(attachment.id.uuidString).blob"
-                    let blobURL = attachmentDirectory.appendingPathComponent(fileName)
-                    try attachment.data.write(to: blobURL, options: [.atomic, .completeFileProtection])
-                    referencedBlobNames.insert(fileName)
-                    attachments.append(DSHStoredAttachment(id: attachment.id, name: attachment.name,
-                                                            isImage: attachment.isImage, fileName: fileName))
-                }
-                return DSHStoredInitialMessage(
-                    promptRequestID: pending.promptRequestID,
-                    text: pending.text,
-                    attachments: attachments,
-                    sessionID: pending.sessionID,
-                    uploadedAttachments: pending.uploadedAttachments)
-            }
-            var storedCreations: [String: [String: DSHStoredSessionCreationTransaction]] = [:]
-            for (machineID, transactions) in sessionCreationTransactionsByMachine {
-                var next: [String: DSHStoredSessionCreationTransaction] = [:]
-                for (requestID, transaction) in transactions {
-                    next[requestID] = DSHStoredSessionCreationTransaction(
-                        command: transaction.command,
-                        initialMessage: try transaction.initialMessage.map(storedInitialMessage),
-                        failure: transaction.failure,
-                        detached: transaction.detached,
-                        retryDeadline: transaction.retryDeadline)
-                }
-                storedCreations[machineID] = next
-            }
-            var storedInitialMessages: [String: [String: DSHStoredInitialMessageTransaction]] = [:]
-            for (machineID, transactions) in initialMessageTransactionsByMachine {
-                var next: [String: DSHStoredInitialMessageTransaction] = [:]
-                for (requestID, transaction) in transactions {
-                    next[requestID] = DSHStoredInitialMessageTransaction(
-                        pending: try storedInitialMessage(transaction.pending),
-                        failure: transaction.failure)
-                }
-                storedInitialMessages[machineID] = next
-            }
-            let store = DSHPendingTransactionStore(
-                sessionCreationTransactionsByMachine: storedCreations,
-                lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
-                initialMessageTransactionsByMachine: storedInitialMessages,
-                pendingPromptTransactionsByMachine: pendingPromptTransactionsByMachine,
-                failedPromptTransactionsByMachine: failedPromptTransactionsByMachine)
-            let data = try JSONEncoder().encode(store)
-            let directory = pendingTransactionStoreURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: pendingTransactionStoreURL, options: [.atomic, .completeFileProtection])
-            if let files = try? FileManager.default.contentsOfDirectory(at: attachmentDirectory,
-                                                                           includingPropertiesForKeys: nil) {
-                for file in files where file.pathExtension == "blob" &&
-                    !referencedBlobNames.contains(file.lastPathComponent) {
-                    try FileManager.default.removeItem(at: file)
-                }
-            }
+            let snapshot = try makePendingTransactionSnapshot()
+            try await pendingTransactionFileStore.write(snapshot)
             return true
         } catch {
             // Keep the in-memory transaction and surface the loss of durable
@@ -630,6 +808,18 @@ final class DSHAppModel: ObservableObject {
             pendingTransactionPersistenceUnavailable = true
             errorMessage = "无法保存待处理请求，暂不安全重试。"
             return false
+        }
+    }
+
+    private func persistPendingTransactionStoreLater() {
+        Task { @MainActor [weak self] in
+            _ = await self?.persistPendingTransactionStore()
+        }
+    }
+
+    private func persistCurrentTransactionsLater(for machineID: String) {
+        Task { @MainActor [weak self] in
+            _ = await self?.persistCurrentTransactions(for: machineID)
         }
     }
 
@@ -677,9 +867,8 @@ final class DSHAppModel: ObservableObject {
     /// is called after every mutation that could otherwise be lost if iOS is
     /// killed without giving the socket a disconnect callback.
     @discardableResult
-    private func persistCurrentTransactions(for machineID: String) -> Bool {
+    private func persistCurrentTransactions(for machineID: String) async -> Bool {
         guard !pendingTransactionPersistenceUnavailable else { return false }
-        guard !machineID.isEmpty else { return true }
         var creationSnapshot: [String: DSHSessionCreationTransaction] = [:]
         for requestID in pendingSessionCreationRequestIDs {
             guard let command = pendingSessionCreationCommandsByRequestID[requestID] else { continue }
@@ -729,12 +918,18 @@ final class DSHAppModel: ObservableObject {
         } else {
             failedPromptTransactionsByMachine[machineID] = failedSendsByRequestID.mapValues(storedFailedSend)
         }
-        return persistPendingTransactionStore()
+        // Preview/test transports can be marked paired before a profile has a
+        // machine id.  Keep their in-memory per-machine snapshot so a
+        // disconnect/reconnect still restores an in-flight request, while
+        // avoiding a shared on-disk journal entry that could leak between
+        // unrelated preview models.
+        guard !machineID.isEmpty else { return true }
+        return await persistPendingTransactionStore()
     }
 
     @discardableResult
-    private func suspendSessionCreationTransactions(for machineID: String) -> Bool {
-        return persistCurrentTransactions(for: machineID)
+    private func suspendSessionCreationTransactions(for machineID: String) async -> Bool {
+        return await persistCurrentTransactions(for: machineID)
     }
 
     private func restoreSessionCreationTransactions(for machineID: String) {
@@ -784,7 +979,7 @@ final class DSHAppModel: ObservableObject {
 
     private func removeStoredSessionCreationTransaction(_ requestID: String, for machineID: String) {
         guard var snapshot = sessionCreationTransactionsByMachine[machineID] else {
-            persistPendingTransactionStore()
+            persistPendingTransactionStoreLater()
             return
         }
         snapshot.removeValue(forKey: requestID)
@@ -797,12 +992,12 @@ final class DSHAppModel: ObservableObject {
                 lastSessionCreationRequestIDsByMachine[machineID] = snapshot.keys.sorted().last
             }
         }
-        persistPendingTransactionStore()
+        persistPendingTransactionStoreLater()
     }
 
     private func removeStoredInitialMessageTransaction(_ requestID: String, for machineID: String) {
         guard var snapshot = initialMessageTransactionsByMachine[machineID] else {
-            persistPendingTransactionStore()
+            persistPendingTransactionStoreLater()
             return
         }
         snapshot.removeValue(forKey: requestID)
@@ -811,7 +1006,7 @@ final class DSHAppModel: ObservableObject {
         } else {
             initialMessageTransactionsByMachine[machineID] = snapshot
         }
-        persistPendingTransactionStore()
+        persistPendingTransactionStoreLater()
     }
 
     /// Drops all in-flight per-machine bookkeeping. History batches belong to
@@ -855,6 +1050,7 @@ final class DSHAppModel: ObservableObject {
         requestedCatalogsForConnection = false
         // Queued prompts belong to one machine: swap the in-memory set for
         // the newly active machine's persisted one (disk already holds both).
+        queuedPromptSendIDs.removeAll(keepingCapacity: false)
         queuedPromptsBySession.removeAll(keepingCapacity: false)
         restoreQueuedPrompts()
     }
@@ -881,7 +1077,9 @@ final class DSHAppModel: ObservableObject {
             self.machineName = active.machineName
             self.machineID = active.machineId
         }
-        loadPendingTransactionStore()
+        Task { @MainActor [weak self] in
+            await self?.loadPendingTransactionStore()
+        }
         restoreQueuedPrompts()
     }
 
@@ -1155,13 +1353,13 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        guard suspendSessionCreationTransactions(for: previousMachineID) else {
-            pendingMachineSelectionID = nil
-            connect()
-            return
-        }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard await self.suspendSessionCreationTransactions(for: previousMachineID) else {
+                self.pendingMachineSelectionID = nil
+                self.connect()
+                return
+            }
             await self.transport.setActiveMachine(machine.machineId)
             guard self.machineSelectionGeneration == selection else { return }
             self.pendingMachineSelectionID = nil
@@ -1181,10 +1379,6 @@ final class DSHAppModel: ObservableObject {
         let wasActive = machine.machineId == activeMachine?.machineId
         let isPendingSelection = machine.machineId == pendingMachineSelectionID
         let needsRecovery = wasActive || isPendingSelection
-        // A pending target is not the machine represented by the live maps;
-        // snapshot only the active machine before deletion. The target's
-        // already-durable records remain untouched until removal succeeds.
-        if wasActive, !persistCurrentTransactions(for: machine.machineId) { return }
         if needsRecovery { machineSelectionGeneration &+= 1 }
         let recoveryGeneration = machineSelectionGeneration
         if isPendingSelection { pendingMachineSelectionID = nil }
@@ -1196,6 +1390,14 @@ final class DSHAppModel: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // A pending target is not the machine represented by the live
+            // maps; snapshot only the active machine before deletion. The
+            // target's already-durable records remain untouched until removal
+            // succeeds.
+            if wasActive, !(await self.persistCurrentTransactions(for: machine.machineId)) {
+                self.connect()
+                return
+            }
             do {
                 try await self.transport.removeMachine(machine.machineId)
             } catch {
@@ -1212,7 +1414,7 @@ final class DSHAppModel: ObservableObject {
             self.initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.failedPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
-            self.persistPendingTransactionStore()
+            await self.persistPendingTransactionStore()
             self.refreshMachines()
             guard needsRecovery else {
                 self.isPaired = !self.machines.isEmpty
@@ -1287,7 +1489,11 @@ final class DSHAppModel: ObservableObject {
     var currentDeviceId: String? { profiles.activeProfile?.deviceId }
 
     func connect() {
-        guard isPaired, eventTask == nil else { return }
+        guard pendingTransactionStoreLoaded, isPaired, eventTask == nil else { return }
+        if suspendingTransactions {
+            reconnectAfterSuspension = true
+            return
+        }
         if pendingSessionCreationRequestIDs.isEmpty {
             restoreSessionCreationTransactions(for: machineID)
         }
@@ -1328,19 +1534,32 @@ final class DSHAppModel: ObservableObject {
     }
 
     func disconnect() {
+        guard !suspendingTransactions else { return }
         machineSelectionGeneration &+= 1
         pendingMachineSelectionID = nil
         eventTask?.cancel()
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        guard suspendSessionCreationTransactions(for: machineID) else { return }
-        resetTransientRequestState()
-        Task { await transport.disconnect() }
-        state.transportState = .disconnected
-        state.machineOnline = false
-        state.bridgeReachable = nil
-        state.connectionState = .disconnected
+        suspendingTransactions = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard await self.suspendSessionCreationTransactions(for: self.machineID) else {
+                self.suspendingTransactions = false
+                self.connect()
+                return
+            }
+            self.resetTransientRequestState()
+            await self.transport.disconnect()
+            self.state.transportState = .disconnected
+            self.state.machineOnline = false
+            self.state.bridgeReachable = nil
+            self.state.connectionState = .disconnected
+            let shouldReconnect = self.reconnectAfterSuspension
+            self.reconnectAfterSuspension = false
+            self.suspendingTransactions = false
+            if shouldReconnect { self.connect() }
+        }
     }
 
     func forgetPairing() {
@@ -1351,13 +1570,13 @@ final class DSHAppModel: ObservableObject {
         eventFlushTask?.cancel()
         eventFlushTask = nil
         let forgottenMachineID = activeMachine?.machineId ?? machineID
-        guard suspendSessionCreationTransactions(for: forgottenMachineID) else {
-            connect()
-            return
-        }
-        resetTransientRequestState()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard await self.suspendSessionCreationTransactions(for: forgottenMachineID) else {
+                self.connect()
+                return
+            }
+            self.resetTransientRequestState()
             do { try await self.transport.forgetPairing() }
             catch {
                 self.errorMessage = error.localizedDescription
@@ -1374,7 +1593,7 @@ final class DSHAppModel: ObservableObject {
             self.initialMessageTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.failedPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
-            self.persistPendingTransactionStore()
+            await self.persistPendingTransactionStore()
             self.refreshMachines()
             self.state = .init()
             if let active = self.activeMachine {
@@ -1485,11 +1704,19 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeValue(forKey: requestId)
         detachedSessionCreationRequestIDs.remove(requestId)
         armSessionCreationTimeout(requestID: requestId)
-        guard persistCurrentTransactions(for: machineID) else {
-            cancelSessionCreationTimeout(requestID: requestId)
-            return false
+        let expectedMachineGeneration = machineStateGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.machineStateGeneration == expectedMachineGeneration,
+                  self.machineID == machineID,
+                  await self.persistCurrentTransactions(for: machineID) else {
+                self?.cancelSessionCreationTimeout(requestID: requestId)
+                return
+            }
+            guard self.machineStateGeneration == expectedMachineGeneration,
+                  self.machineID == machineID else { return }
+            self.send(command)
         }
-        send(command)
         return true
     }
 
@@ -1667,17 +1894,81 @@ final class DSHAppModel: ObservableObject {
         sendPrompt(text, attachments: [], to: sessionID)
     }
 
+    private struct DSHPreparedPrompt: Sendable {
+        let requestID: String
+        let attempt: Int
+        let text: String
+        let receipts: [String]
+        let messageAttachments: [DSHMessageAttachment]
+        let sessionID: String
+        let mode: String
+        let machineID: String
+        let machineGeneration: Int
+    }
+
+    @discardableResult
     func sendPrompt(_ text: String, attachments: [String],
                     messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
                     mode: String = "queue", requestId requestedRequestID: String? = nil,
                     expectedMachineGeneration: Int? = nil,
-                    expectedMachineID: String? = nil) {
+                    expectedMachineID: String? = nil) -> Bool {
+        guard let prepared = preparePrompt(text, attachments: attachments,
+                                           messageAttachments: messageAttachments, to: sessionID,
+                                           mode: mode, requestId: requestedRequestID,
+                                           expectedMachineGeneration: expectedMachineGeneration,
+                                           expectedMachineID: expectedMachineID) else { return false }
+        Task { @MainActor [weak self] in
+            _ = await self?.persistAndSend(prepared)
+        }
+        return true
+    }
+
+    /// Persists a prompt transaction before the caller clears its editor. The
+    /// normal fire-and-forget API above remains for existing event handlers and
+    /// tests; UI paths that own the draft use this result-bearing variant so a
+    /// storage failure leaves the text and attachment chips intact.
+    @discardableResult
+    func sendPromptPersisted(_ text: String, attachments: [String],
+                             messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
+                             mode: String = "queue", requestId requestedRequestID: String? = nil,
+                             expectedMachineGeneration: Int? = nil,
+                             expectedMachineID: String? = nil) async -> Bool {
+        guard let prepared = preparePrompt(text, attachments: attachments,
+                                           messageAttachments: messageAttachments, to: sessionID,
+                                           mode: mode, requestId: requestedRequestID,
+                                           expectedMachineGeneration: expectedMachineGeneration,
+                                           expectedMachineID: expectedMachineID) else { return false }
+        return await persistAndSend(prepared)
+    }
+
+    /// Gives attachment-producing UI a durable preflight before it uploads
+    /// bytes to the Mac. This does not create a prompt; it only verifies that
+    /// the transaction journal is writable while the original draft remains
+    /// in the editor.
+    func preparePromptPersistence(expectedMachineGeneration: Int? = nil,
+                                  expectedMachineID: String? = nil) async -> Bool {
+        let generation = expectedMachineGeneration ?? machineStateGeneration
+        guard !pendingTransactionPersistenceUnavailable,
+              generation == machineStateGeneration,
+              expectedMachineID == nil || expectedMachineID == machineID else { return false }
+        return await persistCurrentTransactions(for: machineID)
+    }
+
+    private func preparePrompt(_ text: String, attachments: [String],
+                               messageAttachments: [DSHMessageAttachment], to sessionID: String,
+                               mode: String, requestId requestedRequestID: String?,
+                               expectedMachineGeneration: Int?,
+                               expectedMachineID: String?) -> DSHPreparedPrompt? {
         if let expectedMachineGeneration,
-           expectedMachineGeneration != machineStateGeneration { return }
-        if let expectedMachineID, expectedMachineID != machineID { return }
+           expectedMachineGeneration != machineStateGeneration { return nil }
+        if let expectedMachineID, expectedMachineID != machineID { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || !attachments.isEmpty else { return }
-        guard validatePromptText(trimmed) else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty else { return nil }
+        guard attachments.count <= Self.maxPendingAttachmentCount else {
+            errorMessage = "一条消息最多包含 16 个附件。"
+            return nil
+        }
+        guard validatePromptText(trimmed) else { return nil }
         let requestId = requestedRequestID ?? UUID().uuidString
         if !messageAttachments.isEmpty {
             pendingMessageAttachmentsByRequestID[requestId] = messageAttachments
@@ -1698,12 +1989,39 @@ final class DSHAppModel: ObservableObject {
             id: requestId, text: trimmed, receipts: attachments,
             sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt,
             messageAttachments: messageAttachments)
-        guard persistCurrentTransactions(for: machineID) else { return }
-        armSendAckTimeout(requestId: requestId, attempt: attempt)
-        let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
-        send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
-                                   sessionId: sessionID, text: trimmed, attachments: parts,
-                                   mode: mode, requestId: requestId))
+        return DSHPreparedPrompt(requestID: requestId, attempt: attempt, text: trimmed,
+                                 receipts: attachments, messageAttachments: messageAttachments,
+                                 sessionID: sessionID, mode: mode, machineID: machineID,
+                                 machineGeneration: machineStateGeneration)
+    }
+
+    private func persistAndSend(_ prepared: DSHPreparedPrompt) async -> Bool {
+        guard machineStateGeneration == prepared.machineGeneration,
+              machineID == prepared.machineID else { return false }
+        guard await persistCurrentTransactions(for: prepared.machineID) else {
+            if pendingSendsByRequestID[prepared.requestID]?.attempt == prepared.attempt {
+                pendingSendsByRequestID.removeValue(forKey: prepared.requestID)
+                clearPendingMessageAttachments(for: prepared.requestID)
+                failedSendsByRequestID[prepared.requestID] = DSHFailedSend(
+                    id: prepared.requestID, text: prepared.text, receipts: prepared.receipts,
+                    sessionID: prepared.sessionID, mode: prepared.mode,
+                    messageAttachments: prepared.messageAttachments,
+                    failure: .local("无法保存待处理请求，消息尚未发送。"))
+            }
+            errorMessage = "无法保存待处理请求，消息尚未发送。"
+            return false
+        }
+        guard machineStateGeneration == prepared.machineGeneration,
+              machineID == prepared.machineID else { return false }
+        armSendAckTimeout(requestId: prepared.requestID, attempt: prepared.attempt)
+        let parts = prepared.receipts.map {
+            DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)])
+        }
+        send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: prepared.machineID,
+                                   sessionId: prepared.sessionID, text: prepared.text,
+                                   attachments: parts, mode: prepared.mode,
+                                   requestId: prepared.requestID))
+        return true
     }
 
     /// An outbound prompt awaiting its accepted user message. If nothing
@@ -1784,7 +2102,7 @@ final class DSHAppModel: ObservableObject {
                                                           receipts: pending.receipts,
                                                           sessionID: pending.sessionID, mode: pending.mode,
                                                           messageAttachments: pending.messageAttachments, failure: failure)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
     }
 
     /// A request id is authoritative.  A message with an id that does not match
@@ -1794,7 +2112,7 @@ final class DSHAppModel: ObservableObject {
         if let requestID {
             pendingSendsByRequestID.removeValue(forKey: requestID)
             failedSendsByRequestID.removeValue(forKey: requestID)
-            persistCurrentTransactions(for: machineID)
+            persistCurrentTransactionsLater(for: machineID)
             return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1806,7 +2124,7 @@ final class DSHAppModel: ObservableObject {
         if let failure = failedSendsByRequestID.values.first(where: {
             $0.sessionID == sessionID && $0.text == trimmed
         }) { failedSendsByRequestID.removeValue(forKey: failure.id) }
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
     }
 
     private func clearPendingMessageAttachments(for requestID: String) {
@@ -1845,7 +2163,7 @@ final class DSHAppModel: ObservableObject {
             sessionID: sessionID, mode: mode,
             messageAttachments: messageAttachments,
             failure: .local(error.localizedDescription))
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -1868,7 +2186,7 @@ final class DSHAppModel: ObservableObject {
         guard let failed = failedSendsByRequestID[requestID] else { return }
         guard validatePromptText(failed.text) else { return }
         failedSendsByRequestID.removeValue(forKey: requestID)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
         // A timeout means the Mac may already have accepted the side effect.
         // Reuse the complete original command identity and mode so Connector
         // and Bridge idempotency coalesce the retry instead of executing it
@@ -1885,7 +2203,7 @@ final class DSHAppModel: ObservableObject {
 
     func dismissFailedSend(requestID: String) {
         failedSendsByRequestID.removeValue(forKey: requestID)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
     }
 
     func dismissFailedSend() {
@@ -1918,6 +2236,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     private var queuedPromptsBySession: [String: [DSHQueuedPrompt]] = [:]
+    private var queuedPromptSendIDs: Set<String> = []
     private static let queuedPromptTTL: TimeInterval = 24 * 60 * 60
     private static let queuedPromptsDefaultsKey = "dsh-anywhere.queued-prompts"
 
@@ -1988,17 +2307,35 @@ final class DSHAppModel: ObservableObject {
         return item
     }
 
+    /// Sends a locally held queue item only after its normal prompt
+    /// transaction is durable. A failed journal write leaves the item in the
+    /// local queue instead of making the editor and queue both lose it.
+    func sendQueuedPrompt(id: String, sessionID: String) {
+        guard let item = queuedPromptsBySession[sessionID]?.first(where: { $0.id == id && !$0.sent }),
+              queuedPromptSendIDs.insert(id).inserted else { return }
+        let generation = machineStateGeneration
+        let activeMachineID = machineID
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.queuedPromptSendIDs.remove(id) }
+            let sent = await self.sendPromptPersisted(
+                item.text, attachments: [], to: sessionID, mode: item.mode,
+                expectedMachineGeneration: generation, expectedMachineID: activeMachineID)
+            if sent {
+                _ = self.takeQueuedPrompt(id: id, sessionID: sessionID)
+            }
+        }
+    }
+
     /// Fires the oldest held prompt when a turn settles. Returns false when
     /// there is nothing to fire (or the session is gone).
     @discardableResult
     private func flushQueuedPrompt(for sessionID: String) -> Bool {
-        guard var queue = queuedPromptsBySession[sessionID],
+        guard let queue = queuedPromptsBySession[sessionID],
               let index = queue.firstIndex(where: { !$0.sent }) else { return false }
         guard validatePromptText(queue[index].text) else { return false }
-        let item = queue.remove(at: index)
-        queuedPromptsBySession[sessionID] = queue
-        persistQueuedPrompts()
-        sendPrompt(item.text, to: sessionID)
+        let item = queue[index]
+        sendQueuedPrompt(id: item.id, sessionID: sessionID)
         return true
     }
 
@@ -2634,12 +2971,17 @@ final class DSHAppModel: ObservableObject {
         // message phase in one atomic snapshot. If persistence fails, the
         // previous create transaction remains on disk and can safely replay
         // its idempotent acknowledgement after the next launch.
-        guard persistCurrentTransactions(for: machineID) else { return }
-        guard let pending else { return }
         let machineGeneration = self.machineStateGeneration
         Task { @MainActor [weak self] in
-            await self?.sendInitialMessage(pending, creationRequestID: requestID,
-                                            to: session.id, machineGeneration: machineGeneration)
+            guard let self,
+                  self.machineStateGeneration == machineGeneration,
+                  self.machineID == machineID,
+                  await self.persistCurrentTransactions(for: machineID) else { return }
+            guard self.machineStateGeneration == machineGeneration,
+                  self.machineID == machineID,
+                  let pending else { return }
+            await self.sendInitialMessage(pending, creationRequestID: requestID,
+                                          to: session.id, machineGeneration: machineGeneration)
         }
     }
 
@@ -2692,7 +3034,7 @@ final class DSHAppModel: ObservableObject {
                 ? "创建会话失败。" : detail,
             resultUnknown: resultUnknown,
             retryUntil: retryUntil)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
         errorMessage = detail
     }
 
@@ -2708,6 +3050,7 @@ final class DSHAppModel: ObservableObject {
     /// Returns the most recent unresolved create for the active Mac so a new
     /// sheet can restore a transaction after a machine switch.
     func recoverableSessionCreationRequestID() -> String? {
+        guard !suspendingTransactions else { return nil }
         if let lastSessionCreationRequestID,
            pendingSessionCreationRequestIDs.contains(lastSessionCreationRequestID),
            !detachedSessionCreationRequestIDs.contains(lastSessionCreationRequestID) {
@@ -2753,8 +3096,16 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeValue(forKey: requestID)
         detachedSessionCreationRequestIDs.remove(requestID)
         armSessionCreationTimeout(requestID: requestID)
-        guard persistCurrentTransactions(for: machineID) else { return }
-        send(command)
+        let expectedMachineGeneration = machineStateGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.machineStateGeneration == expectedMachineGeneration,
+                  self.machineID == machineID,
+                  await self.persistCurrentTransactions(for: machineID) else { return }
+            guard self.machineStateGeneration == expectedMachineGeneration,
+                  self.machineID == machineID else { return }
+            self.send(command)
+        }
     }
 
     /// Keeps an unknown-result request correlated while the user edits a new
@@ -2765,7 +3116,7 @@ final class DSHAppModel: ObservableObject {
         guard let failure = failedSessionCreations[requestID], failure.resultUnknown,
               pendingSessionCreationCommandsByRequestID[requestID] != nil else { return }
         detachedSessionCreationRequestIDs.insert(requestID)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
         errorMessage = "原创建请求结果待确认；已保留它，稍后若 Mac 已创建会话会单独提示。"
     }
 
@@ -2844,24 +3195,28 @@ final class DSHAppModel: ObservableObject {
                                                      receiptId: receipt)
                 pendingMessage.uploadedAttachments[attachmentKey] = uploaded
                 pendingInitialMessagesByRequestID[creationRequestID] = pendingMessage
-                guard persistCurrentTransactions(for: machineID) else {
+                guard await persistCurrentTransactions(for: machineID) else {
                     throw DSHAttachmentUploadError.persistenceUnavailable
                 }
                 receipts.append(receipt)
                 messageAttachments.append(uploaded)
             }
             if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
-            sendPrompt(pendingMessage.text, attachments: receipts,
-                       messageAttachments: messageAttachments, to: sessionID,
-                       requestId: pendingMessage.promptRequestID,
-                       expectedMachineGeneration: machineGeneration,
-                       expectedMachineID: machineID)
+            let sent = await sendPromptPersisted(
+                pendingMessage.text, attachments: receipts,
+                messageAttachments: messageAttachments, to: sessionID,
+                requestId: pendingMessage.promptRequestID,
+                expectedMachineGeneration: machineGeneration,
+                expectedMachineID: machineID)
+            guard sent else {
+                throw DSHAttachmentUploadError.persistenceUnavailable
+            }
         } catch {
             if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
             failedInitialMessages[creationRequestID] = DSHInitialMessageFailure(
                 id: creationRequestID, sessionID: sessionID, text: pendingMessage.text,
                 detail: error.localizedDescription)
-            persistCurrentTransactions(for: machineID)
+            _ = await persistCurrentTransactions(for: machineID)
             errorMessage = error.localizedDescription
         }
     }
@@ -2887,11 +3242,13 @@ final class DSHAppModel: ObservableObject {
         guard let pending = pendingInitialMessagesByRequestID[failure.id],
               let sessionID = pending.sessionID else { return }
         failedInitialMessages.removeValue(forKey: failure.id)
-        guard persistCurrentTransactions(for: machineID) else { return }
         let generation = machineStateGeneration
         Task { @MainActor [weak self] in
-            await self?.sendInitialMessage(pending, creationRequestID: failure.id,
-                                            to: sessionID, machineGeneration: generation)
+            guard let self,
+                  self.machineStateGeneration == generation,
+                  await self.persistCurrentTransactions(for: self.machineID) else { return }
+            await self.sendInitialMessage(pending, creationRequestID: failure.id,
+                                          to: sessionID, machineGeneration: generation)
         }
     }
 
@@ -2902,7 +3259,7 @@ final class DSHAppModel: ObservableObject {
 
     func dismissFailedInitialMessage(_ failure: DSHInitialMessageFailure) {
         failedInitialMessages.removeValue(forKey: failure.id)
-        persistCurrentTransactions(for: machineID)
+        persistCurrentTransactionsLater(for: machineID)
     }
 
     func dismissFailedInitialMessage() {

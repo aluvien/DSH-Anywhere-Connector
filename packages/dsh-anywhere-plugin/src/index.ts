@@ -300,7 +300,9 @@ interface NativeContext extends Context {
   }
   readonly sessionController: {
     list(request: Record<string, never>, signal: AbortSignal): Promise<{ items: unknown[] }>
-    create(request: { cwd?: string; workspaceId?: string; agentPreset?: string; model?: { provider: string; model: string; reasoningEffort?: string }}): Promise<{ sessionId: string; agentPreset?: string }>
+    create(request: { requestId?: string; createRequestId?: string; cwd?: string; workspaceId?: string; agentPreset?: string; model?: { provider: string; model: string; reasoningEffort?: string }}): Promise<{ sessionId: string; agentPreset?: string }>
+    /** Optional recovery hook for adapters that persist the create operation id. */
+    findByRequestId?(requestId: string, signal: AbortSignal): Promise<{ sessionId: string } | undefined>
     /** Available in current Harness builds; optional for older connectors. */
     rename?(request: { sessionId: string; title: string }): Promise<unknown>
     selectModel(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<unknown>
@@ -360,6 +362,8 @@ interface SessionCreationRecord {
   readonly pending?: boolean
   /** Native create committed, but optional setup has not completed yet. */
   readonly sessionId?: string
+  /** Stable operation identity passed into the native create boundary. */
+  readonly nativeOperationId?: string
   readonly setup?: SessionCreationSetup | undefined
   readonly setupComplete?: boolean
   /** A pre-stage-machine response may have been captured before setup finished. */
@@ -435,9 +439,10 @@ class SessionMetadataStore {
     if (entry.response === undefined) {
       // A previous Bridge process recorded the operation before invoking the
       // native create but died before it could learn the session id. Never
-      // execute that request a second time; let the client refresh/query the
-      // authoritative session list instead.
-      if (entry.sessionId === undefined) {
+      // execute that request a second time. The HTTP layer gets one chance to
+      // reconcile the operation id with an adapter-provided authoritative list;
+      // if that is unavailable it still fails closed.
+      if (entry.sessionId === undefined && entry.pending !== true) {
         throw new HttpError(503, 'session creation result is still unknown', 'unknown')
       }
     }
@@ -474,7 +479,8 @@ class SessionMetadataStore {
   }
 
   async setSessionCreationPending(key: string, fingerprint: string | undefined,
-                                  setup: SessionCreationSetup): Promise<void> {
+                                  setup: SessionCreationSetup,
+                                  nativeOperationId?: string): Promise<void> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
@@ -495,12 +501,14 @@ class SessionMetadataStore {
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint, pending: true, setup, setupComplete: false,
+      ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
     await this.persist()
   }
 
   async setSessionCreationStarted(key: string, fingerprint: string | undefined,
-                                  sessionId: string, setup: SessionCreationSetup): Promise<void> {
+                                  sessionId: string, setup: SessionCreationSetup,
+                                  nativeOperationId?: string): Promise<void> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
@@ -510,6 +518,7 @@ class SessionMetadataStore {
       sessionId,
       setup,
       setupComplete: false,
+      ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
     await this.persist()
   }
@@ -625,7 +634,11 @@ class SessionMetadataStore {
               (typeof raw.completedAt !== 'number' || !Number.isFinite(raw.completedAt) || raw.completedAt < 0)) {
             throw new Error('session creation completion timestamp is invalid')
           }
+          if (raw.nativeOperationId !== undefined && typeof raw.nativeOperationId !== 'string') {
+            throw new Error('session creation native operation metadata is invalid')
+          }
           const fingerprint = typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined
+          const nativeOperationId = typeof raw.nativeOperationId === 'string' ? raw.nativeOperationId : undefined
           const response = raw.response
           let setup: SessionCreationSetup | undefined
           if (raw.setup !== undefined) {
@@ -648,6 +661,7 @@ class SessionMetadataStore {
               fingerprint,
               response: response as JsonObject,
               ...(sessionId === undefined ? {} : { sessionId }),
+              ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
               ...(setup === undefined ? {} : { setup }),
               setupComplete: legacySetupUnknown ? false : raw.setupComplete === true,
               ...(legacySetupUnknown ? { legacySetupUnknown: true } : {}),
@@ -660,6 +674,7 @@ class SessionMetadataStore {
                 ? { schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION } : {}),
               fingerprint,
               sessionId: raw.sessionId,
+              ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
               ...(setup === undefined ? {} : { setup }),
               setupComplete: raw.setupComplete === true,
               ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
@@ -670,6 +685,7 @@ class SessionMetadataStore {
                 ? { schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION } : {}),
               fingerprint,
               pending: true,
+              ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
               ...(setup === undefined ? {} : { setup }),
               setupComplete: false,
             })
@@ -805,6 +821,16 @@ async function applySessionCreationSetup(
 
 function metadataPath(): string {
   return join(process.env.DSH_ANYWHERE_DATA_DIR ?? join(homedir(), 'Library', 'Application Support', 'DSH Anywhere'), 'session-metadata.json')
+}
+
+/**
+ * Native Harness adapters receive a bounded opaque operation id rather than
+ * the Bridge's NUL-delimited durable key.  If the adapter persists this id on
+ * the created session, a Bridge restart can reconcile a tombstone that was
+ * written just before the native create returned.
+ */
+function nativeOperationIdFor(durableKey: string): string {
+  return createHash('sha256').update(durableKey).digest('hex')
 }
 
 /** Mirrors the connector's own defaultConfigPath so both resolve one file. */
@@ -1156,8 +1182,10 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       if (req.method === 'POST' && requestId !== undefined && requestId.length > 0 && requestId.length <= 256 &&
           authenticatedDevice !== undefined) {
         const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+        const originDeviceId = authenticatedDevice.id === CONNECTOR_DEVICE_ID
+          ? (header(req, 'x-dsh-origin-device-id') ?? '') : authenticatedDevice.id
         const key = createHash('sha256')
-          .update(`${authenticatedDevice.id}\0${req.method}\0${pathname}\0${requestId}`)
+          .update(`${authenticatedDevice.id}\0${originDeviceId}\0${req.method}\0${pathname}\0${requestId}`)
           .digest('hex')
         const suppliedHash = header(req, 'x-dsh-request-hash')
         const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
@@ -1797,6 +1825,18 @@ async function handleHttp(
     // machine record cannot contain the requested setup, so a fingerprinted
     // retry must provide the body needed to safely finish that setup.
     const body = objectOf(await readJson(req))
+    const bodyDeviceId = optionalStringOf(body.deviceId)
+    const headerDeviceId = header(req, 'x-dsh-origin-device-id')
+    if (device.id === CONNECTOR_DEVICE_ID &&
+        bodyDeviceId !== undefined && headerDeviceId !== undefined && bodyDeviceId !== headerDeviceId) {
+      throw new HttpError(400, 'origin device id does not match its request header')
+    }
+    const originDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? bodyDeviceId ?? headerDeviceId ?? device.id
+      : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && !pairing.hasDevice(originDeviceId)) {
+      throw new HttpError(403, 'origin device is not paired with this Bridge')
+    }
     const cwd = optionalStringOf(body.cwd)
     const workspaceId = optionalStringOf(body.workspaceId)
     const agentPreset = optionalStringOf(body.agentPreset)
@@ -1820,7 +1860,8 @@ async function handleHttp(
     // guard an authenticated caller could make the on-disk session creation
     // map grow with arbitrarily large request-id headers.
     const durableKey = requestId === undefined || requestId.length === 0
-      ? undefined : `${device.id}\0${requestId}`
+      ? undefined : `${originDeviceId}\0${requestId}`
+    const nativeOperationId = durableKey === undefined ? undefined : nativeOperationIdFor(durableKey)
     if (durableKey !== undefined) {
       const remembered = metadata.sessionCreationEntry(durableKey, fingerprint)
       if (remembered?.response !== undefined && remembered.setupComplete === true) {
@@ -1828,6 +1869,42 @@ async function handleHttp(
         // have restarted.  Replay the durable create result without invoking
         // Harness a second time.
         json(res, 200, remembered.response)
+        return
+      }
+      if (remembered?.pending === true) {
+        // The Bridge may have died after Harness committed the native create
+        // but before setSessionCreationStarted() persisted its session id.
+        // Never call native create again. Adapters that persist the operation
+        // id can reconcile it directly; the list fallback supports adapters
+        // that expose the same marker on their session projection.
+        let recoveredSessionID: string | undefined
+        try {
+          if (remembered.nativeOperationId !== undefined) {
+            const findByRequestId = ctx.sessionController.findByRequestId
+            if (findByRequestId !== undefined) {
+              recoveredSessionID = (await findByRequestId(
+                remembered.nativeOperationId, AbortSignal.timeout(15_000)))?.sessionId
+            }
+          }
+          if (recoveredSessionID === undefined && remembered.nativeOperationId !== undefined) {
+            const summaries = await listSummaries(ctx, metadata, true, originDeviceId)
+            recoveredSessionID = summaries.find((item) =>
+              item.createRequestId === remembered.nativeOperationId)?.id
+          }
+        } catch {
+          recoveredSessionID = undefined
+        }
+        if (recoveredSessionID === undefined) {
+          throw new HttpError(503, 'session creation result is still unknown', 'unknown')
+        }
+        await metadata.setSessionCreationStarted(
+          durableKey, fingerprint, recoveredSessionID, setup, remembered.nativeOperationId)
+        await applySessionCreationSetup(ctx, metadata, recoveredSessionID, setup)
+        const summary = (await listSummaries(ctx, metadata, true, originDeviceId))
+          .find((item) => item.id === recoveredSessionID)
+        const response = { sessionId: recoveredSessionID, ...(summary === undefined ? {} : { summary }) }
+        await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
+        json(res, 200, response)
         return
       }
       if (remembered?.legacySetupUnknown === true) {
@@ -1843,7 +1920,7 @@ async function handleHttp(
           throw new HttpError(503, 'legacy session creation result is unknown', 'unknown')
         }
         await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
-        const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === remembered.sessionId)
+        const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === remembered.sessionId)
         const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
         await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
         json(res, 200, response)
@@ -1858,7 +1935,7 @@ async function handleHttp(
         }
         const setup = remembered.setup
         await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
-        const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === remembered.sessionId)
+        const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === remembered.sessionId)
         const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
         await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
         json(res, 200, response)
@@ -1869,9 +1946,13 @@ async function handleHttp(
       // Record the operation identity before invoking Harness.  If this
       // process dies while native creation is in flight, a restarted Bridge
       // has a durable tombstone and will refuse a duplicate execution.
-      await metadata.setSessionCreationPending(durableKey, fingerprint, setup)
+      await metadata.setSessionCreationPending(durableKey, fingerprint, setup, nativeOperationId)
     }
     const result = await ctx.sessionController.create({
+      ...(nativeOperationId === undefined ? {} : {
+        requestId: nativeOperationId,
+        createRequestId: nativeOperationId,
+      }),
       ...(cwd === undefined ? {} : { cwd }),
       ...(workspaceId === undefined ? {} : { workspaceId }),
       ...(agentPreset === undefined ? {} : { agentPreset }),
@@ -1883,10 +1964,10 @@ async function handleHttp(
     // second Harness session.  The complete projection below replaces this
     // minimal replay record once setup succeeds.
     if (durableKey !== undefined) {
-      await metadata.setSessionCreationStarted(durableKey, fingerprint, result.sessionId, setup)
+      await metadata.setSessionCreationStarted(durableKey, fingerprint, result.sessionId, setup, nativeOperationId)
     }
     await applySessionCreationSetup(ctx, metadata, result.sessionId, setup)
-    const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === result.sessionId)
+    const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === result.sessionId)
     const response = { ...result, ...(summary === undefined ? {} : { summary }) }
     if (durableKey !== undefined) await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
     json(res, 201, response)
@@ -2117,9 +2198,10 @@ async function listSummaries(
   const summaries = result.items
     .map((item) => {
       const summary = normalizeSessionSummary(item, ctx, metadata)
-      const creationRequestId = deviceId === undefined
-        ? undefined : metadata.sessionCreationRequestIdForSession(deviceId, summary.id)
-      return creationRequestId === undefined ? summary : { ...summary, creationRequestId }
+      const createRequestId = deviceId === undefined
+        ? summary.createRequestId
+        : metadata.sessionCreationRequestIdForSession(deviceId, summary.id) ?? summary.createRequestId
+      return createRequestId === undefined ? summary : { ...summary, createRequestId }
     })
     // A subagent session is how the agent delegates its own work, not a
     // conversation the user started. Listing them buried the real ones: 18 of
@@ -2379,6 +2461,7 @@ export function normalizeSessionSummary(
   model?: string
   reasoningEffort?: string
   permissionMode?: PermissionMode
+  createRequestId?: string
 } {
   const item = recordOf(value)
   const id = typeof item.sessionId === 'string'
@@ -2394,6 +2477,11 @@ export function normalizeSessionSummary(
   const permissionMode = metadata?.permission(id)
   const archived = item.archived === true || metadata?.isArchived(id, workspaceRegistryOf(ctx))
   const branch = metadata?.branch(id) ?? (typeof item.branch === 'string' ? item.branch : undefined)
+  const createRequestId = typeof item.createRequestId === 'string'
+    ? item.createRequestId
+    : typeof item.creationRequestId === 'string'
+      ? item.creationRequestId
+      : typeof item.requestId === 'string' ? item.requestId : undefined
   return {
     id,
     title: explicitTitle ?? (item.blank === true ? '新会话' : (cwd === undefined ? `Session ${id.slice(0, 8)}` : basename(cwd))),
@@ -2410,6 +2498,7 @@ export function normalizeSessionSummary(
     ...(item.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
     ...(selection === undefined ? {} : selection),
     ...(permissionMode === undefined ? {} : { permissionMode }),
+    ...(createRequestId === undefined ? {} : { createRequestId }),
   }
 }
 

@@ -77,6 +77,7 @@ interface BridgeRequest {
   readonly method: "GET" | "POST";
   readonly path: string;
   readonly body?: Record<string, unknown>;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 type TransientStreamingEvent = Extract<EventEnvelope, {
@@ -610,6 +611,7 @@ export class DSHAnywhereConnector {
       method: request.method,
       headers: {
         ...authorization(this.config.bridgeToken),
+        ...request.headers,
         ...(idempotencyKey === undefined ? {} : { "x-dsh-request-id": idempotencyKey }),
         ...(encodedBody === undefined ? {} : {
           "content-type": "application/json",
@@ -717,7 +719,10 @@ export class DSHAnywhereConnector {
         sequence: ++this.sequence,
         timestamp: Date.now(),
         type: "session.created",
-        payload: SessionSummarySchema.parse(Object.keys(summary).length > 0 ? summary : fallbackSummary),
+        payload: SessionSummarySchema.parse({
+          ...(Object.keys(summary).length > 0 ? summary : fallbackSummary),
+          createRequestId: command.requestId,
+        }),
       });
       if (command.payload.initialPrompt !== undefined) {
         await this.callBridge({
@@ -1519,7 +1524,9 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
       return {
         method: "POST",
         path: "/sessions",
+        headers: { "x-dsh-origin-device-id": command.deviceId },
         body: {
+          deviceId: command.deviceId,
           ...(command.payload.title === undefined ? {} : { title: command.payload.title }),
           ...(command.payload.workingDirectory === undefined ? {} : { cwd: command.payload.workingDirectory }),
           ...(command.payload.workspaceId === undefined ? {} : { workspaceId: command.payload.workspaceId }),
