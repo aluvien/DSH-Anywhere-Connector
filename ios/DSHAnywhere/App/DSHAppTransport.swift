@@ -35,6 +35,11 @@ protocol DSHAppTransport: Sendable {
     func pairedDevices() async throws -> [DSHRelayDevice]
     /// Revokes one device. The Relay refuses to let a device revoke itself.
     func revokeDevice(_ deviceId: String) async throws
+    /// Returns the profile store after connect-time pairing recovery. A
+    /// recovery pass may revoke the old active profile or promote another Mac,
+    /// so AppModel must refresh its published selection before consuming the
+    /// returned event stream.
+    func profileSnapshot() async -> DSHTransportProfileSnapshot?
 }
 
 extension DSHAppTransport {
@@ -45,10 +50,20 @@ extension DSHAppTransport {
     func rollbackPairing(machineId: String) async {}
     func commitPairing(machineId: String) async {}
     func markPairingLocallyCommitted(machineId: String) async -> Bool { true }
+    func profileSnapshot() async -> DSHTransportProfileSnapshot? { nil }
+}
+
+struct DSHTransportProfileSnapshot: Sendable {
+    let profiles: [DSHRemoteProfile]
+    let activeProfile: DSHRemoteProfile?
 }
 
 private struct DSHRelayUpgradeRequired: LocalizedError {
     var errorDescription: String? { "请先升级 Relay 服务后再使用项目、模式或重命名功能。已有会话仍可正常使用。" }
+}
+
+private struct DSHRelayPairingUpgradeRequired: LocalizedError {
+    var errorDescription: String? { "当前 Relay 不支持安全配对，请先升级 Relay 服务后再试。" }
 }
 
 private enum DSHProvisionalPairingState: String, Codable, Sendable {
@@ -118,6 +133,10 @@ actor DSHRemoteTransport: DSHAppTransport {
     private var provisionalPairings: [String: DSHProvisionalPairing] = [:]
     private static let provisionalPairingsKey = "dsh-anywhere.provisional-pairings"
 
+    func profileSnapshot() async -> DSHTransportProfileSnapshot? {
+        DSHTransportProfileSnapshot(profiles: store.profiles, activeProfile: store.activeProfile)
+    }
+
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
         self.tokenStore = tokenStore
@@ -133,6 +152,7 @@ actor DSHRemoteTransport: DSHAppTransport {
             throw DSHAPIError.http(status: 409, message: "上一笔配对补偿尚未完成，请联网后重试。")
         }
         let baseURL = try DSHAPIClient.relayBaseURL(from: serverAddress)
+        try await verifyProvisionalPairingSupport(baseURL)
         let result = try await DSHAPIClient(relayBaseURL: baseURL).pair(
             machineId: machineId, credential: credential, deviceName: deviceName,
             provisional: true
@@ -383,6 +403,7 @@ actor DSHRemoteTransport: DSHAppTransport {
                 try await DSHAPIClient(relayBaseURL: provisional.profile.relayBaseURL)
                     .revokeSelfDevice(machineId: provisional.profile.machineId, token: provisional.token)
                 try? tokenStore.delete(account: provisional.profile.deviceId)
+                store.remove(marker.machineId)
                 provisionalPairings.removeValue(forKey: marker.deviceId)
                 markers.removeValue(forKey: marker.deviceId)
             } catch {
@@ -393,6 +414,7 @@ actor DSHRemoteTransport: DSHAppTransport {
                 // remain fail-closed and keep the compensating revoke pending.
                 if case DSHAPIError.http(let status, _) = error, status == 401 {
                     try? tokenStore.delete(account: provisional.profile.deviceId)
+                    store.remove(marker.machineId)
                     provisionalPairings.removeValue(forKey: marker.deviceId)
                     markers.removeValue(forKey: marker.deviceId)
                 } else {
@@ -401,6 +423,22 @@ actor DSHRemoteTransport: DSHAppTransport {
             }
         }
         saveProvisionalMarkers(markers)
+    }
+
+    private func verifyProvisionalPairingSupport(_ baseURL: URL) async throws {
+        var request = URLRequest(url: baseURL.appending(path: "health"))
+        request.timeoutInterval = 10
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await URLSession.shared.data(for: request)
+        struct Health: Decodable {
+            let schemaRevision: Int?
+            let provisionalPairing: Bool?
+        }
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let health = try? JSONDecoder().decode(Health.self, from: data),
+              health.provisionalPairing == true || (health.schemaRevision ?? 0) >= 10 else {
+            throw DSHRelayPairingUpgradeRequired()
+        }
     }
 
     private func drainProvisionalPairings() async {

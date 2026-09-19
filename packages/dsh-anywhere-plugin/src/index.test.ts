@@ -636,6 +636,29 @@ describe('native bridge mutations', () => {
       .resolves.toEqual({ status: 200, body: { items: [] } })
   })
 
+  it('does not partially compact a mixed session-create batch', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-compact-atomic-'))
+    const completedKey = `${CONNECTOR_DEVICE_ID}\u0000completed-create`
+    const pendingKey = `${CONNECTOR_DEVICE_ID}\u0000pending-create`
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      sessionCreations: {
+        [completedKey]: {
+          schemaVersion: 1,
+          sessionId: 'session-kept',
+          response: { sessionId: 'session-kept' },
+          setup: {}, setupComplete: true, completedAt: 1,
+        },
+        [pendingKey]: { schemaVersion: 1, pending: true, setup: {}, setupComplete: false },
+      },
+    }))
+    const request = mount({ dataDir })
+    await expect(request('POST', '/dsh-anywhere/v1/admin/session-creations/compact', {
+      keys: [completedKey, pendingKey],
+    })).resolves.toMatchObject({ status: 409 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'completed-create'))
+      .resolves.toMatchObject({ status: 200, body: { sessionId: 'session-kept' } })
+  })
+
   it('records the native create before optional setup can fail', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-setup-failure-'))
     let creates = 0

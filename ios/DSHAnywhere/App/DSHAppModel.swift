@@ -2082,6 +2082,41 @@ final class DSHAppModel: ObservableObject {
         machines = profiles.profiles
     }
 
+    /// Transport recovery can revoke a provisional profile or promote the
+    /// next stored Mac before returning its event stream. Keep the published
+    /// AppModel identity in lockstep with that actor-owned profile store so a
+    /// stream for machine B is never rendered or sent as machine A.
+    @discardableResult
+    private func synchronizeTransportProfiles(_ snapshot: DSHTransportProfileSnapshot) -> Bool {
+        let previousMachineID = machineID
+        machines = snapshot.profiles
+        guard let active = snapshot.activeProfile,
+              !removedMachineIDs.contains(active.machineId) else {
+            if !previousMachineID.isEmpty {
+                machineID = ""
+                resetTransientRequestState()
+            }
+            machineName = ""
+            isPaired = false
+            state.connectionState = .disconnected
+            state.transportState = .disconnected
+            state.machineOnline = false
+            state.bridgeReachable = nil
+            return false
+        }
+        if previousMachineID != active.machineId {
+            machineID = active.machineId
+            machineName = active.machineName
+            resetTransientRequestState()
+            state = DSHStoreState()
+            restoreSessionCreationTransactions(for: active.machineId)
+        }
+        machineID = active.machineId
+        machineName = active.machineName
+        isPaired = true
+        return true
+    }
+
     /// A transport persists credentials before returning from pair(). If the
     /// subsequent journal/fence commit fails, remove that provisional profile
     /// instead of leaving an active-but-fenced identity that would reconnect
@@ -2334,13 +2369,19 @@ final class DSHAppModel: ObservableObject {
             await self.transport.setIncludeArchived(self.showArchivedSessions)
             let stream = await transport.connect()
             guard self.machineStateGeneration == connectionGeneration else { return }
+            if let snapshot = await self.transport.profileSnapshot(),
+               !self.synchronizeTransportProfiles(snapshot) {
+                self.eventTask = nil
+                return
+            }
+            let streamGeneration = self.machineStateGeneration
             do {
                 for try await event in stream {
-                    guard self.machineStateGeneration == connectionGeneration else { return }
+                    guard self.machineStateGeneration == streamGeneration else { return }
                     self.enqueue(event)
                 }
             } catch {
-                guard self.machineStateGeneration == connectionGeneration else { return }
+                guard self.machineStateGeneration == streamGeneration else { return }
                 self.flushPendingEvents()
                 self.markPendingSessionCreationsUnknown(
                     detail: "连接已断开，创建结果待确认。")
@@ -2350,7 +2391,7 @@ final class DSHAppModel: ObservableObject {
                 self.state.bridgeReachable = nil
                 self.state.connectionState = .failed(error.localizedDescription)
             }
-            guard self.machineStateGeneration == connectionGeneration else { return }
+            guard self.machineStateGeneration == streamGeneration else { return }
             self.flushPendingEvents()
             if !Task.isCancelled {
                 self.markPendingSessionCreationsUnknown(

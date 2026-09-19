@@ -895,6 +895,8 @@ class SessionMetadataStore {
         throw new HttpError(409, 'only completed session creation records may be compacted')
       }
       removed.set(key, entry)
+    }
+    for (const key of removed.keys()) {
       this.sessionCreationResults.delete(key)
     }
     if (removed.size === 0) return 0
@@ -1107,6 +1109,8 @@ class SessionMetadataStore {
         throw new HttpError(409, 'only completed remote mutation records may be compacted')
       }
       removed.set(key, entry)
+    }
+    for (const key of removed.keys()) {
       this.remoteMutationResults.delete(key)
     }
     if (removed.size === 0) return 0
@@ -1173,6 +1177,11 @@ class SessionMetadataStore {
         throw new HttpError(409, 'only pending remote mutation records may be resolved')
       }
       previous.set(key, entry)
+    }
+    // Validate the complete batch before changing the in-memory map. A mixed
+    // request (one pending key followed by a completed key) must not leave
+    // the earlier key half-resolved when the endpoint returns 409.
+    for (const [key, entry] of previous) {
       if (resolution.kind === 'not-committed') {
         this.remoteMutationResults.delete(key)
       } else {
