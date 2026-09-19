@@ -9,6 +9,9 @@ protocol DSHAppTransport: Sendable {
     /// Keeps the handshake/resume snapshot aligned with the visible archive filter.
     func setIncludeArchived(_ value: Bool) async
     func send(_ command: DSHCommand) async throws
+    /// Optional local deadline used by durable prompt retries.  Existing
+    /// preview/test transports inherit the ordinary send behavior.
+    func send(_ command: DSHCommand, notAfter: Date?) async throws
     func disconnect() async
     func forgetPairing() async throws
     /// Chooses which paired Mac subsequent connections target.
@@ -19,6 +22,12 @@ protocol DSHAppTransport: Sendable {
     func pairedDevices() async throws -> [DSHRelayDevice]
     /// Revokes one device. The Relay refuses to let a device revoke itself.
     func revokeDevice(_ deviceId: String) async throws
+}
+
+extension DSHAppTransport {
+    func send(_ command: DSHCommand, notAfter: Date?) async throws {
+        try await send(command)
+    }
 }
 
 private struct DSHRelayUpgradeRequired: LocalizedError {
@@ -103,6 +112,10 @@ actor DSHRemoteTransport: DSHAppTransport {
     }
 
     func send(_ command: DSHCommand) async throws {
+        try await send(command, notAfter: nil)
+    }
+
+    func send(_ command: DSHCommand, notAfter: Date?) async throws {
         guard let connection else { throw DSHWebSocketError.notConnected }
         guard let activeProfile = store.activeProfile,
               command.machineId == activeProfile.machineId else {
@@ -124,7 +137,7 @@ actor DSHRemoteTransport: DSHAppTransport {
                                   sessionId: command.sessionId, timestamp: command.timestamp,
                                   type: command.type, payload: .object(payload))
         }
-        try await connection.send(outgoing)
+        try await connection.send(outgoing, notAfter: notAfter)
     }
 
     /// New routed commands require schema 7. A staged rollout must not send

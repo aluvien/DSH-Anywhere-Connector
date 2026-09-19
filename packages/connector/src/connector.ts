@@ -193,7 +193,10 @@ export class DSHAnywhereConnector {
    * offline edge must not overtake a session.create that Relay delivered just
    * before it. */
   private readonly deviceBridgeOperations = new Map<string, Promise<void>>();
-  private readonly deviceSessionCreates = new Map<string, Promise<void>>();
+  /** Every create started for a device must stay fenced until it settles.
+   * Keeping only the latest Promise lets an earlier request outlive the map
+   * entry and be overtaken by an offline presence edge. */
+  private readonly deviceSessionCreates = new Map<string, Set<Promise<void>>>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -503,11 +506,14 @@ export class DSHAnywhereConnector {
     if (command.data.type === "session.create") {
       const start = () => {
         const completion = this.dispatchCommand(command.data);
-        this.deviceSessionCreates.set(command.data.deviceId, completion);
+        const creates = this.deviceSessionCreates.get(command.data.deviceId) ?? new Set<Promise<void>>();
+        creates.add(completion);
+        this.deviceSessionCreates.set(command.data.deviceId, creates);
         void completion.finally(() => {
-          if (this.deviceSessionCreates.get(command.data.deviceId) === completion) {
-            this.deviceSessionCreates.delete(command.data.deviceId);
-          }
+          const current = this.deviceSessionCreates.get(command.data.deviceId);
+          if (!current) return;
+          current.delete(completion);
+          if (current.size === 0) this.deviceSessionCreates.delete(command.data.deviceId);
         });
       };
       // Preserve the normal synchronous dispatch timing when no presence
@@ -710,7 +716,10 @@ export class DSHAnywhereConnector {
       // Relay sends the device-offline edge after any payload already routed
       // to the machine socket. Wait for a preceding create to finish its
       // Bridge request before deleting the origin lease.
-      if (!online) await this.deviceSessionCreates.get(deviceId);
+      if (!online) {
+        const activeCreates = [...(this.deviceSessionCreates.get(deviceId) ?? [])];
+        await Promise.all(activeCreates.map((create) => create.catch(() => undefined)));
+      }
       return this.reportDevicePresence(deviceId, online, connectorId, relayGeneration, relayEpoch);
     });
   }

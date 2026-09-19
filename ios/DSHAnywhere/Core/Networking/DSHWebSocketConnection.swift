@@ -104,6 +104,10 @@ extension URLSessionWebSocketTask: DSHWebSocketTasking {
 
 public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
     case notConnected
+    /// A durable request-id retention deadline elapsed before a frame could
+    /// be put on the socket.  This is a local, terminal condition: the
+    /// original id must not be reused after the server-side tombstone expires.
+    case dedupeWindowExpired
     case invalidMessage
     case unsupportedProtocolVersion(Int)
     case unauthorizedRelayRole
@@ -117,6 +121,7 @@ public enum DSHWebSocketError: Error, LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .notConnected: return "The Relay WebSocket is not connected."
+        case .dedupeWindowExpired: return "The request-id safety window expired before sending."
         case .invalidMessage: return "The Relay WebSocket message is not valid protocol JSON."
         case .unsupportedProtocolVersion(let version): return "Unsupported protocol version \(version)."
         case .unauthorizedRelayRole: return "The Relay authenticated this connection with an unexpected role."
@@ -260,23 +265,42 @@ public actor DSHWebSocketConnection {
     /// The UI may construct placeholder identifiers. The paired identity is
     /// always substituted here before the command leaves the phone.
     public func send(_ command: DSHCommand) async throws {
+        try await send(command, notAfter: nil)
+    }
+
+    /// Sends a command while honoring the caller's durable idempotency
+    /// deadline.  The ordinary ten-second reconnect grace remains in effect
+    /// for commands without a deadline; prompt retries use the stricter of
+    /// the two so a late task.send cannot outlive the Connector/Bridge
+    /// tombstone.
+    public func send(_ command: DSHCommand, notAfter: Date?) async throws {
         // The receive loop deliberately keeps the stream alive while the
         // URLSession task reconnects. A user can tap Send during that short
         // window, so wait for the next relay.ready handshake instead of
         // failing immediately with the misleading "not connected" alert.
-        let deadline = Date().addingTimeInterval(10)
+        let reconnectDeadline = Date().addingTimeInterval(10)
+        let deadline = min(reconnectDeadline, notAfter ?? reconnectDeadline)
         while (_state != .connected || socket == nil) && !stopped {
-            if Date() >= deadline { throw DSHWebSocketError.notConnected }
-            try await Task.sleep(nanoseconds: 100_000_000)
+            if Date() >= deadline {
+                throw notAfter == nil ? DSHWebSocketError.notConnected
+                                       : .dedupeWindowExpired
+            }
+            let remaining = deadline.timeIntervalSinceNow
+            try await Task.sleep(nanoseconds: UInt64(min(0.1, max(0, remaining)) * 1_000_000_000))
         }
-        guard !stopped, let socket else { throw DSHWebSocketError.notConnected }
+        guard !stopped, let socket else {
+            throw notAfter == nil ? DSHWebSocketError.notConnected : .dedupeWindowExpired
+        }
+        guard notAfter.map({ Date() < $0 }) ?? true else {
+            throw DSHWebSocketError.dedupeWindowExpired
+        }
         guard command.machineId == configuration.machineId else {
             throw DSHWebSocketError.machineMismatch
         }
         let normalized = normalized(command)
         let generation = rememberSessionSnapshotRequestIfNeeded(normalized)
         do {
-            try await sendRelay(normalized, over: socket)
+            try await sendRelay(normalized, over: socket, notAfter: notAfter)
         } catch {
             revokeSessionSnapshotRequest(normalized.requestId, generation: generation)
             throw error
@@ -365,6 +389,8 @@ public actor DSHWebSocketConnection {
         switch socketError {
         case .notConnected, .closed:
             return true
+        case .dedupeWindowExpired:
+            return false
         case .invalidMessage, .unsupportedProtocolVersion, .unauthorizedRelayRole,
              .authenticationRequired, .machineMismatch, .relay, .messageTooLarge:
             // Retrying unchanged credentials or an incompatible wire message
@@ -545,7 +571,8 @@ public actor DSHWebSocketConnection {
                    type: command.type, payload: command.payload)
     }
 
-    private func sendRelay(_ command: DSHCommand, over task: any DSHWebSocketTasking) async throws {
+    private func sendRelay(_ command: DSHCommand, over task: any DSHWebSocketTasking,
+                           notAfter: Date? = nil) async throws {
         let payload = try DSHRelayPayloadMessage.wrapping(machineId: configuration.machineId,
                                                            sender: .device, body: command)
         var encoder = JSONEncoder()
@@ -554,6 +581,9 @@ public actor DSHWebSocketConnection {
         // Check the bytes that will actually cross the socket. In particular,
         // slash escaping can nearly double a high-0xFF Base64 attachment.
         guard data.count <= 16 * 1024 * 1024 else { throw DSHWebSocketError.messageTooLarge }
+        guard notAfter.map({ Date() < $0 }) ?? true else {
+            throw DSHWebSocketError.dedupeWindowExpired
+        }
         try await task.send(.data(data))
     }
 

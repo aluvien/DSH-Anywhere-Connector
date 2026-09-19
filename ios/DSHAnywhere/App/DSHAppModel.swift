@@ -5,12 +5,14 @@ import UserNotifications
 private enum DSHAttachmentUploadError: LocalizedError {
     case timedOut
     case tooLarge
+    case quotaExceeded
     case persistenceUnavailable
 
     var errorDescription: String? {
         switch self {
         case .timedOut: return "The attachment upload timed out. Please try again."
         case .tooLarge: return "Attachments must be 10 MiB or smaller."
+        case .quotaExceeded: return "待处理附件总量已达到上限，请先取消旧请求后重试。"
         case .persistenceUnavailable: return "待处理请求存储不可用，已停止自动重试。"
         }
     }
@@ -121,6 +123,48 @@ private struct DSHStoredInitialMessage: Codable, Sendable {
     let sessionID: String?
     let uploadedAttachments: [String: DSHMessageAttachment]
     let dedupeExpiresAt: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case promptRequestID, text, attachments, sessionID, uploadedAttachments, dedupeExpiresAt
+    }
+
+    init(promptRequestID: String, text: String, attachments: [DSHStoredAttachment],
+         sessionID: String?, uploadedAttachments: [String: DSHMessageAttachment],
+         dedupeExpiresAt: Date?) {
+        self.promptRequestID = promptRequestID
+        self.text = text
+        self.attachments = attachments
+        self.sessionID = sessionID
+        self.uploadedAttachments = uploadedAttachments
+        self.dedupeExpiresAt = dedupeExpiresAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        promptRequestID = try container.decode(String.self, forKey: .promptRequestID)
+        text = try container.decode(String.self, forKey: .text)
+        attachments = try container.decode([DSHStoredAttachment].self, forKey: .attachments)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+        uploadedAttachments = try container.decodeIfPresent(
+            [String: DSHMessageAttachment].self, forKey: .uploadedAttachments) ?? [:]
+        // A legacy initial-message record can represent a prompt that already
+        // crossed the socket.  Missing deadline metadata therefore migrates to
+        // an expired window; an explicit null remains the safe, not-yet-sent
+        // representation used by current session-create records.
+        dedupeExpiresAt = container.contains(.dedupeExpiresAt)
+            ? try container.decodeIfPresent(Date.self, forKey: .dedupeExpiresAt)
+            : .now
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(promptRequestID, forKey: .promptRequestID)
+        try container.encode(text, forKey: .text)
+        try container.encode(attachments, forKey: .attachments)
+        try container.encodeIfPresent(sessionID, forKey: .sessionID)
+        try container.encode(uploadedAttachments, forKey: .uploadedAttachments)
+        try container.encode(dedupeExpiresAt, forKey: .dedupeExpiresAt)
+    }
 }
 
 private struct DSHStoredSessionCreationTransaction: Codable, Sendable {
@@ -224,6 +268,56 @@ private struct DSHStoredFailedSend: Codable, Sendable {
     /// retry window in the journal so a later launch cannot outlive the
     /// Connector/Bridge request-id tombstone and execute it again.
     let retryUntil: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, text, receipts, sessionID, mode, messageAttachments, failure, retryUntil
+    }
+
+    init(id: String, text: String, receipts: [String], sessionID: String,
+         mode: String, messageAttachments: [DSHMessageAttachment],
+         failure: DSHStoredSendFailure, retryUntil: Date?) {
+        self.id = id
+        self.text = text
+        self.receipts = receipts
+        self.sessionID = sessionID
+        self.mode = mode
+        self.messageAttachments = messageAttachments
+        self.failure = failure
+        self.retryUntil = retryUntil
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        text = try container.decode(String.self, forKey: .text)
+        receipts = try container.decode([String].self, forKey: .receipts)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        mode = try container.decode(String.self, forKey: .mode)
+        messageAttachments = try container.decode([DSHMessageAttachment].self, forKey: .messageAttachments)
+        failure = try container.decode(DSHStoredSendFailure.self, forKey: .failure)
+        // Builds before the finite prompt-idempotency window was introduced
+        // omitted this key.  Such a request may already have reached Relay,
+        // so migration must fail closed instead of interpreting the missing
+        // value as an indefinitely safe local retry.  An explicit JSON null
+        // remains the intentional "proven local failure" representation.
+        retryUntil = container.contains(.retryUntil)
+            ? try container.decodeIfPresent(Date.self, forKey: .retryUntil)
+            : .now
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(text, forKey: .text)
+        try container.encode(receipts, forKey: .receipts)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(mode, forKey: .mode)
+        try container.encode(messageAttachments, forKey: .messageAttachments)
+        try container.encode(failure, forKey: .failure)
+        // Encode nil explicitly.  Omitting it would make a future launch
+        // mistake a deliberately local failure for an unsafe legacy record.
+        try container.encode(retryUntil, forKey: .retryUntil)
+    }
 }
 
 private struct DSHPendingTransactionSnapshot: Sendable {
@@ -658,6 +752,12 @@ final class DSHAppModel: ObservableObject {
     /// side effect. Keep recovery fail-closed until the next launch can read
     /// or recreate the store.
     private var pendingTransactionPersistenceUnavailable = false
+    private enum PendingPersistenceFailure: Equatable {
+        case none
+        case quotaExceeded
+        case unavailable
+    }
+    private var lastPendingPersistenceFailure: PendingPersistenceFailure = .none
     private var pendingTransactionStoreLoaded = false
     /// Every mutation waits for the first journal load to merge disk state.
     /// Without this task, a user who switches/removes a Mac immediately after
@@ -845,7 +945,7 @@ final class DSHAppModel: ObservableObject {
                 }
                 attachmentBytes += attachment.data.count
                 guard attachmentBytes <= Self.maxPendingAttachmentBytes else {
-                    throw DSHAttachmentUploadError.tooLarge
+                    throw DSHAttachmentUploadError.quotaExceeded
                 }
                 let fileName = "\(attachment.id.uuidString).blob"
                 referencedBlobNames.insert(fileName)
@@ -933,18 +1033,34 @@ final class DSHAppModel: ObservableObject {
 
     @discardableResult
     private func persistPendingTransactionStore() async -> Bool {
+        lastPendingPersistenceFailure = .none
         await awaitPendingTransactionStoreLoaded()
-        guard pendingTransactionStoreLoaded else { return false }
-        guard !pendingTransactionPersistenceUnavailable else { return false }
+        guard pendingTransactionStoreLoaded else {
+            lastPendingPersistenceFailure = .unavailable
+            return false
+        }
+        guard !pendingTransactionPersistenceUnavailable else {
+            lastPendingPersistenceFailure = .unavailable
+            return false
+        }
         do {
             let snapshot = try makePendingTransactionSnapshot()
             try await pendingTransactionFileStore.write(snapshot)
             return true
+        } catch DSHAttachmentUploadError.quotaExceeded {
+            // A valid batch can exceed the aggregate attachment budget while
+            // the journal itself is perfectly healthy. Do not poison the
+            // process-wide persistence gate: deleting/cancelling an older
+            // transaction must be able to free space and persist again.
+            lastPendingPersistenceFailure = .quotaExceeded
+            errorMessage = "待处理附件总量已达到上限，请先取消旧请求后重试。"
+            return false
         } catch {
             // Keep the in-memory transaction and surface the loss of durable
             // recovery explicitly. The app refuses further side effects until
             // the next launch can recreate or repair the store; silently
             // dropping the record would turn a process kill into a duplicate.
+            lastPendingPersistenceFailure = .unavailable
             pendingTransactionPersistenceUnavailable = true
             errorMessage = "无法保存待处理请求，暂不安全重试。"
             return false
@@ -1041,6 +1157,11 @@ final class DSHAppModel: ObservableObject {
         await awaitPendingTransactionStoreLoaded()
         guard pendingTransactionStoreLoaded else { return false }
         guard !pendingTransactionPersistenceUnavailable else { return false }
+        let previousCreationSnapshot = sessionCreationTransactionsByMachine[machineID]
+        let previousLastCreationRequestID = lastSessionCreationRequestIDsByMachine[machineID]
+        let previousInitialSnapshot = initialMessageTransactionsByMachine[machineID]
+        let previousPendingSnapshot = pendingPromptTransactionsByMachine[machineID]
+        let previousFailedSnapshot = failedPromptTransactionsByMachine[machineID]
         var creationSnapshot: [String: DSHSessionCreationTransaction] = [:]
         for requestID in pendingSessionCreationRequestIDs {
             guard let command = pendingSessionCreationCommandsByRequestID[requestID] else { continue }
@@ -1096,7 +1217,36 @@ final class DSHAppModel: ObservableObject {
         // avoiding a shared on-disk journal entry that could leak between
         // unrelated preview models.
         guard !machineID.isEmpty else { return true }
-        return await persistPendingTransactionStore()
+        let persisted = await persistPendingTransactionStore()
+        guard !(!persisted && lastPendingPersistenceFailure == .quotaExceeded) else {
+            if let previousCreationSnapshot {
+                sessionCreationTransactionsByMachine[machineID] = previousCreationSnapshot
+            } else {
+                sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            if let previousLastCreationRequestID {
+                lastSessionCreationRequestIDsByMachine[machineID] = previousLastCreationRequestID
+            } else {
+                lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
+            }
+            if let previousInitialSnapshot {
+                initialMessageTransactionsByMachine[machineID] = previousInitialSnapshot
+            } else {
+                initialMessageTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            if let previousPendingSnapshot {
+                pendingPromptTransactionsByMachine[machineID] = previousPendingSnapshot
+            } else {
+                pendingPromptTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            if let previousFailedSnapshot {
+                failedPromptTransactionsByMachine[machineID] = previousFailedSnapshot
+            } else {
+                failedPromptTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            return false
+        }
+        return persisted
     }
 
     /// Every transaction-store mutation must wait for the startup merge.  A
@@ -2314,6 +2464,10 @@ final class DSHAppModel: ObservableObject {
         if let expectedMachineID, expectedMachineID != machineID { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return nil }
+        if let dedupeExpiresAt, Date() >= dedupeExpiresAt {
+            errorMessage = "原消息已超过安全重试窗口，请重新发送以避免重复执行。"
+            return nil
+        }
         guard attachments.count <= Self.maxPendingAttachmentCount else {
             errorMessage = "一条消息最多包含 16 个附件。"
             return nil
@@ -2662,11 +2816,12 @@ final class DSHAppModel: ObservableObject {
             ?? []
         clearPendingMessageAttachments(for: command.requestId)
         let resultUnknown = promptTransportResultUnknown(error)
+        let deadlineExpired = (error as? DSHWebSocketError) == .dedupeWindowExpired
         let retryUntil = resultUnknown
             ? (pending?.dedupeExpiresAt
                 ?? pending?.sentAt.addingTimeInterval(Self.promptIdempotencyWindow)
                 ?? Date().addingTimeInterval(Self.promptIdempotencyWindow))
-            : nil
+            : (deadlineExpired ? pending?.dedupeExpiresAt ?? .now : nil)
         failedSendsByRequestID[command.requestId] = DSHFailedSend(
             id: command.requestId, text: text, receipts: receipts,
             sessionID: sessionID, mode: mode,
@@ -2679,7 +2834,7 @@ final class DSHAppModel: ObservableObject {
     private func promptTransportResultUnknown(_ error: Error) -> Bool {
         guard let transportError = error as? DSHWebSocketError else { return true }
         switch transportError {
-        case .notConnected, .machineMismatch, .messageTooLarge,
+        case .dedupeWindowExpired, .notConnected, .machineMismatch, .messageTooLarge,
              .invalidMessage, .unsupportedProtocolVersion,
              .unauthorizedRelayRole, .authenticationRequired:
             return false
@@ -2759,13 +2914,50 @@ final class DSHAppModel: ObservableObject {
         /// False = held locally (editable, cancellable, sendable). True =
         /// already sent to the server queue (bubble mirror only).
         let sent: Bool
+        /// A stable request id has been reserved and mirrored locally, but the
+        /// normal durable prompt transaction has not yet been committed. This
+        /// state is known not to have reached Relay and can be recovered even
+        /// after the ten-minute remote dedupe window.
+        let dispatchPrepared: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case id, text, mode, sentAt, dispatchAt, requestId, sent, dispatchPrepared
+        }
 
         init(id: String = UUID().uuidString, text: String, mode: String,
              sentAt: Date = .now, dispatchAt: Date? = nil,
-             sent: Bool = false, requestId: String? = nil) {
+             sent: Bool = false, requestId: String? = nil,
+             dispatchPrepared: Bool = false) {
             self.id = id; self.text = text; self.mode = mode
             self.sentAt = sentAt; self.dispatchAt = dispatchAt
             self.sent = sent; self.requestId = requestId
+            self.dispatchPrepared = dispatchPrepared
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            text = try container.decode(String.self, forKey: .text)
+            mode = try container.decode(String.self, forKey: .mode)
+            sentAt = try container.decode(Date.self, forKey: .sentAt)
+            dispatchAt = try container.decodeIfPresent(Date.self, forKey: .dispatchAt)
+            requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
+            sent = try container.decode(Bool.self, forKey: .sent)
+            // Older queue mirrors had only held/sent. Treat them as may-have-
+            // sent records, never as known-unsent dispatch preparations.
+            dispatchPrepared = try container.decodeIfPresent(Bool.self, forKey: .dispatchPrepared) ?? false
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(text, forKey: .text)
+            try container.encode(mode, forKey: .mode)
+            try container.encode(sentAt, forKey: .sentAt)
+            try container.encodeIfPresent(dispatchAt, forKey: .dispatchAt)
+            try container.encodeIfPresent(requestId, forKey: .requestId)
+            try container.encode(sent, forKey: .sent)
+            try container.encode(dispatchPrepared, forKey: .dispatchPrepared)
         }
     }
 
@@ -2802,7 +2994,7 @@ final class DSHAppModel: ObservableObject {
     func queuedPrompts(for sessionID: String) -> [DSHQueuedPrompt] {
         let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
         let fresh = queuedPromptsBySession[sessionID, default: []].filter {
-            ($0.sent ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff
+            ($0.sent || $0.dispatchPrepared ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff
         }
         if fresh.count != queuedPromptsBySession[sessionID]?.count {
             queuedPromptsBySession[sessionID] = fresh
@@ -2815,7 +3007,7 @@ final class DSHAppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               var queue = queuedPromptsBySession[sessionID],
-              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return }
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent && !$0.dispatchPrepared }) else { return }
         guard validatePromptText(trimmed) else { return }
         queue[index].text = trimmed
         queuedPromptsBySession[sessionID] = queue
@@ -2827,7 +3019,7 @@ final class DSHAppModel: ObservableObject {
     @discardableResult
     func cancelQueuedPrompt(id: String, sessionID: String) -> Bool {
         guard var queue = queuedPromptsBySession[sessionID],
-              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return false }
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent && !$0.dispatchPrepared }) else { return false }
         queue.remove(at: index)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
@@ -2837,7 +3029,7 @@ final class DSHAppModel: ObservableObject {
     /// Pops the oldest locally held prompt for immediate sending.
     func takeQueuedPrompt(id: String, sessionID: String) -> DSHQueuedPrompt? {
         guard var queue = queuedPromptsBySession[sessionID],
-              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }) else { return nil }
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent && !$0.dispatchPrepared }) else { return nil }
         let item = queue.remove(at: index)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
@@ -2857,9 +3049,17 @@ final class DSHAppModel: ObservableObject {
         // then be reconciled by the same id after a process kill; leaving Q as
         // an anonymous `sent=false` item allowed a second request id later.
         let requestID = item.requestId ?? UUID().uuidString
+        let dispatchAt = item.dispatchAt ?? .now
+        // A dispatch preparation is known not to have reached Relay. If its
+        // task is killed before the durable prompt journal is committed, it
+        // may safely start a fresh ten-minute window on recovery. Once the
+        // queue mirror is already marked sent, retain the original deadline.
+        let dedupeDeadline = item.dispatchPrepared
+            ? nil : dispatchAt.addingTimeInterval(Self.promptIdempotencyWindow)
         queue[index] = DSHQueuedPrompt(id: item.id, text: item.text, mode: item.mode,
-                                       sentAt: item.sentAt, dispatchAt: item.dispatchAt ?? .now,
-                                       sent: true, requestId: requestID)
+                                       sentAt: item.sentAt, dispatchAt: dispatchAt,
+                                       sent: false, requestId: requestID,
+                                       dispatchPrepared: true)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
         let generation = machineStateGeneration
@@ -2870,11 +3070,25 @@ final class DSHAppModel: ObservableObject {
             let sent = await self.sendPromptPersisted(
                 item.text, attachments: [], to: sessionID, mode: item.mode,
                 requestId: requestID, expectedMachineGeneration: generation,
-                expectedMachineID: activeMachineID)
+                expectedMachineID: activeMachineID,
+                dedupeExpiresAt: dedupeDeadline)
+            if sent,
+               var currentQueue = self.queuedPromptsBySession[sessionID],
+               let currentIndex = currentQueue.firstIndex(where: {
+                   $0.id == id && $0.requestId == requestID
+               }) {
+                currentQueue[currentIndex] = DSHQueuedPrompt(
+                    id: id, text: currentQueue[currentIndex].text,
+                    mode: currentQueue[currentIndex].mode,
+                    sentAt: currentQueue[currentIndex].sentAt,
+                    dispatchAt: currentQueue[currentIndex].dispatchAt,
+                    sent: true, requestId: requestID)
+                self.queuedPromptsBySession[sessionID] = currentQueue
+                self.persistQueuedPrompts()
+            }
             // Keep the sent queue mirror until prompt.accepted retires it.  A
             // failed/unknown send can therefore be retried with this same id
             // instead of generating a second side effect.
-            _ = sent
         }
     }
 
@@ -2883,7 +3097,7 @@ final class DSHAppModel: ObservableObject {
     @discardableResult
     private func flushQueuedPrompt(for sessionID: String) -> Bool {
         guard let queue = queuedPromptsBySession[sessionID],
-              let index = queue.firstIndex(where: { !$0.sent }) else { return false }
+              let index = queue.firstIndex(where: { !$0.sent && !$0.dispatchPrepared }) else { return false }
         guard validatePromptText(queue[index].text) else { return false }
         let item = queue[index]
         sendQueuedPrompt(id: item.id, sessionID: sessionID)
@@ -2901,7 +3115,7 @@ final class DSHAppModel: ObservableObject {
         else { return }
         let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
         queuedPromptsBySession = restored.mapValues { items in
-            items.filter { ($0.sent ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff }
+            items.filter { ($0.sent || $0.dispatchPrepared ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff }
         }
     }
 
@@ -3157,6 +3371,9 @@ final class DSHAppModel: ObservableObject {
 
     private func send(_ command: DSHCommand) {
         let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
+        let promptDeadline = command.type == "prompt.send"
+            ? pendingSendsByRequestID[command.requestId]?.dedupeExpiresAt
+            : nil
         let machineGeneration = self.machineStateGeneration
         let expectedMachineID = self.machineID
         Task { @MainActor [weak self] in
@@ -3164,7 +3381,7 @@ final class DSHAppModel: ObservableObject {
                 guard let self,
                       self.machineStateGeneration == machineGeneration,
                       self.machineID == expectedMachineID else { return }
-                try await self.transport.send(command)
+                try await self.transport.send(command, notAfter: promptDeadline)
             }
             catch {
                 guard let self else { return }
@@ -3721,9 +3938,33 @@ final class DSHAppModel: ObservableObject {
         let generation = machineStateGeneration
         let activeMachineID = machineID
         let cutoff = Date().addingTimeInterval(-Self.promptIdempotencyWindow)
+        // If the process died after the durable prompt journal committed but
+        // before the UserDefaults mirror was promoted from dispatchPrepared
+        // to sent, the journal is authoritative. Promote the mirror without
+        // sending a second request.
+        var reconciled = false
+        for (sessionID, items) in queuedPromptsBySession {
+            var next = items
+            for index in next.indices {
+                guard next[index].dispatchPrepared,
+                      let requestID = next[index].requestId,
+                      pendingSendsByRequestID[requestID] != nil ||
+                          failedSendsByRequestID[requestID] != nil else { continue }
+                let item = next[index]
+                next[index] = DSHQueuedPrompt(
+                    id: item.id, text: item.text, mode: item.mode,
+                    sentAt: item.sentAt, dispatchAt: item.dispatchAt,
+                    sent: true, requestId: requestID)
+                reconciled = true
+            }
+            queuedPromptsBySession[sessionID] = next
+        }
+        if reconciled { persistQueuedPrompts() }
         let candidates = queuedPromptsBySession.flatMap { sessionID, items in
             items.filter { item in
-                item.sent && (item.dispatchAt ?? item.sentAt) >= cutoff && item.requestId != nil &&
+                (item.dispatchPrepared ||
+                    (item.sent && (item.dispatchAt ?? item.sentAt) >= cutoff)) &&
+                    item.requestId != nil &&
                     pendingSendsByRequestID[item.requestId!] == nil &&
                     failedSendsByRequestID[item.requestId!] == nil
             }.map { (sessionID: sessionID, item: $0) }
@@ -3731,8 +3972,15 @@ final class DSHAppModel: ObservableObject {
         for candidate in candidates {
             let sessionID = candidate.sessionID
             let item = candidate.item
-            guard let requestID = item.requestId,
-                  queuedPromptSendIDs.insert(item.id).inserted else { continue }
+            guard let requestID = item.requestId else { continue }
+            if item.dispatchPrepared {
+                // Known-unsent preparation: sendQueuedPrompt intentionally
+                // starts a fresh local dedupe window, even if the queue item
+                // waited longer than the remote tombstone lifetime.
+                sendQueuedPrompt(id: item.id, sessionID: sessionID)
+                continue
+            }
+            guard queuedPromptSendIDs.insert(item.id).inserted else { continue }
             Task { @MainActor [weak self] in
                 defer { self?.queuedPromptSendIDs.remove(item.id) }
                 guard let self,
@@ -3742,7 +3990,9 @@ final class DSHAppModel: ObservableObject {
                     item.text, attachments: [], to: sessionID,
                     mode: item.mode, requestId: requestID,
                     expectedMachineGeneration: generation,
-                    expectedMachineID: activeMachineID)
+                    expectedMachineID: activeMachineID,
+                    dedupeExpiresAt: (item.dispatchAt ?? item.sentAt)
+                        .addingTimeInterval(Self.promptIdempotencyWindow))
             }
         }
     }
