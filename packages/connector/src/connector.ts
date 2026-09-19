@@ -190,13 +190,13 @@ export class DSHAnywhereConnector {
   private readonly presenceUpdates = new Map<string, Promise<boolean>>();
   private readonly presenceRefreshRequired = new Set<string>();
   /** Serializes Bridge-side effects for one Relay device. In particular, an
-   * offline edge must not overtake a session.create that Relay delivered just
-   * before it. */
+   * offline edge must not overtake a presence-authenticated create/upload that
+   * Relay delivered just before it. */
   private readonly deviceBridgeOperations = new Map<string, Promise<void>>();
-  /** Every create started for a device must stay fenced until it settles.
-   * Keeping only the latest Promise lets an earlier request outlive the map
-   * entry and be overtaken by an offline presence edge. */
-  private readonly deviceSessionCreates = new Map<string, Set<Promise<void>>>();
+  /** Every presence-authenticated operation started for a device must stay
+   * fenced until it settles. Keeping only the latest Promise lets an earlier
+   * request outlive the map entry and be overtaken by an offline edge. */
+  private readonly devicePresenceOperations = new Map<string, Set<Promise<void>>>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -255,7 +255,7 @@ export class DSHAnywhereConnector {
     this.presenceUpdates.clear();
     this.presenceRefreshRequired.clear();
     this.deviceBridgeOperations.clear();
-    this.deviceSessionCreates.clear();
+    this.devicePresenceOperations.clear();
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
     this.latestSessionListCommands.clear();
@@ -498,22 +498,23 @@ export class DSHAnywhereConnector {
       return;
     }
     this.log("info", `Received ${command.data.type} from device ${shortID(command.data.deviceId)}`);
-    // A session.create is authenticated by the Bridge-local presence lease.
-    // Keep it in the same per-device operation chain as presence edges: an
-    // offline edge delivered immediately afterwards must wait until this
-    // command has reached the Bridge, otherwise the Bridge can delete the
-    // lease first and turn a valid create into a final 403.
-    if (command.data.type === "session.create") {
+    // Session creation and attachment upload are authenticated by the
+    // Bridge-local presence lease. Keep both in the same per-device operation
+    // chain as presence edges: an offline edge delivered immediately
+    // afterwards must wait until the request has reached the Bridge, otherwise
+    // the Bridge can delete the lease first and turn a valid request into a
+    // final 403.
+    if (requiresDevicePresence(command.data)) {
       const start = () => {
         const completion = this.dispatchCommand(command.data);
-        const creates = this.deviceSessionCreates.get(command.data.deviceId) ?? new Set<Promise<void>>();
-        creates.add(completion);
-        this.deviceSessionCreates.set(command.data.deviceId, creates);
+        const operations = this.devicePresenceOperations.get(command.data.deviceId) ?? new Set<Promise<void>>();
+        operations.add(completion);
+        this.devicePresenceOperations.set(command.data.deviceId, operations);
         void completion.finally(() => {
-          const current = this.deviceSessionCreates.get(command.data.deviceId);
+          const current = this.devicePresenceOperations.get(command.data.deviceId);
           if (!current) return;
           current.delete(completion);
-          if (current.size === 0) this.deviceSessionCreates.delete(command.data.deviceId);
+          if (current.size === 0) this.devicePresenceOperations.delete(command.data.deviceId);
         });
       };
       // Preserve the normal synchronous dispatch timing when no presence
@@ -717,8 +718,8 @@ export class DSHAnywhereConnector {
       // to the machine socket. Wait for a preceding create to finish its
       // Bridge request before deleting the origin lease.
       if (!online) {
-        const activeCreates = [...(this.deviceSessionCreates.get(deviceId) ?? [])];
-        await Promise.all(activeCreates.map((create) => create.catch(() => undefined)));
+        const activeOperations = [...(this.devicePresenceOperations.get(deviceId) ?? [])];
+        await Promise.all(activeOperations.map((operation) => operation.catch(() => undefined)));
       }
       return this.reportDevicePresence(deviceId, online, connectorId, relayGeneration, relayEpoch);
     });
@@ -1161,7 +1162,11 @@ export class DSHAnywhereConnector {
     // it reached the Harness; every other create failure keeps the original
     // request id in the recoverable "result unknown" state.
     const definitelyRejected = error instanceof BridgeRequestError && (
-      (error.status >= 400 && error.status < 500 && error.outcome !== "unknown") ||
+      // An explicit committed-recovery outcome wins over the HTTP status:
+      // optional session setup can surface a native 4xx after create already
+      // committed, and must not be treated as a definitely rejected create.
+      (error.outcome !== "retryable-committed" &&
+        error.status >= 400 && error.status < 500 && error.outcome !== "unknown") ||
       // The Bridge marks a retryable 5xx only when it knows the handler
       // accepted no side effect. Presence preflight uses this path before
       // dispatchCommand, so session.create is definitely unaccepted too.
@@ -1170,6 +1175,7 @@ export class DSHAnywhereConnector {
     const resultUnknown = !definitelyRejected && (
       (error instanceof Error && error.name === "TimeoutError")
       || (error instanceof BridgeRequestError && error.outcome === "unknown")
+      || (error instanceof BridgeRequestError && error.outcome === "retryable-committed")
       || command.type === "session.create"
     );
     const reason = resultUnknown
@@ -1793,7 +1799,7 @@ class BridgeRequestError extends Error {
   constructor(
     readonly status: number,
     message = `HTTP ${status}`,
-    readonly outcome: "retryable" | "unknown" | undefined = undefined,
+    readonly outcome: "retryable" | "retryable-committed" | "unknown" | undefined = undefined,
   ) {
     super(message);
   }
@@ -1833,6 +1839,10 @@ function isSessionProjectionMutation(command: CommandEnvelope): boolean {
   return command.type === "session.archive" || command.type === "session.model"
     || command.type === "permission.set" || command.type === "workspace.rename"
     || command.type === "workspace.delete" || command.type === "session.rename";
+}
+
+function requiresDevicePresence(command: CommandEnvelope): boolean {
+  return command.type === "session.create" || command.type === "attachment.upload";
 }
 
 function trailingSlash(value: string): string {

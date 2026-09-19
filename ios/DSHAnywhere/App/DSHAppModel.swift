@@ -340,11 +340,26 @@ private struct DSHLoadedPendingTransactionStore: Sendable {
 private actor DSHPendingTransactionFileStore {
     private let metadataURL: URL
     private let attachmentDirectoryURL: URL
+    private let removedMachineIDsURL: URL
     private var latestGeneration = 0
 
-    init(metadataURL: URL, attachmentDirectoryURL: URL) {
+    init(metadataURL: URL, attachmentDirectoryURL: URL, removedMachineIDsURL: URL) {
         self.metadataURL = metadataURL
         self.attachmentDirectoryURL = attachmentDirectoryURL
+        self.removedMachineIDsURL = removedMachineIDsURL
+    }
+
+    func writeRemovedMachineIDs(_ machineIDs: Set<String>) throws {
+        let directory = removedMachineIDsURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temporaryURL = directory.appendingPathComponent("removed-machines-\(UUID().uuidString).tmp")
+        let data = try JSONEncoder().encode(machineIDs)
+        try data.write(to: temporaryURL, options: [.atomic, .completeFileProtection])
+        if FileManager.default.fileExists(atPath: removedMachineIDsURL.path) {
+            _ = try FileManager.default.replaceItemAt(removedMachineIDsURL, withItemAt: temporaryURL)
+        } else {
+            try FileManager.default.moveItem(at: temporaryURL, to: removedMachineIDsURL)
+        }
     }
 
     func write(_ snapshot: DSHPendingTransactionSnapshot) throws {
@@ -382,6 +397,13 @@ private actor DSHPendingTransactionFileStore {
     }
 
     func load() throws -> DSHLoadedPendingTransactionStore {
+        let fencedMachineIDs: Set<String>
+        if FileManager.default.fileExists(atPath: removedMachineIDsURL.path) {
+            let data = try Data(contentsOf: removedMachineIDsURL)
+            fencedMachineIDs = try JSONDecoder().decode(Set<String>.self, from: data)
+        } else {
+            fencedMachineIDs = []
+        }
         // A first launch has no journal yet.  Treat that absence as an empty
         // store instead of converting the normal ENOENT variant returned by
         // a simulator/device into a fail-closed persistence error.
@@ -391,11 +413,15 @@ private actor DSHPendingTransactionFileStore {
                     sessionCreationTransactionsByMachine: [:],
                     lastSessionCreationRequestIDsByMachine: [:],
                     initialMessageTransactionsByMachine: [:],
-                    removedMachineIDs: []),
+                    removedMachineIDs: fencedMachineIDs),
                 blobs: [:])
         }
         let metadata = try Data(contentsOf: metadataURL)
-        let store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: metadata)
+        var store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: metadata)
+        // The small sidecar fence is authoritative across failures of the
+        // large transaction journal. Merge it before any caller can restore a
+        // machine's staged side effects.
+        store.removedMachineIDs.formUnion(fencedMachineIDs)
         var names = Set<String>()
         func collect(_ attachments: [DSHStoredAttachment]) throws {
             for attachment in attachments {
@@ -744,9 +770,15 @@ final class DSHAppModel: ObservableObject {
             .appendingPathComponent("DSH Anywhere/pending-attachments", isDirectory: true)
     }
 
+    private var removedMachineIDsURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DSH Anywhere/removed-machines.json")
+    }
+
     private lazy var pendingTransactionFileStore = DSHPendingTransactionFileStore(
         metadataURL: pendingTransactionStoreURL,
-        attachmentDirectoryURL: pendingAttachmentDirectoryURL)
+        attachmentDirectoryURL: pendingAttachmentDirectoryURL,
+        removedMachineIDsURL: removedMachineIDsURL)
     private var pendingPersistenceGeneration = 0
 
     private static let maxPendingAttachmentCount = 16
@@ -1102,6 +1134,20 @@ final class DSHAppModel: ObservableObject {
     private func persistPendingTransactionStoreLater() {
         Task { @MainActor [weak self] in
             _ = await self?.persistPendingTransactionStore()
+        }
+    }
+
+    /// Removed-machine fences live in a tiny sidecar so a large attachment
+    /// journal failure cannot erase the lifecycle boundary that prevents old
+    /// requests from returning after re-pairing.
+    @discardableResult
+    private func persistRemovedMachineFence() async -> Bool {
+        do {
+            try await pendingTransactionFileStore.writeRemovedMachineIDs(removedMachineIDs)
+            return true
+        } catch {
+            errorMessage = "无法安全保存本机删除记录，已停止继续配对或删除。"
+            return false
         }
     }
 
@@ -1704,12 +1750,37 @@ final class DSHAppModel: ObservableObject {
                 // Pairing is an explicit new lifecycle. Clear only this
                 // machine's removal fence; its old queue key was deleted at
                 // removal and must not be resurrected by a re-pair.
-                self.removedMachineIDs.remove(profile.machineId)
                 self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: profile.machineId)
+                self.sessionCreationTransactionsByMachine.removeValue(forKey: profile.machineId)
+                self.initialMessageTransactionsByMachine.removeValue(forKey: profile.machineId)
+                self.pendingPromptTransactionsByMachine.removeValue(forKey: profile.machineId)
+                self.failedPromptTransactionsByMachine.removeValue(forKey: profile.machineId)
                 UserDefaults.standard.removeObject(
                     forKey: self.queuedPromptsDefaultsKey(for: profile.machineId))
                 self.resetTransientRequestState()
-                _ = await self.persistPendingTransactionStore()
+                // Keep the old fence while the large journal is rewritten;
+                // this first write removes any stale per-machine records. A
+                // later sidecar clear and final journal write complete the new
+                // pairing lifecycle without exposing a crash window.
+                guard await self.persistPendingTransactionStore() else {
+                    self.removedMachineIDs.insert(profile.machineId)
+                    _ = await self.persistRemovedMachineFence()
+                    return
+                }
+                self.removedMachineIDs.remove(profile.machineId)
+                guard await self.persistRemovedMachineFence() else {
+                    self.removedMachineIDs.insert(profile.machineId)
+                    _ = await self.persistPendingTransactionStore()
+                    return
+                }
+                guard await self.persistPendingTransactionStore() else {
+                    // The sidecar was cleared, but the old journal fence is
+                    // still safe. Restore the in-memory fence and leave the
+                    // new pair disconnected until the user retries pairing.
+                    self.removedMachineIDs.insert(profile.machineId)
+                    _ = await self.persistRemovedMachineFence()
+                    return
+                }
                 self.refreshMachines()
                 self.isPaired = true
                 self.connect()
@@ -1788,9 +1859,21 @@ final class DSHAppModel: ObservableObject {
                 self.connect()
                 return
             }
+            // Fence the lifecycle before deleting the remote profile. If the
+            // app is killed after the remote deletion, the sidecar still
+            // prevents the old journal/queue from being restored on relaunch.
+            self.removedMachineIDs.insert(machine.machineId)
+            guard await self.persistRemovedMachineFence() else {
+                if needsRecovery, self.machineSelectionGeneration == recoveryGeneration {
+                    self.restoreActiveMachineAfterRemoval()
+                }
+                return
+            }
             do {
                 try await self.transport.removeMachine(machine.machineId)
             } catch {
+                self.removedMachineIDs.remove(machine.machineId)
+                guard await self.persistRemovedMachineFence() else { return }
                 self.errorMessage = error.localizedDescription
                 self.refreshMachines()
                 if needsRecovery, self.machineSelectionGeneration == recoveryGeneration {
@@ -1977,9 +2060,17 @@ final class DSHAppModel: ObservableObject {
                 self.connect()
                 return
             }
+            self.removedMachineIDs.insert(forgottenMachineID)
+            guard await self.persistRemovedMachineFence() else {
+                self.removedMachineIDs.remove(forgottenMachineID)
+                self.connect()
+                return
+            }
             self.resetTransientRequestState()
             do { try await self.transport.forgetPairing() }
             catch {
+                self.removedMachineIDs.remove(forgottenMachineID)
+                guard await self.persistRemovedMachineFence() else { return }
                 self.errorMessage = error.localizedDescription
                 self.refreshMachines()
                 self.machineID = self.activeMachine?.machineId ?? forgottenMachineID

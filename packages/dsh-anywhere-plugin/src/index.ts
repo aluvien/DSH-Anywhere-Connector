@@ -35,6 +35,7 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
 const IDEMPOTENCY_TTL_MS = 10 * 60_000
 const MAX_IDEMPOTENCY_ENTRIES = 2_000
+const ATTACHMENT_UPLOAD_RETENTION_MS = 30 * 24 * 60 * 60_000
 
 interface CapturedHttpResponse {
   readonly status: number
@@ -88,7 +89,7 @@ export class IdempotentHttpResponses {
         (captured) => {
           if (this.entries.get(key) === entry) {
             const outcome = idempotencyOutcomeOf(captured)
-            if (outcome === 'retryable') {
+            if (outcome === 'retryable' || outcome === 'retryable-committed') {
               // The handler explicitly established that no side effect was
               // accepted. Let a same-id retry invoke it again after recovery.
               this.entries.delete(key)
@@ -139,10 +140,10 @@ async function captureHttpResponse(handler: (capture: ServerResponse) => Promise
   return { status, headers, body }
 }
 
-function idempotencyOutcomeOf(captured: CapturedHttpResponse): 'final' | 'retryable' | 'unknown' {
+function idempotencyOutcomeOf(captured: CapturedHttpResponse): 'final' | 'retryable' | 'retryable-committed' | 'unknown' {
   const header = captured.headers['x-dsh-idempotency-outcome']
   const value = Array.isArray(header) ? header[0] : header
-  return value === 'retryable' ? 'retryable' : value === 'final' ? 'final' : 'unknown'
+  return value === 'retryable' || value === 'retryable-committed' ? value : value === 'final' ? 'final' : 'unknown'
 }
 
 export const name = 'dsh-anywhere-native-bridge'
@@ -304,6 +305,11 @@ interface NativeContext extends Context {
     create(request: { requestId?: string; createRequestId?: string; cwd?: string; workspaceId?: string; agentPreset?: string; model?: { provider: string; model: string; reasoningEffort?: string }}): Promise<{ sessionId: string; agentPreset?: string }>
     /** Optional recovery hook for adapters that persist the create operation id. */
     findByRequestId?(requestId: string, signal: AbortSignal): Promise<{ sessionId: string } | undefined>
+    /** Optional recovery hook for file-upload adapters that persist the
+     * stable upload operation id alongside the staged receipt. Older Harness
+     * builds do not expose this lookup; those builds fail closed on an
+     * uncertain upload instead of issuing a duplicate native upload. */
+    findAttachmentByRequestId?(requestId: string, signal: AbortSignal): Promise<unknown | undefined>
     /** Available in current Harness builds; optional for older connectors. */
     rename?(request: { sessionId: string; title: string }): Promise<unknown>
     selectModel(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<unknown>
@@ -375,6 +381,9 @@ interface SessionCreationRecord {
 
 interface AttachmentUploadRecord {
   readonly fingerprint: string | undefined
+  /** Stable operation identity understood by adapters that can reconcile a
+   * staged receipt after the Bridge died before persisting the response. */
+  readonly nativeOperationId?: string
   readonly pending?: boolean
   readonly response?: JsonObject
   readonly completedAt?: number
@@ -473,26 +482,74 @@ class SessionMetadataStore {
     return entry.response
   }
 
-  async setAttachmentUploadPending(key: string, fingerprint: string | undefined): Promise<void> {
+  attachmentUploadPendingEntry(key: string, fingerprint: string | undefined): AttachmentUploadRecord | undefined {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    const entry = this.attachmentUploadResults.get(key)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    return entry.response === undefined && entry.pending === true ? entry : undefined
+  }
+
+  async setAttachmentUploadPending(key: string, fingerprint: string | undefined,
+                                   nativeOperationId?: string): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const cutoff = Date.now() - ATTACHMENT_UPLOAD_RETENTION_MS
+    let pruned = false
+    for (const [entryKey, entry] of this.attachmentUploadResults) {
+      if (entry.response !== undefined && entry.completedAt !== undefined && entry.completedAt < cutoff) {
+        this.attachmentUploadResults.delete(entryKey)
+        pruned = true
+      }
+    }
+    if (pruned) await this.persist()
     if (!this.attachmentUploadResults.has(key) &&
         this.attachmentUploadResults.size >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
       throw new HttpError(503, 'attachment upload idempotency capacity is full', 'unknown')
     }
-    this.attachmentUploadResults.set(key, { fingerprint, pending: true })
+    this.attachmentUploadResults.set(key, {
+      fingerprint,
+      pending: true,
+      ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
+    })
     await this.persist()
   }
 
   async setAttachmentUploadResult(key: string, fingerprint: string | undefined,
-                                  response: JsonObject): Promise<void> {
+                                  response: JsonObject, nativeOperationId?: string): Promise<void> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
+    const previous = this.attachmentUploadResults.get(key)
+    const operationId = nativeOperationId ?? previous?.nativeOperationId
     this.attachmentUploadResults.set(key, {
-      fingerprint, response, completedAt: Date.now(),
+      fingerprint,
+      response,
+      completedAt: Date.now(),
+      ...(operationId === undefined ? {} : { nativeOperationId: operationId }),
     })
+    await this.persist()
+  }
+
+  async markAttachmentUploadNotCommitted(key: string, fingerprint: string | undefined): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.attachmentUploadResults.get(key)
+    if (entry === undefined) return
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    // A native 4xx/501 response proves the upload did not reach the file
+    // service. Remove the marker so the same stable request id can retry after
+    // the local capability is restored instead of remaining permanently
+    // stuck in the fail-closed pending state.
+    this.attachmentUploadResults.delete(key)
     await this.persist()
   }
 
@@ -637,6 +694,7 @@ class SessionMetadataStore {
   }
 
   private async load(): Promise<void> {
+    let migratedAttachmentTimestamps = false
     try {
       const parsedValue: unknown = JSON.parse(await readFile(this.path, 'utf8'))
       if (typeof parsedValue !== 'object' || parsedValue === null || Array.isArray(parsedValue)) {
@@ -771,6 +829,9 @@ class SessionMetadataStore {
           if (raw.fingerprint !== undefined && typeof raw.fingerprint !== 'string') {
             throw new Error('attachment upload fingerprint metadata is invalid')
           }
+          if (raw.nativeOperationId !== undefined && typeof raw.nativeOperationId !== 'string') {
+            throw new Error('attachment upload operation metadata is invalid')
+          }
           if (raw.pending !== undefined && typeof raw.pending !== 'boolean') {
             throw new Error('attachment upload pending metadata is invalid')
           }
@@ -786,11 +847,16 @@ class SessionMetadataStore {
           if (response === undefined && raw.pending !== true) {
             throw new Error('attachment upload metadata contains an incomplete record')
           }
+          const completedAt = typeof raw.completedAt === 'number'
+            ? raw.completedAt
+            : response === undefined ? undefined : Date.now()
+          if (response !== undefined && raw.completedAt === undefined) migratedAttachmentTimestamps = true
           this.attachmentUploadResults.set(key, {
             fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
+            ...(typeof raw.nativeOperationId === 'string' ? { nativeOperationId: raw.nativeOperationId } : {}),
             ...(raw.pending === true ? { pending: true } : {}),
             ...(response === undefined ? {} : { response: response as JsonObject }),
-            ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
+            ...(completedAt === undefined ? {} : { completedAt }),
           })
         }
       }
@@ -801,6 +867,9 @@ class SessionMetadataStore {
         this.persistenceUnavailable = true
         this.warn('Session presentation metadata is unreadable; refusing durable session creation until it is repaired')
       }
+    }
+    if (migratedAttachmentTimestamps && !this.persistenceUnavailable) {
+      try { await this.persist() } catch { /* persistenceUnavailable is set by persist */ }
     }
   }
 
@@ -886,9 +955,12 @@ function isPermissionPreset(value: PermissionMode): value is 'read-only' | 'work
 
 function retryableSessionSetupError(error: unknown): HttpError {
   if (error instanceof HttpError) {
-    return new HttpError(error.status, error.message, 'retryable')
+    // The native session already exists at this point. The outer HTTP cache
+    // must release the id so the durable setup record can be resumed, while
+    // the Connector must continue to report the create as result-unknown.
+    return new HttpError(error.status, error.message, 'retryable-committed')
   }
-  return new HttpError(502, error instanceof Error ? error.message : String(error), 'retryable')
+  return new HttpError(502, error instanceof Error ? error.message : String(error), 'retryable-committed')
 }
 
 async function applySessionCreationSetup(
@@ -2318,18 +2390,54 @@ async function handleHttp(
     }
     const sessionId = decodeURIComponent(uploadMatch[1]!)
     const requestId = header(req, 'x-dsh-request-id')
+    if (requestId !== undefined && requestId.length > 256) {
+      throw new HttpError(400, 'request id must be at most 256 characters')
+    }
     const suppliedHash = header(req, 'x-dsh-request-hash')
     const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
       ? suppliedHash.toLowerCase() : undefined
     const originDeviceId = device.id === CONNECTOR_DEVICE_ID
       ? (header(req, 'x-dsh-origin-device-id') ?? device.id) : device.id
+    if (originDeviceId.length === 0 || originDeviceId.length > 256) {
+      throw new HttpError(400, 'origin device id is invalid')
+    }
     if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID &&
         !relayDevices.has(originDeviceId)) {
       throw new HttpError(403, 'origin device is not connected through Relay')
     }
     const durableKey = requestId === undefined || requestId.length === 0
       ? undefined : `${originDeviceId}\0${sessionId}\0${requestId}`
+    const nativeOperationId = durableKey === undefined
+      ? undefined : nativeOperationIdFor(`attachment\0${durableKey}`)
     if (durableKey !== undefined) {
+      const pending = metadata.attachmentUploadPendingEntry(durableKey, fingerprint)
+      if (pending !== undefined) {
+        // A Bridge restart can happen after the native file service committed
+        // its staged receipt but before this metadata file recorded the
+        // response. Adapters that persist the stable operation id can return
+        // that original receipt here. If the adapter cannot reconcile it, the
+        // pending marker remains fail-closed: issuing a second upload would
+        // create an orphaned file and violate at-most-once semantics.
+        const findAttachmentByRequestId = ctx.sessionController.findAttachmentByRequestId
+        if (findAttachmentByRequestId !== undefined && pending.nativeOperationId !== undefined) {
+          try {
+            const recovered = await findAttachmentByRequestId(
+              pending.nativeOperationId, AbortSignal.timeout(15_000))
+            const response = attachmentUploadResponseOf(recovered, body.name)
+            if (response !== undefined) {
+              await metadata.setAttachmentUploadResult(
+                durableKey, fingerprint, response, pending.nativeOperationId)
+              json(res, 200, response)
+              return
+            }
+          } catch {
+            // Recovery is best effort. Keep the durable pending marker and
+            // report an unknown result below; never fall back to a duplicate
+            // native upload after an ambiguous adapter failure.
+          }
+        }
+        throw new HttpError(503, 'attachment upload result is still unknown', 'unknown')
+      }
       const remembered = metadata.attachmentUploadEntry(durableKey, fingerprint)
       if (remembered !== undefined) {
         json(res, 201, remembered)
@@ -2338,11 +2446,26 @@ async function handleHttp(
       // Commit a fail-closed marker before invoking the native file service.
       // If the response is lost after the upload side effect, a later retry
       // will see the pending marker instead of uploading a second file.
-      await metadata.setAttachmentUploadPending(durableKey, fingerprint)
+      await metadata.setAttachmentUploadPending(durableKey, fingerprint, nativeOperationId)
     }
-    const result = await uploadAttachment(ctx, sessionId, body.data, body.name)
+    let result: Record<string, unknown>
+    try {
+      result = await uploadAttachment(ctx, sessionId, body.data, body.name, nativeOperationId)
+    } catch (error) {
+      // A native client error is a proof that no file side effect was
+      // accepted. The local 501 capability error is also deterministic: the
+      // upload service was never invoked. Release the durable marker and
+      // allow a same-id retry; keep other 5xx/unknown failures pending because
+      // the file service may have committed before its response was lost.
+      if (durableKey !== undefined && error instanceof HttpError &&
+          (error.status < 500 || error.status === 501)) {
+        await metadata.markAttachmentUploadNotCommitted(durableKey, fingerprint)
+        throw new HttpError(error.status, error.message, 'retryable')
+      }
+      throw error
+    }
     if (durableKey !== undefined) {
-      await metadata.setAttachmentUploadResult(durableKey, fingerprint, result)
+      await metadata.setAttachmentUploadResult(durableKey, fingerprint, result, nativeOperationId)
     }
     json(res, 201, result)
     return
@@ -2551,19 +2674,37 @@ async function uploadAttachment(
   sessionId: string,
   data: string,
   name: string,
+  nativeOperationId?: string,
 ): Promise<Record<string, unknown>> {
   if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness file upload service is unavailable')
   const result = await ctx.typertGateway.invoke({
     namespace: 'fileUploads',
     method: 'upload',
-    args: { agentId: sessionId, request: { data, name } },
+    args: {
+      agentId: sessionId,
+      request: {
+        data,
+        name,
+        // The current generated file-upload contract ignores unknown request
+        // fields, while adapters that support recovery can persist this
+        // operation id next to the staged receipt. Keeping it stable across
+        // Bridge restarts is what makes findAttachmentByRequestId useful.
+        ...(nativeOperationId === undefined ? {} : { requestId: nativeOperationId }),
+      },
+    },
     signal: AbortSignal.timeout(120_000),
   })
-  const value = recordOf(result)
-  const nested = recordOf(value.value)
-  const receiptId = typeof value.receiptId === 'string' ? value.receiptId : stringOr(nested.receiptId, '')
-  if (receiptId.length === 0) throw new HttpError(502, 'Harness file upload returned no receipt')
-  const file = recordOf(value.file ?? nested.file)
+  const response = attachmentUploadResponseOf(result, name)
+  if (response === undefined) throw new HttpError(502, 'Harness file upload returned no receipt')
+  return response
+}
+
+function attachmentUploadResponseOf(value: unknown, name: string): Record<string, unknown> | undefined {
+  const result = recordOf(value)
+  const nested = recordOf(result.value)
+  const receiptId = typeof result.receiptId === 'string' ? result.receiptId : stringOr(nested.receiptId, '')
+  if (receiptId.length === 0) return undefined
+  const file = recordOf(result.file ?? nested.file)
   return {
     receiptId,
     name,

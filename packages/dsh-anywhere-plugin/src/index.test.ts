@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -7,6 +8,7 @@ import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
 import { historyRecipient, CONNECTOR_DEVICE_ID, LIVE_REASONING_TRAIL_LIMIT, PairingRateLimiter, apply, inject, isSubagentSession, liveReasoningTrail, liveStreamChunkEvent, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
+import { HttpError } from './http.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('DeepSeek Harness event normalization', () => {
@@ -418,6 +420,7 @@ describe('native bridge mutations', () => {
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
     invoke?: (request: unknown) => Promise<unknown>
+    findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined>
     dataDir?: string
   } = {}) {
     // Each mounted Bridge gets an isolated metadata file.  The real plugin
@@ -439,6 +442,9 @@ describe('native bridge mutations', () => {
       sessionController: {
         list: async () => ({ items: [] }),
         create: options.create ?? (async () => ({ sessionId: 'session-new' })),
+        ...(options.findAttachmentByRequestId === undefined ? {} : {
+          findAttachmentByRequestId: options.findAttachmentByRequestId,
+        }),
         ...(options.rename === undefined ? {} : { rename: options.rename }),
         selectModel: async () => undefined,
         modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, routableProviders: [], groups: [], failures: [] }),
@@ -724,6 +730,56 @@ describe('native bridge mutations', () => {
       name: 'too-large.bin', data: 'A'.repeat(Math.ceil((10 * 1024 * 1024) / 3) * 4 + 1),
     })).resolves.toMatchObject({ status: 413 })
     expect(uploads).toBe(1)
+  })
+
+  it('releases a pending attachment after a deterministic native rejection', async () => {
+    let attempts = 0
+    const request = mount({
+      invoke: async () => {
+        attempts += 1
+        if (attempts === 1) throw new HttpError(501, 'upload service unavailable')
+        return { ok: true, value: { receiptId: 'receipt-retry', file: { size: 3 } } }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, 'attachment-retry',
+    )).resolves.toMatchObject({ status: 501 })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, 'attachment-retry',
+    )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-retry' } })
+    expect(attempts).toBe(2)
+  })
+
+  it('reconciles a committed attachment receipt after a Bridge restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-recovery-'))
+    const requestId = 'attachment-recover'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000${requestId}`
+    const nativeOperationId = createHash('sha256')
+      .update(`attachment\0${key}`).digest('hex')
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      attachmentUploads: {
+        [key]: { pending: true, nativeOperationId },
+      },
+    }))
+    let uploads = 0
+    const request = mount({
+      dataDir,
+      invoke: async () => {
+        uploads += 1
+        return { ok: true, value: { receiptId: 'must-not-upload-again' } }
+      },
+      findAttachmentByRequestId: async (operationId) => {
+        expect(operationId).toBe(nativeOperationId)
+        return { receiptId: 'receipt-recovered', file: { size: 3 } }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, requestId,
+    )).resolves.toMatchObject({ status: 200, body: { receiptId: 'receipt-recovered' } })
+    expect(uploads).toBe(0)
   })
 })
 
