@@ -486,11 +486,18 @@ export class DSHAnywhereConnector {
     // presence update with session.create (or another mutation).  The update
     // is serialized per device; a failed report yields a retryable protocol
     // error instead of allowing the Bridge to manufacture a final 403.
-    const presenceUpdate = this.presenceUpdates.get(command.data.deviceId)
-      ?? (this.presenceRefreshRequired.has(command.data.deviceId)
-        ? this.reportDevicePresence(command.data.deviceId, true, this.bridgeConnectorId,
-                                    this.relayLeaseGeneration, this.relayEpoch)
-        : undefined);
+    // Only session.create uses the phone identity for Bridge authorization.
+    // Read-only snapshots and the other Connector-scoped commands remain
+    // useful while a presence lease is being refreshed, and should not be
+    // blocked by a best-effort presence HTTP update.
+    const presenceRequired = command.data.type === "session.create";
+    const presenceUpdate = presenceRequired
+      ? (this.presenceUpdates.get(command.data.deviceId)
+        ?? (this.presenceRefreshRequired.has(command.data.deviceId)
+          ? this.reportDevicePresence(command.data.deviceId, true, this.bridgeConnectorId,
+                                      this.relayLeaseGeneration, this.relayEpoch)
+          : undefined))
+      : undefined;
     if (presenceUpdate !== undefined) {
       void presenceUpdate.then((registered) => {
         if (this.relay !== socket || !this.running) return;
@@ -659,6 +666,7 @@ export class DSHAnywhereConnector {
                                relayGeneration = this.relayLeaseGeneration,
                                relayEpoch = this.relayEpoch): Promise<boolean> {
     if (connectorId === undefined || relayGeneration === undefined || relayEpoch === undefined) {
+      if (online) this.presenceRefreshRequired.add(deviceId);
       return Promise.resolve(false);
     }
     const previous = this.presenceUpdates.get(deviceId) ?? Promise.resolve(true);
