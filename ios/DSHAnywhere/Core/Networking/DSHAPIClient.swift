@@ -96,6 +96,17 @@ public final class DSHAPIClient: @unchecked Sendable {
         )
     }
 
+    /// Compensates a just-completed pairing when the phone cannot commit its
+    /// local profile/journal. This endpoint is deliberately separate from
+    /// sibling device management, whose route refuses self-revocation.
+    public func revokeSelfDevice(machineId: String, token: String) async throws {
+        let _: RevokeResponse = try await perform(
+            method: "DELETE",
+            path: ["v1", "machines", machineId, "devices", "self"],
+            bearerToken: token
+        )
+    }
+
     private func perform<Body: Encodable, Value: Decodable>(method: String, path: [String], body: Body) async throws -> Value {
         var request = makeRequest(method: method, path: path, bearerToken: nil)
         request.httpBody = try encoder.encode(body)

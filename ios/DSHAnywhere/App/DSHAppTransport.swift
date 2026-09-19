@@ -19,8 +19,13 @@ protocol DSHAppTransport: Sendable {
     /// Forgets one paired Mac, leaving the others intact.
     func removeMachine(_ machineId: String) async throws
     /// Rolls back a locally persisted profile after a post-pairing journal
-    /// transaction failed. This never calls the remote Relay.
+    /// transaction failed. The production transport also revokes the
+    /// provisional Relay device credential created by pair().
     func rollbackPairing(machineId: String) async
+    /// Marks a pairing durable after the local profile, transaction journal,
+    /// and removal fence have all committed. This closes the compensating
+    /// rollback window for the production transport.
+    func commitPairing(machineId: String) async
     /// Devices paired to the active machine, straight from the Relay.
     func pairedDevices() async throws -> [DSHRelayDevice]
     /// Revokes one device. The Relay refuses to let a device revoke itself.
@@ -33,6 +38,7 @@ extension DSHAppTransport {
     }
 
     func rollbackPairing(machineId: String) async {}
+    func commitPairing(machineId: String) async {}
 }
 
 private struct DSHRelayUpgradeRequired: LocalizedError {
@@ -55,6 +61,10 @@ actor DSHRemoteTransport: DSHAppTransport {
     /// The target of the currently suspended machine switch. Deleting an
     /// unrelated profile must not cancel it, but deleting this target must.
     private var pendingMachineSelectionID: String?
+    /// Credentials returned by Relay remain provisional until the app has
+    /// committed its local profile and transaction journal. Keeping them here
+    /// lets a failed post-pair commit issue a compensating self-revoke.
+    private var provisionalPairings: [String: (profile: DSHRemoteProfile, token: String)] = [:]
 
     init(tokenStore: any DSHTokenStore = DSHKeychainTokenStore(),
          store: DSHProfileStore = DSHProfileStore()) {
@@ -69,15 +79,21 @@ actor DSHRemoteTransport: DSHAppTransport {
         let result = try await DSHAPIClient(relayBaseURL: baseURL).pair(
             machineId: machineId, credential: credential, deviceName: deviceName
         )
+        provisionalPairings[result.profile.machineId] = (result.profile, result.token)
         // Pairing a second Mac makes the returned profile active. Tear down
         // the old machine socket before committing that profile so no event
         // or command can cross the lifecycle boundary.
-        await disconnect()
-        try tokenStore.save(result.token, account: result.profile.deviceId)
-        // Adds to the machine list rather than replacing it, so pairing a second
-        // Mac no longer makes the first one unreachable.
-        store.upsert(result.profile)
-        return result.profile
+        do {
+            await disconnect()
+            try tokenStore.save(result.token, account: result.profile.deviceId)
+            // Adds to the machine list rather than replacing it, so pairing a second
+            // Mac no longer makes the first one unreachable.
+            store.upsert(result.profile)
+            return result.profile
+        } catch {
+            await revokeProvisionalPairing(result.profile.machineId)
+            throw error
+        }
     }
 
     func connect() async -> AsyncThrowingStream<DSHEvent, Error> {
@@ -223,9 +239,14 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func rollbackPairing(machineId: String) async {
         if store.activeMachineId == machineId { await disconnect() }
+        await revokeProvisionalPairing(machineId)
         guard let profile = store.profiles.first(where: { $0.machineId == machineId }) else { return }
         try? tokenStore.delete(account: profile.deviceId)
         store.remove(machineId)
+    }
+
+    func commitPairing(machineId: String) async {
+        provisionalPairings.removeValue(forKey: machineId)
     }
 
     func pairedDevices() async throws -> [DSHRelayDevice] {
@@ -246,6 +267,19 @@ actor DSHRemoteTransport: DSHAppTransport {
             throw DSHAPIError.missingCredentials
         }
         return (profile, token)
+    }
+
+    private func revokeProvisionalPairing(_ machineId: String) async {
+        guard let provisional = provisionalPairings.removeValue(forKey: machineId) else { return }
+        do {
+            try await DSHAPIClient(relayBaseURL: provisional.profile.relayBaseURL)
+                .revokeSelfDevice(machineId: provisional.profile.machineId, token: provisional.token)
+        } catch {
+            // Keep the local profile rollback fail-closed even if Relay is
+            // temporarily unreachable. A subsequent rollback attempt in the
+            // same process can retry the compensating revoke.
+            provisionalPairings[machineId] = provisional
+        }
     }
 }
 

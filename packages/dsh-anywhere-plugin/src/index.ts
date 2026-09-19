@@ -812,6 +812,40 @@ class SessionMetadataStore {
     await this.persist()
   }
 
+  /**
+   * Remove only completed session-create tombstones after an operator has
+   * explicitly confirmed that the corresponding request ids are no longer
+   * replayable.  Completed records are otherwise permanent: evicting one by
+   * age would turn an offline retry into a second native session.  The
+   * Connector-only admin route is therefore an intentional, auditable escape
+   * hatch for the bounded metadata file rather than an automatic TTL.
+   */
+  async compactSessionCreationRecords(keys: readonly string[]): Promise<number> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    if (keys.length > 128) throw new HttpError(400, 'at most 128 session creation records may be compacted at once')
+    const uniqueKeys = [...new Set(keys)]
+    const removed = new Map<string, SessionCreationRecord>()
+    for (const key of uniqueKeys) {
+      const entry = this.sessionCreationResults.get(key)
+      if (entry === undefined) continue
+      if (entry.response === undefined || entry.setupComplete !== true) {
+        throw new HttpError(409, 'only completed session creation records may be compacted')
+      }
+      removed.set(key, entry)
+      this.sessionCreationResults.delete(key)
+    }
+    if (removed.size === 0) return 0
+    try {
+      await this.persist()
+    } catch (error) {
+      for (const [key, entry] of removed) this.sessionCreationResults.set(key, entry)
+      throw error
+    }
+    return removed.size
+  }
+
   async setSessionCreationPending(key: string, fingerprint: string | undefined,
                                   setup: SessionCreationSetup,
                                   nativeOperationId?: string): Promise<void> {
@@ -872,6 +906,8 @@ class SessionMetadataStore {
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
+    const wasArchived = this.archived.has(sessionId)
+    const wasUnarchived = this.unarchived.has(sessionId)
     if (archived) {
       this.archived.add(sessionId)
       this.unarchived.delete(sessionId)
@@ -883,26 +919,55 @@ class SessionMetadataStore {
       // still present the expected list.
       this.unarchived.add(sessionId)
     }
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (wasArchived) this.archived.add(sessionId)
+      else this.archived.delete(sessionId)
+      if (wasUnarchived) this.unarchived.add(sessionId)
+      else this.unarchived.delete(sessionId)
+      throw error
+    }
   }
 
   async setPermission(sessionId: string, mode: PermissionMode): Promise<void> {
+    const previous = this.permissions.get(sessionId)
     this.permissions.set(sessionId, mode)
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.permissions.delete(sessionId)
+      else this.permissions.set(sessionId, previous)
+      throw error
+    }
   }
 
   async setTitle(sessionId: string, title: string): Promise<void> {
     const trimmed = title.trim().slice(0, 512)
     if (trimmed.length === 0) return
+    const previous = this.titles.get(sessionId)
     this.titles.set(sessionId, trimmed)
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.titles.delete(sessionId)
+      else this.titles.set(sessionId, previous)
+      throw error
+    }
   }
 
   async setBranch(sessionId: string, branch: string): Promise<void> {
     const trimmed = branch.trim().slice(0, 512)
     if (trimmed.length === 0) return
+    const previous = this.branches.get(sessionId)
     this.branches.set(sessionId, trimmed)
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.branches.delete(sessionId)
+      else this.branches.set(sessionId, previous)
+      throw error
+    }
   }
 
   private async load(): Promise<void> {
@@ -1088,7 +1153,7 @@ class SessionMetadataStore {
           if (response === undefined && raw.pending !== true && raw.expired !== true) {
             throw new Error('attachment upload metadata contains an incomplete record')
           }
-          if (raw.expired === true) {
+          if (raw.expired === true && raw.reconciled !== true) {
             expiredAttachmentRecordCount += 1
             if (expiredAttachmentRecordCount > MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
               throw new Error('attachment upload metadata exceeds its tombstone safety capacity')
@@ -2133,6 +2198,21 @@ async function handleHttp(
     const result = await metadata.reconcileExpiredAttachmentUploads(
       ctx.sessionController.findAttachmentByRequestId, requestedLimit, afterKey)
     json(res, 200, result)
+    return
+  }
+
+  if (req.method === 'POST' && path === '/admin/session-creations/compact') {
+    if (device.id !== CONNECTOR_DEVICE_ID) {
+      throw new HttpError(403, 'only the Connector may compact session creation records')
+    }
+    const body = objectOf(await readJson(req))
+    if (!Array.isArray(body.keys) || body.keys.length > 128 ||
+        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 512)) {
+      throw new HttpError(400, 'keys must be an array of at most 128 durable session creation keys')
+    }
+    const keys = body.keys as string[]
+    const removed = await metadata.compactSessionCreationRecords(keys)
+    json(res, 200, { removed })
     return
   }
 

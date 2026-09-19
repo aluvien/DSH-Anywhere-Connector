@@ -447,6 +447,35 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     }
 
     const revokeMatch = /^\/v1\/machines\/([^/]+)\/devices\/([^/]+)$/.exec(url.pathname);
+    const selfRevokeMatch = /^\/v1\/machines\/([^/]+)\/devices\/self$/.exec(url.pathname);
+    if (request.method === "DELETE" && selfRevokeMatch !== null) {
+      const principal = authenticateBearer(request, registry);
+      const machineId = decodeURIComponent(selfRevokeMatch[1]!);
+      // This endpoint is intentionally separate from the sibling-management
+      // route below. A newly paired phone may need to compensate a local
+      // journal failure before its profile has been committed, but ordinary
+      // device management must continue refusing accidental self-revocation.
+      if (principal === undefined || principal.role !== "device" ||
+          principal.machineId !== machineId || principal.deviceId === undefined) {
+        respondJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      const deviceId = principal.deviceId;
+      for (const connection of connections) {
+        if (connection.principal.role === "device" &&
+            connection.principal.machineId === machineId &&
+            connection.principal.deviceId === deviceId) {
+          if (connections.delete(connection)) broadcastPresence(connection.principal, false);
+          connection.ws.close(4401, "device revoked");
+        }
+      }
+      if (!await registry.revokeDevice(machineId, deviceId)) {
+        respondJson(response, 404, { error: "unknown_device" });
+        return;
+      }
+      respondJson(response, 200, { revoked: true, deviceId });
+      return;
+    }
     if (request.method === "DELETE" && revokeMatch !== null) {
       const principal = authenticateBearer(request, registry);
       const machineId = decodeURIComponent(revokeMatch[1]!);

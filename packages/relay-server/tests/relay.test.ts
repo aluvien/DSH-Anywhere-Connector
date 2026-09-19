@@ -354,6 +354,14 @@ describe("Relay server", () => {
     return { status: response.status, body: await response.json() as { error?: string } };
   }
 
+  async function revokeSelf(base: string, machineId: string, token: string) {
+    const response = await fetch(`${base}/v1/machines/${machineId}/devices/self`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return { status: response.status, body: await response.json() as { error?: string; deviceId?: string } };
+  }
+
   it("lists a machine's devices without ever returning credential material", async () => {
     const server = await relay();
     const machine = await register(server.url, "Mac");
@@ -388,6 +396,17 @@ describe("Relay server", () => {
     const self = await revoke(server.url, machine.machineId, phoneA.deviceId, phoneA.deviceToken);
     expect(self.status).toBe(409);
     expect(self.body.error).toBe("self_revoke");
+  });
+
+  it("allows a device to compensate a just-created provisional pairing", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const phone = await pair(server.url, machine, "iPhone");
+
+    const removed = await revokeSelf(server.url, machine.machineId, phone.deviceToken);
+    expect(removed.status).toBe(200);
+    expect(removed.body.deviceId).toBe(phone.deviceId);
+    expect((await devices(server.url, machine.machineId, phone.deviceToken)).status).toBe(401);
   });
 
   it("keeps device management inside one machine", async () => {

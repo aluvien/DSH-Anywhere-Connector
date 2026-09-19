@@ -84,6 +84,16 @@ private struct DSHSessionCreationTransaction: Codable, Sendable {
     let retryDeadline: Date
 }
 
+/// A non-prompt native mutation whose transport acknowledgement was lost.
+/// Keep the complete command (including its request id) so a user retry can
+/// safely re-enter Connector/Bridge idempotency instead of minting a second
+/// request after the first may already have crossed the socket.
+private struct DSHRemoteMutationTransaction: Codable, Sendable {
+    let command: DSHCommand
+    var failure: String?
+    let retryDeadline: Date
+}
+
 private struct DSHInitialMessageTransaction: Codable, Sendable {
     let pending: DSHPendingInitialMessage
     let failure: DSHInitialMessageFailure?
@@ -472,6 +482,7 @@ private actor DSHPendingTransactionFileStore {
             store.removedMachineIDs = fencedMachineIDs
             for machineID in fencedMachineIDs {
                 store.sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+                store.remoteMutationTransactionsByMachine.removeValue(forKey: machineID)
                 store.lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
                 store.initialMessageTransactionsByMachine.removeValue(forKey: machineID)
                 store.pendingPromptTransactionsByMachine.removeValue(forKey: machineID)
@@ -527,6 +538,7 @@ private actor DSHPendingTransactionFileStore {
 
 private struct DSHPendingTransactionStore: Codable, Sendable {
     var sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]]
+    var remoteMutationTransactionsByMachine: [String: [String: DSHRemoteMutationTransaction]]
     var lastSessionCreationRequestIDsByMachine: [String: String]
     var initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]]
     var pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]]
@@ -537,18 +549,21 @@ private struct DSHPendingTransactionStore: Codable, Sendable {
     var removedMachineIDs: Set<String>
 
     private enum CodingKeys: String, CodingKey {
-        case sessionCreationTransactionsByMachine, lastSessionCreationRequestIDsByMachine,
+        case sessionCreationTransactionsByMachine, remoteMutationTransactionsByMachine,
+             lastSessionCreationRequestIDsByMachine,
              initialMessageTransactionsByMachine, pendingPromptTransactionsByMachine,
              failedPromptTransactionsByMachine, removedMachineIDs
     }
 
     init(sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]],
+         remoteMutationTransactionsByMachine: [String: [String: DSHRemoteMutationTransaction]] = [:],
          lastSessionCreationRequestIDsByMachine: [String: String],
          initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]],
          pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]] = [:],
          failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:],
          removedMachineIDs: Set<String> = []) {
         self.sessionCreationTransactionsByMachine = sessionCreationTransactionsByMachine
+        self.remoteMutationTransactionsByMachine = remoteMutationTransactionsByMachine
         self.lastSessionCreationRequestIDsByMachine = lastSessionCreationRequestIDsByMachine
         self.initialMessageTransactionsByMachine = initialMessageTransactionsByMachine
         self.pendingPromptTransactionsByMachine = pendingPromptTransactionsByMachine
@@ -561,6 +576,9 @@ private struct DSHPendingTransactionStore: Codable, Sendable {
         sessionCreationTransactionsByMachine = try container.decode(
             [String: [String: DSHStoredSessionCreationTransaction]].self,
             forKey: .sessionCreationTransactionsByMachine)
+        remoteMutationTransactionsByMachine = try container.decodeIfPresent(
+            [String: [String: DSHRemoteMutationTransaction]].self,
+            forKey: .remoteMutationTransactionsByMachine) ?? [:]
         lastSessionCreationRequestIDsByMachine = try container.decode(
             [String: String].self, forKey: .lastSessionCreationRequestIDsByMachine)
         initialMessageTransactionsByMachine = try container.decode(
@@ -788,6 +806,10 @@ final class DSHAppModel: ObservableObject {
     /// Keep one snapshot per paired Mac so switching A -> B cannot delete an
     /// A request that may still complete on the original machine.
     private var sessionCreationTransactionsByMachine: [String: [String: DSHSessionCreationTransaction]] = [:]
+    /// Durable request identities for native mutations other than prompt and
+    /// session.create. A transport error is not proof that the Connector did
+    /// not execute the command, so retries must find the original command.
+    private var remoteMutationTransactionsByMachine: [String: [String: DSHRemoteMutationTransaction]] = [:]
     private var lastSessionCreationRequestIDsByMachine: [String: String] = [:]
     /// A session may already exist while its first prompt is still uploading
     /// or awaiting acceptance. Keep that second phase by machine as well, so
@@ -970,6 +992,32 @@ final class DSHAppModel: ObservableObject {
                 creations.removeValue(forKey: removedMachineID)
             }
             sessionCreationTransactionsByMachine = creations
+            var remoteMutations = store.remoteMutationTransactionsByMachine
+            // Once the app has restarted, an entry without a terminal
+            // acknowledgement is an unknown result even if the process died
+            // between journaling and the first send. Reusing its exact
+            // request id is safe in both cases and prevents an accidental
+            // second native mutation.
+            for (activeMachineID, current) in remoteMutationTransactionsByMachine {
+                var merged = remoteMutations[activeMachineID] ?? [:]
+                merged.merge(current) { _, current in current }
+                remoteMutations[activeMachineID] = merged
+            }
+            var restoredRemoteMutations: [String: [String: DSHRemoteMutationTransaction]] = [:]
+            for (activeMachineID, transactions) in remoteMutations {
+                restoredRemoteMutations[activeMachineID] = transactions.mapValues { transaction in
+                    var restored = transaction
+                    if restored.failure == nil {
+                        restored.failure = "连接已断开，操作结果待确认。"
+                    }
+                    return restored
+                }
+            }
+            remoteMutations = restoredRemoteMutations
+            for removedMachineID in removedMachineIDs {
+                remoteMutations.removeValue(forKey: removedMachineID)
+            }
+            remoteMutationTransactionsByMachine = remoteMutations
             var lastIDs = store.lastSessionCreationRequestIDsByMachine
             for removedMachineID in removedMachineIDs {
                 lastIDs.removeValue(forKey: removedMachineID)
@@ -1211,6 +1259,7 @@ final class DSHAppModel: ObservableObject {
         }
         let store = DSHPendingTransactionStore(
             sessionCreationTransactionsByMachine: storedCreations,
+            remoteMutationTransactionsByMachine: remoteMutationTransactionsByMachine,
             lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
             initialMessageTransactionsByMachine: storedInitialMessages,
             pendingPromptTransactionsByMachine: storedPendingPrompts,
@@ -1366,6 +1415,7 @@ final class DSHAppModel: ObservableObject {
         guard pendingTransactionStoreLoaded else { return false }
         guard !pendingTransactionPersistenceUnavailable else { return false }
         let previousCreationSnapshot = sessionCreationTransactionsByMachine[machineID]
+        let previousRemoteMutationSnapshot = remoteMutationTransactionsByMachine[machineID]
         let previousLastCreationRequestID = lastSessionCreationRequestIDsByMachine[machineID]
         let previousInitialSnapshot = initialMessageTransactionsByMachine[machineID]
         let previousPendingSnapshot = pendingPromptTransactionsByMachine[machineID]
@@ -1431,6 +1481,11 @@ final class DSHAppModel: ObservableObject {
                 sessionCreationTransactionsByMachine[machineID] = previousCreationSnapshot
             } else {
                 sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            if let previousRemoteMutationSnapshot {
+                remoteMutationTransactionsByMachine[machineID] = previousRemoteMutationSnapshot
+            } else {
+                remoteMutationTransactionsByMachine.removeValue(forKey: machineID)
             }
             if let previousLastCreationRequestID {
                 lastSessionCreationRequestIDsByMachine[machineID] = previousLastCreationRequestID
@@ -1918,6 +1973,7 @@ final class DSHAppModel: ObservableObject {
                 // removal and must not be resurrected by a re-pair.
                 self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: profile.machineId)
                 self.sessionCreationTransactionsByMachine.removeValue(forKey: profile.machineId)
+                self.remoteMutationTransactionsByMachine.removeValue(forKey: profile.machineId)
                 self.initialMessageTransactionsByMachine.removeValue(forKey: profile.machineId)
                 self.pendingPromptTransactionsByMachine.removeValue(forKey: profile.machineId)
                 self.failedPromptTransactionsByMachine.removeValue(forKey: profile.machineId)
@@ -1947,11 +2003,17 @@ final class DSHAppModel: ObservableObject {
                         serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
                     return
                 }
+                await self.transport.commitPairing(machineId: profile.machineId)
                 self.refreshMachines()
                 self.isPaired = true
                 self.pairingSuccessRevision &+= 1
                 self.connect()
             } catch {
+                // DSHRemoteTransport may have obtained a Relay credential
+                // before a local token/journal write failed. Give it one more
+                // chance to issue the compensating self-revoke even though no
+                // profile was returned to this transaction.
+                await self.transport.rollbackPairing(machineId: trimmedMachineID)
                 // Pairing is additive. If the new Mac fails, restore the
                 // previous active profile and reconnect it rather than leaving
                 // the home screen detached from a healthy machine.
@@ -2110,6 +2172,7 @@ final class DSHAppModel: ObservableObject {
                 return
             }
             self.sessionCreationTransactionsByMachine.removeValue(forKey: machine.machineId)
+            self.remoteMutationTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: machine.machineId)
             self.initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
@@ -2315,6 +2378,7 @@ final class DSHAppModel: ObservableObject {
                 return
             }
             self.sessionCreationTransactionsByMachine.removeValue(forKey: forgottenMachineID)
+            self.remoteMutationTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: forgottenMachineID)
             self.initialMessageTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
@@ -2549,11 +2613,16 @@ final class DSHAppModel: ObservableObject {
         let requestId = UUID().uuidString
         createdWorkspace = nil
         isCreatingWorkspace = true
-        pendingWorkspaceCreationRequestID = requestId
-        send(DSHCommand.createWorkspace(deviceId: deviceID, machineId: machineID,
-                                        path: cleanPath,
-                                        title: cleanTitle?.isEmpty == false ? cleanTitle : nil,
-                                        requestId: requestId))
+        let proposed = DSHCommand.createWorkspace(deviceId: deviceID, machineId: machineID,
+                                                   path: cleanPath,
+                                                   title: cleanTitle?.isEmpty == false ? cleanTitle : nil,
+                                                   requestId: requestId)
+        guard let command = durableRemoteMutationCommand(proposed) else {
+            isCreatingWorkspace = false
+            return
+        }
+        pendingWorkspaceCreationRequestID = command.requestId
+        send(command)
     }
 
     /// Loads the durable transcript for an existing session. Session snapshots
@@ -3687,8 +3756,10 @@ final class DSHAppModel: ObservableObject {
     func executeCommand(_ line: String, for sessionID: String) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        send(DSHCommand.executeCommand(deviceId: deviceID, machineId: machineID,
-                                      sessionId: sessionID, line: trimmed))
+        let proposed = DSHCommand.executeCommand(deviceId: deviceID, machineId: machineID,
+                                                  sessionId: sessionID, line: trimmed)
+        guard let command = durableRemoteMutationCommand(proposed) else { return }
+        send(command)
     }
 
     func uploadAttachment(name: String, data: Data, for sessionID: String) {
@@ -3838,6 +3909,94 @@ final class DSHAppModel: ObservableObject {
                                        answers: answers))
     }
 
+    private func isDurableRemoteMutation(_ command: DSHCommand) -> Bool {
+        command.type == "command.execute" || command.type == "workspace.create"
+    }
+
+    /// Returns an existing command when the same native mutation is retried.
+    /// Matching the payload as well as the type prevents an unrelated command
+    /// from inheriting an old request id. An expired tombstone is not safe to
+    /// replay, so leave it parked and require the user to resolve it instead
+    /// of silently minting a duplicate request.
+    private func durableRemoteMutationCommand(_ proposed: DSHCommand) -> DSHCommand? {
+        guard isDurableRemoteMutation(proposed) else { return proposed }
+        guard !machineID.isEmpty else {
+            errorMessage = "当前没有可用的 Mac。"
+            return nil
+        }
+        if let existing = remoteMutationTransactionsByMachine[machineID]?.values.first(where: {
+            $0.command.type == proposed.type &&
+            $0.command.machineId == proposed.machineId &&
+            $0.command.sessionId == proposed.sessionId &&
+            $0.command.payload == proposed.payload
+        }) {
+            guard Date() < existing.retryDeadline else {
+                errorMessage = "上一次操作结果仍未确认，请先重新连接 Mac 后再试。"
+                return nil
+            }
+            return existing.command
+        }
+        remoteMutationTransactionsByMachine[machineID, default: [:]][proposed.requestId] =
+            DSHRemoteMutationTransaction(
+                command: proposed,
+                failure: nil,
+                retryDeadline: Date().addingTimeInterval(Self.promptIdempotencyWindow))
+        return proposed
+    }
+
+    private func completeRemoteMutation(_ requestID: String, for machineID: String? = nil) {
+        let targetMachineID = machineID ?? self.machineID
+        guard var transactions = remoteMutationTransactionsByMachine[targetMachineID],
+              transactions.removeValue(forKey: requestID) != nil else { return }
+        if transactions.isEmpty {
+            remoteMutationTransactionsByMachine.removeValue(forKey: targetMachineID)
+        } else {
+            remoteMutationTransactionsByMachine[targetMachineID] = transactions
+        }
+        if targetMachineID == self.machineID {
+            persistCurrentTransactionsLater(for: targetMachineID)
+        } else {
+            persistPendingTransactionStoreLater()
+        }
+    }
+
+    private func remoteMutationDefinitelyNotSent(_ error: Error) -> Bool {
+        guard let websocketError = error as? DSHWebSocketError else { return false }
+        switch websocketError {
+        case .dedupeWindowExpired, .invalidMessage, .unsupportedProtocolVersion,
+             .unauthorizedRelayRole, .authenticationRequired, .machineMismatch,
+             .messageTooLarge:
+            return true
+        case .relay(let code, _):
+            return code == "target_unavailable" || code == "invalid_message"
+                || code == "unsupported_message" || code == "machine_mismatch"
+                || code == "sender_mismatch" || code == "target_not_allowed"
+                || code == "body_machine_mismatch" || code == "body_device_mismatch"
+        case .notConnected, .eventBufferOverflow, .closed:
+            return false
+        }
+    }
+
+    private func markRemoteMutationFailed(_ requestID: String, detail: String,
+                                          error: Error? = nil, machineID targetMachineID: String? = nil) {
+        if let error, remoteMutationDefinitelyNotSent(error) {
+            completeRemoteMutation(requestID, for: targetMachineID)
+            return
+        }
+        let mutationMachineID = targetMachineID ?? machineID
+        guard var transactions = remoteMutationTransactionsByMachine[mutationMachineID],
+              var transaction = transactions[requestID] else { return }
+        transaction.failure = detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "连接已断开，操作结果待确认。" : detail
+        transactions[requestID] = transaction
+        remoteMutationTransactionsByMachine[mutationMachineID] = transactions
+        if mutationMachineID == self.machineID {
+            persistCurrentTransactionsLater(for: mutationMachineID)
+        } else {
+            persistPendingTransactionStoreLater()
+        }
+    }
+
     private func send(_ command: DSHCommand) {
         guard !removedMachineFenceUnavailable,
               !pendingTransactionPersistenceUnavailable,
@@ -3856,11 +4015,21 @@ final class DSHAppModel: ObservableObject {
                 guard let self,
                       self.machineStateGeneration == machineGeneration,
                       self.machineID == expectedMachineID else { return }
+                if self.isDurableRemoteMutation(command) {
+                    guard await self.persistCurrentTransactions(for: expectedMachineID) else {
+                        self.markRemoteMutationFailed(
+                            command.requestId,
+                            detail: "无法保存待处理操作，结果尚未确认。")
+                        self.errorMessage = "无法保存待处理操作，结果尚未确认。"
+                        return
+                    }
+                }
                 try await self.transport.send(command, notAfter: promptDeadline)
             }
             catch {
                 guard let self else { return }
-                self.clearFailedRemoteRequest(command.requestId, detail: error.localizedDescription)
+                self.clearFailedRemoteRequest(command.requestId, detail: error.localizedDescription,
+                                               error: error, machineID: expectedMachineID)
                 // A prompt that never left the phone parks for retry (with
                 // its text intact) instead of only flashing an alert while
                 // the draft is already gone.
@@ -3877,7 +4046,8 @@ final class DSHAppModel: ObservableObject {
     /// A local transport rejection (offline socket or an older Relay schema)
     /// has no protocol.error envelope. Clear only the request state owned by
     /// that command so folder-picker controls never remain disabled forever.
-    private func clearFailedRemoteRequest(_ requestID: String, detail: String) {
+    private func clearFailedRemoteRequest(_ requestID: String, detail: String,
+                                          error: Error? = nil, machineID targetMachineID: String? = nil) {
         if requestID == pendingWorkspaceCreationRequestID {
             pendingWorkspaceCreationRequestID = nil
             isCreatingWorkspace = false
@@ -3885,6 +4055,11 @@ final class DSHAppModel: ObservableObject {
         if requestID == pendingDirectoryRequestID {
             pendingDirectoryRequestID = nil
             isLoadingDirectory = false
+        }
+        let mutationMachineID = targetMachineID ?? machineID
+        if remoteMutationTransactionsByMachine[mutationMachineID]?[requestID] != nil {
+            markRemoteMutationFailed(requestID, detail: detail, error: error, machineID: mutationMachineID)
+            return
         }
         if pendingSessionCreationRequestIDs.contains(requestID) {
             // A transport send can fail after bytes have left the phone.  The
@@ -4236,16 +4411,33 @@ final class DSHAppModel: ObservableObject {
     private func handleRemoteRequestCompletion(_ event: DSHEvent) {
         let requestID = event.envelope.messageId
         switch event.kind {
-        case .workspaceCreated(let workspace)
-            where requestID == pendingWorkspaceCreationRequestID:
+        case .workspaceCreated(let workspace):
+            completeRemoteMutation(requestID, for: event.envelope.machineId)
+            guard requestID == pendingWorkspaceCreationRequestID else { break }
             pendingWorkspaceCreationRequestID = nil
             isCreatingWorkspace = false
             createdWorkspace = workspace
             requestWorkspaces()
+        case .commandResult(let result):
+            // command.result carries the request id in its payload; use it
+            // instead of assuming every future Connector event keeps the
+            // envelope message id equal to the original command id.
+            completeRemoteMutation(result.requestId, for: event.envelope.machineId)
         case .directoryListing where requestID == pendingDirectoryRequestID:
             pendingDirectoryRequestID = nil
             isLoadingDirectory = false
         case .protocolError(let error):
+            let eventMachineID = event.envelope.machineId
+            if remoteMutationTransactionsByMachine[eventMachineID]?[requestID] != nil {
+                if error.code == "bridge-result-unknown" || error.retryable {
+                    markRemoteMutationFailed(requestID, detail: error.message, machineID: eventMachineID)
+                } else {
+                    // An explicit non-retryable rejection is the one case in
+                    // which the Connector proves the native mutation did not
+                    // commit. It is safe to mint a fresh id on a later tap.
+                    completeRemoteMutation(requestID, for: eventMachineID)
+                }
+            }
             if requestID == pendingWorkspaceCreationRequestID {
                 pendingWorkspaceCreationRequestID = nil
                 isCreatingWorkspace = false

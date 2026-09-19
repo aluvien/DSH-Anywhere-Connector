@@ -545,6 +545,30 @@ describe('native bridge mutations', () => {
     expect(creates).toBe(1)
   })
 
+  it('compacts only explicitly completed session-create tombstones', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-session-compact-'))
+    let creates = 0
+    const request = mount({
+      dataDir,
+      create: async () => ({ sessionId: `session-${++creates}` }),
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'compact-me',
+    )).resolves.toMatchObject({ status: 201, body: { sessionId: 'session-1' } })
+    const key = `${CONNECTOR_DEVICE_ID}\u0000compact-me`
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/admin/session-creations/compact', { keys: [key] },
+    )).resolves.toEqual({ status: 200, body: { removed: 1 } })
+    const restartedRequest = mount({
+      dataDir,
+      create: async () => ({ sessionId: `session-${++creates}` }),
+    })
+    await expect(restartedRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'compact-me',
+    )).resolves.toMatchObject({ status: 201, body: { sessionId: 'session-2' } })
+    expect(creates).toBe(2)
+  })
+
   it('records the native create before optional setup can fail', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-setup-failure-'))
     let creates = 0
