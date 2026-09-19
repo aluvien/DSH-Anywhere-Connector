@@ -18,6 +18,9 @@ protocol DSHAppTransport: Sendable {
     func setActiveMachine(_ machineId: String) async
     /// Forgets one paired Mac, leaving the others intact.
     func removeMachine(_ machineId: String) async throws
+    /// Rolls back a locally persisted profile after a post-pairing journal
+    /// transaction failed. This never calls the remote Relay.
+    func rollbackPairing(machineId: String) async
     /// Devices paired to the active machine, straight from the Relay.
     func pairedDevices() async throws -> [DSHRelayDevice]
     /// Revokes one device. The Relay refuses to let a device revoke itself.
@@ -28,6 +31,8 @@ extension DSHAppTransport {
     func send(_ command: DSHCommand, notAfter: Date?) async throws {
         try await send(command)
     }
+
+    func rollbackPairing(machineId: String) async {}
 }
 
 private struct DSHRelayUpgradeRequired: LocalizedError {
@@ -209,6 +214,13 @@ actor DSHRemoteTransport: DSHAppTransport {
         if let profile = store.profiles.first(where: { $0.machineId == machineId }) {
             try tokenStore.delete(account: profile.deviceId)
         }
+        store.remove(machineId)
+    }
+
+    func rollbackPairing(machineId: String) async {
+        if store.activeMachineId == machineId { await disconnect() }
+        guard let profile = store.profiles.first(where: { $0.machineId == machineId }) else { return }
+        try? tokenStore.delete(account: profile.deviceId)
         store.remove(machineId)
     }
 

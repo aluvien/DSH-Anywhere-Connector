@@ -2,11 +2,14 @@ import Foundation
 import Combine
 import UserNotifications
 
+private let dshAttachmentRecoveryWindow: TimeInterval = 30 * 24 * 60 * 60
+
 private enum DSHAttachmentUploadError: LocalizedError {
     case timedOut
     case tooLarge
     case quotaExceeded
     case persistenceUnavailable
+    case recoveryExpired
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +17,7 @@ private enum DSHAttachmentUploadError: LocalizedError {
         case .tooLarge: return "Attachments must be 10 MiB or smaller."
         case .quotaExceeded: return "待处理附件总量已达到上限，请先取消旧请求后重试。"
         case .persistenceUnavailable: return "待处理请求存储不可用，已停止自动重试。"
+        case .recoveryExpired: return "附件恢复期限已过，请重新选择附件后发送。"
         }
     }
 }
@@ -34,6 +38,10 @@ private struct DSHPendingInitialMessage: Codable, Sendable {
     /// Receipt metadata survives a partial upload failure. Retrying the
     /// second file must not upload the first file again.
     var uploadedAttachments: [String: DSHMessageAttachment] = [:]
+    /// The Bridge retains attachment identities for this same period. Once it
+    /// expires, automatic recovery is stopped rather than reusing an id that
+    /// may have been garbage-collected remotely.
+    var attachmentRecoveryDeadline: Date?
 }
 
 struct DSHInitialMessageFailure: Identifiable, Equatable, Codable, Sendable {
@@ -123,20 +131,23 @@ private struct DSHStoredInitialMessage: Codable, Sendable {
     let sessionID: String?
     let uploadedAttachments: [String: DSHMessageAttachment]
     let dedupeExpiresAt: Date?
+    let attachmentRecoveryDeadline: Date?
 
     private enum CodingKeys: String, CodingKey {
-        case promptRequestID, text, attachments, sessionID, uploadedAttachments, dedupeExpiresAt
+        case promptRequestID, text, attachments, sessionID, uploadedAttachments, dedupeExpiresAt,
+             attachmentRecoveryDeadline
     }
 
     init(promptRequestID: String, text: String, attachments: [DSHStoredAttachment],
          sessionID: String?, uploadedAttachments: [String: DSHMessageAttachment],
-         dedupeExpiresAt: Date?) {
+         dedupeExpiresAt: Date?, attachmentRecoveryDeadline: Date?) {
         self.promptRequestID = promptRequestID
         self.text = text
         self.attachments = attachments
         self.sessionID = sessionID
         self.uploadedAttachments = uploadedAttachments
         self.dedupeExpiresAt = dedupeExpiresAt
+        self.attachmentRecoveryDeadline = attachmentRecoveryDeadline
     }
 
     init(from decoder: Decoder) throws {
@@ -154,6 +165,9 @@ private struct DSHStoredInitialMessage: Codable, Sendable {
         dedupeExpiresAt = container.contains(.dedupeExpiresAt)
             ? try container.decodeIfPresent(Date.self, forKey: .dedupeExpiresAt)
             : .now
+        attachmentRecoveryDeadline = container.contains(.attachmentRecoveryDeadline)
+            ? try container.decodeIfPresent(Date.self, forKey: .attachmentRecoveryDeadline)
+            : (attachments.isEmpty ? nil : .now)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -164,6 +178,7 @@ private struct DSHStoredInitialMessage: Codable, Sendable {
         try container.encodeIfPresent(sessionID, forKey: .sessionID)
         try container.encode(uploadedAttachments, forKey: .uploadedAttachments)
         try container.encode(dedupeExpiresAt, forKey: .dedupeExpiresAt)
+        try container.encode(attachmentRecoveryDeadline, forKey: .attachmentRecoveryDeadline)
     }
 }
 
@@ -212,13 +227,15 @@ private struct DSHStoredPendingSend: Codable, Sendable {
     /// old journals omit these optional fields.
     let stagedAttachments: [DSHStoredAttachment]?
     let uploadedAttachments: [String: DSHMessageAttachment]?
+    let attachmentRecoveryDeadline: Date?
 
     init(id: String, text: String, receipts: [String], sessionID: String,
          mode: String, sentAt: Date, dedupeExpiresAt: Date? = nil, attempt: Int,
          messageAttachments: [DSHMessageAttachment],
          stagedAttachments: [DSHStoredAttachment]? = nil,
          uploadedAttachments: [String: DSHMessageAttachment]? = nil,
-         phase: DSHPromptTransactionPhase? = nil) {
+         phase: DSHPromptTransactionPhase? = nil,
+         attachmentRecoveryDeadline: Date? = nil) {
         self.id = id
         self.text = text
         self.receipts = receipts
@@ -231,12 +248,13 @@ private struct DSHStoredPendingSend: Codable, Sendable {
         self.stagedAttachments = stagedAttachments
         self.uploadedAttachments = uploadedAttachments
         self.phase = phase
+        self.attachmentRecoveryDeadline = attachmentRecoveryDeadline
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, text, receipts, sessionID, mode, sentAt, attempt,
              messageAttachments, stagedAttachments, uploadedAttachments, phase,
-             dedupeExpiresAt
+             dedupeExpiresAt, attachmentRecoveryDeadline
     }
 
     init(from decoder: Decoder) throws {
@@ -252,6 +270,10 @@ private struct DSHStoredPendingSend: Codable, Sendable {
         messageAttachments = try container.decode([DSHMessageAttachment].self, forKey: .messageAttachments)
         stagedAttachments = try container.decodeIfPresent([DSHStoredAttachment].self, forKey: .stagedAttachments)
         uploadedAttachments = try container.decodeIfPresent([String: DSHMessageAttachment].self, forKey: .uploadedAttachments)
+        attachmentRecoveryDeadline = container.contains(.attachmentRecoveryDeadline)
+            ? try container.decodeIfPresent(Date.self, forKey: .attachmentRecoveryDeadline)
+            : (stagedAttachments?.isEmpty == false
+                ? sentAt.addingTimeInterval(dshAttachmentRecoveryWindow) : nil)
         phase = try container.decodeIfPresent(DSHPromptTransactionPhase.self, forKey: .phase)
     }
 }
@@ -711,6 +733,10 @@ final class DSHAppModel: ObservableObject {
     /// queue mirror may be resumed after a crash only while this identity is
     /// still guaranteed to coalesce at the remote side.
     static let promptIdempotencyWindow: TimeInterval = 10 * 60
+    /// The Bridge retains completed attachment identities for this period.
+    /// Staged uploads use the same deadline so a long-offline phone never
+    /// reuses an operation id after the Bridge has safely compacted it.
+    static let attachmentRecoveryWindow: TimeInterval = dshAttachmentRecoveryWindow
     var sessionCreationRetryWindow: TimeInterval = 10 * 60
     private var sessionCreationRetryDeadlines: [String: Date] = [:]
     private var sessionCreationResultOrder: [String] = []
@@ -845,7 +871,8 @@ final class DSHAppModel: ObservableObject {
             attachments: attachments,
             sessionID: stored.sessionID,
             dedupeExpiresAt: stored.dedupeExpiresAt,
-            uploadedAttachments: stored.uploadedAttachments)
+            uploadedAttachments: stored.uploadedAttachments,
+            attachmentRecoveryDeadline: stored.attachmentRecoveryDeadline)
     }
 
     private func loadPendingTransactionStore() async {
@@ -988,7 +1015,16 @@ final class DSHAppModel: ObservableObject {
         }
         pendingTransactionStoreLoaded = true
         restoreSessionCreationTransactions(for: machineID)
-        if isPaired { connect() }
+        // A profile can be written by transport.pair before the AppModel has
+        // finished its journal/fence transaction. Never reconnect a profile
+        // that is still fenced after a failed lifecycle commit.
+        if isPaired && !removedMachineIDs.contains(machineID) {
+            connect()
+        } else if removedMachineIDs.contains(machineID) {
+            isPaired = false
+            state.connectionState = .disconnected
+            state.transportState = .disconnected
+        }
     }
 
     private func makePendingTransactionSnapshot() throws -> DSHPendingTransactionSnapshot {
@@ -1025,7 +1061,8 @@ final class DSHAppModel: ObservableObject {
                 attachments: attachments,
                 sessionID: pending.sessionID,
                 uploadedAttachments: pending.uploadedAttachments,
-                dedupeExpiresAt: pending.dedupeExpiresAt)
+                dedupeExpiresAt: pending.dedupeExpiresAt,
+                attachmentRecoveryDeadline: pending.attachmentRecoveryDeadline)
         }
         func storedPendingSend(_ pending: DSHPendingSend) throws -> DSHStoredPendingSend {
             let attachments = try storeAttachments(pending.stagedAttachments)
@@ -1036,7 +1073,8 @@ final class DSHAppModel: ObservableObject {
                 attempt: pending.attempt, messageAttachments: pending.messageAttachments,
                 stagedAttachments: attachments.isEmpty ? nil : attachments,
                 uploadedAttachments: pending.uploadedAttachments.isEmpty ? nil : pending.uploadedAttachments,
-                phase: pending.phase)
+                phase: pending.phase,
+                attachmentRecoveryDeadline: pending.attachmentRecoveryDeadline)
         }
         var storedCreations: [String: [String: DSHStoredSessionCreationTransaction]] = [:]
         for (machineID, transactions) in sessionCreationTransactionsByMachine {
@@ -1162,7 +1200,8 @@ final class DSHAppModel: ObservableObject {
                              sessionID: value.sessionID, mode: value.mode, sentAt: value.sentAt,
                              dedupeExpiresAt: value.dedupeExpiresAt,
                              attempt: value.attempt, messageAttachments: value.messageAttachments,
-                             phase: value.phase)
+                             phase: value.phase,
+                             attachmentRecoveryDeadline: value.attachmentRecoveryDeadline)
     }
 
     private func pendingSend(_ value: DSHStoredPendingSend,
@@ -1763,22 +1802,16 @@ final class DSHAppModel: ObservableObject {
                 // later sidecar clear and final journal write complete the new
                 // pairing lifecycle without exposing a crash window.
                 guard await self.persistPendingTransactionStore() else {
-                    self.removedMachineIDs.insert(profile.machineId)
-                    _ = await self.persistRemovedMachineFence()
+                    await self.rollbackFailedPairing(profile.machineId)
                     return
                 }
                 self.removedMachineIDs.remove(profile.machineId)
                 guard await self.persistRemovedMachineFence() else {
-                    self.removedMachineIDs.insert(profile.machineId)
-                    _ = await self.persistPendingTransactionStore()
+                    await self.rollbackFailedPairing(profile.machineId)
                     return
                 }
                 guard await self.persistPendingTransactionStore() else {
-                    // The sidecar was cleared, but the old journal fence is
-                    // still safe. Restore the in-memory fence and leave the
-                    // new pair disconnected until the user retries pairing.
-                    self.removedMachineIDs.insert(profile.machineId)
-                    _ = await self.persistRemovedMachineFence()
+                    await self.rollbackFailedPairing(profile.machineId)
                     return
                 }
                 self.refreshMachines()
@@ -1790,6 +1823,27 @@ final class DSHAppModel: ObservableObject {
 
     private func refreshMachines() {
         machines = profiles.profiles
+    }
+
+    /// A transport persists credentials before returning from pair(). If the
+    /// subsequent journal/fence commit fails, remove that provisional profile
+    /// instead of leaving an active-but-fenced identity that would reconnect
+    /// after relaunch with no durable recovery path.
+    private func rollbackFailedPairing(_ machineID: String) async {
+        await transport.rollbackPairing(machineId: machineID)
+        removedMachineIDs.insert(machineID)
+        _ = await persistRemovedMachineFence()
+        refreshMachines()
+        if let active = profiles.activeProfile,
+           !removedMachineIDs.contains(active.machineId) {
+            machineName = active.machineName
+            self.machineID = active.machineId
+            isPaired = true
+        } else {
+            machineName = ""
+            self.machineID = ""
+            isPaired = false
+        }
     }
 
     /// Points the app at another paired Mac. The socket is torn down first
@@ -1973,7 +2027,8 @@ final class DSHAppModel: ObservableObject {
     var currentDeviceId: String? { profiles.activeProfile?.deviceId }
 
     func connect() {
-        guard pendingTransactionStoreLoaded, isPaired, eventTask == nil else { return }
+        guard pendingTransactionStoreLoaded, isPaired, eventTask == nil,
+              !machineID.isEmpty, !removedMachineIDs.contains(machineID) else { return }
         if suspendingTransactions {
             reconnectAfterSuspension = true
             return
@@ -2135,6 +2190,10 @@ final class DSHAppModel: ObservableObject {
                        permissionMode: String = "workspace-write",
                        initialPrompt: String? = nil,
                        initialAttachments: [DSHStagedAttachment] = []) -> Bool {
+        guard !removedMachineIDs.contains(machineID), !machineID.isEmpty else {
+            errorMessage = "当前 Mac 配对事务尚未完成，请重新配对后再试。"
+            return false
+        }
         guard !pendingTransactionPersistenceUnavailable else {
             errorMessage = "待处理请求存储不可用，已停止创建以避免重复会话。"
             return false
@@ -2198,7 +2257,9 @@ final class DSHAppModel: ObservableObject {
                 text: trimmedInitialPrompt,
                 attachments: initialAttachments,
                 sessionID: nil,
-                dedupeExpiresAt: nil)
+                dedupeExpiresAt: nil,
+                attachmentRecoveryDeadline: initialAttachments.isEmpty
+                    ? nil : Date().addingTimeInterval(Self.attachmentRecoveryWindow))
         }
         let command = DSHCommand(requestId: requestId, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
@@ -2512,7 +2573,9 @@ final class DSHAppModel: ObservableObject {
                 id: requestID, text: trimmed, receipts: [], sessionID: sessionID,
                 mode: mode, sentAt: .now, attempt: attempt,
                 messageAttachments: [], phase: .preparing, stagedAttachments: staged,
-                uploadedAttachments: [:])
+                uploadedAttachments: [:],
+                attachmentRecoveryDeadline: staged.isEmpty
+                    ? nil : Date().addingTimeInterval(Self.attachmentRecoveryWindow))
             pendingSendsByRequestID[requestID] = pending
             guard await persistCurrentTransactions(for: machineID) else {
                 pendingSendsByRequestID.removeValue(forKey: requestID)
@@ -2528,6 +2591,9 @@ final class DSHAppModel: ObservableObject {
             pending!.stagedAttachments = staged
             pending!.sentAt = .now
             pending!.phase = .preparing
+            if pending!.attachmentRecoveryDeadline == nil, !staged.isEmpty {
+                pending!.attachmentRecoveryDeadline = Date().addingTimeInterval(Self.attachmentRecoveryWindow)
+            }
             pendingSendsByRequestID[requestID] = pending
             guard await persistCurrentTransactions(for: machineID) else { return false }
         }
@@ -2535,8 +2601,24 @@ final class DSHAppModel: ObservableObject {
         guard var current = pendingSendsByRequestID[requestID] else { return false }
         guard current.sessionID == sessionID,
               current.phase == .preparing || current.phase == .readyToSend else { return false }
+        if let deadline = current.attachmentRecoveryDeadline,
+           Date() >= deadline,
+           (!current.stagedAttachments.isEmpty || !current.uploadedAttachments.isEmpty) {
+            pendingSendsByRequestID.removeValue(forKey: requestID)
+            failedSendsByRequestID[requestID] = DSHFailedSend(
+                id: requestID, text: current.text, receipts: current.receipts,
+                sessionID: current.sessionID, mode: current.mode,
+                messageAttachments: current.messageAttachments,
+                failure: .local("附件恢复期限已过，请重新选择附件后发送。"),
+                retryUntil: .now)
+            _ = await persistCurrentTransactions(for: machineID)
+            throw DSHAttachmentUploadError.recoveryExpired
+        }
         if current.phase == .preparing && current.stagedAttachments.isEmpty && !staged.isEmpty && current.receipts.isEmpty {
             current.stagedAttachments = staged
+            if current.attachmentRecoveryDeadline == nil {
+                current.attachmentRecoveryDeadline = Date().addingTimeInterval(Self.attachmentRecoveryWindow)
+            }
         }
         // A reconnect can invoke this method to resume an already-preparing
         // request; the stored staged array is authoritative in that case.
@@ -2722,11 +2804,13 @@ final class DSHAppModel: ObservableObject {
         /// map instead of losing the draft after partial remote uploads.
         var stagedAttachments: [DSHStagedAttachment] = []
         var uploadedAttachments: [String: DSHMessageAttachment] = [:]
+        /// Matches the Bridge's completed attachment retention window.
+        var attachmentRecoveryDeadline: Date?
 
         private enum CodingKeys: String, CodingKey {
             case id, text, receipts, sessionID, mode, sentAt, attempt,
                  messageAttachments, phase, stagedAttachments, uploadedAttachments,
-                 dedupeExpiresAt
+                 dedupeExpiresAt, attachmentRecoveryDeadline
         }
 
         init(id: String, text: String, receipts: [String], sessionID: String,
@@ -2734,7 +2818,8 @@ final class DSHAppModel: ObservableObject {
              messageAttachments: [DSHMessageAttachment],
              phase: DSHPromptTransactionPhase = .awaitingAck,
              stagedAttachments: [DSHStagedAttachment] = [],
-             uploadedAttachments: [String: DSHMessageAttachment] = [:]) {
+             uploadedAttachments: [String: DSHMessageAttachment] = [:],
+             attachmentRecoveryDeadline: Date? = nil) {
             self.id = id
             self.text = text
             self.receipts = receipts
@@ -2747,6 +2832,7 @@ final class DSHAppModel: ObservableObject {
             self.phase = phase
             self.stagedAttachments = stagedAttachments
             self.uploadedAttachments = uploadedAttachments
+            self.attachmentRecoveryDeadline = attachmentRecoveryDeadline
         }
 
         init(from decoder: Decoder) throws {
@@ -2763,6 +2849,9 @@ final class DSHAppModel: ObservableObject {
             stagedAttachments = try container.decodeIfPresent([DSHStagedAttachment].self, forKey: .stagedAttachments) ?? []
             uploadedAttachments = try container.decodeIfPresent(
                 [String: DSHMessageAttachment].self, forKey: .uploadedAttachments) ?? [:]
+            attachmentRecoveryDeadline = container.contains(.attachmentRecoveryDeadline)
+                ? try container.decodeIfPresent(Date.self, forKey: .attachmentRecoveryDeadline)
+                : (stagedAttachments.isEmpty ? nil : sentAt.addingTimeInterval(dshAttachmentRecoveryWindow))
             if let storedPhase = try container.decodeIfPresent(DSHPromptTransactionPhase.self, forKey: .phase) {
                 phase = storedPhase
             } else if !stagedAttachments.isEmpty {
@@ -2791,6 +2880,7 @@ final class DSHAppModel: ObservableObject {
             try container.encode(phase, forKey: .phase)
             try container.encode(stagedAttachments, forKey: .stagedAttachments)
             try container.encode(uploadedAttachments, forKey: .uploadedAttachments)
+            try container.encodeIfPresent(attachmentRecoveryDeadline, forKey: .attachmentRecoveryDeadline)
         }
     }
 
@@ -3432,6 +3522,9 @@ final class DSHAppModel: ObservableObject {
     func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String,
                                  machineGeneration: Int? = nil,
                                  requestID requestedRequestID: String? = nil) async throws -> String {
+        guard !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
+            throw DSHWebSocketError.machineMismatch
+        }
         guard data.count <= Self.maxAttachmentBytes else { throw DSHAttachmentUploadError.tooLarge }
         if let machineGeneration, machineGeneration != self.machineStateGeneration {
             throw CancellationError()
@@ -3556,6 +3649,10 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func send(_ command: DSHCommand) {
+        guard !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
+            errorMessage = "当前 Mac 配对事务尚未完成，请重新配对后再试。"
+            return
+        }
         let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
         let promptDeadline = command.type == "prompt.send"
             ? pendingSendsByRequestID[command.requestId]?.dedupeExpiresAt
@@ -4220,6 +4317,11 @@ final class DSHAppModel: ObservableObject {
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         var pendingMessage = pending
         do {
+            if let deadline = pendingMessage.attachmentRecoveryDeadline,
+               Date() >= deadline,
+               (!pendingMessage.attachments.isEmpty || !pendingMessage.uploadedAttachments.isEmpty) {
+                throw DSHAttachmentUploadError.recoveryExpired
+            }
             var receipts: [String] = []
             var messageAttachments: [DSHMessageAttachment] = []
             receipts.reserveCapacity(pendingMessage.attachments.count)

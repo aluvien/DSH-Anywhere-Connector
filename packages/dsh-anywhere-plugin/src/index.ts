@@ -89,7 +89,7 @@ export class IdempotentHttpResponses {
         (captured) => {
           if (this.entries.get(key) === entry) {
             const outcome = idempotencyOutcomeOf(captured)
-            if (outcome === 'retryable' || outcome === 'retryable-committed') {
+            if (outcome === 'retryable' || outcome === 'retryable-committed' || outcome === 'retryable-durable') {
               // The handler explicitly established that no side effect was
               // accepted. Let a same-id retry invoke it again after recovery.
               this.entries.delete(key)
@@ -140,10 +140,11 @@ async function captureHttpResponse(handler: (capture: ServerResponse) => Promise
   return { status, headers, body }
 }
 
-function idempotencyOutcomeOf(captured: CapturedHttpResponse): 'final' | 'retryable' | 'retryable-committed' | 'unknown' {
+function idempotencyOutcomeOf(captured: CapturedHttpResponse): 'final' | 'retryable' | 'retryable-committed' | 'retryable-durable' | 'unknown' {
   const header = captured.headers['x-dsh-idempotency-outcome']
   const value = Array.isArray(header) ? header[0] : header
-  return value === 'retryable' || value === 'retryable-committed' ? value : value === 'final' ? 'final' : 'unknown'
+  return value === 'retryable' || value === 'retryable-committed' || value === 'retryable-durable'
+    ? value : value === 'final' ? 'final' : 'unknown'
 }
 
 export const name = 'dsh-anywhere-native-bridge'
@@ -288,6 +289,16 @@ export interface LiveStreamAttempt {
   reasoningTrail: string
 }
 
+/**
+ * Result of reconciling a durable attachment operation after a Bridge
+ * restart. `unknown` is deliberately distinct from `not-committed`: only
+ * the latter permits the same request id to invoke the native uploader again.
+ */
+export type AttachmentUploadRecoveryResult =
+  | { readonly state: 'found'; readonly response: unknown }
+  | { readonly state: 'not-committed' }
+  | { readonly state: 'unknown' }
+
 interface NativeContext extends Context {
   readonly webServer: {
     register(route: {
@@ -309,7 +320,7 @@ interface NativeContext extends Context {
      * stable upload operation id alongside the staged receipt. Older Harness
      * builds do not expose this lookup; those builds fail closed on an
      * uncertain upload instead of issuing a duplicate native upload. */
-    findAttachmentByRequestId?(requestId: string, signal: AbortSignal): Promise<unknown | undefined>
+    findAttachmentByRequestId?(requestId: string, signal: AbortSignal): Promise<unknown | undefined | AttachmentUploadRecoveryResult>
     /** Available in current Harness builds; optional for older connectors. */
     rename?(request: { sessionId: string; title: string }): Promise<unknown>
     selectModel(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<unknown>
@@ -2423,20 +2434,32 @@ async function handleHttp(
           try {
             const recovered = await findAttachmentByRequestId(
               pending.nativeOperationId, AbortSignal.timeout(15_000))
-            const response = attachmentUploadResponseOf(recovered, body.name)
-            if (response !== undefined) {
+            const recovery = attachmentUploadRecoveryResultOf(recovered)
+            if (recovery.state === 'found') {
+              const response = attachmentUploadResponseOf(recovery.response, body.name)
+              if (response === undefined) throw new Error('attachment recovery returned no receipt')
               await metadata.setAttachmentUploadResult(
                 durableKey, fingerprint, response, pending.nativeOperationId)
               json(res, 200, response)
               return
             }
+            if (recovery.state === 'not-committed') {
+              // The adapter has authoritative knowledge that the operation
+              // never crossed the native upload boundary. Release the marker
+              // and continue through the ordinary upload path below.
+              await metadata.markAttachmentUploadNotCommitted(durableKey, fingerprint)
+            } else {
+              throw new HttpError(503, 'attachment upload result is still unknown', 'retryable-durable')
+            }
           } catch {
             // Recovery is best effort. Keep the durable pending marker and
             // report an unknown result below; never fall back to a duplicate
             // native upload after an ambiguous adapter failure.
+            throw new HttpError(503, 'attachment upload result is still unknown', 'retryable-durable')
           }
+        } else {
+          throw new HttpError(503, 'attachment upload result is still unknown', 'retryable-durable')
         }
-        throw new HttpError(503, 'attachment upload result is still unknown', 'unknown')
       }
       const remembered = metadata.attachmentUploadEntry(durableKey, fingerprint)
       if (remembered !== undefined) {
@@ -2711,6 +2734,28 @@ function attachmentUploadResponseOf(value: unknown, name: string): Record<string
     ...(typeof file.mediaType === 'string' ? { mediaType: file.mediaType } : {}),
     ...(typeof file.size === 'number' ? { size: file.size } : {}),
   }
+}
+
+function attachmentUploadRecoveryResultOf(value: unknown): AttachmentUploadRecoveryResult {
+  if (value === undefined) return { state: 'unknown' }
+  const record = recordOf(value)
+  const state = typeof record.state === 'string'
+    ? record.state
+    : typeof record.status === 'string' ? record.status : undefined
+  if (state === 'not-committed' || state === 'definitelyNotCommitted') {
+    return { state: 'not-committed' }
+  }
+  if (state === 'unknown') return { state: 'unknown' }
+  if (state === 'found') {
+    return {
+      state: 'found',
+      response: record.response ?? record.value,
+    }
+  }
+  // Older adapters returned the receipt object directly. Preserve that
+  // contract as a successful lookup while allowing new adapters to return an
+  // explicit three-state result.
+  return { state: 'found', response: value }
 }
 
 function objectOf(value: unknown): JsonObject {

@@ -34,7 +34,7 @@ export class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
-    readonly idempotencyOutcome: 'final' | 'retryable' | 'retryable-committed' | 'unknown' = status >= 500 ? 'unknown' : 'final',
+    readonly idempotencyOutcome: 'final' | 'retryable' | 'retryable-committed' | 'retryable-durable' | 'unknown' = status >= 500 ? 'unknown' : 'final',
   ) {
     super(message)
   }

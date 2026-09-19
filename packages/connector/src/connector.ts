@@ -687,7 +687,8 @@ export class DSHAnywhereConnector {
     });
     if (!response.ok) {
       const outcomeHeader = response.headers.get("x-dsh-idempotency-outcome");
-      const outcome = outcomeHeader === "retryable" || outcomeHeader === "unknown"
+      const outcome = outcomeHeader === "retryable" || outcomeHeader === "retryable-committed"
+        || outcomeHeader === "retryable-durable" || outcomeHeader === "unknown"
         ? outcomeHeader : undefined;
       throw new BridgeRequestError(response.status, `HTTP ${response.status}`, outcome);
     }
@@ -1176,6 +1177,7 @@ export class DSHAnywhereConnector {
       (error instanceof Error && error.name === "TimeoutError")
       || (error instanceof BridgeRequestError && error.outcome === "unknown")
       || (error instanceof BridgeRequestError && error.outcome === "retryable-committed")
+      || (error instanceof BridgeRequestError && error.outcome === "retryable-durable")
       || command.type === "session.create"
     );
     const reason = resultUnknown
@@ -1189,7 +1191,9 @@ export class DSHAnywhereConnector {
     // An explicit Bridge `unknown` outcome remains non-retryable because the
     // native side may already have committed a partial effect.
     const retryable = resultUnknown
-      ? command.type === "session.create" || (error instanceof Error && error.name === "TimeoutError")
+      ? command.type === "session.create"
+        || (error instanceof BridgeRequestError && error.outcome === "retryable-durable")
+        || (error instanceof Error && error.name === "TimeoutError")
       : isRetryable(error);
     this.sendEvent({
       version: PROTOCOL_VERSION,
@@ -1799,7 +1803,7 @@ class BridgeRequestError extends Error {
   constructor(
     readonly status: number,
     message = `HTTP ${status}`,
-    readonly outcome: "retryable" | "retryable-committed" | "unknown" | undefined = undefined,
+    readonly outcome: "retryable" | "retryable-committed" | "retryable-durable" | "unknown" | undefined = undefined,
   ) {
     super(message);
   }
@@ -1860,7 +1864,9 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function isRetryable(error: unknown): boolean {
   if (!(error instanceof BridgeRequestError)) return true;
-  if (error.outcome !== undefined) return error.outcome === "retryable";
+  if (error.outcome !== undefined) {
+    return error.outcome === "retryable" || error.outcome === "retryable-durable";
+  }
   return error.status >= 500;
 }
 

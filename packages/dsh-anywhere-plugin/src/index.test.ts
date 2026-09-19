@@ -420,7 +420,7 @@ describe('native bridge mutations', () => {
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
     invoke?: (request: unknown) => Promise<unknown>
-    findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined>
+    findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined | { state: 'found' | 'not-committed' | 'unknown'; response?: unknown }>
     dataDir?: string
   } = {}) {
     // Each mounted Bridge gets an isolated metadata file.  The real plugin
@@ -780,6 +780,33 @@ describe('native bridge mutations', () => {
       { name: 'a.txt', data: 'YWJj' }, requestId,
     )).resolves.toMatchObject({ status: 200, body: { receiptId: 'receipt-recovered' } })
     expect(uploads).toBe(0)
+  })
+
+  it('retries after an adapter proves a pending upload never committed', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-not-committed-'))
+    const requestId = 'attachment-not-committed'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000${requestId}`
+    const nativeOperationId = createHash('sha256')
+      .update(`attachment\0${key}`).digest('hex')
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      attachmentUploads: {
+        [key]: { pending: true, nativeOperationId },
+      },
+    }))
+    let uploads = 0
+    const request = mount({
+      dataDir,
+      invoke: async () => {
+        uploads += 1
+        return { ok: true, value: { receiptId: 'receipt-after-negative-recovery' } }
+      },
+      findAttachmentByRequestId: async () => ({ state: 'not-committed' }),
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions/s1/attachments',
+      { name: 'a.txt', data: 'YWJj' }, requestId,
+    )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-after-negative-recovery' } })
+    expect(uploads).toBe(1)
   })
 })
 
