@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 import ImageIO
 import UIKit
 
-struct DSHStagedAttachment: Identifiable, Sendable, Codable {
+struct DSHStagedAttachment: Identifiable, Sendable, Codable, Equatable {
     let id: UUID
     let name: String
     let data: Data
@@ -2071,7 +2071,10 @@ struct ConversationView: View {
             model.draft = ""
             return
         }
-        let requestId = UUID().uuidString
+        let requestId = staged.isEmpty
+            ? UUID().uuidString
+            : (model.stagedPromptRequestID(text: trimmed, attachments: staged, sessionID: sessionID)
+                ?? UUID().uuidString)
 
         // Keep the editor's contents until the prompt transaction is durably
         // accepted. `isSending` prevents a double tap while uploads are in
@@ -2095,32 +2098,19 @@ struct ConversationView: View {
                 return
             }
             do {
-                var receipts: [String] = []
-                var messageAttachments: [DSHMessageAttachment] = []
-                receipts.reserveCapacity(staged.count)
-                for attachment in staged {
-                    let receipt = try await model.uploadAttachmentAndWait(name: attachment.name,
-                                                                           data: attachment.data,
-                                                                           for: sessionID,
-                                                                           machineGeneration: machineGeneration)
-                    receipts.append(receipt)
-                    let mediaType = attachment.isImage ? "image/jpeg" : nil
-                    model.cacheAttachmentData(attachment.data, for: receipt)
-                    messageAttachments.append(DSHMessageAttachment(id: receipt,
-                                                                    name: attachment.name,
-                                                                    mediaType: mediaType,
-                                                                    receiptId: receipt))
+                let sent: Bool
+                if staged.isEmpty {
+                    sent = await model.sendPromptPersisted(
+                        text, attachments: [], to: sessionID, mode: mode, requestId: requestId,
+                        expectedMachineGeneration: machineGeneration,
+                        expectedMachineID: expectedMachineID)
+                } else {
+                    sent = try await model.sendStagedPromptPersisted(
+                        text, attachments: staged, to: sessionID, mode: mode,
+                        requestId: requestId,
+                        expectedMachineGeneration: machineGeneration,
+                        expectedMachineID: expectedMachineID)
                 }
-                guard model.isCurrentMachineGeneration(machineGeneration),
-                      model.machineID == expectedMachineID else {
-                    isSending = false
-                    return
-                }
-                let sent = await model.sendPromptPersisted(
-                    text, attachments: receipts, messageAttachments: messageAttachments,
-                    to: sessionID, mode: mode, requestId: requestId,
-                    expectedMachineGeneration: machineGeneration,
-                    expectedMachineID: expectedMachineID)
                 guard sent else {
                     isSending = false
                     return

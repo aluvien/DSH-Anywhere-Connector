@@ -477,6 +477,19 @@ export class DSHAnywhereConnector {
       return;
     }
     this.log("info", `Received ${command.data.type} from device ${shortID(command.data.deviceId)}`);
+    // Relay delivers the device-presence edge immediately before the first
+    // command from a newly connected phone.  The Bridge uses that reported
+    // lease as the origin-authentication proof, so do not race the HTTP
+    // presence update with session.create (or another mutation).  The update
+    // is serialized per device; a failed report still resolves and the normal
+    // Bridge response then explains the unavailable origin.
+    const presenceUpdate = this.presenceUpdates.get(command.data.deviceId);
+    if (presenceUpdate !== undefined) {
+      void presenceUpdate.then(() => {
+        if (this.relay === socket && this.running) this.dispatchCommand(command.data);
+      });
+      return;
+    }
     this.dispatchCommand(command.data);
   }
 

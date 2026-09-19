@@ -361,7 +361,7 @@ interface SessionCreationRecord {
   readonly response?: JsonObject
   readonly pending?: boolean
   /** Native create committed, but optional setup has not completed yet. */
-  readonly sessionId?: string
+  sessionId?: string
   /** Stable operation identity passed into the native create boundary. */
   readonly nativeOperationId?: string
   readonly setup?: SessionCreationSetup | undefined
@@ -454,18 +454,44 @@ class SessionMetadataStore {
    * device.  Session snapshots use this correlation only to recover a
    * detached create after its live `session.created` event was lost.
    */
-  sessionCreationRequestIdForSession(deviceId: string, sessionId: string): string | undefined {
+  async sessionCreationRequestIdForSession(deviceId: string, sessionId: string,
+                                           observedCreateRequestId?: string): Promise<string | undefined> {
     const prefix = `${deviceId}\0`
     let match: string | undefined
     for (const [key, entry] of this.sessionCreationResults) {
-      if (!key.startsWith(prefix) || entry.sessionId !== sessionId) continue
+      if (!key.startsWith(prefix)) continue
+      const matchesSession = entry.sessionId === sessionId
+      const matchesNativeOperation = observedCreateRequestId !== undefined &&
+        entry.nativeOperationId === observedCreateRequestId
+      if (!matchesSession && !matchesNativeOperation) continue
       // A native create may have committed before a later setup stage failed.
       // That partial record still identifies the session and must be exposed
       // for snapshot reconciliation; otherwise a lost `session.created`
       // leaves the iOS transaction detached forever.
       match = key.slice(prefix.length)
+      if (matchesNativeOperation && entry.sessionId !== sessionId) {
+        // This is the crash window between native create and
+        // setSessionCreationStarted().  Once the authoritative list gives us
+        // the session id, persist that association and project the original
+        // phone request id instead of leaking the internal hash operation id.
+        entry.sessionId = sessionId
+        await this.persist()
+      }
     }
     return match
+  }
+
+  async markSessionCreationNotCommitted(key: string, fingerprint: string | undefined): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.sessionCreationResults.get(key)
+    if (entry === undefined) return
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    this.sessionCreationResults.delete(key)
+    await this.persist()
   }
 
   private completedRecordsEligibleForCompaction(now: number): string[] {
@@ -1834,8 +1860,17 @@ async function handleHttp(
     const originDeviceId = device.id === CONNECTOR_DEVICE_ID
       ? bodyDeviceId ?? headerDeviceId ?? device.id
       : device.id
-    if (device.id === CONNECTOR_DEVICE_ID && !pairing.hasDevice(originDeviceId)) {
-      throw new HttpError(403, 'origin device is not paired with this Bridge')
+    if (originDeviceId.length === 0 || originDeviceId.length > 256) {
+      throw new HttpError(400, 'origin device id is invalid')
+    }
+    if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID &&
+        !relayDevices.has(originDeviceId)) {
+      // A phone paired through Relay is not present in the Bridge-local
+      // PairingAuthority.  The Connector's authenticated Relay lease is the
+      // authoritative proof that this origin is a currently connected,
+      // paired device; using the local pairing table here rejected every
+      // normal remote session.create request with 403.
+      throw new HttpError(403, 'origin device is not connected through Relay')
     }
     const cwd = optionalStringOf(body.cwd)
     const workspaceId = optionalStringOf(body.workspaceId)
@@ -1948,16 +1983,38 @@ async function handleHttp(
       // has a durable tombstone and will refuse a duplicate execution.
       await metadata.setSessionCreationPending(durableKey, fingerprint, setup, nativeOperationId)
     }
-    const result = await ctx.sessionController.create({
-      ...(nativeOperationId === undefined ? {} : {
-        requestId: nativeOperationId,
-        createRequestId: nativeOperationId,
-      }),
-      ...(cwd === undefined ? {} : { cwd }),
-      ...(workspaceId === undefined ? {} : { workspaceId }),
-      ...(agentPreset === undefined ? {} : { agentPreset }),
-      ...(model === undefined ? {} : { model }),
-    })
+    let result: { sessionId: string; agentPreset?: string }
+    try {
+      result = await ctx.sessionController.create({
+        ...(nativeOperationId === undefined ? {} : {
+          requestId: nativeOperationId,
+          createRequestId: nativeOperationId,
+        }),
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(workspaceId === undefined ? {} : { workspaceId }),
+        ...(agentPreset === undefined ? {} : { agentPreset }),
+        ...(model === undefined ? {} : { model }),
+      })
+    } catch (error) {
+      // A rejected native call is safe to forget only when the adapter can
+      // authoritatively prove that the operation id never committed.  If the
+      // adapter cannot answer (or answers with an existing session), retain
+      // the pending tombstone and fail closed so a retry cannot create twice.
+      let notCommitted = false
+      const findByRequestId = ctx.sessionController.findByRequestId
+      if (nativeOperationId !== undefined && findByRequestId !== undefined) {
+        try {
+          notCommitted = (await findByRequestId(
+            nativeOperationId, AbortSignal.timeout(15_000))) === undefined
+        } catch {
+          notCommitted = false
+        }
+      }
+      if (notCommitted && durableKey !== undefined) {
+        await metadata.markSessionCreationNotCommitted(durableKey, fingerprint)
+      }
+      throw error
+    }
     // The native create has already committed the side effect at this point.
     // Persist its identity before optional title/model/permission setup, so a
     // later setup failure or a lost response can never make a retry create a
@@ -2195,14 +2252,14 @@ async function listSummaries(
   deviceId?: string,
 ): Promise<ReturnType<typeof normalizeSessionSummary>[]> {
   const result = await ctx.sessionController.list({}, AbortSignal.timeout(15_000))
-  const summaries = result.items
-    .map((item) => {
+  const summaries = (await Promise.all(result.items.map(async (item) => {
       const summary = normalizeSessionSummary(item, ctx, metadata)
       const createRequestId = deviceId === undefined
         ? summary.createRequestId
-        : metadata.sessionCreationRequestIdForSession(deviceId, summary.id) ?? summary.createRequestId
+        : await metadata.sessionCreationRequestIdForSession(
+          deviceId, summary.id, summary.createRequestId) ?? summary.createRequestId
       return createRequestId === undefined ? summary : { ...summary, createRequestId }
-    })
+    })))
     // A subagent session is how the agent delegates its own work, not a
     // conversation the user started. Listing them buried the real ones: 18 of
     // 40 rows were subagents in practice, each titled with its task prompt.
