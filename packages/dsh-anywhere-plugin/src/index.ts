@@ -560,7 +560,6 @@ class SessionMetadataStore {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
-    this.rejectGrowthWhileOverCapacity('attachment upload metadata capacity is full')
     const now = Date.now()
     const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
     let expiredCount = [...this.attachmentUploadResults.values()]
@@ -610,6 +609,10 @@ class SessionMetadataStore {
     if (!this.attachmentUploadResults.has(key) && activeCount >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
       throw new HttpError(503, 'attachment upload idempotency capacity is full', 'unknown')
     }
+    // Let the pruning pass above compact completed records even while the
+    // file is over the normal byte budget. Only the new pending record is a
+    // growth operation and must wait for reconciliation/compaction.
+    this.rejectGrowthWhileOverCapacity('attachment upload metadata capacity is full')
     this.attachmentUploadResults.set(key, {
       fingerprint,
       ...(name === undefined ? {} : { name }),
@@ -638,7 +641,7 @@ class SessionMetadataStore {
       ...(operationId === undefined ? {} : { nativeOperationId: operationId }),
     })
     try {
-      await this.persist()
+      await this.persist(previous?.expired === true)
     } catch (error) {
       if (previous === undefined) this.attachmentUploadResults.delete(key)
       else this.attachmentUploadResults.set(key, previous)
@@ -1100,7 +1103,7 @@ class SessionMetadataStore {
     }
   }
 
-  private persist(): Promise<void> {
+  private persist(allowCapacityRecoveryReplacement = false): Promise<void> {
     if (this.persistenceUnavailable) {
       return Promise.reject(new Error('session presentation metadata is unavailable'))
     }
@@ -1122,7 +1125,10 @@ class SessionMetadataStore {
       // A pre-existing oversized file is repairable only through shrink-only
       // writes. Reject growth, but do not poison the store so an operator can
       // reconcile expired attachment tombstones and compact it below the cap.
-      if (!this.persistenceCapacityExceeded || snapshotBytes >= this.metadataByteLength) {
+      const canReplaceOneExpiredRecord = allowCapacityRecoveryReplacement &&
+        this.persistenceCapacityExceeded && snapshotBytes < MAX_SESSION_METADATA_LOAD_BYTES
+      if (!canReplaceOneExpiredRecord &&
+          (!this.persistenceCapacityExceeded || snapshotBytes >= this.metadataByteLength)) {
         // There may be no file yet (for example the very first oversized
         // request). Use the rejected snapshot as the recovery baseline so a
         // later deletion can still shrink it into a writable range.
