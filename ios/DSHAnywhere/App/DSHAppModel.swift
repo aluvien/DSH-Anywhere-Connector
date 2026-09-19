@@ -26,6 +26,9 @@ private struct DSHPendingInitialMessage: Codable, Sendable {
     let text: String
     let attachments: [DSHStagedAttachment]
     var sessionID: String?
+    /// Fixed when the independent prompt.send first enters the wire-facing
+    /// phase. Recovery must not extend the server dedupe window.
+    var dedupeExpiresAt: Date?
     /// Receipt metadata survives a partial upload failure. Retrying the
     /// second file must not upload the first file again.
     var uploadedAttachments: [String: DSHMessageAttachment] = [:]
@@ -117,6 +120,7 @@ private struct DSHStoredInitialMessage: Codable, Sendable {
     let attachments: [DSHStoredAttachment]
     let sessionID: String?
     let uploadedAttachments: [String: DSHMessageAttachment]
+    let dedupeExpiresAt: Date?
 }
 
 private struct DSHStoredSessionCreationTransaction: Codable, Sendable {
@@ -153,6 +157,9 @@ private struct DSHStoredPendingSend: Codable, Sendable {
     let sessionID: String
     let mode: String
     let sentAt: Date
+    /// The fixed server-side request-id retention deadline. This is separate
+    /// from sentAt because a queued draft may wait locally before dispatch.
+    let dedupeExpiresAt: Date?
     let attempt: Int
     let messageAttachments: [DSHMessageAttachment]
     let phase: DSHPromptTransactionPhase?
@@ -163,7 +170,7 @@ private struct DSHStoredPendingSend: Codable, Sendable {
     let uploadedAttachments: [String: DSHMessageAttachment]?
 
     init(id: String, text: String, receipts: [String], sessionID: String,
-         mode: String, sentAt: Date, attempt: Int,
+         mode: String, sentAt: Date, dedupeExpiresAt: Date? = nil, attempt: Int,
          messageAttachments: [DSHMessageAttachment],
          stagedAttachments: [DSHStoredAttachment]? = nil,
          uploadedAttachments: [String: DSHMessageAttachment]? = nil,
@@ -174,6 +181,7 @@ private struct DSHStoredPendingSend: Codable, Sendable {
         self.sessionID = sessionID
         self.mode = mode
         self.sentAt = sentAt
+        self.dedupeExpiresAt = dedupeExpiresAt
         self.attempt = attempt
         self.messageAttachments = messageAttachments
         self.stagedAttachments = stagedAttachments
@@ -183,7 +191,8 @@ private struct DSHStoredPendingSend: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, text, receipts, sessionID, mode, sentAt, attempt,
-             messageAttachments, stagedAttachments, uploadedAttachments, phase
+             messageAttachments, stagedAttachments, uploadedAttachments, phase,
+             dedupeExpiresAt
     }
 
     init(from decoder: Decoder) throws {
@@ -194,6 +203,7 @@ private struct DSHStoredPendingSend: Codable, Sendable {
         sessionID = try container.decode(String.self, forKey: .sessionID)
         mode = try container.decode(String.self, forKey: .mode)
         sentAt = try container.decode(Date.self, forKey: .sentAt)
+        dedupeExpiresAt = try container.decodeIfPresent(Date.self, forKey: .dedupeExpiresAt)
         attempt = try container.decode(Int.self, forKey: .attempt)
         messageAttachments = try container.decode([DSHMessageAttachment].self, forKey: .messageAttachments)
         stagedAttachments = try container.decodeIfPresent([DSHStoredAttachment].self, forKey: .stagedAttachments)
@@ -690,6 +700,7 @@ final class DSHAppModel: ObservableObject {
             text: stored.text,
             attachments: attachments,
             sessionID: stored.sessionID,
+            dedupeExpiresAt: stored.dedupeExpiresAt,
             uploadedAttachments: stored.uploadedAttachments)
     }
 
@@ -851,13 +862,15 @@ final class DSHAppModel: ObservableObject {
                 text: pending.text,
                 attachments: attachments,
                 sessionID: pending.sessionID,
-                uploadedAttachments: pending.uploadedAttachments)
+                uploadedAttachments: pending.uploadedAttachments,
+                dedupeExpiresAt: pending.dedupeExpiresAt)
         }
         func storedPendingSend(_ pending: DSHPendingSend) throws -> DSHStoredPendingSend {
             let attachments = try storeAttachments(pending.stagedAttachments)
             return DSHStoredPendingSend(
                 id: pending.id, text: pending.text, receipts: pending.receipts,
                 sessionID: pending.sessionID, mode: pending.mode, sentAt: pending.sentAt,
+                dedupeExpiresAt: pending.dedupeExpiresAt,
                 attempt: pending.attempt, messageAttachments: pending.messageAttachments,
                 stagedAttachments: attachments.isEmpty ? nil : attachments,
                 uploadedAttachments: pending.uploadedAttachments.isEmpty ? nil : pending.uploadedAttachments,
@@ -953,6 +966,7 @@ final class DSHAppModel: ObservableObject {
     private func storedPendingSend(_ value: DSHPendingSend) -> DSHStoredPendingSend {
         DSHStoredPendingSend(id: value.id, text: value.text, receipts: value.receipts,
                              sessionID: value.sessionID, mode: value.mode, sentAt: value.sentAt,
+                             dedupeExpiresAt: value.dedupeExpiresAt,
                              attempt: value.attempt, messageAttachments: value.messageAttachments,
                              phase: value.phase)
     }
@@ -982,6 +996,7 @@ final class DSHAppModel: ObservableObject {
         }
         return DSHPendingSend(id: value.id, text: value.text, receipts: value.receipts,
                        sessionID: value.sessionID, mode: value.mode, sentAt: value.sentAt,
+                       dedupeExpiresAt: value.dedupeExpiresAt,
                        attempt: value.attempt, messageAttachments: value.messageAttachments,
                        phase: value.phase ?? (staged.isEmpty
                            ? (value.uploadedAttachments?.isEmpty == false ? .readyToSend : .awaitingAck)
@@ -1127,6 +1142,14 @@ final class DSHAppModel: ObservableObject {
                 }
             }
         }
+        // Restore existing failures before expiring stale awaitingAck
+        // transactions. timeoutPendingSend() creates new entries in this map;
+        // assigning the disk snapshot afterwards would erase those freshly
+        // recovered retry records.
+        if let failedSnapshot = failedPromptTransactionsByMachine[machineID] {
+            let restored = failedSnapshot.mapValues(failedSend)
+            failedSendsByRequestID.merge(restored) { current, _ in current }
+        }
         if let pendingSnapshot = pendingPromptTransactionsByMachine[machineID] {
             pendingSendsByRequestID = pendingSnapshot
             for pending in pendingSendsByRequestID.values {
@@ -1139,9 +1162,6 @@ final class DSHAppModel: ObservableObject {
                                       delay: sendAckTimeout - elapsed)
                 }
             }
-        }
-        if let failedSnapshot = failedPromptTransactionsByMachine[machineID] {
-            failedSendsByRequestID = failedSnapshot.mapValues(failedSend)
         }
     }
 
@@ -1870,7 +1890,8 @@ final class DSHAppModel: ObservableObject {
                 promptRequestID: UUID().uuidString,
                 text: trimmedInitialPrompt,
                 attachments: initialAttachments,
-                sessionID: nil)
+                sessionID: nil,
+                dedupeExpiresAt: nil)
         }
         let command = DSHCommand(requestId: requestId, deviceId: deviceID, machineId: machineID,
                                   type: "session.create",
@@ -2106,12 +2127,14 @@ final class DSHAppModel: ObservableObject {
                     messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
                     mode: String = "queue", requestId requestedRequestID: String? = nil,
                     expectedMachineGeneration: Int? = nil,
-                    expectedMachineID: String? = nil) -> Bool {
+                    expectedMachineID: String? = nil,
+                    dedupeExpiresAt: Date? = nil) -> Bool {
         guard let prepared = preparePrompt(text, attachments: attachments,
                                            messageAttachments: messageAttachments, to: sessionID,
                                            mode: mode, requestId: requestedRequestID,
                                            expectedMachineGeneration: expectedMachineGeneration,
-                                           expectedMachineID: expectedMachineID) else { return false }
+                                           expectedMachineID: expectedMachineID,
+                                           dedupeExpiresAt: dedupeExpiresAt) else { return false }
         Task { @MainActor [weak self] in
             _ = await self?.persistAndSend(prepared)
         }
@@ -2127,12 +2150,14 @@ final class DSHAppModel: ObservableObject {
                              messageAttachments: [DSHMessageAttachment] = [], to sessionID: String,
                              mode: String = "queue", requestId requestedRequestID: String? = nil,
                              expectedMachineGeneration: Int? = nil,
-                             expectedMachineID: String? = nil) async -> Bool {
+                             expectedMachineID: String? = nil,
+                             dedupeExpiresAt: Date? = nil) async -> Bool {
         guard let prepared = preparePrompt(text, attachments: attachments,
                                            messageAttachments: messageAttachments, to: sessionID,
                                            mode: mode, requestId: requestedRequestID,
                                            expectedMachineGeneration: expectedMachineGeneration,
-                                           expectedMachineID: expectedMachineID) else { return false }
+                                           expectedMachineID: expectedMachineID,
+                                           dedupeExpiresAt: dedupeExpiresAt) else { return false }
         return await persistAndSend(prepared)
     }
 
@@ -2250,6 +2275,9 @@ final class DSHAppModel: ObservableObject {
               pendingSendsByRequestID[requestID] != nil else { return false }
         current.phase = .awaitingAck
         current.sentAt = .now
+        if current.dedupeExpiresAt == nil {
+            current.dedupeExpiresAt = Date().addingTimeInterval(Self.promptIdempotencyWindow)
+        }
         pendingSendsByRequestID[requestID] = current
         guard await persistCurrentTransactions(for: machineID) else { return false }
         armSendAckTimeout(requestId: requestID, attempt: current.attempt)
@@ -2279,7 +2307,8 @@ final class DSHAppModel: ObservableObject {
                                messageAttachments: [DSHMessageAttachment], to sessionID: String,
                                mode: String, requestId requestedRequestID: String?,
                                expectedMachineGeneration: Int?,
-                               expectedMachineID: String?) -> DSHPreparedPrompt? {
+                               expectedMachineID: String?,
+                               dedupeExpiresAt: Date? = nil) -> DSHPreparedPrompt? {
         if let expectedMachineGeneration,
            expectedMachineGeneration != machineStateGeneration { return nil }
         if let expectedMachineID, expectedMachineID != machineID { return nil }
@@ -2308,7 +2337,8 @@ final class DSHAppModel: ObservableObject {
         sendAttemptGenerations[requestId] = attempt
         pendingSendsByRequestID[requestId] = DSHPendingSend(
             id: requestId, text: trimmed, receipts: attachments,
-            sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt,
+            sessionID: sessionID, mode: mode, sentAt: .now,
+            dedupeExpiresAt: dedupeExpiresAt, attempt: attempt,
             messageAttachments: messageAttachments)
         return DSHPreparedPrompt(requestID: requestId, attempt: attempt, text: trimmed,
                                  receipts: attachments, messageAttachments: messageAttachments,
@@ -2319,6 +2349,17 @@ final class DSHAppModel: ObservableObject {
     private func persistAndSend(_ prepared: DSHPreparedPrompt) async -> Bool {
         guard machineStateGeneration == prepared.machineGeneration,
               machineID == prepared.machineID else { return false }
+        guard var pending = pendingSendsByRequestID[prepared.requestID],
+              pending.attempt == prepared.attempt else { return false }
+        // The idempotency deadline starts at the first wire-facing attempt,
+        // not when a local queue item was created. A retry carrying an
+        // existing deadline must never extend the server tombstone.
+        pending.phase = .awaitingAck
+        pending.sentAt = .now
+        if pending.dedupeExpiresAt == nil {
+            pending.dedupeExpiresAt = Date().addingTimeInterval(Self.promptIdempotencyWindow)
+        }
+        pendingSendsByRequestID[prepared.requestID] = pending
         guard await persistCurrentTransactions(for: prepared.machineID) else {
             if pendingSendsByRequestID[prepared.requestID]?.attempt == prepared.attempt {
                 pendingSendsByRequestID.removeValue(forKey: prepared.requestID)
@@ -2354,6 +2395,9 @@ final class DSHAppModel: ObservableObject {
         let sessionID: String
         let mode: String
         var sentAt: Date
+        /// Fixed when this request first enters awaitingAck. Retries reuse
+        /// the same deadline instead of extending remote idempotency.
+        var dedupeExpiresAt: Date?
         let attempt: Int
         var messageAttachments: [DSHMessageAttachment]
         var phase: DSHPromptTransactionPhase
@@ -2365,11 +2409,12 @@ final class DSHAppModel: ObservableObject {
 
         private enum CodingKeys: String, CodingKey {
             case id, text, receipts, sessionID, mode, sentAt, attempt,
-                 messageAttachments, phase, stagedAttachments, uploadedAttachments
+                 messageAttachments, phase, stagedAttachments, uploadedAttachments,
+                 dedupeExpiresAt
         }
 
         init(id: String, text: String, receipts: [String], sessionID: String,
-             mode: String, sentAt: Date, attempt: Int,
+             mode: String, sentAt: Date, dedupeExpiresAt: Date? = nil, attempt: Int,
              messageAttachments: [DSHMessageAttachment],
              phase: DSHPromptTransactionPhase = .awaitingAck,
              stagedAttachments: [DSHStagedAttachment] = [],
@@ -2380,6 +2425,7 @@ final class DSHAppModel: ObservableObject {
             self.sessionID = sessionID
             self.mode = mode
             self.sentAt = sentAt
+            self.dedupeExpiresAt = dedupeExpiresAt
             self.attempt = attempt
             self.messageAttachments = messageAttachments
             self.phase = phase
@@ -2395,6 +2441,7 @@ final class DSHAppModel: ObservableObject {
             sessionID = try container.decode(String.self, forKey: .sessionID)
             mode = try container.decode(String.self, forKey: .mode)
             sentAt = try container.decode(Date.self, forKey: .sentAt)
+            dedupeExpiresAt = try container.decodeIfPresent(Date.self, forKey: .dedupeExpiresAt)
             attempt = try container.decode(Int.self, forKey: .attempt)
             messageAttachments = try container.decode([DSHMessageAttachment].self, forKey: .messageAttachments)
             stagedAttachments = try container.decodeIfPresent([DSHStagedAttachment].self, forKey: .stagedAttachments) ?? []
@@ -2422,6 +2469,7 @@ final class DSHAppModel: ObservableObject {
             try container.encode(sessionID, forKey: .sessionID)
             try container.encode(mode, forKey: .mode)
             try container.encode(sentAt, forKey: .sentAt)
+            try container.encodeIfPresent(dedupeExpiresAt, forKey: .dedupeExpiresAt)
             try container.encode(attempt, forKey: .attempt)
             try container.encode(messageAttachments, forKey: .messageAttachments)
             try container.encode(phase, forKey: .phase)
@@ -2548,12 +2596,14 @@ final class DSHAppModel: ObservableObject {
         } else {
             failure = .server("Mac 未响应")
         }
+        let retryUntil = pending.dedupeExpiresAt
+            ?? pending.sentAt.addingTimeInterval(Self.promptIdempotencyWindow)
         failedSendsByRequestID[requestId] = DSHFailedSend(id: requestId, text: pending.text,
                                                           receipts: pending.receipts,
                                                           sessionID: pending.sessionID, mode: pending.mode,
                                                           messageAttachments: pending.messageAttachments,
                                                           failure: failure,
-                                                          retryUntil: Date().addingTimeInterval(Self.promptIdempotencyWindow))
+                                                          retryUntil: retryUntil)
         persistCurrentTransactionsLater(for: machineID)
     }
 
@@ -2584,9 +2634,10 @@ final class DSHAppModel: ObservableObject {
         pendingMessageAttachmentCleanupTasks.removeValue(forKey: requestID)?.cancel()
     }
 
-    /// A transport throw means the prompt never left the phone: park it for
-    /// retry instead of only flashing an alert, and drop its staged
-    /// thumbnails so they cannot attach to a later, unrelated message.
+    /// Park a transport failure instead of only flashing an alert. Errors from
+    /// the WebSocket task itself are result-unknown: URLSession may report a
+    /// failed completion after the frame already reached Relay, so they must
+    /// retain the original request-id deadline just like an ACK timeout.
     /// Internal for tests.
     func parkFailedPromptSend(_ command: DSHCommand, error: Error,
                               attempt: Int? = nil, machineGeneration: Int? = nil) {
@@ -2610,12 +2661,31 @@ final class DSHAppModel: ObservableObject {
             ?? pendingMessageAttachmentsByRequestID[command.requestId]
             ?? []
         clearPendingMessageAttachments(for: command.requestId)
+        let resultUnknown = promptTransportResultUnknown(error)
+        let retryUntil = resultUnknown
+            ? (pending?.dedupeExpiresAt
+                ?? pending?.sentAt.addingTimeInterval(Self.promptIdempotencyWindow)
+                ?? Date().addingTimeInterval(Self.promptIdempotencyWindow))
+            : nil
         failedSendsByRequestID[command.requestId] = DSHFailedSend(
             id: command.requestId, text: text, receipts: receipts,
             sessionID: sessionID, mode: mode,
             messageAttachments: messageAttachments,
-            failure: .local(error.localizedDescription), retryUntil: nil)
+            failure: resultUnknown ? .server(error.localizedDescription) : .local(error.localizedDescription),
+            retryUntil: retryUntil)
         persistCurrentTransactionsLater(for: machineID)
+    }
+
+    private func promptTransportResultUnknown(_ error: Error) -> Bool {
+        guard let transportError = error as? DSHWebSocketError else { return true }
+        switch transportError {
+        case .notConnected, .machineMismatch, .messageTooLarge,
+             .invalidMessage, .unsupportedProtocolVersion,
+             .unauthorizedRelayRole, .authenticationRequired:
+            return false
+        case .closed, .eventBufferOverflow, .relay:
+            return true
+        }
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -2641,15 +2711,18 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "原消息已超过安全重试窗口，请重新发送以避免重复执行。"
             return
         }
-        failedSendsByRequestID.removeValue(forKey: requestID)
-        persistCurrentTransactionsLater(for: machineID)
         // A timeout means the Mac may already have accepted the side effect.
         // Reuse the complete original command identity and mode so Connector
         // and Bridge idempotency coalesce the retry instead of executing it
         // a second time (a genuinely new submission still gets a new UUID).
-        sendPrompt(failed.text, attachments: failed.receipts,
-                   messageAttachments: failed.messageAttachments, to: failed.sessionID,
-                   mode: failed.mode, requestId: failed.id)
+        let accepted = sendPrompt(failed.text, attachments: failed.receipts,
+                                  messageAttachments: failed.messageAttachments, to: failed.sessionID,
+                                  mode: failed.mode, requestId: failed.id,
+                                  dedupeExpiresAt: failed.retryUntil)
+        if accepted {
+            failedSendsByRequestID.removeValue(forKey: requestID)
+            persistCurrentTransactionsLater(for: machineID)
+        }
     }
 
     func retryFailedSend() {
@@ -2676,6 +2749,9 @@ final class DSHAppModel: ObservableObject {
         var text: String
         let mode: String
         let sentAt: Date
+        /// Set when a stable request id is assigned for actual dispatch. It
+        /// is separate from sentAt, which is the original local queue time.
+        let dispatchAt: Date?
         /// Request identity for entries sent directly to the server queue.
         /// Older persisted entries have no identity and are never retired by
         /// an unrelated history event.
@@ -2685,9 +2761,11 @@ final class DSHAppModel: ObservableObject {
         let sent: Bool
 
         init(id: String = UUID().uuidString, text: String, mode: String,
-             sentAt: Date = .now, sent: Bool = false, requestId: String? = nil) {
+             sentAt: Date = .now, dispatchAt: Date? = nil,
+             sent: Bool = false, requestId: String? = nil) {
             self.id = id; self.text = text; self.mode = mode
-            self.sentAt = sentAt; self.sent = sent; self.requestId = requestId
+            self.sentAt = sentAt; self.dispatchAt = dispatchAt
+            self.sent = sent; self.requestId = requestId
         }
     }
 
@@ -2716,13 +2794,16 @@ final class DSHAppModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
         guard validatePromptText(trimmed) else { return }
         queuedPromptsBySession[sessionID, default: []].append(
-            DSHQueuedPrompt(text: trimmed, mode: mode, sent: true, requestId: requestId))
+            DSHQueuedPrompt(text: trimmed, mode: mode, dispatchAt: .now,
+                            sent: true, requestId: requestId))
         persistQueuedPrompts()
     }
 
     func queuedPrompts(for sessionID: String) -> [DSHQueuedPrompt] {
         let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
-        let fresh = queuedPromptsBySession[sessionID, default: []].filter { $0.sentAt > cutoff }
+        let fresh = queuedPromptsBySession[sessionID, default: []].filter {
+            ($0.sent ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff
+        }
         if fresh.count != queuedPromptsBySession[sessionID]?.count {
             queuedPromptsBySession[sessionID] = fresh
             persistQueuedPrompts()
@@ -2777,7 +2858,8 @@ final class DSHAppModel: ObservableObject {
         // an anonymous `sent=false` item allowed a second request id later.
         let requestID = item.requestId ?? UUID().uuidString
         queue[index] = DSHQueuedPrompt(id: item.id, text: item.text, mode: item.mode,
-                                       sentAt: item.sentAt, sent: true, requestId: requestID)
+                                       sentAt: item.sentAt, dispatchAt: item.dispatchAt ?? .now,
+                                       sent: true, requestId: requestID)
         queuedPromptsBySession[sessionID] = queue
         persistQueuedPrompts()
         let generation = machineStateGeneration
@@ -2818,7 +2900,9 @@ final class DSHAppModel: ObservableObject {
               let restored = try? JSONDecoder().decode([String: [DSHQueuedPrompt]].self, from: data)
         else { return }
         let cutoff = Date.now.addingTimeInterval(-Self.queuedPromptTTL)
-        queuedPromptsBySession = restored.mapValues { $0.filter { $0.sentAt > cutoff } }
+        queuedPromptsBySession = restored.mapValues { items in
+            items.filter { ($0.sent ? ($0.dispatchAt ?? $0.sentAt) : $0.sentAt) > cutoff }
+        }
     }
 
     /// Retires the oldest queued entry whose text matches an accepted user
@@ -3639,7 +3723,7 @@ final class DSHAppModel: ObservableObject {
         let cutoff = Date().addingTimeInterval(-Self.promptIdempotencyWindow)
         let candidates = queuedPromptsBySession.flatMap { sessionID, items in
             items.filter { item in
-                item.sent && item.sentAt >= cutoff && item.requestId != nil &&
+                item.sent && (item.dispatchAt ?? item.sentAt) >= cutoff && item.requestId != nil &&
                     pendingSendsByRequestID[item.requestId!] == nil &&
                     failedSendsByRequestID[item.requestId!] == nil
             }.map { (sessionID: sessionID, item: $0) }
@@ -3735,12 +3819,34 @@ final class DSHAppModel: ObservableObject {
                 messageAttachments.append(uploaded)
             }
             if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
+            // Once the initial text has entered the ordinary prompt transport,
+            // its request id has the same finite remote dedupe lifetime as any
+            // other prompt. Do not let this separate initial-message journal
+            // create a second, unbounded retry path.
+            if let existing = pendingSendsByRequestID[pendingMessage.promptRequestID],
+               existing.phase == .awaitingAck || existing.phase == .preparing || existing.phase == .readyToSend {
+                return
+            }
+            let inheritedDeadline = pendingMessage.dedupeExpiresAt
+                ?? pendingSendsByRequestID[pendingMessage.promptRequestID]?.dedupeExpiresAt
+                ?? failedSendsByRequestID[pendingMessage.promptRequestID]?.retryUntil
+            if let inheritedDeadline, Date() >= inheritedDeadline {
+                throw DSHAttachmentUploadError.persistenceUnavailable
+            }
+            let dedupeDeadline = inheritedDeadline
+                ?? Date().addingTimeInterval(Self.promptIdempotencyWindow)
+            pendingMessage.dedupeExpiresAt = dedupeDeadline
+            pendingInitialMessagesByRequestID[creationRequestID] = pendingMessage
+            guard await persistCurrentTransactions(for: machineID) else {
+                throw DSHAttachmentUploadError.persistenceUnavailable
+            }
             let sent = await sendPromptPersisted(
                 pendingMessage.text, attachments: receipts,
                 messageAttachments: messageAttachments, to: sessionID,
                 requestId: pendingMessage.promptRequestID,
                 expectedMachineGeneration: machineGeneration,
-                expectedMachineID: machineID)
+                expectedMachineID: machineID,
+                dedupeExpiresAt: dedupeDeadline)
             guard sent else {
                 throw DSHAttachmentUploadError.persistenceUnavailable
             }
@@ -3774,6 +3880,22 @@ final class DSHAppModel: ObservableObject {
         }
         guard let pending = pendingInitialMessagesByRequestID[failure.id],
               let sessionID = pending.sessionID else { return }
+        // After the initial upload reaches prompt.send, the normal prompt
+        // transaction owns its request id and deadline. Reuse that path so
+        // this UI button cannot bypass the finite dedupe window.
+        if let promptFailure = failedSendsByRequestID[pending.promptRequestID] {
+            retryFailedSend(requestID: promptFailure.id)
+            return
+        }
+        if let prompt = pendingSendsByRequestID[pending.promptRequestID] {
+            if prompt.phase == .awaitingAck || prompt.phase == .preparing || prompt.phase == .readyToSend {
+                return
+            }
+        }
+        if let deadline = pending.dedupeExpiresAt, Date() >= deadline {
+            errorMessage = "首条消息已超过安全重试窗口，请重新发送以避免重复执行。"
+            return
+        }
         failedInitialMessages.removeValue(forKey: failure.id)
         let generation = machineStateGeneration
         Task { @MainActor [weak self] in

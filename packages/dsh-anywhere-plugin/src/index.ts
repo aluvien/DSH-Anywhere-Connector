@@ -369,16 +369,12 @@ interface SessionCreationRecord {
   readonly setupComplete?: boolean
   /** A pre-stage-machine response may have been captured before setup finished. */
   readonly legacySetupUnknown?: boolean
-  /** Used only for safe retention-based compaction of completed records. */
+  /** Observability metadata; completed records are retained as tombstones. */
   readonly completedAt?: number
 }
 
 const MAX_SESSION_CREATION_RECORDS = 4096
 const SESSION_CREATION_RECORD_SCHEMA_VERSION = 1 as const
-// A completed request is retained for a generous recovery window. Pending and
-// unknown records are never evicted automatically because doing so could allow
-// a late retry to execute native create twice.
-const SESSION_CREATION_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000
 
 type PermissionMode = 'ask' | 'never' | 'read-only' | 'workspace-write' | 'danger-full-access'
 
@@ -500,16 +496,6 @@ class SessionMetadataStore {
     await this.persist()
   }
 
-  private completedRecordsEligibleForCompaction(now: number): string[] {
-    return [...this.sessionCreationResults].flatMap(([key, entry]) => {
-      const completedAt = entry.completedAt
-      return entry.setupComplete === true && entry.response !== undefined &&
-        completedAt !== undefined && Number.isFinite(completedAt) &&
-        now - completedAt >= SESSION_CREATION_COMPLETED_RETENTION_MS
-        ? [key] : []
-    })
-  }
-
   async setSessionCreationPending(key: string, fingerprint: string | undefined,
                                   setup: SessionCreationSetup,
                                   nativeOperationId?: string): Promise<void> {
@@ -517,17 +503,10 @@ class SessionMetadataStore {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     if (!this.sessionCreationResults.has(key) && this.sessionCreationResults.size >= MAX_SESSION_CREATION_RECORDS) {
-      const compactable = this.completedRecordsEligibleForCompaction(Date.now())
-      if (this.sessionCreationResults.size - compactable.length >= MAX_SESSION_CREATION_RECORDS) {
-        // A full table is deliberately fail-closed. The operator can still
-        // retry after the completed retention window or repair/reconcile an
-        // unknown record; we never evict one whose native side effect is not
-        // known to be complete.
-        throw new HttpError(503, 'session creation idempotency capacity is full', 'unknown')
-      }
-      for (const compactableKey of compactable) this.sessionCreationResults.delete(compactableKey)
-    }
-    if (!this.sessionCreationResults.has(key) && this.sessionCreationResults.size >= MAX_SESSION_CREATION_RECORDS) {
+      // Completed records are permanent at-most-once tombstones. Evicting a
+      // response after an arbitrary retention period would let a phone that
+      // was offline for months invoke native create a second time. Fail closed
+      // at capacity and require operator reconciliation instead.
       throw new HttpError(503, 'session creation idempotency capacity is full', 'unknown')
     }
     this.sessionCreationResults.set(key, {

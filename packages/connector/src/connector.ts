@@ -189,6 +189,11 @@ export class DSHAnywhereConnector {
   private readonly onlineRelayDevices = new Set<string>();
   private readonly presenceUpdates = new Map<string, Promise<boolean>>();
   private readonly presenceRefreshRequired = new Set<string>();
+  /** Serializes Bridge-side effects for one Relay device. In particular, an
+   * offline edge must not overtake a session.create that Relay delivered just
+   * before it. */
+  private readonly deviceBridgeOperations = new Map<string, Promise<void>>();
+  private readonly deviceSessionCreates = new Map<string, Promise<void>>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -246,6 +251,8 @@ export class DSHAnywhereConnector {
     this.onlineRelayDevices.clear();
     this.presenceUpdates.clear();
     this.presenceRefreshRequired.clear();
+    this.deviceBridgeOperations.clear();
+    this.deviceSessionCreates.clear();
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
     this.latestSessionListCommands.clear();
@@ -289,7 +296,7 @@ export class DSHAnywhereConnector {
       this.onlineRelayDevices.clear();
       this.presenceRefreshRequired.clear();
       for (const deviceId of disconnectedDevices) {
-        void this.reportDevicePresence(deviceId, false, bridgeConnectorId, relayGeneration, relayEpoch);
+        void this.enqueuePresenceUpdate(deviceId, false, bridgeConnectorId, relayGeneration, relayEpoch);
       }
       if (code === 4001) {
         // Relay uses 4001 when another Connector with the same machine lease
@@ -319,7 +326,7 @@ export class DSHAnywhereConnector {
       this.bridgeAttempts = 0;
       this.log("info", "Local DSH bridge connected");
       for (const deviceId of this.onlineRelayDevices) {
-        void this.reportDevicePresence(deviceId, true, connectorId, this.relayLeaseGeneration, this.relayEpoch);
+        void this.enqueuePresenceUpdate(deviceId, true, connectorId, this.relayLeaseGeneration, this.relayEpoch);
         // A Bridge greeting may contain a snapshot from before the Relay or
         // Bridge reconnect. Refresh every currently-online device from the
         // authoritative HTTP list instead of forwarding that stale greeting.
@@ -466,8 +473,8 @@ export class DSHAnywhereConnector {
       this.relayLeaseGeneration = leaseGeneration;
       this.relayEpoch = relayEpoch;
       for (const deviceId of this.onlineRelayDevices) {
-        void this.reportDevicePresence(deviceId, true, this.bridgeConnectorId,
-                                       this.relayLeaseGeneration, this.relayEpoch);
+        void this.enqueuePresenceUpdate(deviceId, true, this.bridgeConnectorId,
+                                        this.relayLeaseGeneration, this.relayEpoch);
       }
       return;
     }
@@ -475,8 +482,8 @@ export class DSHAnywhereConnector {
       if (message.data.role === "device" && message.data.deviceId !== undefined) {
         if (message.data.online) this.onlineRelayDevices.add(message.data.deviceId);
         else this.onlineRelayDevices.delete(message.data.deviceId);
-        void this.reportDevicePresence(message.data.deviceId, message.data.online,
-                                       this.bridgeConnectorId, this.relayLeaseGeneration, this.relayEpoch);
+        void this.enqueuePresenceUpdate(message.data.deviceId, message.data.online,
+                                        this.bridgeConnectorId, this.relayLeaseGeneration, this.relayEpoch);
         if (message.data.online) void this.pushSessionSnapshot(message.data.deviceId);
       }
       return;
@@ -488,37 +495,49 @@ export class DSHAnywhereConnector {
       return;
     }
     this.log("info", `Received ${command.data.type} from device ${shortID(command.data.deviceId)}`);
-    // Relay delivers the device-presence edge immediately before the first
-    // command from a newly connected phone.  The Bridge uses that reported
-    // lease as the origin-authentication proof, so do not race the HTTP
-    // presence update with session.create (or another mutation).  The update
-    // is serialized per device; a failed report yields a retryable protocol
-    // error instead of allowing the Bridge to manufacture a final 403.
-    // Only session.create uses the phone identity for Bridge authorization.
-    // Read-only snapshots and the other Connector-scoped commands remain
-    // useful while a presence lease is being refreshed, and should not be
-    // blocked by a best-effort presence HTTP update.
-    const presenceRequired = command.data.type === "session.create";
-    const presenceUpdate = presenceRequired
-      ? (this.presenceUpdates.get(command.data.deviceId)
-        ?? (this.presenceRefreshRequired.has(command.data.deviceId)
-          ? this.reportDevicePresence(command.data.deviceId, true, this.bridgeConnectorId,
-                                      this.relayLeaseGeneration, this.relayEpoch)
-          : undefined))
-      : undefined;
-    if (presenceUpdate !== undefined) {
-      void presenceUpdate.then((registered) => {
+    // A session.create is authenticated by the Bridge-local presence lease.
+    // Keep it in the same per-device operation chain as presence edges: an
+    // offline edge delivered immediately afterwards must wait until this
+    // command has reached the Bridge, otherwise the Bridge can delete the
+    // lease first and turn a valid create into a final 403.
+    if (command.data.type === "session.create") {
+      const start = () => {
+        const completion = this.dispatchCommand(command.data);
+        this.deviceSessionCreates.set(command.data.deviceId, completion);
+        void completion.finally(() => {
+          if (this.deviceSessionCreates.get(command.data.deviceId) === completion) {
+            this.deviceSessionCreates.delete(command.data.deviceId);
+          }
+        });
+      };
+      // Preserve the normal synchronous dispatch timing when no presence
+      // refresh is pending. The completion is still tracked for a following
+      // offline edge, while duplicate deliveries coalesce immediately.
+      if (!this.presenceUpdates.has(command.data.deviceId) &&
+          !this.presenceRefreshRequired.has(command.data.deviceId)) {
+        start();
+        return;
+      }
+      void this.enqueueDeviceBridgeOperation(command.data.deviceId, async () => {
         if (this.relay !== socket || !this.running) return;
-        if (registered) this.dispatchCommand(command.data);
-        else this.sendProtocolError(command.data, new BridgeRequestError(
-          503, "Relay device presence is not registered with the local bridge", "retryable"));
+        const presenceUpdate = this.presenceUpdates.get(command.data.deviceId)
+          ?? (this.presenceRefreshRequired.has(command.data.deviceId)
+            ? this.reportDevicePresence(command.data.deviceId, true, this.bridgeConnectorId,
+                                        this.relayLeaseGeneration, this.relayEpoch)
+            : undefined);
+        if (presenceUpdate !== undefined && !await presenceUpdate) {
+          this.sendProtocolError(command.data, new BridgeRequestError(
+            503, "Relay device presence is not registered with the local bridge", "retryable"));
+          return;
+        }
+        start();
       });
       return;
     }
-    this.dispatchCommand(command.data);
+    void this.dispatchCommand(command.data);
   }
 
-  private dispatchCommand(command: CommandEnvelope): void {
+  private dispatchCommand(command: CommandEnvelope): Promise<void> {
     const now = Date.now();
     for (const [key, execution] of this.commandExecutions) {
       if (execution.expiresAt <= now) this.commandExecutions.delete(key);
@@ -537,11 +556,11 @@ export class DSHAnywhereConnector {
     // after the first superseded response has already been sent.
     if (command.type === "session.list" && this.isSupersededSessionList(command)) {
       this.sendSupersededSessionList(command);
-      return;
+      return Promise.resolve();
     }
     if (command.type === "workspace.catalog" && this.isSupersededWorkspaceCatalog(command)) {
       this.sendSupersededWorkspaceCatalog(command);
-      return;
+      return Promise.resolve();
     }
     const key = commandKey(command.machineId, command.deviceId, command.requestId);
     const existing = this.commandExecutions.get(key);
@@ -552,22 +571,22 @@ export class DSHAnywhereConnector {
       // request is still running there. Re-submit the same request id so the
       // Bridge either starts it after recovery or returns its stored result;
       // never turn a retry into a fresh side effect with a new id.
-      void existing.promise.then((outcome) => {
+      return existing.promise.then((outcome) => {
         if (this.commandExecutions.get(key) !== existing) return;
         if (outcome.state === "failed" && outcome.retryable) {
           this.commandExecutions.delete(key);
           this.commandResults.delete(key);
-          this.dispatchCommand(command);
+          return this.dispatchCommand(command);
         } else {
           this.replayCommandResult(command);
         }
       });
-      return;
     }
     this.commandResults.delete(key);
     const promise = this.executeCommand(command);
     this.commandExecutions.set(key, { promise, expiresAt: now + COMMAND_DEDUP_TTL_MS, events: [] });
     void promise;
+    return promise.then(() => undefined);
   }
 
   private async executeCommand(command: CommandEnvelope): Promise<CommandExecutionOutcome> {
@@ -667,6 +686,33 @@ export class DSHAnywhereConnector {
     }
     const contentType = response.headers.get("content-type") ?? "";
     return contentType.includes("application/json") ? response.json() : undefined;
+  }
+
+  private enqueueDeviceBridgeOperation<T>(deviceId: string,
+                                          operation: () => Promise<T>): Promise<T> {
+    const previous = this.deviceBridgeOperations.get(deviceId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    const settled = next.then(() => undefined, () => undefined);
+    this.deviceBridgeOperations.set(deviceId, settled);
+    void settled.finally(() => {
+      if (this.deviceBridgeOperations.get(deviceId) === settled) {
+        this.deviceBridgeOperations.delete(deviceId);
+      }
+    });
+    return next;
+  }
+
+  private enqueuePresenceUpdate(deviceId: string, online: boolean,
+                                connectorId = this.bridgeConnectorId,
+                                relayGeneration = this.relayLeaseGeneration,
+                                relayEpoch = this.relayEpoch): Promise<boolean> {
+    return this.enqueueDeviceBridgeOperation(deviceId, async () => {
+      // Relay sends the device-offline edge after any payload already routed
+      // to the machine socket. Wait for a preceding create to finish its
+      // Bridge request before deleting the origin lease.
+      if (!online) await this.deviceSessionCreates.get(deviceId);
+      return this.reportDevicePresence(deviceId, online, connectorId, relayGeneration, relayEpoch);
+    });
   }
 
   private reportDevicePresence(deviceId: string, online: boolean,
