@@ -620,6 +620,22 @@ describe('native bridge mutations', () => {
     expect(creates).toBe(2)
   })
 
+  it('lists and explicitly reconciles unknown remote mutation tombstones', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-remote-reconcile-'))
+    const key = `${CONNECTOR_DEVICE_ID}\u0000/sessions/s1/command\u0000unknown-command`
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      remoteMutations: { [key]: { pending: true, createdAt: 1 } },
+    }))
+    const request = mount({ dataDir })
+    await expect(request('GET', '/dsh-anywhere/v1/admin/remote-mutations/pending?limit=1'))
+      .resolves.toEqual({ status: 200, body: { items: [{ key, createdAt: 1 }] } })
+    await expect(request('POST', '/dsh-anywhere/v1/admin/remote-mutations/reconcile', {
+      keys: [key], kind: 'not-committed', confirm: true,
+    })).resolves.toEqual({ status: 200, body: { resolved: 1, kind: 'not-committed' } })
+    await expect(request('GET', '/dsh-anywhere/v1/admin/remote-mutations/pending'))
+      .resolves.toEqual({ status: 200, body: { items: [] } })
+  })
+
   it('records the native create before optional setup can fail', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-setup-failure-'))
     let creates = 0

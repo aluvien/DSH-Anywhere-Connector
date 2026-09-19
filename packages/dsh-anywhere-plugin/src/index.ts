@@ -411,6 +411,7 @@ interface SessionCreationRecord {
 interface RemoteMutationRecord {
   readonly fingerprint: string | undefined
   readonly pending?: boolean
+  readonly createdAt?: number
   readonly status?: number
   readonly response?: unknown
   readonly completedAt?: number
@@ -1023,7 +1024,7 @@ class SessionMetadataStore {
     const previous = this.remoteMutationResults.get(key)
     const previousCapacityExceeded = this.persistenceCapacityExceeded
     const previousMetadataByteLength = this.metadataByteLength
-    this.remoteMutationResults.set(key, { fingerprint, pending: true })
+    this.remoteMutationResults.set(key, { fingerprint, pending: true, createdAt: Date.now() })
     try {
       await this.persist()
     } catch (error) {
@@ -1048,6 +1049,7 @@ class SessionMetadataStore {
     const previousMetadataByteLength = this.metadataByteLength
     this.remoteMutationResults.set(key, {
       fingerprint,
+      ...(previous.createdAt === undefined ? {} : { createdAt: previous.createdAt }),
       status,
       response: response === undefined ? null : response,
       completedAt: Date.now(),
@@ -1117,6 +1119,88 @@ class SessionMetadataStore {
       throw error
     }
     return removed.size
+  }
+
+  remoteMutationPending(limit: number, afterKey?: string): {
+    items: readonly { key: string; fingerprint?: string; createdAt?: number }[]
+    nextAfterKey?: string
+  } {
+    const keys = [...this.remoteMutationResults.keys()]
+      .filter((key) => this.remoteMutationResults.get(key)?.pending === true)
+      .sort()
+      .filter((key) => afterKey === undefined || key > afterKey)
+    const selected = keys.slice(0, limit)
+    return {
+      items: selected.map((key) => {
+        const entry = this.remoteMutationResults.get(key)!
+        return {
+          key,
+          ...(entry.fingerprint === undefined ? {} : { fingerprint: entry.fingerprint }),
+          ...(entry.createdAt === undefined ? {} : { createdAt: entry.createdAt }),
+        }
+      }),
+      ...(keys.length > selected.length && selected.length > 0
+        ? { nextAfterKey: selected[selected.length - 1] } : {}),
+    }
+  }
+
+  /**
+   * Resolve pending remote mutations only through an explicit Connector-admin
+   * action. A "not-committed" resolution releases capacity; a completed
+   * resolution installs the operator-supplied authoritative response so a
+   * later retry replays it instead of executing the native mutation again.
+   */
+  async resolveRemoteMutations(keys: readonly string[], resolution: {
+    kind: 'not-committed' | 'completed'
+    status?: number
+    response?: unknown
+  }): Promise<number> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    if (keys.length > 128) throw new HttpError(400, 'at most 128 remote mutation keys may be resolved at once')
+    if (resolution.kind === 'completed' &&
+        (resolution.status === undefined || !Number.isSafeInteger(resolution.status) ||
+         resolution.status < 100 || resolution.status > 599 || resolution.response === undefined)) {
+      throw new HttpError(400, 'completed resolution requires a valid status and response')
+    }
+    const uniqueKeys = [...new Set(keys)]
+    const previous = new Map<string, RemoteMutationRecord>()
+    for (const key of uniqueKeys) {
+      const entry = this.remoteMutationResults.get(key)
+      if (entry === undefined) continue
+      if (entry.pending !== true) {
+        throw new HttpError(409, 'only pending remote mutation records may be resolved')
+      }
+      previous.set(key, entry)
+      if (resolution.kind === 'not-committed') {
+        this.remoteMutationResults.delete(key)
+      } else {
+        const status = resolution.status
+        if (status === undefined || resolution.response === undefined) {
+          throw new HttpError(400, 'completed resolution requires a valid status and response')
+        }
+        this.remoteMutationResults.set(key, {
+          fingerprint: entry.fingerprint,
+          ...(entry.createdAt === undefined ? {} : { createdAt: entry.createdAt }),
+          status,
+          response: resolution.response,
+          completedAt: Date.now(),
+        })
+      }
+    }
+    if (previous.size === 0) return 0
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
+    try {
+      await this.persist()
+    } catch (error) {
+      for (const [key, entry] of previous) this.remoteMutationResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
+    return previous.size
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -1345,6 +1429,10 @@ class SessionMetadataStore {
           if (raw.pending !== undefined && typeof raw.pending !== 'boolean') {
             throw new Error('remote mutation pending metadata is invalid')
           }
+          if (raw.createdAt !== undefined &&
+              (typeof raw.createdAt !== 'number' || !Number.isFinite(raw.createdAt) || raw.createdAt < 0)) {
+            throw new Error('remote mutation creation timestamp is invalid')
+          }
           if (raw.status !== undefined &&
               (typeof raw.status !== 'number' || !Number.isSafeInteger(raw.status) || raw.status < 100 || raw.status > 599)) {
             throw new Error('remote mutation status metadata is invalid')
@@ -1366,6 +1454,7 @@ class SessionMetadataStore {
           this.remoteMutationResults.set(key, {
             fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
             ...(raw.pending === true ? { pending: true } : {}),
+            ...(typeof raw.createdAt === 'number' ? { createdAt: raw.createdAt } : {}),
             ...(typeof raw.status === 'number' ? { status: raw.status } : {}),
             ...(hasResponse ? { response: raw.response } : {}),
             ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
@@ -2520,6 +2609,52 @@ async function handleHttp(
     const keys = body.keys as string[]
     const removed = await metadata.compactRemoteMutationRecords(keys)
     json(res, 200, { removed })
+    return
+  }
+
+  if (req.method === 'GET' && path === '/admin/remote-mutations/pending') {
+    if (device.id !== CONNECTOR_DEVICE_ID) {
+      throw new HttpError(403, 'only the Connector may inspect pending remote mutations')
+    }
+    const rawLimit = url.searchParams.get('limit')
+    const limit = rawLimit === null ? 128 : Number(rawLimit)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) {
+      throw new HttpError(400, 'limit must be an integer between 1 and 128')
+    }
+    const afterKey = url.searchParams.get('afterKey') ?? undefined
+    if (afterKey !== undefined && (afterKey.length === 0 || afterKey.length > 1_024)) {
+      throw new HttpError(400, 'afterKey must be between 1 and 1024 characters')
+    }
+    json(res, 200, metadata.remoteMutationPending(limit, afterKey))
+    return
+  }
+
+  if (req.method === 'POST' && path === '/admin/remote-mutations/reconcile') {
+    if (device.id !== CONNECTOR_DEVICE_ID) {
+      throw new HttpError(403, 'only the Connector may reconcile remote mutations')
+    }
+    const body = objectOf(await readJson(req))
+    if (!Array.isArray(body.keys) || body.keys.length > 128 ||
+        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 1_024)) {
+      throw new HttpError(400, 'keys must be an array of at most 128 durable remote mutation keys')
+    }
+    const kind = body.kind
+    if (kind !== 'not-committed' && kind !== 'completed') {
+      throw new HttpError(400, 'kind must be not-committed or completed')
+    }
+    if (body.confirm !== true) {
+      throw new HttpError(400, 'remote mutation reconciliation requires confirm=true')
+    }
+    if (kind === 'completed' &&
+        (typeof body.status !== 'number' || !Number.isSafeInteger(body.status) ||
+         body.status < 100 || body.status > 599 || body.response === undefined)) {
+      throw new HttpError(400, 'completed resolution requires a valid status and response')
+    }
+    const resolution = kind === 'completed'
+      ? { kind: 'completed' as const, status: body.status as number, response: body.response }
+      : { kind: 'not-committed' as const }
+    const resolved = await metadata.resolveRemoteMutations(body.keys as string[], resolution)
+    json(res, 200, { resolved, kind })
     return
   }
 

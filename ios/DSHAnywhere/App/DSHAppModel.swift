@@ -84,6 +84,16 @@ private struct DSHSessionCreationTransaction: Codable, Sendable {
     let retryDeadline: Date
 }
 
+private enum DSHRemoteMutationDeliveryState: String, Codable, Sendable {
+    /// The current durable request has never entered a send attempt that may
+    /// have crossed the socket. A local pre-send rejection can safely release
+    /// this transaction.
+    case neverSent
+    /// At least one attempt may have reached Relay. Later errors from a retry
+    /// describe only that retry and must not erase the historical tombstone.
+    case mayHaveBeenSent
+}
+
 /// A non-prompt native mutation whose transport acknowledgement was lost.
 /// Keep the complete command (including its request id) so a user retry can
 /// safely re-enter Connector/Bridge idempotency instead of minting a second
@@ -92,6 +102,32 @@ private struct DSHRemoteMutationTransaction: Codable, Sendable {
     let command: DSHCommand
     var failure: String?
     let retryDeadline: Date
+    var deliveryState: DSHRemoteMutationDeliveryState
+
+    init(command: DSHCommand, failure: String?, retryDeadline: Date,
+         deliveryState: DSHRemoteMutationDeliveryState = .neverSent) {
+        self.command = command
+        self.failure = failure
+        self.retryDeadline = retryDeadline
+        self.deliveryState = deliveryState
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case command, failure, retryDeadline, deliveryState
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        command = try container.decode(DSHCommand.self, forKey: .command)
+        failure = try container.decodeIfPresent(String.self, forKey: .failure)
+        retryDeadline = try container.decode(Date.self, forKey: .retryDeadline)
+        // Older journals do not record whether the request ever reached the
+        // transport. Preserve the safer ambiguous interpretation rather than
+        // allowing a later local error to erase an unknown native mutation.
+        deliveryState = try container.decodeIfPresent(
+            DSHRemoteMutationDeliveryState.self, forKey: .deliveryState)
+            ?? .mayHaveBeenSent
+    }
 }
 
 private struct DSHInitialMessageTransaction: Codable, Sendable {
@@ -3990,6 +4026,29 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
+    /// Persist the historical send boundary before invoking the transport.
+    /// The returned value describes the state *before this attempt*; it lets a
+    /// local `.notConnected` rejection release only a never-before-sent
+    /// request while preserving a request whose earlier attempt was already
+    /// result-unknown.
+    private func beginRemoteMutationAttempt(_ requestID: String, for machineID: String) async -> Bool? {
+        guard var transactions = remoteMutationTransactionsByMachine[machineID],
+              var transaction = transactions[requestID] else { return nil }
+        let hadPriorMayHaveBeenSent = transaction.deliveryState == .mayHaveBeenSent
+        transaction.deliveryState = .mayHaveBeenSent
+        transactions[requestID] = transaction
+        remoteMutationTransactionsByMachine[machineID] = transactions
+        guard await persistCurrentTransactions(for: machineID) else {
+            if hadPriorMayHaveBeenSent {
+                remoteMutationTransactionsByMachine[machineID]?[requestID] = transaction
+            } else {
+                remoteMutationTransactionsByMachine[machineID]?[requestID]?.deliveryState = .neverSent
+            }
+            return nil
+        }
+        return hadPriorMayHaveBeenSent
+    }
+
     private func remoteMutationDefinitelyNotSent(_ error: Error) -> Bool {
         guard let websocketError = error as? DSHWebSocketError else { return false }
         switch websocketError {
@@ -4003,8 +4062,10 @@ final class DSHAppModel: ObservableObject {
                 || code == "sender_mismatch" || code == "target_not_allowed"
                 || code == "body_machine_mismatch" || code == "body_device_mismatch"
         case .notConnected:
-            // No socket existed at the call boundary, so no bytes could have
-            // crossed Relay. Drop the journal entry and allow a fresh id.
+            // This describes only the current send attempt. A prior attempt
+            // may already have crossed Relay; the historical delivery state
+            // passed to markRemoteMutationFailed decides whether release is
+            // actually safe.
             return true
         case .eventBufferOverflow, .closed:
             return false
@@ -4012,14 +4073,17 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func markRemoteMutationFailed(_ requestID: String, detail: String,
-                                          error: Error? = nil, machineID targetMachineID: String? = nil) {
-        if let error, remoteMutationDefinitelyNotSent(error) {
+                                          error: Error? = nil,
+                                          hadPriorMayHaveBeenSent: Bool? = nil,
+                                          machineID targetMachineID: String? = nil) {
+        if let error, remoteMutationDefinitelyNotSent(error), hadPriorMayHaveBeenSent != true {
             completeRemoteMutation(requestID, for: targetMachineID)
             return
         }
         let mutationMachineID = targetMachineID ?? machineID
         guard var transactions = remoteMutationTransactionsByMachine[mutationMachineID],
               var transaction = transactions[requestID] else { return }
+        transaction.deliveryState = .mayHaveBeenSent
         transaction.failure = detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "连接已断开，操作结果待确认。" : detail
         transactions[requestID] = transaction
@@ -4050,23 +4114,35 @@ final class DSHAppModel: ObservableObject {
                       self.machineStateGeneration == machineGeneration,
                       self.machineID == expectedMachineID else { return }
                 if self.isDurableRemoteMutation(command) {
-                    guard await self.persistCurrentTransactions(for: expectedMachineID) else {
+                    guard let hadPriorMayHaveBeenSent = await self.beginRemoteMutationAttempt(
+                        command.requestId, for: expectedMachineID) else {
                         self.markRemoteMutationFailed(
                             command.requestId,
                             detail: "无法保存待处理操作，结果尚未确认。")
                         self.errorMessage = "无法保存待处理操作，结果尚未确认。"
                         return
                     }
+                    let mutationDeadline = self.remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.retryDeadline
+                    do {
+                        try await self.transport.send(command, notAfter: promptDeadline ?? mutationDeadline)
+                    } catch {
+                        self.clearFailedRemoteRequest(command.requestId,
+                                                      detail: error.localizedDescription,
+                                                      error: error,
+                                                      machineID: expectedMachineID,
+                                                      hadPriorMayHaveBeenSent: hadPriorMayHaveBeenSent)
+                        throw error
+                    }
+                    return
                 }
-                let mutationDeadline = self.isDurableRemoteMutation(command)
-                    ? self.remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.retryDeadline
-                    : nil
-                try await self.transport.send(command, notAfter: promptDeadline ?? mutationDeadline)
+                try await self.transport.send(command, notAfter: promptDeadline)
             }
             catch {
                 guard let self else { return }
-                self.clearFailedRemoteRequest(command.requestId, detail: error.localizedDescription,
-                                               error: error, machineID: expectedMachineID)
+                if !self.isDurableRemoteMutation(command) {
+                    self.clearFailedRemoteRequest(command.requestId, detail: error.localizedDescription,
+                                                   error: error, machineID: expectedMachineID)
+                }
                 // A prompt that never left the phone parks for retry (with
                 // its text intact) instead of only flashing an alert while
                 // the draft is already gone.
@@ -4084,7 +4160,9 @@ final class DSHAppModel: ObservableObject {
     /// has no protocol.error envelope. Clear only the request state owned by
     /// that command so folder-picker controls never remain disabled forever.
     private func clearFailedRemoteRequest(_ requestID: String, detail: String,
-                                          error: Error? = nil, machineID targetMachineID: String? = nil) {
+                                          error: Error? = nil,
+                                          machineID targetMachineID: String? = nil,
+                                          hadPriorMayHaveBeenSent: Bool? = nil) {
         if requestID == pendingWorkspaceCreationRequestID {
             pendingWorkspaceCreationRequestID = nil
             isCreatingWorkspace = false
@@ -4095,7 +4173,9 @@ final class DSHAppModel: ObservableObject {
         }
         let mutationMachineID = targetMachineID ?? machineID
         if remoteMutationTransactionsByMachine[mutationMachineID]?[requestID] != nil {
-            markRemoteMutationFailed(requestID, detail: detail, error: error, machineID: mutationMachineID)
+            markRemoteMutationFailed(requestID, detail: detail, error: error,
+                                      hadPriorMayHaveBeenSent: hadPriorMayHaveBeenSent,
+                                      machineID: mutationMachineID)
             return
         }
         if pendingSessionCreationRequestIDs.contains(requestID) {

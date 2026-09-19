@@ -422,6 +422,15 @@ describe("Relay server", () => {
     expect(paired.body.provisionalUntil).toBeGreaterThan(Date.now());
     expect((await devices(server.url, machine.machineId, machine.machineToken)).body.devices)
       .toEqual([]);
+    expect((await devices(server.url, machine.machineId, paired.body.deviceToken)).status).toBe(401);
+    const provisionalSocket = new WebSocket(wsUrl(server.url), {
+      headers: { authorization: `Bearer ${paired.body.deviceToken}` },
+    });
+    await expect(new Promise<void>((resolve, reject) => {
+      provisionalSocket.once("unexpected-response", () => resolve());
+      provisionalSocket.once("open", () => reject(new Error("provisional device connected")));
+      provisionalSocket.once("error", () => resolve());
+    })).resolves.toBeUndefined();
 
     const activation = await fetch(
       `${server.url}/v1/machines/${machine.machineId}/devices/self/activate`, {

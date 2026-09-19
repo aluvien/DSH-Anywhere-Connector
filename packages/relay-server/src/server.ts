@@ -147,8 +147,20 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const pairRateMaxBuckets = options.pairRateMaxBuckets ?? DEFAULT_PAIR_RATE_BUCKETS;
   const trustedProxyAddresses = new Set(options.trustedProxyAddresses ?? []);
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_MESSAGE_BYTES });
+  const closeExpiredProvisionalConnections = (expired: readonly { machineId: string; deviceId: string }[]): void => {
+    const expiredKeys = new Set(expired.map((device) => `${device.machineId}\0${device.deviceId}`));
+    for (const connection of connections) {
+      if (connection.principal.role !== "device" ||
+          !expiredKeys.has(`${connection.principal.machineId}\0${connection.principal.deviceId}`)) continue;
+      if (connections.delete(connection)) broadcastPresence(connection.principal, false);
+      connection.ws.close(4401, "provisional pairing expired");
+    }
+  };
+  const sweepExpiredProvisionalDevices = async (): Promise<void> => {
+    closeExpiredProvisionalConnections(await registry.sweepExpiredProvisionalDevices());
+  };
   const provisionalSweepTimer = setInterval(() => {
-    void registry.sweepExpiredProvisionalDevices().catch(() => undefined);
+    void sweepExpiredProvisionalDevices().catch(() => undefined);
   }, PROVISIONAL_DEVICE_SWEEP_INTERVAL_MS);
   provisionalSweepTimer.unref?.();
 
@@ -304,6 +316,11 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     // two callbacks.
     if (!connections.has(source) || source.ws.readyState !== WebSocket.OPEN) return;
     const { principal } = source;
+    if (principal.role === "device" && !registry.isActiveDevice(principal.machineId, principal.deviceId)) {
+      if (connections.delete(source)) broadcastPresence(principal, false);
+      source.ws.close(4401, "device is no longer active");
+      return;
+    }
     if (payload.machineId !== principal.machineId) {
       sendError(source, "machine_mismatch", "The token is not authorized for this machine.", payload.machineId, payload.messageId);
       return;
@@ -327,6 +344,8 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     const targetRole = principal.role === "machine" ? "device" : "machine";
     const targets = [...connections].filter((connection) =>
       connection.principal.machineId === principal.machineId && connection.principal.role === targetRole &&
+      (connection.principal.role === "machine" ||
+        registry.isActiveDevice(connection.principal.machineId, connection.principal.deviceId)) &&
       (payload.targetDeviceId === undefined ||
         (connection.principal.role === "device" && connection.principal.deviceId === payload.targetDeviceId)) &&
       connection.ws.readyState === WebSocket.OPEN,
@@ -356,7 +375,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     // Expired provisional credentials are already rejected synchronously by
     // Registry.authenticate(); clean their persisted records before handling
     // the next HTTP request so abandoned pairings do not grow the registry.
-    await registry.sweepExpiredProvisionalDevices();
+    await sweepExpiredProvisionalDevices();
     const url = new URL(request.url ?? "/", "http://relay.invalid");
     if (request.method === "GET" && url.pathname === "/health") {
       respondJson(response, 200, {
@@ -461,7 +480,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
 
     const activateSelfMatch = /^\/v1\/machines\/([^/]+)\/devices\/self\/activate$/.exec(url.pathname);
     if (request.method === "POST" && activateSelfMatch !== null) {
-      const principal = authenticateBearer(request, registry);
+      const principal = authenticateBearer(request, registry, "any");
       const machineId = decodeURIComponent(activateSelfMatch[1]!);
       if (principal === undefined || principal.role !== "device" ||
           principal.machineId !== machineId || principal.deviceId === undefined) {
@@ -479,7 +498,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     const revokeMatch = /^\/v1\/machines\/([^/]+)\/devices\/([^/]+)$/.exec(url.pathname);
     const selfRevokeMatch = /^\/v1\/machines\/([^/]+)\/devices\/self$/.exec(url.pathname);
     if (request.method === "DELETE" && selfRevokeMatch !== null) {
-      const principal = authenticateBearer(request, registry);
+      const principal = authenticateBearer(request, registry, "any");
       const machineId = decodeURIComponent(selfRevokeMatch[1]!);
       // This endpoint is intentionally separate from the sibling-management
       // route below. A newly paired phone may need to compensate a local
@@ -608,9 +627,11 @@ const bearerToken = (request: IncomingMessage): string | undefined => {
   return match?.[1];
 };
 
-const authenticateBearer = (request: IncomingMessage, registry: Registry): RelayPrincipal | undefined => {
+const authenticateBearer = (request: IncomingMessage, registry: Registry,
+                           mode: "active" | "any" = "active"): RelayPrincipal | undefined => {
   const token = bearerToken(request);
-  return token === undefined ? undefined : registry.authenticate(token);
+  if (token === undefined) return undefined;
+  return mode === "any" ? registry.authenticate(token) : registry.authenticateActive(token);
 };
 
 const readJson = async (request: IncomingMessage): Promise<unknown> => {

@@ -247,7 +247,7 @@ export class Registry {
    * accumulate indefinitely in the persistent registry. Authentication and
    * listing already reject them synchronously; this cleanup is best-effort
    * housekeeping performed by the Relay server. */
-  public async sweepExpiredProvisionalDevices(now = Date.now()): Promise<void> {
+  public async sweepExpiredProvisionalDevices(now = Date.now()): Promise<readonly { machineId: string; deviceId: string }[]> {
     const expired = Object.values(this.state.devices)
       .filter((device) => device.revokedAt === undefined &&
         device.provisionalUntil !== undefined && now >= device.provisionalUntil)
@@ -255,6 +255,7 @@ export class Registry {
     for (const device of expired) {
       await this.revokeDevice(device.machineId, device.deviceId);
     }
+    return expired.map((device) => ({ machineId: device.machineId, deviceId: device.deviceId }));
   }
 
   /**
@@ -312,12 +313,44 @@ export class Registry {
   }
 
   public authenticate(token: string): RelayPrincipal | undefined {
+    return this.authenticateDeviceToken(token, "any");
+  }
+
+  /** Authenticates only machine credentials and activated device credentials.
+   * Ordinary Relay APIs and WebSocket sessions use this boundary; provisional
+   * pairing tokens are limited to activation/compensation endpoints. */
+  public authenticateActive(token: string): RelayPrincipal | undefined {
     for (const machine of Object.values(this.state.machines)) {
       if (secretEquals(machine.tokenHash, token)) return { role: "machine", machineId: machine.id };
     }
+    return this.authenticateDeviceToken(token, "active");
+  }
+
+  /** Authenticates a device credential while it is still provisional. */
+  public authenticateProvisional(token: string): RelayPrincipal | undefined {
+    return this.authenticateDeviceToken(token, "provisional");
+  }
+
+  /** Synchronous fence used for every frame from an already-upgraded socket. */
+  public isActiveDevice(machineId: string, deviceId: string): boolean {
+    const device = this.state.devices[deviceId];
+    return device !== undefined && device.machineId === machineId &&
+      device.revokedAt === undefined &&
+      device.provisionalUntil === undefined;
+  }
+
+  private authenticateDeviceToken(token: string, mode: "any" | "active" | "provisional"): RelayPrincipal | undefined {
+    if (mode !== "provisional") {
+      for (const machine of Object.values(this.state.machines)) {
+        if (secretEquals(machine.tokenHash, token)) return { role: "machine", machineId: machine.id };
+      }
+    }
     for (const device of Object.values(this.state.devices)) {
       if (device.revokedAt !== undefined) continue;
-      if (device.provisionalUntil !== undefined && Date.now() >= device.provisionalUntil) continue;
+      const provisional = device.provisionalUntil !== undefined;
+      if (provisional && Date.now() >= device.provisionalUntil!) continue;
+      if (mode === "active" && provisional) continue;
+      if (mode === "provisional" && !provisional) continue;
       if (secretEquals(device.tokenHash, token)) {
         return { role: "device", machineId: device.machineId, deviceId: device.id };
       }
