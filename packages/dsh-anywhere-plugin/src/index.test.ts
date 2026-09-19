@@ -557,7 +557,7 @@ describe('native bridge mutations', () => {
     })
     await expect(firstRequest(
       'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code', permissionMode: 'workspace-write' }, 'setup-failure',
-    )).resolves.toMatchObject({ status: 500 })
+    )).resolves.toMatchObject({ status: 502 })
 
     const restartedRequest = mount({ dataDir, create: async () => ({ sessionId: 'should-not-run' }) })
     await expect(restartedRequest(
@@ -584,7 +584,7 @@ describe('native bridge mutations', () => {
     })
     await expect(firstRequest(
       'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code', permissionMode: 'workspace-write' }, 'setup-recovery',
-    )).resolves.toMatchObject({ status: 500 })
+    )).resolves.toMatchObject({ status: 502 })
 
     const restartedRequest = mount({ dataDir })
     await expect(restartedRequest(

@@ -373,7 +373,15 @@ interface SessionCreationRecord {
   readonly completedAt?: number
 }
 
+interface AttachmentUploadRecord {
+  readonly fingerprint: string | undefined
+  readonly pending?: boolean
+  readonly response?: JsonObject
+  readonly completedAt?: number
+}
+
 const MAX_SESSION_CREATION_RECORDS = 4096
+const MAX_ATTACHMENT_UPLOAD_RECORDS = 8192
 const SESSION_CREATION_RECORD_SCHEMA_VERSION = 1 as const
 
 type PermissionMode = 'ask' | 'never' | 'read-only' | 'workspace-write' | 'danger-full-access'
@@ -394,6 +402,10 @@ class SessionMetadataStore {
    * idempotency cache is intentionally short-lived, but a lost response must
    * remain queryable after that cache expires or the Bridge restarts. */
   private sessionCreationResults = new Map<string, SessionCreationRecord>()
+  /** Attachment receipts need the same crash/retry protection as session
+   * creation. A pending record fails closed after a native upload response is
+   * lost; replaying the upload could otherwise create an orphaned file. */
+  private attachmentUploadResults = new Map<string, AttachmentUploadRecord>()
   /** A corrupt metadata file must never make the create dedupe layer forget
    * an already committed session and execute the same request again. */
   private persistenceUnavailable = false
@@ -444,6 +456,44 @@ class SessionMetadataStore {
       }
     }
     return entry
+  }
+
+  attachmentUploadEntry(key: string, fingerprint: string | undefined): JsonObject | undefined {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.attachmentUploadResults.get(key)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    if (entry.response === undefined) {
+      throw new HttpError(503, 'attachment upload result is still unknown', 'unknown')
+    }
+    return entry.response
+  }
+
+  async setAttachmentUploadPending(key: string, fingerprint: string | undefined): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    if (!this.attachmentUploadResults.has(key) &&
+        this.attachmentUploadResults.size >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
+      throw new HttpError(503, 'attachment upload idempotency capacity is full', 'unknown')
+    }
+    this.attachmentUploadResults.set(key, { fingerprint, pending: true })
+    await this.persist()
+  }
+
+  async setAttachmentUploadResult(key: string, fingerprint: string | undefined,
+                                  response: JsonObject): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    this.attachmentUploadResults.set(key, {
+      fingerprint, response, completedAt: Date.now(),
+    })
+    await this.persist()
   }
 
   /**
@@ -705,6 +755,45 @@ class SessionMetadataStore {
           }
         }
       }
+      const attachmentUploads = parsed.attachmentUploads
+      if (attachmentUploads !== undefined &&
+          (typeof attachmentUploads !== 'object' || attachmentUploads === null || Array.isArray(attachmentUploads))) {
+        throw new Error('attachment upload metadata must be an object')
+      }
+      if (typeof attachmentUploads === 'object' && attachmentUploads !== null && !Array.isArray(attachmentUploads)) {
+        if (Object.keys(attachmentUploads).length > MAX_ATTACHMENT_UPLOAD_RECORDS) {
+          throw new Error('attachment upload metadata exceeds its safety capacity')
+        }
+        for (const [key, raw] of Object.entries(attachmentUploads)) {
+          if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+            throw new Error('attachment upload metadata contains an invalid record')
+          }
+          if (raw.fingerprint !== undefined && typeof raw.fingerprint !== 'string') {
+            throw new Error('attachment upload fingerprint metadata is invalid')
+          }
+          if (raw.pending !== undefined && typeof raw.pending !== 'boolean') {
+            throw new Error('attachment upload pending metadata is invalid')
+          }
+          if (raw.completedAt !== undefined &&
+              (typeof raw.completedAt !== 'number' || !Number.isFinite(raw.completedAt) || raw.completedAt < 0)) {
+            throw new Error('attachment upload completion timestamp is invalid')
+          }
+          const response = raw.response
+          if (response !== undefined &&
+              (typeof response !== 'object' || response === null || Array.isArray(response))) {
+            throw new Error('attachment upload response metadata is invalid')
+          }
+          if (response === undefined && raw.pending !== true) {
+            throw new Error('attachment upload metadata contains an incomplete record')
+          }
+          this.attachmentUploadResults.set(key, {
+            fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
+            ...(raw.pending === true ? { pending: true } : {}),
+            ...(response === undefined ? {} : { response: response as JsonObject }),
+            ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
+          })
+        }
+      }
     } catch (error) {
       // A missing or corrupt presentation file must never prevent Harness from
       // starting; the durable Harness session store remains authoritative.
@@ -730,6 +819,7 @@ class SessionMetadataStore {
       titles: Object.fromEntries(this.titles),
       branches: Object.fromEntries(this.branches),
       sessionCreations: Object.fromEntries(this.sessionCreationResults),
+      attachmentUploads: Object.fromEntries(this.attachmentUploadResults),
     }, null, 2)
     this.persistQueue = this.persistQueue.catch(() => undefined).then(async () => {
       if (this.persistenceUnavailable) throw new Error('session presentation metadata is unavailable')
@@ -792,6 +882,13 @@ function isMissingFileError(value: unknown): value is NodeJS.ErrnoException {
 
 function isPermissionPreset(value: PermissionMode): value is 'read-only' | 'workspace-write' | 'danger-full-access' {
   return value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access'
+}
+
+function retryableSessionSetupError(error: unknown): HttpError {
+  if (error instanceof HttpError) {
+    return new HttpError(error.status, error.message, 'retryable')
+  }
+  return new HttpError(502, error instanceof Error ? error.message : String(error), 'retryable')
 }
 
 async function applySessionCreationSetup(
@@ -1924,7 +2021,11 @@ async function handleHttp(
         }
         await metadata.setSessionCreationStarted(
           durableKey, fingerprint, recoveredSessionID, setup, remembered.nativeOperationId)
-        await applySessionCreationSetup(ctx, metadata, recoveredSessionID, setup)
+        try {
+          await applySessionCreationSetup(ctx, metadata, recoveredSessionID, setup)
+        } catch (error) {
+          throw retryableSessionSetupError(error)
+        }
         const summary = (await listSummaries(ctx, metadata, true, originDeviceId))
           .find((item) => item.id === recoveredSessionID)
         const response = { sessionId: recoveredSessionID, ...(summary === undefined ? {} : { summary }) }
@@ -1944,7 +2045,11 @@ async function handleHttp(
         if (remembered.sessionId === undefined) {
           throw new HttpError(503, 'legacy session creation result is unknown', 'unknown')
         }
-        await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        try {
+          await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        } catch (error) {
+          throw retryableSessionSetupError(error)
+        }
         const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === remembered.sessionId)
         const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
         await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
@@ -1959,7 +2064,11 @@ async function handleHttp(
           throw new HttpError(503, 'session creation setup record is unreadable', 'unknown')
         }
         const setup = remembered.setup
-        await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        try {
+          await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        } catch (error) {
+          throw retryableSessionSetupError(error)
+        }
         const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === remembered.sessionId)
         const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
         await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
@@ -2013,7 +2122,11 @@ async function handleHttp(
     if (durableKey !== undefined) {
       await metadata.setSessionCreationStarted(durableKey, fingerprint, result.sessionId, setup, nativeOperationId)
     }
-    await applySessionCreationSetup(ctx, metadata, result.sessionId, setup)
+    try {
+      await applySessionCreationSetup(ctx, metadata, result.sessionId, setup)
+    } catch (error) {
+      throw retryableSessionSetupError(error)
+    }
     const summary = (await listSummaries(ctx, metadata, true, originDeviceId)).find((item) => item.id === result.sessionId)
     const response = { ...result, ...(summary === undefined ? {} : { summary }) }
     if (durableKey !== undefined) await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
@@ -2204,7 +2317,33 @@ async function handleHttp(
       throw new HttpError(413, 'attachment is larger than 10 MiB')
     }
     const sessionId = decodeURIComponent(uploadMatch[1]!)
+    const requestId = header(req, 'x-dsh-request-id')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : undefined
+    const originDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? (header(req, 'x-dsh-origin-device-id') ?? device.id) : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID &&
+        !relayDevices.has(originDeviceId)) {
+      throw new HttpError(403, 'origin device is not connected through Relay')
+    }
+    const durableKey = requestId === undefined || requestId.length === 0
+      ? undefined : `${originDeviceId}\0${sessionId}\0${requestId}`
+    if (durableKey !== undefined) {
+      const remembered = metadata.attachmentUploadEntry(durableKey, fingerprint)
+      if (remembered !== undefined) {
+        json(res, 201, remembered)
+        return
+      }
+      // Commit a fail-closed marker before invoking the native file service.
+      // If the response is lost after the upload side effect, a later retry
+      // will see the pending marker instead of uploading a second file.
+      await metadata.setAttachmentUploadPending(durableKey, fingerprint)
+    }
     const result = await uploadAttachment(ctx, sessionId, body.data, body.name)
+    if (durableKey !== undefined) {
+      await metadata.setAttachmentUploadResult(durableKey, fingerprint, result)
+    }
     json(res, 201, result)
     return
   }

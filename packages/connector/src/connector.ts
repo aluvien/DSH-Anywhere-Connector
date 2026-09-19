@@ -1160,8 +1160,13 @@ export class DSHAnywhereConnector {
     // client-error response proves that session creation was rejected before
     // it reached the Harness; every other create failure keeps the original
     // request id in the recoverable "result unknown" state.
-    const definitelyRejected = error instanceof BridgeRequestError
-      && error.status >= 400 && error.status < 500 && error.outcome !== "unknown";
+    const definitelyRejected = error instanceof BridgeRequestError && (
+      (error.status >= 400 && error.status < 500 && error.outcome !== "unknown") ||
+      // The Bridge marks a retryable 5xx only when it knows the handler
+      // accepted no side effect. Presence preflight uses this path before
+      // dispatchCommand, so session.create is definitely unaccepted too.
+      (error.status >= 500 && error.outcome === "retryable")
+    );
     const resultUnknown = !definitelyRejected && (
       (error instanceof Error && error.name === "TimeoutError")
       || (error instanceof BridgeRequestError && error.outcome === "unknown")
@@ -1736,6 +1741,7 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
       return {
         method: "POST",
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/attachments`,
+        headers: { "x-dsh-origin-device-id": command.deviceId },
         body: command.payload,
       };
     default:

@@ -390,7 +390,8 @@ private actor DSHPendingTransactionFileStore {
                 store: DSHPendingTransactionStore(
                     sessionCreationTransactionsByMachine: [:],
                     lastSessionCreationRequestIDsByMachine: [:],
-                    initialMessageTransactionsByMachine: [:]),
+                    initialMessageTransactionsByMachine: [:],
+                    removedMachineIDs: []),
                 blobs: [:])
         }
         let metadata = try Data(contentsOf: metadataURL)
@@ -442,23 +443,29 @@ private struct DSHPendingTransactionStore: Codable, Sendable {
     var initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]]
     var pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]]
     var failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]]
+    /// A durable fence for an explicitly removed/forgotten Mac. If cleanup
+    /// cannot replace the old journal immediately, a later relaunch or
+    /// re-pair must not resurrect that machine's queued side effects.
+    var removedMachineIDs: Set<String>
 
     private enum CodingKeys: String, CodingKey {
         case sessionCreationTransactionsByMachine, lastSessionCreationRequestIDsByMachine,
              initialMessageTransactionsByMachine, pendingPromptTransactionsByMachine,
-             failedPromptTransactionsByMachine
+             failedPromptTransactionsByMachine, removedMachineIDs
     }
 
     init(sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]],
          lastSessionCreationRequestIDsByMachine: [String: String],
          initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]],
          pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]] = [:],
-         failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:]) {
+         failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:],
+         removedMachineIDs: Set<String> = []) {
         self.sessionCreationTransactionsByMachine = sessionCreationTransactionsByMachine
         self.lastSessionCreationRequestIDsByMachine = lastSessionCreationRequestIDsByMachine
         self.initialMessageTransactionsByMachine = initialMessageTransactionsByMachine
         self.pendingPromptTransactionsByMachine = pendingPromptTransactionsByMachine
         self.failedPromptTransactionsByMachine = failedPromptTransactionsByMachine
+        self.removedMachineIDs = removedMachineIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -477,6 +484,8 @@ private struct DSHPendingTransactionStore: Codable, Sendable {
         failedPromptTransactionsByMachine = try container.decodeIfPresent(
             [String: [String: DSHStoredFailedSend]].self,
             forKey: .failedPromptTransactionsByMachine) ?? [:]
+        removedMachineIDs = try container.decodeIfPresent(Set<String>.self,
+                                                         forKey: .removedMachineIDs) ?? []
     }
 }
 
@@ -746,6 +755,10 @@ final class DSHAppModel: ObservableObject {
 
     private var pendingPromptTransactionsByMachine: [String: [String: DSHPendingSend]] = [:]
     private var failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:]
+    /// Explicitly removed machines remain fenced until a deliberate new pair
+    /// clears the tombstone. This prevents old queue/journal data from
+    /// resurfacing if local cleanup was interrupted.
+    private var removedMachineIDs: Set<String> = []
 
     /// A transaction that cannot be written must never be sent again: after
     /// an app kill there would be no request identity left to coalesce the
@@ -807,6 +820,7 @@ final class DSHAppModel: ObservableObject {
         do {
             let loaded = try await pendingTransactionFileStore.load()
             let store = loaded.store
+            removedMachineIDs = store.removedMachineIDs
             var creations: [String: [String: DSHSessionCreationTransaction]] = [:]
             for (machineID, transactions) in store.sessionCreationTransactionsByMachine {
                 var next: [String: DSHSessionCreationTransaction] = [:]
@@ -846,13 +860,21 @@ final class DSHAppModel: ObservableObject {
                 }
                 creations[machineID] = current
             }
+            for removedMachineID in removedMachineIDs {
+                creations.removeValue(forKey: removedMachineID)
+            }
             sessionCreationTransactionsByMachine = creations
             var lastIDs = store.lastSessionCreationRequestIDsByMachine
+            for removedMachineID in removedMachineIDs {
+                lastIDs.removeValue(forKey: removedMachineID)
+            }
             for (activeMachineID, requestID) in lastSessionCreationRequestIDsByMachine {
-                lastIDs[activeMachineID] = requestID
+                if !removedMachineIDs.contains(activeMachineID) {
+                    lastIDs[activeMachineID] = requestID
+                }
             }
             if let lastSessionCreationRequestID,
-               !machineID.isEmpty {
+               !machineID.isEmpty, !removedMachineIDs.contains(machineID) {
                 lastIDs[machineID] = lastSessionCreationRequestID
             }
             lastSessionCreationRequestIDsByMachine = lastIDs
@@ -884,6 +906,9 @@ final class DSHAppModel: ObservableObject {
                 }
                 initialMessages[machineID] = current
             }
+            for removedMachineID in removedMachineIDs {
+                initialMessages.removeValue(forKey: removedMachineID)
+            }
             initialMessageTransactionsByMachine = initialMessages
             var pendingPrompts: [String: [String: DSHPendingSend]] = [:]
             for (storedMachineID, transactions) in store.pendingPromptTransactionsByMachine {
@@ -903,6 +928,9 @@ final class DSHAppModel: ObservableObject {
                 current.merge(pendingSendsByRequestID) { _, current in current }
                 pendingPrompts[machineID] = current
             }
+            for removedMachineID in removedMachineIDs {
+                pendingPrompts.removeValue(forKey: removedMachineID)
+            }
             pendingPromptTransactionsByMachine = pendingPrompts
             var failedPrompts = store.failedPromptTransactionsByMachine
             for (activeMachineID, current) in failedPromptTransactionsByMachine {
@@ -914,6 +942,9 @@ final class DSHAppModel: ObservableObject {
                 var current = failedPrompts[machineID] ?? [:]
                 current.merge(failedSendsByRequestID.mapValues(storedFailedSend)) { _, current in current }
                 failedPrompts[machineID] = current
+            }
+            for removedMachineID in removedMachineIDs {
+                failedPrompts.removeValue(forKey: removedMachineID)
             }
             failedPromptTransactionsByMachine = failedPrompts
         } catch {
@@ -1022,7 +1053,8 @@ final class DSHAppModel: ObservableObject {
             lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
             initialMessageTransactionsByMachine: storedInitialMessages,
             pendingPromptTransactionsByMachine: storedPendingPrompts,
-            failedPromptTransactionsByMachine: failedPromptTransactionsByMachine)
+            failedPromptTransactionsByMachine: failedPromptTransactionsByMachine,
+            removedMachineIDs: removedMachineIDs)
         pendingPersistenceGeneration += 1
         return DSHPendingTransactionSnapshot(metadata: try JSONEncoder().encode(store),
                                               blobs: blobs,
@@ -1265,6 +1297,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func restoreSessionCreationTransactions(for machineID: String) {
+        guard !removedMachineIDs.contains(machineID) else { return }
         if let snapshot = sessionCreationTransactionsByMachine[machineID] {
             for (requestID, transaction) in snapshot {
                 pendingSessionCreationRequestIDs.insert(requestID)
@@ -1668,6 +1701,15 @@ final class DSHAppModel: ObservableObject {
                 UserDefaults.standard.set(address, forKey: "dsh-anywhere.server-address")
                 self.machineName = profile.machineName
                 self.machineID = profile.machineId
+                // Pairing is an explicit new lifecycle. Clear only this
+                // machine's removal fence; its old queue key was deleted at
+                // removal and must not be resurrected by a re-pair.
+                self.removedMachineIDs.remove(profile.machineId)
+                self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: profile.machineId)
+                UserDefaults.standard.removeObject(
+                    forKey: self.queuedPromptsDefaultsKey(for: profile.machineId))
+                self.resetTransientRequestState()
+                _ = await self.persistPendingTransactionStore()
                 self.refreshMachines()
                 self.isPaired = true
                 self.connect()
@@ -1762,7 +1804,18 @@ final class DSHAppModel: ObservableObject {
             self.initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.failedPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
-            await self.persistPendingTransactionStore()
+            self.removedMachineIDs.insert(machine.machineId)
+            UserDefaults.standard.removeObject(
+                forKey: self.queuedPromptsDefaultsKey(for: machine.machineId))
+            let cleanupResult = await self.persistPendingTransactionStoreResult()
+            guard cleanupResult == .persisted else {
+                if cleanupResult == .quotaExceeded {
+                    self.errorMessage = "本机已从 Relay 删除，但本地待处理附件占用过多，清理尚未安全落盘。"
+                } else {
+                    self.errorMessage = "本机已从 Relay 删除，但本地清理尚未安全落盘；旧请求已被隔离。"
+                }
+                return
+            }
             self.refreshMachines()
             guard needsRecovery else {
                 self.isPaired = !self.machines.isEmpty
@@ -1941,18 +1994,31 @@ final class DSHAppModel: ObservableObject {
             self.initialMessageTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.pendingPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.failedPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
-            await self.persistPendingTransactionStore()
+            self.removedMachineIDs.insert(forgottenMachineID)
+            UserDefaults.standard.removeObject(
+                forKey: self.queuedPromptsDefaultsKey(for: forgottenMachineID))
+            let cleanupResult = await self.persistPendingTransactionStoreResult()
+            guard cleanupResult == .persisted else {
+                if cleanupResult == .quotaExceeded {
+                    self.errorMessage = "本机已解除配对，但本地待处理附件占用过多，清理尚未安全落盘。"
+                } else {
+                    self.errorMessage = "本机已解除配对，但本地清理尚未安全落盘；旧请求已被隔离。"
+                }
+                return
+            }
             self.refreshMachines()
             self.state = .init()
             if let active = self.activeMachine {
                 self.machineName = active.machineName
                 self.machineID = active.machineId
+                self.resetTransientRequestState()
                 self.restoreSessionCreationTransactions(for: active.machineId)
                 self.isPaired = true
                 self.connect()
             } else {
                 self.machineName = ""
                 self.machineID = ""
+                self.resetTransientRequestState()
                 self.isPaired = false
             }
         }
@@ -2522,7 +2588,12 @@ final class DSHAppModel: ObservableObject {
                     id: prepared.requestID, text: prepared.text, receipts: prepared.receipts,
                     sessionID: prepared.sessionID, mode: prepared.mode,
                     messageAttachments: prepared.messageAttachments,
-                    failure: .local("无法保存待处理请求，消息尚未发送。"), retryUntil: nil)
+                    failure: .local("无法保存待处理请求，消息尚未发送。"),
+                    // A retry may be failing locally, but its request id can
+                    // have been accepted by an earlier attempt. Preserve the
+                    // existing finite deadline instead of turning it into an
+                    // indefinitely reusable local failure.
+                    retryUntil: pending.dedupeExpiresAt)
             }
             errorMessage = "无法保存待处理请求，消息尚未发送。"
             return false
@@ -2798,6 +2869,7 @@ final class DSHAppModel: ObservableObject {
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         if let attempt, pendingSendsByRequestID[command.requestId]?.attempt != attempt { return }
         if attempt != nil && pendingSendsByRequestID[command.requestId] == nil { return }
+        let inheritedFailed = failedSendsByRequestID[command.requestId]
         let pending = pendingSendsByRequestID.removeValue(forKey: command.requestId)
         var receipts: [String] = []
         var text = ""
@@ -2819,9 +2891,12 @@ final class DSHAppModel: ObservableObject {
         let deadlineExpired = (error as? DSHWebSocketError) == .dedupeWindowExpired
         let retryUntil = resultUnknown
             ? (pending?.dedupeExpiresAt
+                ?? inheritedFailed?.retryUntil
                 ?? pending?.sentAt.addingTimeInterval(Self.promptIdempotencyWindow)
                 ?? Date().addingTimeInterval(Self.promptIdempotencyWindow))
-            : (deadlineExpired ? pending?.dedupeExpiresAt ?? .now : nil)
+            : (deadlineExpired
+                ? pending?.dedupeExpiresAt ?? inheritedFailed?.retryUntil ?? .now
+                : pending?.dedupeExpiresAt ?? inheritedFailed?.retryUntil)
         failedSendsByRequestID[command.requestId] = DSHFailedSend(
             id: command.requestId, text: text, receipts: receipts,
             sessionID: sessionID, mode: mode,
@@ -2887,6 +2962,18 @@ final class DSHAppModel: ObservableObject {
 
     func dismissFailedSend(requestID: String) {
         failedSendsByRequestID.removeValue(forKey: requestID)
+        // A dismissed failure is an explicit terminal user decision, not a
+        // crash gap. Remove its queue mirror so reconnect recovery cannot
+        // infer "pending and failed maps are empty" and submit the request
+        // without another tap.
+        for sessionID in Array(queuedPromptsBySession.keys) {
+            guard var queue = queuedPromptsBySession[sessionID] else { continue }
+            let filtered = queue.filter { $0.requestId != requestID }
+            if filtered.count == queue.count { continue }
+            queue = filtered
+            queuedPromptsBySession[sessionID] = queue
+        }
+        persistQueuedPrompts()
         persistCurrentTransactionsLater(for: machineID)
     }
 
@@ -2966,8 +3053,12 @@ final class DSHAppModel: ObservableObject {
     private static let queuedPromptTTL: TimeInterval = 24 * 60 * 60
     private static let queuedPromptsDefaultsKey = "dsh-anywhere.queued-prompts"
 
-    private var queuedPromptsDefaultsKey: String {
+    private func queuedPromptsDefaultsKey(for machineID: String) -> String {
         "\(Self.queuedPromptsDefaultsKey).\(machineID)"
+    }
+
+    private var queuedPromptsDefaultsKey: String {
+        queuedPromptsDefaultsKey(for: machineID)
     }
 
     /// Holds a text prompt locally until the turn settles (cancellable).
@@ -3110,6 +3201,10 @@ final class DSHAppModel: ObservableObject {
     }
 
     func restoreQueuedPrompts() {
+        guard !removedMachineIDs.contains(machineID) else {
+            queuedPromptsBySession.removeAll(keepingCapacity: false)
+            return
+        }
         guard let data = UserDefaults.standard.data(forKey: queuedPromptsDefaultsKey),
               let restored = try? JSONDecoder().decode([String: [DSHQueuedPrompt]].self, from: data)
         else { return }
