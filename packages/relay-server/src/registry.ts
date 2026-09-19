@@ -16,6 +16,10 @@ export interface DeviceRecord {
   readonly name: string;
   readonly tokenHash: string;
   readonly createdAt: number;
+  /** A provisional pairing cannot authenticate after this deadline. The
+   * marker bounds the Relay-side orphan window if the client dies before it
+   * can persist its local pairing transaction. */
+  provisionalUntil?: number;
   /** A persisted tombstone makes a failed final delete safe to retry. */
   revokedAt?: number;
 }
@@ -44,6 +48,7 @@ export interface DevicePairing {
   readonly deviceId: string;
   readonly deviceToken: string;
   readonly machineName: string;
+  readonly provisionalUntil?: number;
 }
 
 /** A device as its owner may see it. Only token hashes are ever stored. */
@@ -51,6 +56,10 @@ export interface DeviceSummary {
   readonly deviceId: string;
   readonly name: string;
   readonly createdAt: number;
+}
+
+export interface PairDeviceOptions {
+  readonly provisional?: boolean;
 }
 
 /** A freshly minted single-use pairing code and when it stops working. */
@@ -65,6 +74,12 @@ interface PairingCodeRecord {
 }
 
 const PAIRING_CODE_TTL_MS = 10 * 60_000;
+/**
+ * Relay-side bound for the crash window between returning a pairing token and
+ * the phone durably committing its local profile. A client that never reaches
+ * the activation phase therefore cannot leave an indefinitely usable device.
+ */
+export const PROVISIONAL_PAIRING_TTL_MS = 15 * 60_000;
 const PAIRING_CODE_LENGTH = 8;
 /** No 0/O/1/I/L: the code is read off a screen and typed by a human. */
 const PAIRING_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -150,10 +165,11 @@ export class Registry {
     return { machineId, machineToken, pairingSecret };
   }
 
-  public async pairDevice(machineId: string, pairingSecret: string, name: string): Promise<DevicePairing | undefined> {
+  public async pairDevice(machineId: string, pairingSecret: string, name: string,
+                          options: PairDeviceOptions = {}): Promise<DevicePairing | undefined> {
     const machine = this.state.machines[machineId];
     if (machine === undefined || !secretEquals(machine.pairingSecretHash, pairingSecret)) return undefined;
-    return await this.registerDevice(machineId, machine.name, name);
+    return await this.registerDevice(machineId, machine.name, name, options);
   }
 
   /**
@@ -178,7 +194,7 @@ export class Registry {
    * use, so a leaked code cannot be replayed or redirected at another machine.
    */
   public async pairDeviceWithCode(machineId: string, code: string, name: string,
-                                  now = Date.now()): Promise<DevicePairing | undefined> {
+                                  now = Date.now(), options: PairDeviceOptions = {}): Promise<DevicePairing | undefined> {
     this.sweepPairingCodes(now);
     const key = hashSecret(code.trim().toUpperCase());
     const record = this.pairingCodes.get(key);
@@ -188,21 +204,28 @@ export class Registry {
     // Consume before creating the device: a second attempt with the same code
     // must fail even if device creation were to throw.
     this.pairingCodes.delete(key);
-    return await this.registerDevice(machineId, machine.name, name);
+    return await this.registerDevice(machineId, machine.name, name, options);
   }
 
-  private async registerDevice(machineId: string, machineName: string, name: string): Promise<DevicePairing> {
+  private async registerDevice(machineId: string, machineName: string, name: string,
+                               options: PairDeviceOptions = {}): Promise<DevicePairing> {
     const deviceId = `device_${randomUUID()}`;
     const deviceToken = newSecret();
+    const provisionalUntil = options.provisional === true
+      ? Date.now() + PROVISIONAL_PAIRING_TTL_MS : undefined;
     this.state.devices[deviceId] = {
       id: deviceId,
       machineId,
       name,
       tokenHash: hashSecret(deviceToken),
       createdAt: Date.now(),
+      ...(provisionalUntil === undefined ? {} : { provisionalUntil }),
     };
     await this.persist();
-    return { deviceId, deviceToken, machineName };
+    return {
+      deviceId, deviceToken, machineName,
+      ...(provisionalUntil === undefined ? {} : { provisionalUntil }),
+    };
   }
 
   private sweepPairingCodes(now: number): void {
@@ -214,9 +237,52 @@ export class Registry {
   /** Devices paired to one machine, oldest first. Never exposes token hashes. */
   public listDevices(machineId: string): readonly DeviceSummary[] {
     return Object.values(this.state.devices)
-      .filter((device) => device.machineId === machineId && device.revokedAt === undefined)
+      .filter((device) => device.machineId === machineId && device.revokedAt === undefined &&
+        device.provisionalUntil === undefined)
       .sort((left, right) => left.createdAt - right.createdAt)
       .map((device) => ({ deviceId: device.id, name: device.name, createdAt: device.createdAt }));
+  }
+
+  /** Removes expired provisional records so abandoned pair attempts cannot
+   * accumulate indefinitely in the persistent registry. Authentication and
+   * listing already reject them synchronously; this cleanup is best-effort
+   * housekeeping performed by the Relay server. */
+  public async sweepExpiredProvisionalDevices(now = Date.now()): Promise<void> {
+    const expired = Object.values(this.state.devices)
+      .filter((device) => device.revokedAt === undefined &&
+        device.provisionalUntil !== undefined && now >= device.provisionalUntil)
+      .map((device) => ({ machineId: device.machineId, deviceId: device.id }));
+    for (const device of expired) {
+      await this.revokeDevice(device.machineId, device.deviceId);
+    }
+  }
+
+  /**
+   * Completes the second phase of a provisional pairing. It is intentionally
+   * idempotent: a retry after a successful activation returns true without
+   * rewriting the record. Expired provisional records are no longer valid and
+   * are removed before returning false.
+   */
+  public async activateDevice(machineId: string, deviceId: string): Promise<boolean> {
+    const device = this.state.devices[deviceId];
+    if (device === undefined || device.machineId !== machineId || device.revokedAt !== undefined) return false;
+    if (device.provisionalUntil === undefined) return true;
+    if (Date.now() >= device.provisionalUntil) {
+      await this.revokeDevice(machineId, deviceId);
+      return false;
+    }
+    const previousDeadline = device.provisionalUntil;
+    delete device.provisionalUntil;
+    try {
+      await this.persist();
+    } catch (error) {
+      // Restore the provisional fence if the activation write did not reach
+      // disk. The caller will fail closed and retry rather than assuming the
+      // Relay and its registry disagree about lifecycle state.
+      device.provisionalUntil = previousDeadline;
+      throw error;
+    }
+    return true;
   }
 
   /**
@@ -251,6 +317,7 @@ export class Registry {
     }
     for (const device of Object.values(this.state.devices)) {
       if (device.revokedAt !== undefined) continue;
+      if (device.provisionalUntil !== undefined && Date.now() >= device.provisionalUntil) continue;
       if (secretEquals(device.tokenHash, token)) {
         return { role: "device", machineId: device.machineId, deviceId: device.id };
       }
@@ -284,6 +351,7 @@ const isMachine = (value: unknown): value is MachineRecord =>
 const isDevice = (value: unknown): value is DeviceRecord =>
   isRecord(value) && typeof value.id === "string" && typeof value.machineId === "string" && typeof value.name === "string" &&
   typeof value.tokenHash === "string" && typeof value.createdAt === "number" &&
+  (value.provisionalUntil === undefined || typeof value.provisionalUntil === "number") &&
   (value.revokedAt === undefined || typeof value.revokedAt === "number");
 
 const isRegistryFile = (value: unknown): value is RegistryFile => {

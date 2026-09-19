@@ -26,6 +26,11 @@ protocol DSHAppTransport: Sendable {
     /// and removal fence have all committed. This closes the compensating
     /// rollback window for the production transport.
     func commitPairing(machineId: String) async
+    /// Fences a pairing as locally committed before the final journal write.
+    /// The marker is deliberately durable so a crash between that fence and
+    /// the final journal write cannot make a valid Relay device look like an
+    /// abandoned provisional credential on the next launch.
+    func markPairingLocallyCommitted(machineId: String) async -> Bool
     /// Devices paired to the active machine, straight from the Relay.
     func pairedDevices() async throws -> [DSHRelayDevice]
     /// Revokes one device. The Relay refuses to let a device revoke itself.
@@ -39,10 +44,16 @@ extension DSHAppTransport {
 
     func rollbackPairing(machineId: String) async {}
     func commitPairing(machineId: String) async {}
+    func markPairingLocallyCommitted(machineId: String) async -> Bool { true }
 }
 
 private struct DSHRelayUpgradeRequired: LocalizedError {
     var errorDescription: String? { "请先升级 Relay 服务后再使用项目、模式或重命名功能。已有会话仍可正常使用。" }
+}
+
+private enum DSHProvisionalPairingState: String, Codable, Sendable {
+    case provisional
+    case localCommitted
 }
 
 private struct DSHProvisionalPairingMarker: Codable, Sendable {
@@ -50,6 +61,33 @@ private struct DSHProvisionalPairingMarker: Codable, Sendable {
     let deviceId: String
     let relayBaseURL: URL
     let createdAt: Date
+    var state: DSHProvisionalPairingState
+
+    init(machineId: String, deviceId: String, relayBaseURL: URL, createdAt: Date,
+         state: DSHProvisionalPairingState = .provisional) {
+        self.machineId = machineId
+        self.deviceId = deviceId
+        self.relayBaseURL = relayBaseURL
+        self.createdAt = createdAt
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case machineId, deviceId, relayBaseURL, createdAt, state
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        machineId = try container.decode(String.self, forKey: .machineId)
+        deviceId = try container.decode(String.self, forKey: .deviceId)
+        relayBaseURL = try container.decode(URL.self, forKey: .relayBaseURL)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        // Markers written by older builds were all provisional. Treat a
+        // missing state conservatively so an upgrade never silently activates
+        // a credential whose local commit was not proven durable.
+        state = try container.decodeIfPresent(DSHProvisionalPairingState.self, forKey: .state)
+            ?? .provisional
+    }
 }
 
 private struct DSHProvisionalPairing: Sendable {
@@ -89,13 +127,15 @@ actor DSHRemoteTransport: DSHAppTransport {
     nonisolated static var isConfigured: Bool { !DSHProfileStore().profiles.isEmpty }
 
     func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile {
+        await finalizeCommittedPairingMarkers()
         await drainProvisionalPairings()
         if !loadProvisionalMarkers().isEmpty {
             throw DSHAPIError.http(status: 409, message: "上一笔配对补偿尚未完成，请联网后重试。")
         }
         let baseURL = try DSHAPIClient.relayBaseURL(from: serverAddress)
         let result = try await DSHAPIClient(relayBaseURL: baseURL).pair(
-            machineId: machineId, credential: credential, deviceName: deviceName
+            machineId: machineId, credential: credential, deviceName: deviceName,
+            provisional: true
         )
         provisionalPairings[result.profile.deviceId] = DSHProvisionalPairing(
             profile: result.profile, token: result.token)
@@ -117,7 +157,14 @@ actor DSHRemoteTransport: DSHAppTransport {
     }
 
     func connect() async -> AsyncThrowingStream<DSHEvent, Error> {
+        await finalizeCommittedPairingMarkers()
         await drainProvisionalPairings()
+        if !loadProvisionalMarkers().isEmpty {
+            return AsyncThrowingStream {
+                $0.finish(throwing: DSHAPIError.http(
+                    status: 409, message: "上一笔配对补偿尚未完成，请联网后重试。"))
+            }
+        }
         let credentials = try? loadCredentials()
         guard let (profile, token) = credentials else {
             return AsyncThrowingStream { $0.finish(throwing: DSHAPIError.missingCredentials) }
@@ -260,19 +307,39 @@ actor DSHRemoteTransport: DSHAppTransport {
 
     func rollbackPairing(machineId: String) async {
         if store.activeMachineId == machineId { await disconnect() }
-        await revokeProvisionalPairing(machineId)
+        // An explicit local rollback is authoritative even if the marker had
+        // already been fenced as locally committed. It is used only when a
+        // later local journal write failed, so the Relay credential must still
+        // be compensated rather than left active.
+        await revokeProvisionalPairing(machineId, includeCommitted: true)
         guard let profile = store.profiles.first(where: { $0.machineId == machineId }) else { return }
         try? tokenStore.delete(account: profile.deviceId)
         store.remove(machineId)
     }
 
     func commitPairing(machineId: String) async {
+        _ = await markPairingLocallyCommitted(machineId: machineId)
+        await finalizeCommittedPairingMarkers()
+    }
+
+    func markPairingLocallyCommitted(machineId: String) async -> Bool {
         var markers = loadProvisionalMarkers()
-        for (deviceId, marker) in Array(markers) where marker.machineId == machineId {
-            provisionalPairings.removeValue(forKey: deviceId)
-            markers.removeValue(forKey: deviceId)
+        let deviceIDs = markers.compactMap { deviceId, marker in
+            marker.machineId == machineId && marker.state == .provisional ? deviceId : nil
         }
+        guard !deviceIDs.isEmpty else {
+            // A missing marker is not safe to treat as committed: the caller
+            // may otherwise finish its journal while the Relay credential has
+            // no durable lifecycle record at all.
+            return markers.values.contains(where: {
+                $0.machineId == machineId && $0.state == .localCommitted
+            })
+        }
+        for deviceID in deviceIDs { markers[deviceID]?.state = .localCommitted }
         saveProvisionalMarkers(markers)
+        return loadProvisionalMarkers().contains { deviceID, marker in
+            deviceIDs.contains(deviceID) && marker.machineId == machineId && marker.state == .localCommitted
+        }
     }
 
     func pairedDevices() async throws -> [DSHRelayDevice] {
@@ -295,9 +362,11 @@ actor DSHRemoteTransport: DSHAppTransport {
         return (profile, token)
     }
 
-    private func revokeProvisionalPairing(_ machineId: String) async {
+    private func revokeProvisionalPairing(_ machineId: String, includeCommitted: Bool = false) async {
         var markers = loadProvisionalMarkers()
-        let targets = markers.values.filter { $0.machineId == machineId }
+        let targets = markers.values.filter {
+            $0.machineId == machineId && (includeCommitted || $0.state == .provisional)
+        }
         for marker in targets {
             let persistedToken = try? tokenStore.read(account: marker.deviceId)
             let provisional = provisionalPairings[marker.deviceId]
@@ -317,17 +386,69 @@ actor DSHRemoteTransport: DSHAppTransport {
                 provisionalPairings.removeValue(forKey: marker.deviceId)
                 markers.removeValue(forKey: marker.deviceId)
             } catch {
-                provisionalPairings[marker.deviceId] = provisional
+                // A 401 means the Relay-side provisional TTL has elapsed (or
+                // an operator already revoked the token). In either case the
+                // credential is no longer usable, so retaining the marker
+                // would permanently block a fresh pairing. Network failures
+                // remain fail-closed and keep the compensating revoke pending.
+                if case DSHAPIError.http(let status, _) = error, status == 401 {
+                    try? tokenStore.delete(account: provisional.profile.deviceId)
+                    provisionalPairings.removeValue(forKey: marker.deviceId)
+                    markers.removeValue(forKey: marker.deviceId)
+                } else {
+                    provisionalPairings[marker.deviceId] = provisional
+                }
             }
         }
         saveProvisionalMarkers(markers)
     }
 
     private func drainProvisionalPairings() async {
-        let machineIDs = Set(loadProvisionalMarkers().values.map(\.machineId))
+        let machineIDs = Set(loadProvisionalMarkers().values
+            .filter { $0.state == .provisional }
+            .map(\.machineId))
         for machineID in machineIDs {
             await revokeProvisionalPairing(machineID)
         }
+    }
+
+    /// A locally committed marker is safe to keep across a process exit, but
+    /// the Relay still needs the second phase of the pairing handshake. Only
+    /// remove the marker after activation succeeds; otherwise connect() fails
+    /// closed and retries it on the next launch.
+    private func finalizeCommittedPairingMarkers() async {
+        var markers = loadProvisionalMarkers()
+        let targets = markers.values.filter { $0.state == .localCommitted }
+        for marker in targets {
+            let persistedToken = try? tokenStore.read(account: marker.deviceId)
+            let token = provisionalPairings[marker.deviceId]?.token ?? persistedToken
+            guard let token else { continue }
+            do {
+                try await DSHAPIClient(relayBaseURL: marker.relayBaseURL)
+                    .activateSelfDevice(machineId: marker.machineId, token: token)
+                provisionalPairings.removeValue(forKey: marker.deviceId)
+                markers.removeValue(forKey: marker.deviceId)
+            } catch {
+                if case DSHAPIError.http(let status, _) = error, status == 401 {
+                    // The locally committed profile can no longer authenticate
+                    // (expired provisional TTL or external revocation). Drop
+                    // this unusable profile and let the UI request pairing
+                    // again instead of retrying a dead marker forever.
+                    try? tokenStore.delete(account: marker.deviceId)
+                    store.remove(marker.machineId)
+                    provisionalPairings.removeValue(forKey: marker.deviceId)
+                    markers.removeValue(forKey: marker.deviceId)
+                } else {
+                    provisionalPairings[marker.deviceId] = DSHProvisionalPairing(
+                        profile: DSHRemoteProfile(relayBaseURL: marker.relayBaseURL,
+                                                   deviceId: marker.deviceId,
+                                                   machineId: marker.machineId,
+                                                   machineName: ""),
+                        token: token)
+                }
+            }
+        }
+        saveProvisionalMarkers(markers)
     }
 
     private func loadProvisionalMarkers() -> [String: DSHProvisionalPairingMarker] {

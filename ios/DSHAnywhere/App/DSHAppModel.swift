@@ -2001,6 +2001,16 @@ final class DSHAppModel: ObservableObject {
                         serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
                     return
                 }
+                // Fence the Relay credential before the final journal write.
+                // If the app is killed in the remaining crash window, the
+                // transport can activate this locally committed marker on the
+                // next launch instead of mistaking it for an abandoned pair.
+                guard await self.transport.markPairingLocallyCommitted(machineId: profile.machineId) else {
+                    await self.rollbackFailedPairing(
+                        profile.machineId, restoring: previousProfile,
+                        serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
+                    return
+                }
                 guard await self.persistPendingTransactionStore() else {
                     await self.rollbackFailedPairing(
                         profile.machineId, restoring: previousProfile,

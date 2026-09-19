@@ -19,6 +19,7 @@ const MAX_INITIALIZATION_BUFFER_BYTES = MAX_RELAY_MESSAGE_BYTES;
 const MAX_INITIALIZATION_BUFFER_MESSAGES = 32;
 const INITIALIZATION_TIMEOUT_MS = 10_000;
 const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
+const PROVISIONAL_DEVICE_SWEEP_INTERVAL_MS = 60_000;
 /**
  * Bumped whenever the routed `WireMessage` union changes shape. The Relay
  * validates every forwarded body against that union, so a Relay older than the
@@ -104,7 +105,7 @@ const RegisterMachineRequestSchema = (value: unknown): { machineName: string } |
  */
 const PairDeviceRequestSchema = (
   value: unknown,
-): { machineId: string; pairingSecret?: string; pairingCode?: string; deviceName: string } | undefined => {
+): { machineId: string; pairingSecret?: string; pairingCode?: string; deviceName: string; provisional: boolean } | undefined => {
   if (!isRecord(value)) return undefined;
   const { machineId, pairingSecret, deviceName } = value;
   const pairingCode = value.pairingCode;
@@ -123,6 +124,7 @@ const PairDeviceRequestSchema = (
     ...(hasSecret ? { pairingSecret } : {}),
     ...(hasCode ? { pairingCode } : {}),
     deviceName: name,
+    provisional: value.provisional === true,
   };
 };
 
@@ -145,6 +147,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const pairRateMaxBuckets = options.pairRateMaxBuckets ?? DEFAULT_PAIR_RATE_BUCKETS;
   const trustedProxyAddresses = new Set(options.trustedProxyAddresses ?? []);
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_MESSAGE_BYTES });
+  const provisionalSweepTimer = setInterval(() => {
+    void registry.sweepExpiredProvisionalDevices().catch(() => undefined);
+  }, PROVISIONAL_DEVICE_SWEEP_INTERVAL_MS);
+  provisionalSweepTimer.unref?.();
 
   httpServer.on("upgrade", (request, socket, head) => {
     let url: URL;
@@ -347,6 +353,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   };
 
   async function handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // Expired provisional credentials are already rejected synchronously by
+    // Registry.authenticate(); clean their persisted records before handling
+    // the next HTTP request so abandoned pairings do not grow the registry.
+    await registry.sweepExpiredProvisionalDevices();
     const url = new URL(request.url ?? "/", "http://relay.invalid");
     if (request.method === "GET" && url.pathname === "/health") {
       respondJson(response, 200, {
@@ -359,6 +369,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         // caller tells whether the deployed Relay serves those routes yet.
         deviceManagement: true,
         oneTimePairingCodes: true,
+        provisionalPairing: true,
       });
       return;
     }
@@ -402,8 +413,10 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       recordPairAttempt(pairAttempts, key, now);
       recordPairAttempt(pairIpAttempts, ip, now);
       const pairing = body.pairingCode === undefined
-        ? await registry.pairDevice(body.machineId, body.pairingSecret!, body.deviceName)
-        : await registry.pairDeviceWithCode(body.machineId, body.pairingCode, body.deviceName);
+        ? await registry.pairDevice(body.machineId, body.pairingSecret!, body.deviceName,
+          { provisional: body.provisional })
+        : await registry.pairDeviceWithCode(body.machineId, body.pairingCode, body.deviceName,
+          Date.now(), { provisional: body.provisional });
       if (pairing === undefined) {
         // One message for both shapes: distinguishing "expired" from "wrong"
         // would let a caller probe which codes exist.
@@ -443,6 +456,23 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         return;
       }
       respondJson(response, 200, { devices: registry.listDevices(machineId) });
+      return;
+    }
+
+    const activateSelfMatch = /^\/v1\/machines\/([^/]+)\/devices\/self\/activate$/.exec(url.pathname);
+    if (request.method === "POST" && activateSelfMatch !== null) {
+      const principal = authenticateBearer(request, registry);
+      const machineId = decodeURIComponent(activateSelfMatch[1]!);
+      if (principal === undefined || principal.role !== "device" ||
+          principal.machineId !== machineId || principal.deviceId === undefined) {
+        respondJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!await registry.activateDevice(machineId, principal.deviceId)) {
+        respondJson(response, 404, { error: "unknown_or_expired_device" });
+        return;
+      }
+      respondJson(response, 200, { activated: true, deviceId: principal.deviceId });
       return;
     }
 
@@ -528,6 +558,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     server: httpServer,
     url: `http://${address.address.includes(":") ? `[${address.address}]` : address.address}:${address.port}`,
     close: async () => {
+      clearInterval(provisionalSweepTimer);
       for (const connection of connections) connection.ws.close(1001, "Relay stopping");
       await new Promise<void>((resolve, reject) => httpServer.close((error) => error === undefined ? resolve() : reject(error)));
     },

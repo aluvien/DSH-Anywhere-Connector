@@ -409,6 +409,41 @@ describe("Relay server", () => {
     expect((await devices(server.url, machine.machineId, phone.deviceToken)).status).toBe(401);
   });
 
+  it("keeps provisional pairings hidden until the device activates them", async () => {
+    const server = await relay();
+    const machine = await register(server.url, "Mac");
+    const paired = await post<Pairing & { provisionalUntil: number }>(server.url, "/v1/pair", {
+      machineId: machine.machineId,
+      pairingSecret: machine.pairingSecret,
+      deviceName: "iPhone",
+      provisional: true,
+    });
+    expect(paired.status).toBe(201);
+    expect(paired.body.provisionalUntil).toBeGreaterThan(Date.now());
+    expect((await devices(server.url, machine.machineId, machine.machineToken)).body.devices)
+      .toEqual([]);
+
+    const activation = await fetch(
+      `${server.url}/v1/machines/${machine.machineId}/devices/self/activate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${paired.body.deviceToken}` },
+      },
+    );
+    expect(activation.status).toBe(200);
+    expect((await devices(server.url, machine.machineId, machine.machineToken)).body.devices)
+      ?.toHaveLength(1);
+
+    // Activation is safe to retry after a crash between the Relay response and
+    // local marker cleanup.
+    const retry = await fetch(
+      `${server.url}/v1/machines/${machine.machineId}/devices/self/activate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${paired.body.deviceToken}` },
+      },
+    );
+    expect(retry.status).toBe(200);
+  });
+
   it("keeps device management inside one machine", async () => {
     const server = await relay();
     const machineA = await register(server.url, "Mac A");

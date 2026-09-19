@@ -1851,7 +1851,8 @@ function isSessionProjectionMutation(command: CommandEnvelope): boolean {
 }
 
 function requiresDevicePresence(command: CommandEnvelope): boolean {
-  return command.type === "session.create" || command.type === "attachment.upload";
+  return command.type === "session.create" || command.type === "attachment.upload"
+    || command.type === "command.execute" || command.type === "workspace.create";
 }
 
 function trailingSlash(value: string): string {

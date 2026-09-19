@@ -1062,6 +1062,34 @@ class SessionMetadataStore {
     }
   }
 
+  /**
+   * Release a pending mutation only when the native adapter has positively
+   * rejected it before accepting any side effect. Unknown failures must keep
+   * the pending tombstone so a retry cannot execute the operation twice.
+   */
+  async markRemoteMutationNotCommitted(key: string, fingerprint: string | undefined): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.remoteMutationResults.get(key)
+    if (entry === undefined) return
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    if (entry.pending !== true) return
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
+    this.remoteMutationResults.delete(key)
+    try {
+      await this.persist()
+    } catch (error) {
+      this.remoteMutationResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
+  }
+
   async compactRemoteMutationRecords(keys: readonly string[]): Promise<number> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
@@ -1561,6 +1589,17 @@ function retryableSessionSetupError(error: unknown): HttpError {
     return new HttpError(error.status, error.message, 'retryable-committed')
   }
   return new HttpError(502, error instanceof Error ? error.message : String(error), 'retryable-committed')
+}
+
+/**
+ * These adapter errors are raised before the native mutation is accepted
+ * (missing session/service or rejected input).  They are the only failures
+ * allowed to release a durable remote-mutation pending record.  Timeouts and
+ * generic adapter failures remain result-unknown and stay fail-closed.
+ */
+function remoteMutationDefinitelyNotCommitted(error: unknown): error is HttpError {
+  return error instanceof HttpError &&
+    (error.status === 400 || error.status === 404 || error.status === 409 || error.status === 413 || error.status === 501)
 }
 
 async function applySessionCreationSetup(
@@ -2638,6 +2677,19 @@ async function handleHttp(
     try {
       workspace = await registry.create(pathValue, title && title.length > 0 ? title : undefined)
     } catch (error) {
+      if (durableKey !== undefined) {
+        try {
+          // WorkspaceRegistry.create is an atomic capability: a thrown
+          // validation/capability error means no workspace was accepted.
+          // Release that pending identity so a corrected request can retry;
+          // persistence failure keeps the safer unknown tombstone.
+          await metadata.markRemoteMutationNotCommitted(durableKey, fingerprint)
+        } catch (cleanupError) {
+          throw new HttpError(503,
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError), 'unknown')
+        }
+        throw new RetryableHttpError(400, error instanceof Error ? error.message : String(error))
+      }
       throw new HttpError(400, error instanceof Error ? error.message : String(error))
     }
     const response = { workspace: workspaceProjection(workspace) }
@@ -3089,7 +3141,24 @@ async function handleHttp(
       }
       await metadata.setRemoteMutationPending(durableKey, fingerprint)
     }
-    const result = await executeCommand(ctx, sessionId, parsed.data.line, parsed.data.attachments ?? [])
+    let result: unknown
+    try {
+      result = await executeCommand(ctx, sessionId, parsed.data.line, parsed.data.attachments ?? [])
+    } catch (error) {
+      if (durableKey !== undefined && remoteMutationDefinitelyNotCommitted(error)) {
+        try {
+          await metadata.markRemoteMutationNotCommitted(durableKey, fingerprint)
+        } catch (cleanupError) {
+          throw new HttpError(503,
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError), 'unknown')
+        }
+        throw new RetryableHttpError(
+          error.status,
+          error.message,
+        )
+      }
+      throw error
+    }
     if (durableKey !== undefined) await metadata.setRemoteMutationResult(durableKey, fingerprint, 202, result)
     json(res, 202, result)
     return
