@@ -818,11 +818,22 @@ private struct ConversationModals: ViewModifier {
                     }.value
                     guard let raw else { return }
                     let optimized = await optimizedPhotoDataOffMain(raw)
-                    draftAttachments.append(DSHStagedAttachment(name: "camera.jpg",
-                                                                data: optimized,
-                                                                isImage: true))
+                    appendDraftAttachments([DSHStagedAttachment(name: "camera.jpg",
+                                                                  data: optimized,
+                                                                  isImage: true)])
                 }
             }
+    }
+
+    private func appendDraftAttachments(_ values: [DSHStagedAttachment]) {
+        let remaining = max(0, 16 - draftAttachments.count)
+        let accepted = values.filter { $0.data.count <= 10 * 1024 * 1024 }.prefix(remaining)
+        draftAttachments.append(contentsOf: accepted)
+        if accepted.count < values.count {
+            model.errorMessage = draftAttachments.count >= 16
+                ? "一条消息最多包含 16 个附件。"
+                : "附件必须不超过 10 MiB，过大的文件未添加。"
+        }
     }
 }
 
@@ -2134,6 +2145,17 @@ struct ConversationView: View {
             "Could not read that photo. If it is stored in iCloud, open it in Photos once so it downloads, then try again.")
     }
 
+    private func appendDraftAttachments(_ values: [DSHStagedAttachment]) {
+        let remaining = max(0, 16 - draftAttachments.count)
+        let accepted = values.filter { $0.data.count <= 10 * 1024 * 1024 }.prefix(remaining)
+        draftAttachments.append(contentsOf: accepted)
+        if accepted.count < values.count {
+            model.errorMessage = draftAttachments.count >= 16
+                ? "一条消息最多包含 16 个附件。"
+                : "附件必须不超过 10 MiB，过大的文件未添加。"
+        }
+    }
+
     /// File-importer result handler, extracted as a named function so the
     /// view body's type-check budget stays bounded (a trailing closure here
     /// pushed the solver over its limit).
@@ -2146,7 +2168,7 @@ struct ConversationView: View {
             let attachment = DSHStagedAttachment(name: url.lastPathComponent,
                                                  data: data,
                                                  isImage: url.isImageFile)
-            draftAttachments.append(attachment)
+            appendDraftAttachments([attachment])
         }
     }
 
@@ -2172,8 +2194,9 @@ struct ConversationView: View {
                     let attachment = DSHStagedAttachment(name: "photo.jpg",
                                                          data: optimized,
                                                          isImage: true)
-                    draftAttachments.append(attachment)
-                    staged += 1
+                    let before = draftAttachments.count
+                    appendDraftAttachments([attachment])
+                    if draftAttachments.count > before { staged += 1 }
                 } catch {
                     // One bad asset must not sink the other nine.
                     continue

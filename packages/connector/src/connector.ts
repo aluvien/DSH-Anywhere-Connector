@@ -1141,7 +1141,8 @@ export class DSHAnywhereConnector {
   }
 
   private sessionListPath(deviceId: string): string {
-    return this.includeArchivedByDevice.get(deviceId) === true ? "/sessions?includeArchived=true" : "/sessions";
+    const query = this.includeArchivedByDevice.get(deviceId) === true ? "includeArchived=true&" : "";
+    return `/sessions?${query}deviceId=${encodeURIComponent(deviceId)}`;
   }
 
   private beginSessionSnapshotQuery(deviceId: string, includeArchived?: boolean): number {
@@ -1506,7 +1507,7 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
     case "session.list":
       return {
         method: "GET",
-        path: command.payload.includeArchived === true ? "/sessions?includeArchived=true" : "/sessions",
+        path: `${command.payload.includeArchived === true ? "/sessions?includeArchived=true&" : "/sessions?"}deviceId=${encodeURIComponent(command.deviceId)}`,
       };
     case "session.open":
       return {

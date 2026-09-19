@@ -354,6 +354,7 @@ type SessionCreationSetup = {
 }
 
 interface SessionCreationRecord {
+  readonly schemaVersion?: 1
   readonly fingerprint: string | undefined
   readonly response?: JsonObject
   readonly pending?: boolean
@@ -361,9 +362,18 @@ interface SessionCreationRecord {
   readonly sessionId?: string
   readonly setup?: SessionCreationSetup | undefined
   readonly setupComplete?: boolean
+  /** A pre-stage-machine response may have been captured before setup finished. */
+  readonly legacySetupUnknown?: boolean
+  /** Used only for safe retention-based compaction of completed records. */
+  readonly completedAt?: number
 }
 
 const MAX_SESSION_CREATION_RECORDS = 4096
+const SESSION_CREATION_RECORD_SCHEMA_VERSION = 1 as const
+// A completed request is retained for a generous recovery window. Pending and
+// unknown records are never evicted automatically because doing so could allow
+// a late retry to execute native create twice.
+const SESSION_CREATION_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000
 
 type PermissionMode = 'ask' | 'never' | 'read-only' | 'workspace-write' | 'danger-full-access'
 
@@ -434,15 +444,58 @@ class SessionMetadataStore {
     return entry
   }
 
+  /**
+   * Returns the request id which created a session for one authenticated
+   * device.  Session snapshots use this correlation only to recover a
+   * detached create after its live `session.created` event was lost.
+   */
+  sessionCreationRequestIdForSession(deviceId: string, sessionId: string): string | undefined {
+    const prefix = `${deviceId}\0`
+    let match: string | undefined
+    for (const [key, entry] of this.sessionCreationResults) {
+      if (!key.startsWith(prefix) || entry.sessionId !== sessionId) continue
+      // A native create may have committed before a later setup stage failed.
+      // That partial record still identifies the session and must be exposed
+      // for snapshot reconciliation; otherwise a lost `session.created`
+      // leaves the iOS transaction detached forever.
+      match = key.slice(prefix.length)
+    }
+    return match
+  }
+
+  private completedRecordsEligibleForCompaction(now: number): string[] {
+    return [...this.sessionCreationResults].flatMap(([key, entry]) => {
+      const completedAt = entry.completedAt
+      return entry.setupComplete === true && entry.response !== undefined &&
+        completedAt !== undefined && Number.isFinite(completedAt) &&
+        now - completedAt >= SESSION_CREATION_COMPLETED_RETENTION_MS
+        ? [key] : []
+    })
+  }
+
   async setSessionCreationPending(key: string, fingerprint: string | undefined,
                                   setup: SessionCreationSetup): Promise<void> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     if (!this.sessionCreationResults.has(key) && this.sessionCreationResults.size >= MAX_SESSION_CREATION_RECORDS) {
+      const compactable = this.completedRecordsEligibleForCompaction(Date.now())
+      if (this.sessionCreationResults.size - compactable.length >= MAX_SESSION_CREATION_RECORDS) {
+        // A full table is deliberately fail-closed. The operator can still
+        // retry after the completed retention window or repair/reconcile an
+        // unknown record; we never evict one whose native side effect is not
+        // known to be complete.
+        throw new HttpError(503, 'session creation idempotency capacity is full', 'unknown')
+      }
+      for (const compactableKey of compactable) this.sessionCreationResults.delete(compactableKey)
+    }
+    if (!this.sessionCreationResults.has(key) && this.sessionCreationResults.size >= MAX_SESSION_CREATION_RECORDS) {
       throw new HttpError(503, 'session creation idempotency capacity is full', 'unknown')
     }
-    this.sessionCreationResults.set(key, { fingerprint, pending: true, setup, setupComplete: false })
+    this.sessionCreationResults.set(key, {
+      schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
+      fingerprint, pending: true, setup, setupComplete: false,
+    })
     await this.persist()
   }
 
@@ -452,6 +505,7 @@ class SessionMetadataStore {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     this.sessionCreationResults.set(key, {
+      schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint,
       sessionId,
       setup,
@@ -467,11 +521,13 @@ class SessionMetadataStore {
     }
     const sessionId = typeof response.sessionId === 'string' ? response.sessionId : undefined
     this.sessionCreationResults.set(key, {
+      schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint,
       response,
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(setup === undefined ? {} : { setup }),
       setupComplete: true,
+      completedAt: Date.now(),
     })
     await this.persist()
   }
@@ -517,6 +573,10 @@ class SessionMetadataStore {
         throw new Error('session metadata root must be an object')
       }
       const parsed = parsedValue as JsonObject
+      const schemaVersion = parsed.sessionCreationSchemaVersion
+      if (schemaVersion !== undefined && schemaVersion !== SESSION_CREATION_RECORD_SCHEMA_VERSION) {
+        throw new Error('session creation metadata schema version is unsupported')
+      }
       const archived = parsed.archived
       if (Array.isArray(archived)) for (const id of archived) if (typeof id === 'string') this.archived.add(id)
       const unarchived = parsed.unarchived
@@ -555,8 +615,15 @@ class SessionMetadataStore {
           if (raw.fingerprint !== undefined && typeof raw.fingerprint !== 'string') {
             throw new Error('session creation fingerprint metadata is invalid')
           }
+          if (raw.schemaVersion !== undefined && raw.schemaVersion !== SESSION_CREATION_RECORD_SCHEMA_VERSION) {
+            throw new Error('session creation record schema version is unsupported')
+          }
           if (raw.setupComplete !== undefined && typeof raw.setupComplete !== 'boolean') {
             throw new Error('session creation completion metadata is invalid')
+          }
+          if (raw.completedAt !== undefined &&
+              (typeof raw.completedAt !== 'number' || !Number.isFinite(raw.completedAt) || raw.completedAt < 0)) {
+            throw new Error('session creation completion timestamp is invalid')
           }
           const fingerprint = typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined
           const response = raw.response
@@ -574,23 +641,33 @@ class SessionMetadataStore {
             if (sessionId === undefined || sessionId.length === 0) {
               throw new Error('session creation response is missing its session id')
             }
+            const legacySetupUnknown = raw.schemaVersion === undefined || raw.setupComplete === undefined
             this.sessionCreationResults.set(key, {
+              ...(raw.schemaVersion === SESSION_CREATION_RECORD_SCHEMA_VERSION
+                ? { schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION } : {}),
               fingerprint,
               response: response as JsonObject,
               ...(sessionId === undefined ? {} : { sessionId }),
               ...(setup === undefined ? {} : { setup }),
-              ...(raw.setupComplete === false ? { setupComplete: false } : { setupComplete: true }),
+              setupComplete: legacySetupUnknown ? false : raw.setupComplete === true,
+              ...(legacySetupUnknown ? { legacySetupUnknown: true } : {}),
+              ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
             })
           } else if (typeof raw.sessionId === 'string') {
             if (raw.sessionId.length === 0) throw new Error('session creation session id is empty')
             this.sessionCreationResults.set(key, {
+              ...(raw.schemaVersion === SESSION_CREATION_RECORD_SCHEMA_VERSION
+                ? { schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION } : {}),
               fingerprint,
               sessionId: raw.sessionId,
               ...(setup === undefined ? {} : { setup }),
               setupComplete: raw.setupComplete === true,
+              ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
             })
           } else if (raw.pending === true) {
             this.sessionCreationResults.set(key, {
+              ...(raw.schemaVersion === SESSION_CREATION_RECORD_SCHEMA_VERSION
+                ? { schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION } : {}),
               fingerprint,
               pending: true,
               ...(setup === undefined ? {} : { setup }),
@@ -619,6 +696,7 @@ class SessionMetadataStore {
     // serialize atomic replacements instead of racing writeFile calls against
     // the same path or exposing a partially-written JSON document on crash.
     const snapshot = JSON.stringify({
+      sessionCreationSchemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       archived: [...this.archived],
       unarchived: [...this.unarchived],
       permissions: Object.fromEntries(this.permissions),
@@ -1161,7 +1239,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           },
         }, [client])
         void (async () => {
-          const items = await listSummaries(ctx, metadata, false)
+          const items = await listSummaries(ctx, metadata, false, device.id)
           publish({ deviceId: device.id, type: 'session.snapshot', payload: items }, [client])
           await publishModelCatalog(ctx, publish, device.id)
           // Seed the live model projection from the authoritative snapshot
@@ -1627,14 +1705,17 @@ async function handleHttp(
 
   if (req.method === 'GET' && path === '/sessions') {
     const includeArchived = url.searchParams.get('includeArchived') === 'true'
-    json(res, 200, { items: await listSummaries(ctx, metadata, includeArchived) })
+    const requestedDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? url.searchParams.get('deviceId') ?? undefined
+      : device.id
+    json(res, 200, { items: await listSummaries(ctx, metadata, includeArchived, requestedDeviceId) })
     return
   }
 
   const openMatch = /^\/sessions\/([^/]+)\/open$/.exec(path)
   if (req.method === 'POST' && openMatch !== null) {
     const sessionId = decodeURIComponent(openMatch[1]!)
-    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === sessionId)
+    const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === sessionId)
     if (summary === undefined) throw new HttpError(404, 'session not found')
     const body = objectOf(await readJson(req))
     const recipient = historyRecipient(device.id, body.deviceId)
@@ -1712,37 +1793,9 @@ async function handleHttp(
     const suppliedHash = header(req, 'x-dsh-request-hash')
     const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
       ? suppliedHash.toLowerCase() : undefined
-    // Keep the durable key bounded in the same way as the in-memory
-    // idempotency layer and the protocol identifier schema.  Without this
-    // guard an authenticated caller could make the on-disk session creation
-    // map grow with arbitrarily large request-id headers.
-    const durableKey = requestId === undefined || requestId.length === 0
-      ? undefined : `${device.id}\0${requestId}`
-    if (durableKey !== undefined) {
-      const remembered = metadata.sessionCreationEntry(durableKey, fingerprint)
-      if (remembered?.response !== undefined && remembered.setupComplete !== false) {
-        // The in-memory HTTP response cache may have expired or the Bridge may
-        // have restarted.  Replay the durable create result without invoking
-        // Harness a second time.
-        json(res, 200, remembered.response)
-        return
-      }
-      if (remembered?.sessionId !== undefined) {
-        // Native creation already committed, but a post-create setting failed.
-        // Resume those idempotent settings instead of replaying a partial
-        // `{ sessionId }` record as if the requested session were complete.
-        if (remembered.setupComplete !== false || remembered.setup === undefined) {
-          throw new HttpError(503, 'session creation setup record is unreadable', 'unknown')
-        }
-        const setup = remembered.setup
-        await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
-        const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === remembered.sessionId)
-        const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
-        await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
-        json(res, 200, response)
-        return
-      }
-    }
+    // Parse the body before looking up a legacy durable record.  A pre-stage-
+    // machine record cannot contain the requested setup, so a fingerprinted
+    // retry must provide the body needed to safely finish that setup.
     const body = objectOf(await readJson(req))
     const cwd = optionalStringOf(body.cwd)
     const workspaceId = optionalStringOf(body.workspaceId)
@@ -1756,16 +1809,67 @@ async function handleHttp(
     if (permissionMode !== undefined && !isPermissionPreset(permissionMode)) {
       throw new HttpError(400, 'Harness permission presets are read-only, workspace-write and danger-full-access')
     }
+    const setup = {
+      ...(requestedBranch === undefined ? {} : { branch: requestedBranch }),
+      ...(requestedTitle === undefined ? {} : { title: requestedTitle }),
+      ...(model === undefined ? {} : { model }),
+      ...(permissionMode === undefined ? {} : { permissionMode }),
+    }
+    // Keep the durable key bounded in the same way as the in-memory
+    // idempotency layer and the protocol identifier schema.  Without this
+    // guard an authenticated caller could make the on-disk session creation
+    // map grow with arbitrarily large request-id headers.
+    const durableKey = requestId === undefined || requestId.length === 0
+      ? undefined : `${device.id}\0${requestId}`
+    if (durableKey !== undefined) {
+      const remembered = metadata.sessionCreationEntry(durableKey, fingerprint)
+      if (remembered?.response !== undefined && remembered.setupComplete === true) {
+        // The in-memory HTTP response cache may have expired or the Bridge may
+        // have restarted.  Replay the durable create result without invoking
+        // Harness a second time.
+        json(res, 200, remembered.response)
+        return
+      }
+      if (remembered?.legacySetupUnknown === true) {
+        // Old releases persisted only `{ sessionId }` (or a response without
+        // the stage marker).  Never assume that optional setup completed. A
+        // body hash is required before we reconstruct and apply the setup; if
+        // the old caller did not provide one, fail closed rather than guessing
+        // which permission/model/title was requested.
+        if (remembered.fingerprint === undefined || fingerprint === undefined) {
+          throw new HttpError(503, 'legacy session creation result is unknown; retry with a request hash', 'unknown')
+        }
+        if (remembered.sessionId === undefined) {
+          throw new HttpError(503, 'legacy session creation result is unknown', 'unknown')
+        }
+        await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === remembered.sessionId)
+        const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
+        await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
+        json(res, 200, response)
+        return
+      }
+      if (remembered?.sessionId !== undefined) {
+        // Native creation already committed, but a post-create setting failed.
+        // Resume those idempotent settings instead of replaying a partial
+        // `{ sessionId }` record as if the requested session were complete.
+        if (remembered.setupComplete !== false || remembered.setup === undefined) {
+          throw new HttpError(503, 'session creation setup record is unreadable', 'unknown')
+        }
+        const setup = remembered.setup
+        await applySessionCreationSetup(ctx, metadata, remembered.sessionId, setup)
+        const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === remembered.sessionId)
+        const response = { sessionId: remembered.sessionId, ...(summary === undefined ? {} : { summary }) }
+        await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
+        json(res, 200, response)
+        return
+      }
+    }
     if (durableKey !== undefined) {
       // Record the operation identity before invoking Harness.  If this
       // process dies while native creation is in flight, a restarted Bridge
       // has a durable tombstone and will refuse a duplicate execution.
-      await metadata.setSessionCreationPending(durableKey, fingerprint, {
-        ...(requestedBranch === undefined ? {} : { branch: requestedBranch }),
-        ...(requestedTitle === undefined ? {} : { title: requestedTitle }),
-        ...(model === undefined ? {} : { model }),
-        ...(permissionMode === undefined ? {} : { permissionMode }),
-      })
+      await metadata.setSessionCreationPending(durableKey, fingerprint, setup)
     }
     const result = await ctx.sessionController.create({
       ...(cwd === undefined ? {} : { cwd }),
@@ -1779,21 +1883,10 @@ async function handleHttp(
     // second Harness session.  The complete projection below replaces this
     // minimal replay record once setup succeeds.
     if (durableKey !== undefined) {
-      await metadata.setSessionCreationStarted(durableKey, fingerprint, result.sessionId, {
-        ...(requestedBranch === undefined ? {} : { branch: requestedBranch }),
-        ...(requestedTitle === undefined ? {} : { title: requestedTitle }),
-        ...(model === undefined ? {} : { model }),
-        ...(permissionMode === undefined ? {} : { permissionMode }),
-      })
-    }
-    const setup = {
-      ...(requestedBranch === undefined ? {} : { branch: requestedBranch }),
-      ...(requestedTitle === undefined ? {} : { title: requestedTitle }),
-      ...(model === undefined ? {} : { model }),
-      ...(permissionMode === undefined ? {} : { permissionMode }),
+      await metadata.setSessionCreationStarted(durableKey, fingerprint, result.sessionId, setup)
     }
     await applySessionCreationSetup(ctx, metadata, result.sessionId, setup)
-    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === result.sessionId)
+    const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === result.sessionId)
     const response = { ...result, ...(summary === undefined ? {} : { summary }) }
     if (durableKey !== undefined) await metadata.setSessionCreationResult(durableKey, fingerprint, response, setup)
     json(res, 201, response)
@@ -1869,7 +1962,7 @@ async function handleHttp(
     const registryUnarchive = workspaceRegistry?.unarchiveSession
     if (!archived && registryUnarchive !== undefined) await registryUnarchive(sessionId)
     await metadata.setArchived(sessionId, archived)
-    const summary = (await listSummaries(ctx, metadata, true)).find((item) => item.id === sessionId)
+    const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === sessionId)
     json(res, 202, { accepted: true, ...(summary === undefined ? {} : { summary }) })
     return
   }
@@ -2018,10 +2111,16 @@ async function listSummaries(
   ctx: NativeContext,
   metadata: SessionMetadataStore,
   includeArchived: boolean,
+  deviceId?: string,
 ): Promise<ReturnType<typeof normalizeSessionSummary>[]> {
   const result = await ctx.sessionController.list({}, AbortSignal.timeout(15_000))
   const summaries = result.items
-    .map((item) => normalizeSessionSummary(item, ctx, metadata))
+    .map((item) => {
+      const summary = normalizeSessionSummary(item, ctx, metadata)
+      const creationRequestId = deviceId === undefined
+        ? undefined : metadata.sessionCreationRequestIdForSession(deviceId, summary.id)
+      return creationRequestId === undefined ? summary : { ...summary, creationRequestId }
+    })
     // A subagent session is how the agent delegates its own work, not a
     // conversation the user started. Listing them buried the real ones: 18 of
     // 40 rows were subagents in practice, each titled with its task prompt.

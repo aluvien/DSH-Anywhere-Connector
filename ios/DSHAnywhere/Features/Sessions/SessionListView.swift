@@ -147,9 +147,9 @@ struct NewSessionSheet: View {
                     return
                 }
                 let optimized = await optimizedPhotoDataOffMain(raw)
-                initialAttachments.append(DSHStagedAttachment(name: "camera.jpg",
-                                                              data: optimized,
-                                                              isImage: true))
+                appendInitialAttachments([DSHStagedAttachment(name: "camera.jpg",
+                                                               data: optimized,
+                                                               isImage: true)])
             }
         }
         .fileImporter(isPresented: $showInitialFileImporter,
@@ -159,11 +159,11 @@ struct NewSessionSheet: View {
                 let accessed = url.startAccessingSecurityScopedResource()
                 defer { if accessed { url.stopAccessingSecurityScopedResource() } }
                 if let data = try? Data(contentsOf: url) {
-                    initialAttachments.append(DSHStagedAttachment(
+                    appendInitialAttachments([DSHStagedAttachment(
                         name: url.lastPathComponent,
                         data: data,
                         isImage: ["png", "jpg", "jpeg", "heic"].contains(url.pathExtension.lowercased())
-                    ))
+                    )])
                 }
             }
         }
@@ -176,10 +176,11 @@ struct NewSessionSheet: View {
                     do {
                         guard let data = try await item.loadTransferable(type: Data.self) else { continue }
                         let optimized = await optimizedPhotoDataOffMain(data)
-                        initialAttachments.append(DSHStagedAttachment(name: "photo.jpg",
-                                                                      data: optimized,
-                                                                      isImage: true))
-                        staged += 1
+                        let before = initialAttachments.count
+                        appendInitialAttachments([DSHStagedAttachment(name: "photo.jpg",
+                                                                       data: optimized,
+                                                                       isImage: true)])
+                        if initialAttachments.count > before { staged += 1 }
                     } catch {
                         continue
                     }
@@ -728,6 +729,17 @@ struct NewSessionSheet: View {
         model.modes.contains(where: { $0.id == sessionMode })
             && (!initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !initialAttachments.isEmpty)
+    }
+
+    private func appendInitialAttachments(_ values: [DSHStagedAttachment]) {
+        let remaining = max(0, 16 - initialAttachments.count)
+        let accepted = values.filter { $0.data.count <= 10 * 1024 * 1024 }.prefix(remaining)
+        initialAttachments.append(contentsOf: accepted)
+        if accepted.count < values.count {
+            model.errorMessage = initialAttachments.count >= 16
+                ? "首条消息最多包含 16 个附件。"
+                : "附件必须不超过 10 MiB，过大的文件未添加。"
+        }
     }
 
     private var initialAttachmentStrip: some View {

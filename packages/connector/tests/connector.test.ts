@@ -32,11 +32,11 @@ function command(type: "session.list" | "session.open" | "session.create" | "pro
 
 describe("bridge command mapping", () => {
   it("preserves prompt requestId and maps every supported endpoint", () => {
-    expect(bridgeRequestFor(command("session.list"))).toEqual({ method: "GET", path: "/sessions" });
+    expect(bridgeRequestFor(command("session.list"))).toEqual({ method: "GET", path: "/sessions?deviceId=phone-1" });
     expect(bridgeRequestFor({
       version: PROTOCOL_VERSION, requestId: "archives", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
       type: "session.list", payload: { includeArchived: true },
-    } satisfies CommandEnvelope)).toEqual({ method: "GET", path: "/sessions?includeArchived=true" });
+    } satisfies CommandEnvelope)).toEqual({ method: "GET", path: "/sessions?includeArchived=true&deviceId=phone-1" });
     expect(bridgeRequestFor(command("session.open"))).toEqual({ method: "POST", path: "/sessions/session-1/open", body: { deviceId: "phone-1" } });
     expect(bridgeRequestFor(command("session.create"))).toEqual({ method: "POST", path: "/sessions", body: { cwd: "/tmp" } });
     expect(bridgeRequestFor({
@@ -112,7 +112,7 @@ describe("Relay and bridge forwarding", () => {
     const connector = new DSHAnywhereConnector(config, {
       fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ url: String(input), ...(typeof init?.body === "string" ? { body: init.body } : {}) });
-        return new Response(JSON.stringify(String(input).endsWith("/sessions") ? { items: [] } : { accepted: true }), {
+        return new Response(JSON.stringify(new URL(String(input)).pathname.endsWith("/sessions") ? { items: [] } : { accepted: true }), {
           headers: { "content-type": "application/json" },
         });
       }) as unknown as typeof fetch,
@@ -303,7 +303,7 @@ describe("Relay and bridge forwarding", () => {
     let calls = 0;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/sessions") || url.endsWith("/sessions?includeArchived=true")) {
+      if (new URL(url).pathname.endsWith("/sessions")) {
         return new Promise<Response>((resolve) => pending.push(resolve));
       }
       return Promise.resolve(new Response(JSON.stringify({ accepted: true }), { headers: { "content-type": "application/json" } }));
@@ -352,12 +352,12 @@ describe("Relay and bridge forwarding", () => {
     connector.start(); relay.emit("open"); bridge.emit("open");
     const archiveList = { ...command("session.list"), requestId: "archives", payload: { includeArchived: true } };
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archives-relay", sender: "device", body: archiveList }));
-    await vi.waitFor(() => expect(urls).toContain("http://127.0.0.1:3080/dsh-anywhere/v1/sessions?includeArchived=true"));
+    await vi.waitFor(() => expect(urls).toContain("http://127.0.0.1:3080/dsh-anywhere/v1/sessions?includeArchived=true&deviceId=phone-1"));
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archive-relay", sender: "device", body: {
       version: PROTOCOL_VERSION, requestId: "archive", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
       sessionId: "session-1", type: "session.archive", payload: { archived: true },
     } }));
-    await vi.waitFor(() => expect(urls.filter((url) => url.endsWith("/sessions?includeArchived=true")).length).toBeGreaterThanOrEqual(2));
+    await vi.waitFor(() => expect(urls.filter((url) => url.includes("/sessions?includeArchived=true&deviceId=phone-1")).length).toBeGreaterThanOrEqual(2));
     await connector.stop();
   });
 
@@ -367,7 +367,7 @@ describe("Relay and bridge forwarding", () => {
     const pendingLists: Array<(response: Response) => void> = [];
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/sessions") || url.endsWith("/sessions?includeArchived=true")) {
+      if (new URL(url).pathname.endsWith("/sessions")) {
         return new Promise<Response>((resolve) => pendingLists.push(resolve));
       }
       return Promise.resolve(new Response(JSON.stringify({ accepted: true }), {

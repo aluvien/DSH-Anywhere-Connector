@@ -41,6 +41,8 @@ export const SessionSummarySchema = StrictObject({
   model: z.string().min(1).max(512).optional(),
   reasoningEffort: z.string().min(1).max(256).optional(),
   permissionMode: z.enum(["ask", "never", "read-only", "workspace-write", "danger-full-access"]).optional(),
+  /** Correlates a session snapshot with a detached create request. */
+  createRequestId: IdentifierSchema.optional(),
   usage: z.lazy(() => SessionUsageSchema).optional(),
 });
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
@@ -511,6 +513,18 @@ export const PromptSendPayloadSchema = StrictObject({
   const hasAttachments = (value.attachments?.length ?? 0) > 0;
   if (!hasText && !hasContent && !hasAttachments) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "prompt requires text or an attachment" });
+  }
+  const contentAttachments = value.content?.filter((part) => part.type === "file" || part.type === "image").length ?? 0;
+  if (contentAttachments > 16) {
+    context.addIssue({
+      code: z.ZodIssueCode.too_big,
+      origin: "array",
+      maximum: 16,
+      type: "array",
+      inclusive: true,
+      path: ["content"],
+      message: "a prompt may contain at most 16 file or image attachments",
+    });
   }
 });
 export const TurnCancelPayloadSchema = StrictObject({});

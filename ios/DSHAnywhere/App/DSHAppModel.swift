@@ -76,10 +76,130 @@ private struct DSHInitialMessageTransaction: Codable {
     let failure: DSHInitialMessageFailure?
 }
 
+private struct DSHStoredAttachment: Codable {
+    let id: UUID
+    let name: String
+    let isImage: Bool
+    let fileName: String?
+    /// Read only for migration from d575855, which embedded Data in JSON.
+    let legacyData: Data?
+
+    private enum CodingKeys: String, CodingKey { case id, name, isImage, fileName, data }
+
+    init(id: UUID, name: String, isImage: Bool, fileName: String) {
+        self.id = id; self.name = name; self.isImage = isImage
+        self.fileName = fileName; self.legacyData = nil
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        isImage = try container.decode(Bool.self, forKey: .isImage)
+        fileName = try container.decodeIfPresent(String.self, forKey: .fileName)
+        legacyData = try container.decodeIfPresent(Data.self, forKey: .data)
+        if fileName == nil && legacyData == nil { throw DecodingError.dataCorruptedError(
+            forKey: .fileName, in: container, debugDescription: "pending attachment has no blob") }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(isImage, forKey: .isImage)
+        try container.encodeIfPresent(fileName, forKey: .fileName)
+    }
+}
+
+private struct DSHStoredInitialMessage: Codable {
+    let promptRequestID: String
+    let text: String
+    let attachments: [DSHStoredAttachment]
+    let sessionID: String?
+    let uploadedAttachments: [String: DSHMessageAttachment]
+}
+
+private struct DSHStoredSessionCreationTransaction: Codable {
+    let command: DSHCommand
+    let initialMessage: DSHStoredInitialMessage?
+    let failure: DSHSessionCreationFailure?
+    let detached: Bool
+    let retryDeadline: Date
+}
+
+private struct DSHStoredInitialMessageTransaction: Codable {
+    let pending: DSHStoredInitialMessage
+    let failure: DSHInitialMessageFailure?
+}
+
+private enum DSHStoredSendFailure: Codable, Equatable {
+    case local(String)
+    case server(String)
+}
+
+private struct DSHStoredPendingSend: Codable {
+    let id: String
+    let text: String
+    let receipts: [String]
+    let sessionID: String
+    let mode: String
+    let sentAt: Date
+    let attempt: Int
+    let messageAttachments: [DSHMessageAttachment]
+}
+
+private struct DSHStoredFailedSend: Codable {
+    let id: String
+    let text: String
+    let receipts: [String]
+    let sessionID: String
+    let mode: String
+    let messageAttachments: [DSHMessageAttachment]
+    let failure: DSHStoredSendFailure
+}
+
 private struct DSHPendingTransactionStore: Codable {
-    var sessionCreationTransactionsByMachine: [String: [String: DSHSessionCreationTransaction]]
+    var sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]]
     var lastSessionCreationRequestIDsByMachine: [String: String]
-    var initialMessageTransactionsByMachine: [String: [String: DSHInitialMessageTransaction]]
+    var initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]]
+    var pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]]
+    var failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]]
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionCreationTransactionsByMachine, lastSessionCreationRequestIDsByMachine,
+             initialMessageTransactionsByMachine, pendingPromptTransactionsByMachine,
+             failedPromptTransactionsByMachine
+    }
+
+    init(sessionCreationTransactionsByMachine: [String: [String: DSHStoredSessionCreationTransaction]],
+         lastSessionCreationRequestIDsByMachine: [String: String],
+         initialMessageTransactionsByMachine: [String: [String: DSHStoredInitialMessageTransaction]],
+         pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]] = [:],
+         failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:]) {
+        self.sessionCreationTransactionsByMachine = sessionCreationTransactionsByMachine
+        self.lastSessionCreationRequestIDsByMachine = lastSessionCreationRequestIDsByMachine
+        self.initialMessageTransactionsByMachine = initialMessageTransactionsByMachine
+        self.pendingPromptTransactionsByMachine = pendingPromptTransactionsByMachine
+        self.failedPromptTransactionsByMachine = failedPromptTransactionsByMachine
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionCreationTransactionsByMachine = try container.decode(
+            [String: [String: DSHStoredSessionCreationTransaction]].self,
+            forKey: .sessionCreationTransactionsByMachine)
+        lastSessionCreationRequestIDsByMachine = try container.decode(
+            [String: String].self, forKey: .lastSessionCreationRequestIDsByMachine)
+        initialMessageTransactionsByMachine = try container.decode(
+            [String: [String: DSHStoredInitialMessageTransaction]].self,
+            forKey: .initialMessageTransactionsByMachine)
+        pendingPromptTransactionsByMachine = try container.decodeIfPresent(
+            [String: [String: DSHStoredPendingSend]].self,
+            forKey: .pendingPromptTransactionsByMachine) ?? [:]
+        failedPromptTransactionsByMachine = try container.decodeIfPresent(
+            [String: [String: DSHStoredFailedSend]].self,
+            forKey: .failedPromptTransactionsByMachine) ?? [:]
+    }
 }
 
 /// The reasoning choices exposed by the currently selected Harness model.
@@ -329,11 +449,52 @@ final class DSHAppModel: ObservableObject {
             .appendingPathComponent("DSH Anywhere/pending-transactions.json")
     }
 
+    private var pendingAttachmentDirectoryURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DSH Anywhere/pending-attachments", isDirectory: true)
+    }
+
+    private static let maxPendingAttachmentCount = 16
+    private static let maxPendingAttachmentBytes = 192 * 1024 * 1024
+    private static let maxAttachmentBytes = 10 * 1024 * 1024
+
+    private var pendingPromptTransactionsByMachine: [String: [String: DSHStoredPendingSend]] = [:]
+    private var failedPromptTransactionsByMachine: [String: [String: DSHStoredFailedSend]] = [:]
+
     /// A transaction that cannot be written must never be sent again: after
     /// an app kill there would be no request identity left to coalesce the
     /// side effect. Keep recovery fail-closed until the next launch can read
     /// or recreate the store.
     private var pendingTransactionPersistenceUnavailable = false
+
+    private func materializeInitialMessage(_ stored: DSHStoredInitialMessage) throws -> DSHPendingInitialMessage {
+        guard stored.attachments.count <= Self.maxPendingAttachmentCount else {
+            throw DSHAttachmentUploadError.tooLarge
+        }
+        var attachments: [DSHStagedAttachment] = []
+        attachments.reserveCapacity(stored.attachments.count)
+        for attachment in stored.attachments {
+            let data: Data
+            if let legacyData = attachment.legacyData {
+                data = legacyData
+            } else if let fileName = attachment.fileName,
+                      fileName == URL(fileURLWithPath: fileName).lastPathComponent,
+                      fileName.hasSuffix(".blob") {
+                data = try Data(contentsOf: pendingAttachmentDirectoryURL.appendingPathComponent(fileName))
+            } else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard data.count <= Self.maxAttachmentBytes else { throw DSHAttachmentUploadError.tooLarge }
+            attachments.append(DSHStagedAttachment(id: attachment.id, name: attachment.name,
+                                                    data: data, isImage: attachment.isImage))
+        }
+        return DSHPendingInitialMessage(
+            promptRequestID: stored.promptRequestID,
+            text: stored.text,
+            attachments: attachments,
+            sessionID: stored.sessionID,
+            uploadedAttachments: stored.uploadedAttachments)
+    }
 
     private func loadPendingTransactionStore() {
         let url = pendingTransactionStoreURL
@@ -348,28 +509,118 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "未能读取待处理请求，已停止自动重试。"
             return
         }
-        guard let store = try? JSONDecoder().decode(DSHPendingTransactionStore.self, from: data) else {
+        do {
+            let store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: data)
+            var creations: [String: [String: DSHSessionCreationTransaction]] = [:]
+            for (machineID, transactions) in store.sessionCreationTransactionsByMachine {
+                var next: [String: DSHSessionCreationTransaction] = [:]
+                for (requestID, transaction) in transactions {
+                    next[requestID] = DSHSessionCreationTransaction(
+                        command: transaction.command,
+                        initialMessage: try transaction.initialMessage.map(materializeInitialMessage),
+                        failure: transaction.failure,
+                        detached: transaction.detached,
+                        retryDeadline: transaction.retryDeadline)
+                }
+                creations[machineID] = next
+            }
+            sessionCreationTransactionsByMachine = creations
+            lastSessionCreationRequestIDsByMachine = store.lastSessionCreationRequestIDsByMachine
+            var initialMessages: [String: [String: DSHInitialMessageTransaction]] = [:]
+            for (machineID, transactions) in store.initialMessageTransactionsByMachine {
+                var next: [String: DSHInitialMessageTransaction] = [:]
+                for (requestID, transaction) in transactions {
+                    next[requestID] = DSHInitialMessageTransaction(
+                        pending: try materializeInitialMessage(transaction.pending),
+                        failure: transaction.failure)
+                }
+                initialMessages[machineID] = next
+            }
+            initialMessageTransactionsByMachine = initialMessages
+            pendingPromptTransactionsByMachine = store.pendingPromptTransactionsByMachine
+            failedPromptTransactionsByMachine = store.failedPromptTransactionsByMachine
+        } catch {
             pendingTransactionPersistenceUnavailable = true
             errorMessage = "未能读取待处理请求，已停止自动重试。"
-            return
         }
-        sessionCreationTransactionsByMachine = store.sessionCreationTransactionsByMachine
-        lastSessionCreationRequestIDsByMachine = store.lastSessionCreationRequestIDsByMachine
-        initialMessageTransactionsByMachine = store.initialMessageTransactionsByMachine
     }
 
     @discardableResult
     private func persistPendingTransactionStore() -> Bool {
         guard !pendingTransactionPersistenceUnavailable else { return false }
-        let store = DSHPendingTransactionStore(
-            sessionCreationTransactionsByMachine: sessionCreationTransactionsByMachine,
-            lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
-            initialMessageTransactionsByMachine: initialMessageTransactionsByMachine)
         do {
+            let attachmentDirectory = pendingAttachmentDirectoryURL
+            try FileManager.default.createDirectory(at: attachmentDirectory, withIntermediateDirectories: true)
+            var referencedBlobNames = Set<String>()
+            var attachmentBytes = 0
+            func storedInitialMessage(_ pending: DSHPendingInitialMessage) throws -> DSHStoredInitialMessage {
+                guard pending.attachments.count <= Self.maxPendingAttachmentCount else {
+                    throw DSHAttachmentUploadError.tooLarge
+                }
+                var attachments: [DSHStoredAttachment] = []
+                attachments.reserveCapacity(pending.attachments.count)
+                for attachment in pending.attachments {
+                    guard attachment.data.count <= Self.maxAttachmentBytes else {
+                        throw DSHAttachmentUploadError.tooLarge
+                    }
+                    attachmentBytes += attachment.data.count
+                    guard attachmentBytes <= Self.maxPendingAttachmentBytes else {
+                        throw DSHAttachmentUploadError.tooLarge
+                    }
+                    let fileName = "\(attachment.id.uuidString).blob"
+                    let blobURL = attachmentDirectory.appendingPathComponent(fileName)
+                    try attachment.data.write(to: blobURL, options: [.atomic, .completeFileProtection])
+                    referencedBlobNames.insert(fileName)
+                    attachments.append(DSHStoredAttachment(id: attachment.id, name: attachment.name,
+                                                            isImage: attachment.isImage, fileName: fileName))
+                }
+                return DSHStoredInitialMessage(
+                    promptRequestID: pending.promptRequestID,
+                    text: pending.text,
+                    attachments: attachments,
+                    sessionID: pending.sessionID,
+                    uploadedAttachments: pending.uploadedAttachments)
+            }
+            var storedCreations: [String: [String: DSHStoredSessionCreationTransaction]] = [:]
+            for (machineID, transactions) in sessionCreationTransactionsByMachine {
+                var next: [String: DSHStoredSessionCreationTransaction] = [:]
+                for (requestID, transaction) in transactions {
+                    next[requestID] = DSHStoredSessionCreationTransaction(
+                        command: transaction.command,
+                        initialMessage: try transaction.initialMessage.map(storedInitialMessage),
+                        failure: transaction.failure,
+                        detached: transaction.detached,
+                        retryDeadline: transaction.retryDeadline)
+                }
+                storedCreations[machineID] = next
+            }
+            var storedInitialMessages: [String: [String: DSHStoredInitialMessageTransaction]] = [:]
+            for (machineID, transactions) in initialMessageTransactionsByMachine {
+                var next: [String: DSHStoredInitialMessageTransaction] = [:]
+                for (requestID, transaction) in transactions {
+                    next[requestID] = DSHStoredInitialMessageTransaction(
+                        pending: try storedInitialMessage(transaction.pending),
+                        failure: transaction.failure)
+                }
+                storedInitialMessages[machineID] = next
+            }
+            let store = DSHPendingTransactionStore(
+                sessionCreationTransactionsByMachine: storedCreations,
+                lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
+                initialMessageTransactionsByMachine: storedInitialMessages,
+                pendingPromptTransactionsByMachine: pendingPromptTransactionsByMachine,
+                failedPromptTransactionsByMachine: failedPromptTransactionsByMachine)
             let data = try JSONEncoder().encode(store)
             let directory = pendingTransactionStoreURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: pendingTransactionStoreURL, options: [.atomic, .completeFileProtection])
+            if let files = try? FileManager.default.contentsOfDirectory(at: attachmentDirectory,
+                                                                           includingPropertiesForKeys: nil) {
+                for file in files where file.pathExtension == "blob" &&
+                    !referencedBlobNames.contains(file.lastPathComponent) {
+                    try FileManager.default.removeItem(at: file)
+                }
+            }
             return true
         } catch {
             // Keep the in-memory transaction and surface the loss of durable
@@ -380,6 +631,46 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "无法保存待处理请求，暂不安全重试。"
             return false
         }
+    }
+
+    private func storedPendingSend(_ value: DSHPendingSend) -> DSHStoredPendingSend {
+        DSHStoredPendingSend(id: value.id, text: value.text, receipts: value.receipts,
+                             sessionID: value.sessionID, mode: value.mode, sentAt: value.sentAt,
+                             attempt: value.attempt, messageAttachments: value.messageAttachments)
+    }
+
+    private func pendingSend(_ value: DSHStoredPendingSend) -> DSHPendingSend {
+        DSHPendingSend(id: value.id, text: value.text, receipts: value.receipts,
+                       sessionID: value.sessionID, mode: value.mode, sentAt: value.sentAt,
+                       attempt: value.attempt, messageAttachments: value.messageAttachments)
+    }
+
+    private func storedFailure(_ value: DSHSendFailure) -> DSHStoredSendFailure {
+        switch value {
+        case .local(let detail): return .local(detail)
+        case .server(let detail): return .server(detail)
+        }
+    }
+
+    private func failure(_ value: DSHStoredSendFailure) -> DSHSendFailure {
+        switch value {
+        case .local(let detail): return .local(detail)
+        case .server(let detail): return .server(detail)
+        }
+    }
+
+    private func storedFailedSend(_ value: DSHFailedSend) -> DSHStoredFailedSend {
+        DSHStoredFailedSend(id: value.id, text: value.text, receipts: value.receipts,
+                            sessionID: value.sessionID, mode: value.mode,
+                            messageAttachments: value.messageAttachments,
+                            failure: storedFailure(value.failure))
+    }
+
+    private func failedSend(_ value: DSHStoredFailedSend) -> DSHFailedSend {
+        DSHFailedSend(id: value.id, text: value.text, receipts: value.receipts,
+                      sessionID: value.sessionID, mode: value.mode,
+                      messageAttachments: value.messageAttachments,
+                      failure: failure(value.failure))
     }
 
     /// Rebuilds the per-machine durable view from the live request maps. This
@@ -428,6 +719,16 @@ final class DSHAppModel: ObservableObject {
         } else {
             initialMessageTransactionsByMachine[machineID] = initialSnapshot
         }
+        if pendingSendsByRequestID.isEmpty {
+            pendingPromptTransactionsByMachine.removeValue(forKey: machineID)
+        } else {
+            pendingPromptTransactionsByMachine[machineID] = pendingSendsByRequestID.mapValues(storedPendingSend)
+        }
+        if failedSendsByRequestID.isEmpty {
+            failedPromptTransactionsByMachine.removeValue(forKey: machineID)
+        } else {
+            failedPromptTransactionsByMachine[machineID] = failedSendsByRequestID.mapValues(storedFailedSend)
+        }
         return persistPendingTransactionStore()
     }
 
@@ -463,6 +764,21 @@ final class DSHAppModel: ObservableObject {
                     failedInitialMessages[requestID] = failure
                 }
             }
+        }
+        if let pendingSnapshot = pendingPromptTransactionsByMachine[machineID] {
+            pendingSendsByRequestID = pendingSnapshot.mapValues(pendingSend)
+            for pending in pendingSendsByRequestID.values {
+                let elapsed = Date().timeIntervalSince(pending.sentAt)
+                if elapsed >= sendAckTimeout {
+                    timeoutPendingSend(requestId: pending.id, attempt: pending.attempt)
+                } else {
+                    armSendAckTimeout(requestId: pending.id, attempt: pending.attempt,
+                                      delay: sendAckTimeout - elapsed)
+                }
+            }
+        }
+        if let failedSnapshot = failedPromptTransactionsByMachine[machineID] {
+            failedSendsByRequestID = failedSnapshot.mapValues(failedSend)
         }
     }
 
@@ -894,6 +1210,8 @@ final class DSHAppModel: ObservableObject {
             self.sessionCreationTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: machine.machineId)
             self.initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
+            self.pendingPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
+            self.failedPromptTransactionsByMachine.removeValue(forKey: machine.machineId)
             self.persistPendingTransactionStore()
             self.refreshMachines()
             guard needsRecovery else {
@@ -1054,6 +1372,8 @@ final class DSHAppModel: ObservableObject {
             self.sessionCreationTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: forgottenMachineID)
             self.initialMessageTransactionsByMachine.removeValue(forKey: forgottenMachineID)
+            self.pendingPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
+            self.failedPromptTransactionsByMachine.removeValue(forKey: forgottenMachineID)
             self.persistPendingTransactionStore()
             self.refreshMachines()
             self.state = .init()
@@ -1096,6 +1416,14 @@ final class DSHAppModel: ObservableObject {
             return false
         }
         if let initialPrompt, !validatePromptText(initialPrompt) { return false }
+        guard initialAttachments.count <= Self.maxPendingAttachmentCount else {
+            errorMessage = "首条消息最多包含 16 个附件。"
+            return false
+        }
+        guard initialAttachments.allSatisfy({ $0.data.count <= Self.maxAttachmentBytes }) else {
+            errorMessage = "附件必须不超过 10 MiB，请移除过大的文件后重试。"
+            return false
+        }
         // A mode id is owned by the active Mac.  When its catalog is present,
         // reject stale values before they can cross the machine boundary.  A
         // nil catalog is kept compatible with older Connectors and previews;
@@ -1370,6 +1698,7 @@ final class DSHAppModel: ObservableObject {
             id: requestId, text: trimmed, receipts: attachments,
             sessionID: sessionID, mode: mode, sentAt: .now, attempt: attempt,
             messageAttachments: messageAttachments)
+        guard persistCurrentTransactions(for: machineID) else { return }
         armSendAckTimeout(requestId: requestId, attempt: attempt)
         let parts = attachments.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
         send(DSHCommand.sendPrompt(deviceId: deviceID, machineId: machineID,
@@ -1379,7 +1708,7 @@ final class DSHAppModel: ObservableObject {
 
     /// An outbound prompt awaiting its accepted user message. If nothing
     /// comes back, the send failed somewhere between this phone and the Mac.
-    struct DSHPendingSend: Sendable, Equatable, Identifiable {
+    struct DSHPendingSend: Sendable, Equatable, Identifiable, Codable {
         let id: String
         let text: String
         let receipts: [String]
@@ -1390,14 +1719,14 @@ final class DSHAppModel: ObservableObject {
         let messageAttachments: [DSHMessageAttachment]
     }
 
-    enum DSHSendFailure: Sendable, Equatable {
+    enum DSHSendFailure: Sendable, Equatable, Codable {
         /// Never left the phone (socket down at send time or at timeout).
         case local(String)
         /// Left the phone but the Mac never acknowledged (or rejected it).
         case server(String)
     }
 
-    struct DSHFailedSend: Sendable, Equatable, Identifiable {
+    struct DSHFailedSend: Sendable, Equatable, Identifiable, Codable {
         let id: String
         let text: String
         let receipts: [String]
@@ -1423,10 +1752,10 @@ final class DSHAppModel: ObservableObject {
         pendingSendsByRequestID.values.filter { $0.sessionID == sessionID }.count
     }
 
-    private func armSendAckTimeout(requestId: String, attempt: Int) {
+    private func armSendAckTimeout(requestId: String, attempt: Int, delay: TimeInterval? = nil) {
         Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: .seconds(self?.sendAckTimeout ?? 15))
+                try await Task.sleep(for: .seconds(delay ?? self?.sendAckTimeout ?? 15))
             } catch {
                 return
             }
@@ -1455,6 +1784,7 @@ final class DSHAppModel: ObservableObject {
                                                           receipts: pending.receipts,
                                                           sessionID: pending.sessionID, mode: pending.mode,
                                                           messageAttachments: pending.messageAttachments, failure: failure)
+        persistCurrentTransactions(for: machineID)
     }
 
     /// A request id is authoritative.  A message with an id that does not match
@@ -1464,6 +1794,7 @@ final class DSHAppModel: ObservableObject {
         if let requestID {
             pendingSendsByRequestID.removeValue(forKey: requestID)
             failedSendsByRequestID.removeValue(forKey: requestID)
+            persistCurrentTransactions(for: machineID)
             return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1475,6 +1806,7 @@ final class DSHAppModel: ObservableObject {
         if let failure = failedSendsByRequestID.values.first(where: {
             $0.sessionID == sessionID && $0.text == trimmed
         }) { failedSendsByRequestID.removeValue(forKey: failure.id) }
+        persistCurrentTransactions(for: machineID)
     }
 
     private func clearPendingMessageAttachments(for requestID: String) {
@@ -1513,6 +1845,7 @@ final class DSHAppModel: ObservableObject {
             sessionID: sessionID, mode: mode,
             messageAttachments: messageAttachments,
             failure: .local(error.localizedDescription))
+        persistCurrentTransactions(for: machineID)
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -1535,6 +1868,7 @@ final class DSHAppModel: ObservableObject {
         guard let failed = failedSendsByRequestID[requestID] else { return }
         guard validatePromptText(failed.text) else { return }
         failedSendsByRequestID.removeValue(forKey: requestID)
+        persistCurrentTransactions(for: machineID)
         // A timeout means the Mac may already have accepted the side effect.
         // Reuse the complete original command identity and mode so Connector
         // and Bridge idempotency coalesce the retry instead of executing it
@@ -1551,6 +1885,7 @@ final class DSHAppModel: ObservableObject {
 
     func dismissFailedSend(requestID: String) {
         failedSendsByRequestID.removeValue(forKey: requestID)
+        persistCurrentTransactions(for: machineID)
     }
 
     func dismissFailedSend() {
@@ -1807,7 +2142,7 @@ final class DSHAppModel: ObservableObject {
     func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String,
                                  machineGeneration: Int? = nil,
                                  requestID requestedRequestID: String? = nil) async throws -> String {
-        guard data.count <= 10 * 1024 * 1024 else { throw DSHAttachmentUploadError.tooLarge }
+        guard data.count <= Self.maxAttachmentBytes else { throw DSHAttachmentUploadError.tooLarge }
         if let machineGeneration, machineGeneration != self.machineStateGeneration {
             throw CancellationError()
         }
@@ -2047,6 +2382,9 @@ final class DSHAppModel: ObservableObject {
                 historyEvent = explicitlyHistorical
                     || (event.envelope.sessionId.map { isReplayingHistory(sessionID: $0) } ?? false)
             }
+            if case .sessionSnapshot(let sessions) = event.kind {
+                reconcileSessionCreationSnapshot(sessions)
+            }
             handleSessionCreated(event)
             handleRemoteRequestCompletion(event)
             requestRemoteCatalogsWhenConnected(event)
@@ -2245,9 +2583,21 @@ final class DSHAppModel: ObservableObject {
         // navigation from then on; and the Harness announces every new session,
         // so an unrelated one could steal the screen. Matching the request id
         // removes both.
-        let requestID = event.envelope.messageId
+        let requestID = session.createRequestId ?? event.envelope.messageId
         guard pendingSessionCreationRequestIDs.contains(requestID) else { return }
         completeCreatedSession(session, requestID: requestID)
+    }
+
+    /// A reconnect may lose the targeted `session.created` event while the
+    /// authoritative snapshot still contains the durable create correlation.
+    /// Resolve that request from the snapshot before the UI forgets the staged
+    /// first message or presents it as an unrelated session.
+    private func reconcileSessionCreationSnapshot(_ sessions: [DSHSessionSummary]) {
+        for session in sessions {
+            guard let requestID = session.createRequestId,
+                  pendingSessionCreationRequestIDs.contains(requestID) else { continue }
+            completeCreatedSession(session, requestID: requestID)
+        }
     }
 
     private func completeCreatedSession(_ session: DSHSessionSummary, requestID: String) {

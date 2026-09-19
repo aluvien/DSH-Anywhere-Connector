@@ -804,6 +804,8 @@ public struct DSHSessionSummary: Codable, Sendable, Equatable, Identifiable {
     public var model: String?
     public var reasoningEffort: String?
     public var permissionMode: String?
+    /// Correlates an authoritative snapshot with a detached create request.
+    public var createRequestId: String?
     public var usage: DSHSessionUsage?
 
     public init(id: String, title: String = "", updatedAt: Int64 = 0,
@@ -812,13 +814,15 @@ public struct DSHSessionSummary: Codable, Sendable, Equatable, Identifiable {
                 parentSessionId: String? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, permissionMode: String? = nil,
                 agentPreset: String? = nil, mode: String? = nil, branch: String? = nil,
+                createRequestId: String? = nil,
                 usage: DSHSessionUsage? = nil) {
         self.id = id; self.title = title; self.updatedAt = updatedAt
         self.cwd = cwd; self.workspaceId = workspaceId; self.workspaceName = workspaceName
         self.archived = archived; self.running = running; self.blank = blank
         self.parentSessionId = parentSessionId; self.agentPreset = agentPreset; self.mode = mode; self.branch = branch
         self.provider = provider; self.model = model
-        self.reasoningEffort = reasoningEffort; self.permissionMode = permissionMode; self.usage = usage
+        self.reasoningEffort = reasoningEffort; self.permissionMode = permissionMode
+        self.createRequestId = createRequestId; self.usage = usage
     }
 }
 

@@ -361,6 +361,21 @@ describe("prompt attachments", () => {
     expect(CommandEnvelopeSchema.safeParse(message).success).toBe(true);
   });
 
+  it("rejects more than sixteen file or image parts in content", () => {
+    const message = {
+      type: "prompt.send",
+      requestId: "req-many-files",
+      ...base,
+      payload: {
+        content: Array.from({ length: 17 }, (_, index) => ({
+          type: "file" as const,
+          receiptId: `receipt-${index}`,
+        })),
+      },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
+  });
+
   it("still rejects an undeclared field", () => {
     const message = {
       type: "prompt.send",
