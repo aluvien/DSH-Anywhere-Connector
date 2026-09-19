@@ -50,6 +50,10 @@ const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 const MAX_SESSION_METADATA_LOAD_BYTES = 64 * 1024 * 1024
 const MAX_ATTACHMENT_RECONCILIATION_BATCH = 128
 const MAX_REMOTE_MUTATION_RECORDS = 4_096
+// A remote mutation key contains bounded device/request identifiers plus an
+// encoded session path. Keep the admin boundary above the full protocol
+// maximum so every durable record remains listable and reconcilable.
+const MAX_REMOTE_MUTATION_KEY_LENGTH = 8_192
 
 interface CapturedHttpResponse {
   readonly status: number
@@ -61,6 +65,7 @@ interface IdempotencyEntry {
   expiresAt: number
   completed: boolean
   fingerprint: string | undefined
+  durableKey: string | undefined
   result: Promise<CapturedHttpResponse>
 }
 
@@ -74,6 +79,7 @@ export class IdempotentHttpResponses {
     req: IncomingMessage,
     res: ServerResponse,
     handler: (capture: ServerResponse) => Promise<void>,
+    durableKey?: string,
   ): Promise<void> {
     const now = Date.now()
     for (const [entryKey, entry] of this.entries) {
@@ -94,6 +100,7 @@ export class IdempotentHttpResponses {
         expiresAt: Number.POSITIVE_INFINITY,
         completed: false,
         fingerprint,
+        durableKey,
         result: Promise.resolve({ status: 500, headers: {}, body: '' }),
       }
       pending.result = captureHttpResponse(handler)
@@ -132,6 +139,22 @@ export class IdempotentHttpResponses {
     const captured = await entry.result
     res.writeHead(captured.status, captured.headers)
     res.end(captured.body)
+  }
+
+  /**
+   * Durable admin reconciliation changes the authoritative Bridge result.
+   * Drop only completed cache entries; an in-flight handler must remain the
+   * single owner of its request until it resolves, otherwise a concurrent
+   * retry could execute the native side effect twice.
+   */
+  invalidateDurableKeys(keys: readonly string[]): void {
+    const target = new Set(keys)
+    if (target.size === 0) return
+    for (const [cacheKey, entry] of this.entries) {
+      if (entry.completed && entry.durableKey !== undefined && target.has(entry.durableKey)) {
+        this.entries.delete(cacheKey)
+      }
+    }
   }
 }
 
@@ -740,6 +763,7 @@ class SessionMetadataStore {
       Promise<unknown | undefined | AttachmentUploadRecoveryResult>) | undefined,
     limit = MAX_ATTACHMENT_RECONCILIATION_BATCH,
     afterKey?: string,
+    onResolvedKey?: (key: string) => void,
   ): Promise<{ scanned: number; found: number; notCommitted: number; unknown: number; nextCursor?: string }> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
@@ -790,6 +814,7 @@ class SessionMetadataStore {
         }
         try {
           await this.setAttachmentUploadResult(key, entry.fingerprint, response, entry.nativeOperationId)
+          onResolvedKey?.(key)
           found += 1
         } catch {
           unknown += 1
@@ -797,6 +822,7 @@ class SessionMetadataStore {
       } else if (recovery.state === 'not-committed') {
         try {
           await this.markAttachmentUploadNotCommitted(key, entry.fingerprint)
+          onResolvedKey?.(key)
           notCommitted += 1
         } catch {
           unknown += 1
@@ -1754,6 +1780,24 @@ function remoteMutationKeyFor(originDeviceId: string, path: string, requestId: s
   return `${originDeviceId}\0${path}\0${requestId}`
 }
 
+/**
+ * Maps the Connector's outer HTTP idempotency entry to the same durable key
+ * used by the inner mutation handler. Admin reconciliation can then evict the
+ * stale captured response without reconstructing a bearer-scoped cache hash.
+ */
+function durableHttpMutationKeyFor(originDeviceId: string, path: string, requestId: string): string | undefined {
+  if (path === '/workspaces' || /^\/sessions\/[^/]+\/command$/.test(path)) {
+    return remoteMutationKeyFor(originDeviceId, path, requestId)
+  }
+  const attachmentMatch = /^\/sessions\/([^/]+)\/attachments$/.exec(path)
+  if (attachmentMatch === null) return undefined
+  try {
+    return `${originDeviceId}\0${decodeURIComponent(attachmentMatch[1]!)}\0${requestId}`
+  } catch {
+    return undefined
+  }
+}
+
 /** Mirrors the connector's own defaultConfigPath so both resolve one file. */
 function defaultConnectorConfigPath(): string {
   const override = process.env.DSH_ANYWHERE_CONFIG
@@ -2062,6 +2106,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         try {
           await handleHttp(
             ctx, req, target, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
+            idempotentResponses,
             config.connectorConfigPath ?? defaultConnectorConfigPath(),
             questions,
             relayDevices,
@@ -2103,8 +2148,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       if (req.method === 'POST' && requestId !== undefined && requestId.length > 0 && requestId.length <= 256 &&
           authenticatedDevice !== undefined) {
         const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+        const routePath = pathname.slice(prefix.length) || '/'
         const originDeviceId = authenticatedDevice.id === CONNECTOR_DEVICE_ID
-          ? (header(req, 'x-dsh-origin-device-id') ?? '') : authenticatedDevice.id
+          ? (header(req, 'x-dsh-origin-device-id') ?? authenticatedDevice.id) : authenticatedDevice.id
         const key = createHash('sha256')
           .update(`${authenticatedDevice.id}\0${originDeviceId}\0${req.method}\0${pathname}\0${requestId}`)
           .digest('hex')
@@ -2112,8 +2158,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
           ? suppliedHash.toLowerCase()
           : undefined
+        const durableKey = durableHttpMutationKeyFor(originDeviceId, routePath, requestId)
         try {
-          await idempotentResponses.respond(key, fingerprint, req, res, serve)
+          await idempotentResponses.respond(key, fingerprint, req, res, serve, durableKey)
         } catch (error) {
           const status = error instanceof HttpError ? error.status : 500
           json(res, status, { error: error instanceof Error ? error.message : String(error) })
@@ -2517,6 +2564,7 @@ async function handleHttp(
   machineId: string,
   metadata: SessionMetadataStore,
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
+  idempotentResponses: IdempotentHttpResponses,
   connectorConfigPath: string,
   questions: PendingQuestions,
   relayDevices: Set<string>,
@@ -2586,7 +2634,8 @@ async function handleHttp(
       throw new HttpError(400, 'afterKey must be between 1 and 2048 characters')
     }
     const result = await metadata.reconcileExpiredAttachmentUploads(
-      ctx.sessionController.findAttachmentByRequestId, requestedLimit, afterKey)
+      ctx.sessionController.findAttachmentByRequestId, requestedLimit, afterKey,
+      (key) => idempotentResponses.invalidateDurableKeys([key]))
     json(res, 200, result)
     return
   }
@@ -2612,7 +2661,7 @@ async function handleHttp(
     }
     const body = objectOf(await readJson(req))
     if (!Array.isArray(body.keys) || body.keys.length > 128 ||
-        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 1_024)) {
+        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > MAX_REMOTE_MUTATION_KEY_LENGTH)) {
       throw new HttpError(400, 'keys must be an array of at most 128 durable remote mutation keys')
     }
     const keys = body.keys as string[]
@@ -2631,8 +2680,8 @@ async function handleHttp(
       throw new HttpError(400, 'limit must be an integer between 1 and 128')
     }
     const afterKey = url.searchParams.get('afterKey') ?? undefined
-    if (afterKey !== undefined && (afterKey.length === 0 || afterKey.length > 1_024)) {
-      throw new HttpError(400, 'afterKey must be between 1 and 1024 characters')
+    if (afterKey !== undefined && (afterKey.length === 0 || afterKey.length > MAX_REMOTE_MUTATION_KEY_LENGTH)) {
+      throw new HttpError(400, `afterKey must be between 1 and ${MAX_REMOTE_MUTATION_KEY_LENGTH} characters`)
     }
     json(res, 200, metadata.remoteMutationPending(limit, afterKey))
     return
@@ -2644,7 +2693,7 @@ async function handleHttp(
     }
     const body = objectOf(await readJson(req))
     if (!Array.isArray(body.keys) || body.keys.length > 128 ||
-        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 1_024)) {
+        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > MAX_REMOTE_MUTATION_KEY_LENGTH)) {
       throw new HttpError(400, 'keys must be an array of at most 128 durable remote mutation keys')
     }
     const kind = body.kind
@@ -2663,6 +2712,7 @@ async function handleHttp(
       ? { kind: 'completed' as const, status: body.status as number, response: body.response }
       : { kind: 'not-committed' as const }
     const resolved = await metadata.resolveRemoteMutations(body.keys as string[], resolution)
+    idempotentResponses.invalidateDurableKeys(body.keys as string[])
     json(res, 200, { resolved, kind })
     return
   }

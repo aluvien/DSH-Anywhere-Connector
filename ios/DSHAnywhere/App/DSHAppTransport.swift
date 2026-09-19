@@ -69,6 +69,9 @@ private struct DSHRelayPairingUpgradeRequired: LocalizedError {
 private enum DSHProvisionalPairingState: String, Codable, Sendable {
     case provisional
     case localCommitted
+    /// Relay has already revoked/expired the credential. This state is
+    /// persisted before local cleanup so a crash can resume safely.
+    case remoteRevoked
 }
 
 private struct DSHProvisionalPairingMarker: Codable, Sendable {
@@ -76,19 +79,22 @@ private struct DSHProvisionalPairingMarker: Codable, Sendable {
     let deviceId: String
     let relayBaseURL: URL
     let createdAt: Date
+    let provisionalUntil: Date?
     var state: DSHProvisionalPairingState
 
     init(machineId: String, deviceId: String, relayBaseURL: URL, createdAt: Date,
+         provisionalUntil: Date? = nil,
          state: DSHProvisionalPairingState = .provisional) {
         self.machineId = machineId
         self.deviceId = deviceId
         self.relayBaseURL = relayBaseURL
         self.createdAt = createdAt
+        self.provisionalUntil = provisionalUntil
         self.state = state
     }
 
     private enum CodingKeys: String, CodingKey {
-        case machineId, deviceId, relayBaseURL, createdAt, state
+        case machineId, deviceId, relayBaseURL, createdAt, provisionalUntil, state
     }
 
     init(from decoder: Decoder) throws {
@@ -97,6 +103,7 @@ private struct DSHProvisionalPairingMarker: Codable, Sendable {
         deviceId = try container.decode(String.self, forKey: .deviceId)
         relayBaseURL = try container.decode(URL.self, forKey: .relayBaseURL)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
+        provisionalUntil = try container.decodeIfPresent(Date.self, forKey: .provisionalUntil)
         // Markers written by older builds were all provisional. Treat a
         // missing state conservatively so an upgrade never silently activates
         // a credential whose local commit was not proven durable.
@@ -108,6 +115,7 @@ private struct DSHProvisionalPairingMarker: Codable, Sendable {
 private struct DSHProvisionalPairing: Sendable {
     let profile: DSHRemoteProfile
     let token: String
+    let provisionalUntil: Date?
 }
 
 actor DSHRemoteTransport: DSHAppTransport {
@@ -132,6 +140,7 @@ actor DSHRemoteTransport: DSHAppTransport {
     /// a process exit cannot silently lose the compensating revoke.
     private var provisionalPairings: [String: DSHProvisionalPairing] = [:]
     private static let provisionalPairingsKey = "dsh-anywhere.provisional-pairings"
+    private static let provisionalPairingTTL: TimeInterval = 15 * 60
 
     func profileSnapshot() async -> DSHTransportProfileSnapshot? {
         DSHTransportProfileSnapshot(profiles: store.profiles, activeProfile: store.activeProfile)
@@ -146,6 +155,9 @@ actor DSHRemoteTransport: DSHAppTransport {
     nonisolated static var isConfigured: Bool { !DSHProfileStore().profiles.isEmpty }
 
     func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile {
+        await cleanupRemoteRevokedMarkers()
+        await expireOrphanedMarkers()
+        await cleanupRemoteRevokedMarkers()
         await finalizeCommittedPairingMarkers()
         await drainProvisionalPairings()
         if !loadProvisionalMarkers().isEmpty {
@@ -158,13 +170,14 @@ actor DSHRemoteTransport: DSHAppTransport {
             provisional: true
         )
         provisionalPairings[result.profile.deviceId] = DSHProvisionalPairing(
-            profile: result.profile, token: result.token)
+            profile: result.profile, token: result.token, provisionalUntil: result.provisionalUntil)
         // Pairing a second Mac makes the returned profile active. Tear down
         // the old machine socket before committing that profile so no event
         // or command can cross the lifecycle boundary.
         do {
             try tokenStore.save(result.token, account: result.profile.deviceId)
-            rememberProvisionalPairing(result.profile, token: result.token)
+            rememberProvisionalPairing(result.profile, token: result.token,
+                                       provisionalUntil: result.provisionalUntil)
             await disconnect()
             // Adds to the machine list rather than replacing it, so pairing a second
             // Mac no longer makes the first one unreachable.
@@ -177,6 +190,9 @@ actor DSHRemoteTransport: DSHAppTransport {
     }
 
     func connect() async -> AsyncThrowingStream<DSHEvent, Error> {
+        await cleanupRemoteRevokedMarkers()
+        await expireOrphanedMarkers()
+        await cleanupRemoteRevokedMarkers()
         await finalizeCommittedPairingMarkers()
         await drainProvisionalPairings()
         if !loadProvisionalMarkers().isEmpty {
@@ -385,7 +401,8 @@ actor DSHRemoteTransport: DSHAppTransport {
     private func revokeProvisionalPairing(_ machineId: String, includeCommitted: Bool = false) async {
         var markers = loadProvisionalMarkers()
         let targets = markers.values.filter {
-            $0.machineId == machineId && (includeCommitted || $0.state == .provisional)
+            $0.machineId == machineId &&
+                (includeCommitted ? $0.state != .remoteRevoked : $0.state == .provisional)
         }
         for marker in targets {
             let persistedToken = try? tokenStore.read(account: marker.deviceId)
@@ -396,12 +413,16 @@ actor DSHRemoteTransport: DSHAppTransport {
                                                    deviceId: marker.deviceId,
                                                    machineId: marker.machineId,
                                                    machineName: ""),
-                        token: token)
+                        token: token, provisionalUntil: marker.provisionalUntil)
                 }
             guard let provisional else { continue }
             do {
                 try await DSHAPIClient(relayBaseURL: provisional.profile.relayBaseURL)
                     .revokeSelfDevice(machineId: provisional.profile.machineId, token: provisional.token)
+                guard markRemoteRevoked(marker, in: &markers) else {
+                    provisionalPairings[marker.deviceId] = provisional
+                    continue
+                }
                 try? tokenStore.delete(account: provisional.profile.deviceId)
                 store.remove(marker.machineId)
                 provisionalPairings.removeValue(forKey: marker.deviceId)
@@ -413,6 +434,10 @@ actor DSHRemoteTransport: DSHAppTransport {
                 // would permanently block a fresh pairing. Network failures
                 // remain fail-closed and keep the compensating revoke pending.
                 if case DSHAPIError.http(let status, _) = error, status == 401 {
+                    guard markRemoteRevoked(marker, in: &markers) else {
+                        provisionalPairings[marker.deviceId] = provisional
+                        continue
+                    }
                     try? tokenStore.delete(account: provisional.profile.deviceId)
                     store.remove(marker.machineId)
                     provisionalPairings.removeValue(forKey: marker.deviceId)
@@ -423,6 +448,55 @@ actor DSHRemoteTransport: DSHAppTransport {
             }
         }
         saveProvisionalMarkers(markers)
+    }
+
+    /// A marker is the durable source of truth for a pairing compensation.
+    /// Once Relay has confirmed revoke (or its 401 proves the credential is
+    /// already unusable), record that fact before deleting local secrets. A
+    /// subsequent launch can then finish cleanup without needing the token.
+    @discardableResult
+    private func markRemoteRevoked(_ marker: DSHProvisionalPairingMarker,
+                                   in markers: inout [String: DSHProvisionalPairingMarker]) -> Bool {
+        guard var next = markers[marker.deviceId] else { return false }
+        next.state = .remoteRevoked
+        markers[marker.deviceId] = next
+        return saveProvisionalMarkers(markers)
+    }
+
+    /// Finishes cleanup that was durably fenced as remoteRevoked before the
+    /// process was killed. Every operation is idempotent.
+    private func cleanupRemoteRevokedMarkers() async {
+        var markers = loadProvisionalMarkers()
+        let targets = markers.values.filter { $0.state == .remoteRevoked }
+        guard !targets.isEmpty else { return }
+        for marker in targets {
+            try? tokenStore.delete(account: marker.deviceId)
+            store.remove(marker.machineId)
+            provisionalPairings.removeValue(forKey: marker.deviceId)
+            markers.removeValue(forKey: marker.deviceId)
+        }
+        saveProvisionalMarkers(markers)
+    }
+
+    /// If a crash happened after local token deletion but before the marker
+    /// was fenced, no network credential remains to perform compensation. The
+    /// Relay provisional deadline is the safe point at which the orphan is
+    /// known to be unusable; old markers fall back to the fixed Relay TTL.
+    private func expireOrphanedMarkers() async {
+        var markers = loadProvisionalMarkers()
+        var changed = false
+        let now = Date()
+        for marker in markers.values where marker.state != .remoteRevoked {
+            let hasToken = provisionalPairings[marker.deviceId] != nil ||
+                (try? tokenStore.read(account: marker.deviceId)) != nil
+            guard !hasToken else { continue }
+            let expiry = marker.provisionalUntil
+                ?? marker.createdAt.addingTimeInterval(Self.provisionalPairingTTL)
+            guard now >= expiry else { continue }
+            markers[marker.deviceId]?.state = .remoteRevoked
+            changed = true
+        }
+        if changed { saveProvisionalMarkers(markers) }
     }
 
     private func verifyProvisionalPairingSupport(_ baseURL: URL) async throws {
@@ -472,6 +546,15 @@ actor DSHRemoteTransport: DSHAppTransport {
                     // (expired provisional TTL or external revocation). Drop
                     // this unusable profile and let the UI request pairing
                     // again instead of retrying a dead marker forever.
+                    guard markRemoteRevoked(marker, in: &markers) else {
+                        provisionalPairings[marker.deviceId] = DSHProvisionalPairing(
+                            profile: DSHRemoteProfile(relayBaseURL: marker.relayBaseURL,
+                                                      deviceId: marker.deviceId,
+                                                      machineId: marker.machineId,
+                                                      machineName: ""),
+                            token: token, provisionalUntil: marker.provisionalUntil)
+                        continue
+                    }
                     try? tokenStore.delete(account: marker.deviceId)
                     store.remove(marker.machineId)
                     provisionalPairings.removeValue(forKey: marker.deviceId)
@@ -482,7 +565,7 @@ actor DSHRemoteTransport: DSHAppTransport {
                                                    deviceId: marker.deviceId,
                                                    machineId: marker.machineId,
                                                    machineName: ""),
-                        token: token)
+                        token: token, provisionalUntil: marker.provisionalUntil)
                 }
             }
         }
@@ -496,17 +579,26 @@ actor DSHRemoteTransport: DSHAppTransport {
         return decoded
     }
 
-    private func saveProvisionalMarkers(_ markers: [String: DSHProvisionalPairingMarker]) {
-        guard let data = try? JSONEncoder().encode(markers) else { return }
+    @discardableResult
+    private func saveProvisionalMarkers(_ markers: [String: DSHProvisionalPairingMarker]) -> Bool {
+        guard let data = try? JSONEncoder().encode(markers) else { return false }
         UserDefaults.standard.set(data, forKey: Self.provisionalPairingsKey)
+        // This marker is the crash-recovery fence for a remote credential.
+        // Force the UserDefaults write before deleting the corresponding
+        // Keychain token/profile below.
+        UserDefaults.standard.synchronize()
+        return UserDefaults.standard.data(forKey: Self.provisionalPairingsKey) == data
     }
 
-    private func rememberProvisionalPairing(_ profile: DSHRemoteProfile, token: String) {
-        provisionalPairings[profile.deviceId] = DSHProvisionalPairing(profile: profile, token: token)
+    private func rememberProvisionalPairing(_ profile: DSHRemoteProfile, token: String,
+                                            provisionalUntil: Date?) {
+        provisionalPairings[profile.deviceId] = DSHProvisionalPairing(
+            profile: profile, token: token, provisionalUntil: provisionalUntil)
         var markers = loadProvisionalMarkers()
         markers[profile.deviceId] = DSHProvisionalPairingMarker(
             machineId: profile.machineId, deviceId: profile.deviceId,
-            relayBaseURL: profile.relayBaseURL, createdAt: Date())
+            relayBaseURL: profile.relayBaseURL, createdAt: Date(),
+            provisionalUntil: provisionalUntil)
         saveProvisionalMarkers(markers)
     }
 }

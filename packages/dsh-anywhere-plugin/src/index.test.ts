@@ -636,6 +636,48 @@ describe('native bridge mutations', () => {
       .resolves.toEqual({ status: 200, body: { items: [] } })
   })
 
+  it('invalidates a cached unknown mutation response after reconciliation', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-reconcile-cache-'))
+    const requestId = 'cached-unknown-command'
+    const key = `${CONNECTOR_DEVICE_ID}\u0000/sessions/s1/command\u0000${requestId}`
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      remoteMutations: { [key]: { pending: true, createdAt: 1 } },
+    }))
+    let invocations = 0
+    const request = mount({
+      dataDir,
+      invoke: async () => {
+        invocations += 1
+        return { ok: true, value: { matched: true, result: { kind: 'text', text: 'replayed' } } }
+      },
+    })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s1/command', { line: 'status' }, requestId))
+      .resolves.toMatchObject({ status: 503 })
+    await expect(request('POST', '/dsh-anywhere/v1/admin/remote-mutations/reconcile', {
+      keys: [key], kind: 'not-committed', confirm: true,
+    })).resolves.toMatchObject({ status: 200 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s1/command', { line: 'status' }, requestId))
+      .resolves.toMatchObject({ status: 202 })
+    expect(invocations).toBe(1)
+  })
+
+  it('accepts remote mutation admin keys containing a maximum encoded session id', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-long-mutation-key-'))
+    const sessionId = '界'.repeat(256)
+    const path = `/sessions/${encodeURIComponent(sessionId)}/command`
+    const key = `${CONNECTOR_DEVICE_ID}\u0000${path}\u0000long-key`
+    expect(key.length).toBeGreaterThan(1_024)
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({
+      remoteMutations: { [key]: { pending: true, createdAt: 1 } },
+    }))
+    const request = mount({ dataDir })
+    await expect(request('GET', '/dsh-anywhere/v1/admin/remote-mutations/pending'))
+      .resolves.toMatchObject({ status: 200, body: { items: [{ key }] } })
+    await expect(request('POST', '/dsh-anywhere/v1/admin/remote-mutations/reconcile', {
+      keys: [key], kind: 'not-committed', confirm: true,
+    })).resolves.toMatchObject({ status: 200, body: { resolved: 1 } })
+  })
+
   it('does not partially compact a mixed session-create batch', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-compact-atomic-'))
     const completedKey = `${CONNECTOR_DEVICE_ID}\u0000completed-create`

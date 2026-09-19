@@ -67,7 +67,7 @@ public final class DSHAPIClient: @unchecked Sendable {
     }
 
     public func pair(machineId: String, credential: DSHPairingCredential, deviceName: String,
-                     provisional: Bool = false) async throws -> (profile: DSHRemoteProfile, token: String) {
+                     provisional: Bool = false) async throws -> (profile: DSHRemoteProfile, token: String, provisionalUntil: Date?) {
         let response: PairResponse = try await perform(
             method: "POST",
             path: ["v1", "pair"],
@@ -76,7 +76,7 @@ public final class DSHAPIClient: @unchecked Sendable {
         )
         let profile = DSHRemoteProfile(relayBaseURL: relayBaseURL, deviceId: response.deviceId,
                                        machineId: machineId, machineName: response.machineName ?? machineId)
-        return (profile, response.deviceToken)
+        return (profile, response.deviceToken, response.provisionalUntil)
     }
 
     /// Devices paired to one machine. The Relay never returns credential
@@ -207,6 +207,26 @@ private struct PairResponse: Decodable {
     let deviceId: String
     let deviceToken: String
     let machineName: String?
+    /// Relay timestamps are milliseconds since the Unix epoch. Keeping the
+    /// deadline with the client-side marker lets an orphaned marker reach a
+    /// deterministic local cleanup point even when its Keychain token is gone.
+    let provisionalUntil: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceId, deviceToken, machineName, provisionalUntil
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try container.decode(String.self, forKey: .deviceId)
+        deviceToken = try container.decode(String.self, forKey: .deviceToken)
+        machineName = try container.decodeIfPresent(String.self, forKey: .machineName)
+        if let milliseconds = try container.decodeIfPresent(Double.self, forKey: .provisionalUntil) {
+            provisionalUntil = Date(timeIntervalSince1970: milliseconds / 1_000)
+        } else {
+            provisionalUntil = nil
+        }
+    }
 }
 
 private struct ServerError: Decodable {
