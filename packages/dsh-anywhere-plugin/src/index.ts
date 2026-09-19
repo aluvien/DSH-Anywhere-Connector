@@ -36,6 +36,14 @@ const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
 const IDEMPOTENCY_TTL_MS = 10 * 60_000
 const MAX_IDEMPOTENCY_ENTRIES = 2_000
 const ATTACHMENT_UPLOAD_RETENTION_MS = 30 * 24 * 60 * 60_000
+/**
+ * Expired attachment records are safety tombstones, not ordinary cache
+ * entries: deleting one without an authoritative native reconciliation could
+ * make a late retry upload the same file twice. Bound their total count and
+ * the enclosing metadata file instead of using an unsafe TTL.
+ */
+const MAX_ATTACHMENT_UPLOAD_TOMBSTONES = 8_192
+const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 
 interface CapturedHttpResponse {
   readonly status: number
@@ -537,6 +545,8 @@ class SessionMetadataStore {
     }
     const now = Date.now()
     const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
+    let expiredCount = [...this.attachmentUploadResults.values()]
+      .filter((entry) => entry.expired === true).length
     let pruned = false
     for (const [entryKey, entry] of this.attachmentUploadResults) {
       if (entry.response !== undefined && entry.completedAt !== undefined && entry.completedAt < cutoff) {
@@ -548,16 +558,34 @@ class SessionMetadataStore {
         // fail-closed reconciliation tombstone instead of occupying an active
         // idempotency slot forever.  Keep the operation identity so a later
         // adapter lookup can recover the receipt or prove non-commitment.
+        if (expiredCount >= MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
+          throw new HttpError(
+            503,
+            'attachment upload tombstone capacity is full; reconcile expired uploads before retrying',
+            'unknown',
+          )
+        }
         this.attachmentUploadResults.set(entryKey, {
           fingerprint: entry.fingerprint,
           ...(entry.nativeOperationId === undefined ? {} : { nativeOperationId: entry.nativeOperationId }),
           expired: true,
           expiredAt: now,
         })
+        expiredCount += 1
         pruned = true
       }
     }
     if (pruned) await this.persist()
+    if (!this.attachmentUploadResults.has(key) && expiredCount >= MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
+      // Reconciliation is intentionally required before accepting more
+      // unknown operations. Keeping the existing tombstones is safer than
+      // evicting one and allowing a duplicate native upload.
+      throw new HttpError(
+        503,
+        'attachment upload tombstone capacity is full; reconcile expired uploads before retrying',
+        'unknown',
+      )
+    }
     const activeCount = [...this.attachmentUploadResults.values()]
       .filter((entry) => entry.expired !== true).length
     if (!this.attachmentUploadResults.has(key) && activeCount >= MAX_ATTACHMENT_UPLOAD_RECORDS) {
@@ -748,6 +776,10 @@ class SessionMetadataStore {
   private async load(): Promise<void> {
     let migratedAttachmentMetadata = false
     try {
+      const metadataStats = await stat(this.path)
+      if (metadataStats.size > MAX_SESSION_METADATA_BYTES) {
+        throw new Error('session presentation metadata exceeds its safety size')
+      }
       const parsedValue: unknown = JSON.parse(await readFile(this.path, 'utf8'))
       if (typeof parsedValue !== 'object' || parsedValue === null || Array.isArray(parsedValue)) {
         throw new Error('session metadata root must be an object')
@@ -872,6 +904,7 @@ class SessionMetadataStore {
       }
       if (typeof attachmentUploads === 'object' && attachmentUploads !== null && !Array.isArray(attachmentUploads)) {
         let activeAttachmentRecordCount = 0
+        let expiredAttachmentRecordCount = 0
         for (const [key, raw] of Object.entries(attachmentUploads)) {
           if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
             throw new Error('attachment upload metadata contains an invalid record')
@@ -911,7 +944,14 @@ class SessionMetadataStore {
           if (response === undefined && raw.pending !== true && raw.expired !== true) {
             throw new Error('attachment upload metadata contains an incomplete record')
           }
-          if (raw.expired !== true) activeAttachmentRecordCount += 1
+          if (raw.expired === true) {
+            expiredAttachmentRecordCount += 1
+            if (expiredAttachmentRecordCount > MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
+              throw new Error('attachment upload metadata exceeds its tombstone safety capacity')
+            }
+          } else {
+            activeAttachmentRecordCount += 1
+          }
           const completedAt = typeof raw.completedAt === 'number'
             ? raw.completedAt
             : response === undefined ? undefined : Date.now()
@@ -971,6 +1011,10 @@ class SessionMetadataStore {
       sessionCreations: Object.fromEntries(this.sessionCreationResults),
       attachmentUploads: Object.fromEntries(this.attachmentUploadResults),
     }, null, 2)
+    if (Buffer.byteLength(snapshot, 'utf8') > MAX_SESSION_METADATA_BYTES) {
+      this.persistenceUnavailable = true
+      return Promise.reject(new Error('session presentation metadata exceeds its safety size'))
+    }
     this.persistQueue = this.persistQueue.catch(() => undefined).then(async () => {
       if (this.persistenceUnavailable) throw new Error('session presentation metadata is unavailable')
       const directory = dirname(this.path)
@@ -2493,7 +2537,9 @@ async function handleHttp(
     if (durableKey !== undefined) {
       const expired = metadata.attachmentUploadExpiredEntry(durableKey, fingerprint)
       if (expired !== undefined) {
-        // An expired marker is no longer an automatic retry.  Give an adapter
+        // Replaying the original authenticated request is the executable
+        // operator-reconciliation path for a tombstone. An expired marker is
+        // no longer an automatic retry. Give an adapter
         // that supports reconciliation one explicit lookup opportunity; only
         // a receipt or authoritative non-commitment may release the permanent
         // tombstone.  Without that proof, keep failing closed so a late phone

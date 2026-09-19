@@ -354,6 +354,14 @@ private struct DSHLoadedPendingTransactionStore: Sendable {
     let blobs: [String: Data]
 }
 
+/// Loading the large transaction journal can fail independently of the small
+/// removed-machine sidecar. Keep the sidecar fence attached to the failure so
+/// startup can still fail closed and reconcile a removed profile instead of
+/// silently reconnecting it.
+private struct DSHPendingTransactionStoreLoadError: Error, Sendable {
+    let fencedMachineIDs: Set<String>
+}
+
 /// Serializes transaction files away from the `@MainActor`.  The model still
 /// builds a small metadata snapshot on the main actor, but blob writes,
 /// directory scans, and atomic replacement all run on this independent
@@ -419,12 +427,16 @@ private actor DSHPendingTransactionFileStore {
     }
 
     func load() throws -> DSHLoadedPendingTransactionStore {
-        let fencedMachineIDs: Set<String>
+        // Read the fence first and keep it independent from the large journal.
+        // An existing (even empty) sidecar is authoritative: an empty sidecar
+        // is the durable completion marker for a re-pair and must not be merged
+        // with a stale removedMachineIDs value left in the old journal.
+        let sidecarMachineIDs: Set<String>?
         if FileManager.default.fileExists(atPath: removedMachineIDsURL.path) {
             let data = try Data(contentsOf: removedMachineIDsURL)
-            fencedMachineIDs = try JSONDecoder().decode(Set<String>.self, from: data)
+            sidecarMachineIDs = try JSONDecoder().decode(Set<String>.self, from: data)
         } else {
-            fencedMachineIDs = []
+            sidecarMachineIDs = nil
         }
         // A first launch has no journal yet.  Treat that absence as an empty
         // store instead of converting the normal ENOENT variant returned by
@@ -435,53 +447,72 @@ private actor DSHPendingTransactionFileStore {
                     sessionCreationTransactionsByMachine: [:],
                     lastSessionCreationRequestIDsByMachine: [:],
                     initialMessageTransactionsByMachine: [:],
-                    removedMachineIDs: fencedMachineIDs),
+                    removedMachineIDs: sidecarMachineIDs ?? []),
                 blobs: [:])
         }
-        let metadata = try Data(contentsOf: metadataURL)
-        var store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: metadata)
-        // The small sidecar fence is authoritative across failures of the
-        // large transaction journal. Merge it before any caller can restore a
-        // machine's staged side effects.
-        store.removedMachineIDs.formUnion(fencedMachineIDs)
-        var names = Set<String>()
-        func collect(_ attachments: [DSHStoredAttachment]) throws {
-            for attachment in attachments {
-                if let fileName = attachment.fileName,
-                   fileName == URL(fileURLWithPath: fileName).lastPathComponent,
-                   fileName.hasSuffix(".blob") {
-                    names.insert(fileName)
-                } else if attachment.legacyData == nil {
-                    throw CocoaError(.fileReadCorruptFile)
+        var fallbackFence = sidecarMachineIDs ?? []
+        do {
+            let metadata = try Data(contentsOf: metadataURL)
+            var store = try JSONDecoder().decode(DSHPendingTransactionStore.self, from: metadata)
+            let fencedMachineIDs = sidecarMachineIDs ?? store.removedMachineIDs
+            fallbackFence = fencedMachineIDs
+            // The sidecar is authoritative when present; the journal field is
+            // retained only as a legacy migration path for installations that
+            // predate the sidecar. Drop fenced machine maps before collecting
+            // blob names so a corrupt attachment on a removed machine cannot
+            // block recovery of every healthy machine.
+            store.removedMachineIDs = fencedMachineIDs
+            for machineID in fencedMachineIDs {
+                store.sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
+                store.lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
+                store.initialMessageTransactionsByMachine.removeValue(forKey: machineID)
+                store.pendingPromptTransactionsByMachine.removeValue(forKey: machineID)
+                store.failedPromptTransactionsByMachine.removeValue(forKey: machineID)
+            }
+            var names = Set<String>()
+            func collect(_ attachments: [DSHStoredAttachment]) throws {
+                for attachment in attachments {
+                    if let fileName = attachment.fileName,
+                       fileName == URL(fileURLWithPath: fileName).lastPathComponent,
+                       fileName.hasSuffix(".blob") {
+                        names.insert(fileName)
+                    } else if attachment.legacyData == nil {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
                 }
             }
-        }
-        func collect(_ value: DSHStoredInitialMessage) throws {
-            try collect(value.attachments)
-        }
-        for transactions in store.sessionCreationTransactionsByMachine.values {
-            for transaction in transactions.values {
-                if let initialMessage = transaction.initialMessage { try collect(initialMessage) }
+            func collect(_ value: DSHStoredInitialMessage) throws {
+                try collect(value.attachments)
             }
-        }
-        for transactions in store.initialMessageTransactionsByMachine.values {
-            for transaction in transactions.values { try collect(transaction.pending) }
-        }
-        // A normal composer prompt can be killed while its attachments are
-        // still uploading.  Its staged blobs live under the pending-prompt
-        // records too, so include those references in the load set or the
-        // recovery pass would report a corrupt journal and lose the draft.
-        for transactions in store.pendingPromptTransactionsByMachine.values {
-            for transaction in transactions.values {
-                try collect(transaction.stagedAttachments ?? [])
+            for transactions in store.sessionCreationTransactionsByMachine.values {
+                for transaction in transactions.values {
+                    if let initialMessage = transaction.initialMessage { try collect(initialMessage) }
+                }
             }
+            for transactions in store.initialMessageTransactionsByMachine.values {
+                for transaction in transactions.values { try collect(transaction.pending) }
+            }
+            // A normal composer prompt can be killed while its attachments are
+            // still uploading.  Its staged blobs live under the pending-prompt
+            // records too, so include those references in the load set or the
+            // recovery pass would report a corrupt journal and lose the draft.
+            for transactions in store.pendingPromptTransactionsByMachine.values {
+                for transaction in transactions.values {
+                    try collect(transaction.stagedAttachments ?? [])
+                }
+            }
+            var blobs: [String: Data] = [:]
+            blobs.reserveCapacity(names.count)
+            for fileName in names {
+                blobs[fileName] = try Data(contentsOf: attachmentDirectoryURL.appendingPathComponent(fileName))
+            }
+            return DSHLoadedPendingTransactionStore(store: store, blobs: blobs)
+        } catch {
+            // Preserve a valid sidecar fence even when the journal or one of
+            // its blobs is corrupt. The caller marks persistence unavailable,
+            // but still deletes/reconciles fenced profiles on this launch.
+            throw DSHPendingTransactionStoreLoadError(fencedMachineIDs: fallbackFence)
         }
-        var blobs: [String: Data] = [:]
-        blobs.reserveCapacity(names.count)
-        for fileName in names {
-            blobs[fileName] = try Data(contentsOf: attachmentDirectoryURL.appendingPathComponent(fileName))
-        }
-        return DSHLoadedPendingTransactionStore(store: store, blobs: blobs)
     }
 }
 
@@ -1007,6 +1038,9 @@ final class DSHAppModel: ObservableObject {
             }
             failedPromptTransactionsByMachine = failedPrompts
         } catch {
+            if let loadError = error as? DSHPendingTransactionStoreLoadError {
+                removedMachineIDs = loadError.fencedMachineIDs
+            }
             let nsError = error as NSError
             if !(nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) {
                 pendingTransactionPersistenceUnavailable = true
@@ -2633,9 +2667,12 @@ final class DSHAppModel: ObservableObject {
         guard var current = pendingSendsByRequestID[requestID] else { return false }
         guard current.sessionID == sessionID,
               current.phase == .preparing || current.phase == .readyToSend else { return false }
+        let hasUnuploadedAttachment = current.stagedAttachments.contains {
+            current.uploadedAttachments[$0.id.uuidString] == nil
+        }
         if let deadline = current.attachmentRecoveryDeadline,
            Date() >= deadline,
-           (!current.stagedAttachments.isEmpty || !current.uploadedAttachments.isEmpty) {
+           hasUnuploadedAttachment {
             pendingSendsByRequestID.removeValue(forKey: requestID)
             failedSendsByRequestID[requestID] = DSHFailedSend(
                 id: requestID, text: current.text, receipts: current.receipts,
@@ -2665,7 +2702,8 @@ final class DSHAppModel: ObservableObject {
                 let uploadRequestID = "\(requestID)/attachment/\(key)"
                 let receipt = try await uploadAttachmentAndWait(
                     name: attachment.name, data: attachment.data, for: sessionID,
-                    machineGeneration: generation, requestID: uploadRequestID)
+                    machineGeneration: generation, requestID: uploadRequestID,
+                    attachmentRecoveryDeadline: current.attachmentRecoveryDeadline)
                 guard !cancelledStagedPromptIDs.contains(requestID),
                       pendingSendsByRequestID[requestID]?.phase == .preparing else {
                     return false
@@ -3553,7 +3591,8 @@ final class DSHAppModel: ObservableObject {
     /// the user taps Send.
     func uploadAttachmentAndWait(name: String, data: Data, for sessionID: String,
                                  machineGeneration: Int? = nil,
-                                 requestID requestedRequestID: String? = nil) async throws -> String {
+                                 requestID requestedRequestID: String? = nil,
+                                 attachmentRecoveryDeadline: Date? = nil) async throws -> String {
         guard !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
             throw DSHWebSocketError.machineMismatch
         }
@@ -3571,7 +3610,13 @@ final class DSHAppModel: ObservableObject {
         let command = DSHCommand.uploadAttachment(deviceId: deviceID, machineId: machineID,
                                                    sessionId: sessionID, name: name, data: data,
                                                    requestId: requestId)
-        try await transport.send(command)
+        // The recovery deadline must reach the actual WebSocket send. A
+        // reconnect inside transport.send may otherwise replay this stable
+        // request id after the Bridge's tombstone window has expired.
+        if let deadline = attachmentRecoveryDeadline, Date() >= deadline {
+            throw DSHAttachmentUploadError.recoveryExpired
+        }
+        try await transport.send(command, notAfter: attachmentRecoveryDeadline)
         // A large camera image may need to cross the phone, Relay, Connector,
         // and the local Harness before the receipt comes back. The old 10
         // second window expired while the Connector was still within its
@@ -4349,11 +4394,12 @@ final class DSHAppModel: ObservableObject {
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
         var pendingMessage = pending
         do {
+            let hasUnuploadedAttachment = pendingMessage.attachments.contains {
+                pendingMessage.uploadedAttachments[$0.id.uuidString] == nil
+            }
             if let deadline = pendingMessage.attachmentRecoveryDeadline,
                Date() >= deadline,
-               (!pendingMessage.attachments.isEmpty || !pendingMessage.uploadedAttachments.isEmpty) {
-                throw DSHAttachmentUploadError.recoveryExpired
-            }
+               hasUnuploadedAttachment { throw DSHAttachmentUploadError.recoveryExpired }
             var receipts: [String] = []
             var messageAttachments: [DSHMessageAttachment] = []
             receipts.reserveCapacity(pendingMessage.attachments.count)
@@ -4373,7 +4419,8 @@ final class DSHAppModel: ObservableObject {
                                                                  data: attachment.data,
                                                                  for: sessionID,
                                                                  machineGeneration: machineGeneration,
-                                                                 requestID: uploadRequestID)
+                                                                 requestID: uploadRequestID,
+                                                                 attachmentRecoveryDeadline: pendingMessage.attachmentRecoveryDeadline)
                 let mediaType = attachment.isImage ? "image/jpeg" : nil
                 cacheAttachmentData(attachment.data, for: receipt)
                 let uploaded = DSHMessageAttachment(id: receipt,
