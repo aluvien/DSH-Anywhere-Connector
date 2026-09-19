@@ -2063,17 +2063,18 @@ async function handleHttp(
     // Attachments have to sit inside `content`: that is where the Harness looks
     // for receipt ids to bind to the message. Sending them in a field of their
     // own is what made the file arrive without the text that accompanied it.
-    const declaredContent = parsed.data.content
-    const content = declaredContent === undefined
-      ? [...(text.length === 0 ? [] : [{ type: 'text' as const, text }]), ...(parsed.data.attachments ?? [])]
-      : [
-          // Be tolerant of older clients that put text in `text` and files in
-          // `content`. The Harness only reads the canonical content array.
-          ...(text.length === 0 || declaredContent.some((part) => part.type === 'text' && part.text === text)
-            ? []
-            : [{ type: 'text' as const, text }]),
-          ...declaredContent,
-        ]
+    const declaredContent = parsed.data.content ?? []
+    // Accept both legacy `attachments` and canonical `content` when a client
+    // sends them together.  Silently choosing one field used to return
+    // `accepted` while dropping the other field's receipts.  The shared
+    // schema applies the combined <=16 attachment limit before this merge.
+    const content = [
+      ...(text.length === 0 || declaredContent.some((part) => part.type === 'text' && part.text === text)
+        ? []
+        : [{ type: 'text' as const, text }]),
+      ...declaredContent,
+      ...(parsed.data.attachments ?? []),
+    ]
     const sessionId = decodeURIComponent(promptMatch[1]!)
     let result: { accepted: true }
     try {

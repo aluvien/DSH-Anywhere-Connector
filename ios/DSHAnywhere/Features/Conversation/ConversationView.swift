@@ -2067,20 +2067,29 @@ struct ConversationView: View {
             // An edited text-only queue submission supersedes any older
             // preparing attachment transaction for this session.  That old
             // draft was never sent and must not resume silently later.
-            model.supersedePreparingPromptTransactions(for: sessionID)
-            model.holdQueuedPrompt(text: trimmed, for: sessionID)
-            isDraftFocused = false
-            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
-                                            to: nil, from: nil, for: nil)
-            model.draft = ""
+            let generation = model.currentMachineGeneration
+            let expectedMachineID = model.machineID
+            isSending = true
+            Task { @MainActor in
+                guard model.isCurrentMachineGeneration(generation),
+                      model.machineID == expectedMachineID,
+                      await model.supersedePreparingPromptTransactions(for: sessionID) else {
+                    isSending = false
+                    return
+                }
+                model.holdQueuedPrompt(text: trimmed, for: sessionID)
+                isDraftFocused = false
+                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                                to: nil, from: nil, for: nil)
+                model.draft = ""
+                isSending = false
+            }
             return
         }
         let requestId = staged.isEmpty
             ? UUID().uuidString
             : (model.stagedPromptRequestID(text: trimmed, attachments: staged, sessionID: sessionID)
                 ?? UUID().uuidString)
-        model.supersedePreparingPromptTransactions(for: sessionID, keeping: requestId)
-
         // Keep the editor's contents until the prompt transaction is durably
         // accepted. `isSending` prevents a double tap while uploads are in
         // flight; clearing earlier would lose the draft if the journal cannot
@@ -2094,6 +2103,12 @@ struct ConversationView: View {
         Task { @MainActor in
             guard model.isCurrentMachineGeneration(machineGeneration),
                   model.machineID == expectedMachineID else {
+                isSending = false
+                return
+            }
+            guard await model.supersedePreparingPromptTransactions(for: sessionID,
+                                                                    keeping: requestId) else {
+                model.errorMessage = "无法保存待处理请求，暂不安全发送。"
                 isSending = false
                 return
             }

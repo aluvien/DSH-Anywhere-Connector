@@ -332,6 +332,14 @@ export class DSHAnywhereConnector {
       if (this.bridge !== socket) return;
       this.bridge = undefined;
       if (this.bridgeConnectorId === connectorId) this.bridgeConnectorId = undefined;
+      // Bridge removes every presence lease owned by a disconnected socket.
+      // Keep the Relay-online set, but fence all session.create delivery until
+      // the replacement socket has installed a fresh lease.  Without this
+      // marker a command arriving in the reconnect window is forwarded to
+      // HTTP and receives a final origin-device 403.
+      for (const deviceId of this.onlineRelayDevices) {
+        this.presenceRefreshRequired.add(deviceId);
+      }
       if (this.running) this.scheduleBridgeReconnect();
     });
   }
@@ -678,6 +686,14 @@ export class DSHAnywhereConnector {
             path: `/devices/${encodeURIComponent(deviceId)}/presence`,
             body: { online, connectorId, relayGeneration, relayEpoch },
           });
+          // The HTTP request may have completed just as this Bridge socket
+          // closed.  Its lease is no longer authoritative in that case; keep
+          // the refresh fence set so a session.create cannot race the
+          // replacement socket's registration.
+          if (online && (this.bridge === undefined || this.bridgeConnectorId !== connectorId)) {
+            this.presenceRefreshRequired.add(deviceId);
+            return false;
+          }
           this.presenceRefreshRequired.delete(deviceId);
           return true;
         } catch (error) {

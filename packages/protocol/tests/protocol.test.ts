@@ -361,6 +361,25 @@ describe("prompt attachments", () => {
     expect(CommandEnvelopeSchema.safeParse(message).success).toBe(true);
   });
 
+  it("counts legacy attachments together with canonical content", () => {
+    const message = {
+      type: "prompt.send",
+      requestId: "req-combined-files",
+      ...base,
+      payload: {
+        content: Array.from({ length: 8 }, (_, index) => ({
+          type: "file" as const,
+          receiptId: `content-${index}`,
+        })),
+        attachments: Array.from({ length: 9 }, (_, index) => ({
+          type: "file" as const,
+          receiptId: `legacy-${index}`,
+        })),
+      },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
+  });
+
   it("rejects more than sixteen file or image parts in content", () => {
     const message = {
       type: "prompt.send",

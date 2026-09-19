@@ -524,7 +524,8 @@ export const PromptSendPayloadSchema = StrictObject({
     context.addIssue({ code: z.ZodIssueCode.custom, message: "prompt requires text or an attachment" });
   }
   const contentAttachments = value.content?.filter((part) => part.type === "file" || part.type === "image").length ?? 0;
-  if (contentAttachments > 16) {
+  const totalAttachments = contentAttachments + (value.attachments?.length ?? 0);
+  if (totalAttachments > 16) {
     context.addIssue({
       code: z.ZodIssueCode.too_big,
       origin: "array",

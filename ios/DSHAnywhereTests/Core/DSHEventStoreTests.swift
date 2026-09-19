@@ -979,6 +979,7 @@ final class DSHEventStoreTests: XCTestCase {
         let firstCommand = await transport.lastCommand(ofType: "session.create")
         XCTAssertEqual(firstCommand?.requestId, requestID)
 
+        model.sessionCreationAckTimeout = 1
         model.retrySessionCreation(requestID: requestID)
         try? await Task.sleep(for: .milliseconds(60))
         let retryCommand = await transport.lastCommand(ofType: "session.create")
@@ -1046,7 +1047,7 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testSessionCreationRetryWindowStopsUnsafeReexecution() async throws {
+    func testSessionCreationRecoveryCanResumeAfterShortHttpWindow() async throws {
         let transport = CorrelationTransport()
         let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 0.01
@@ -1060,10 +1061,13 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.resultUnknown == true)
         let before = await transport.commandCount(ofType: "session.create")
 
+        model.sessionCreationAckTimeout = 1
         model.retrySessionCreation(requestID: requestID)
+        try await Task.sleep(for: .milliseconds(60))
         let after = await transport.commandCount(ofType: "session.create")
-        XCTAssertEqual(after, before, "An expired unknown request must not execute again")
-        XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.detail.contains("安全恢复窗口") == true)
+        XCTAssertEqual(after, before + 1,
+                       "A durable create record must remain recoverable after the short HTTP cache window")
+        XCTAssertNil(model.sessionCreationFailure(for: requestID))
         model.disconnect()
     }
 

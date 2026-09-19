@@ -296,13 +296,14 @@ struct NewSessionSheet: View {
                     }
                 }
                 Spacer(minLength: 4)
-                if !failure.resultUnknown || !model.sessionCreationRetryExpired(for: requestID) {
-                    Button("重试") { model.retrySessionCreation(requestID: requestID) }
-                        .font(.subheadline.weight(.semibold))
-                } else {
-                    Button("刷新任务列表") { model.refreshSessions() }
-                        .font(.caption.weight(.semibold))
+                // A durable Bridge record can resume a committed session
+                // after the short HTTP cache expires.  Keep the recovery
+                // action available instead of trapping partial creates behind
+                // a ten-minute client-only cutoff.
+                Button(failure.resultUnknown ? "恢复" : "重试") {
+                    model.retrySessionCreation(requestID: requestID)
                 }
+                .font(.subheadline.weight(.semibold))
                 Button(failure.resultUnknown ? "保留并编辑" : "返回编辑") {
                     if failure.resultUnknown {
                         model.retainSessionCreationForEditing(requestID: requestID)

@@ -210,6 +210,10 @@ private struct DSHStoredFailedSend: Codable, Sendable {
     let mode: String
     let messageAttachments: [DSHMessageAttachment]
     let failure: DSHStoredSendFailure
+    /// A timeout means the prompt may already have reached the Mac.  Keep the
+    /// retry window in the journal so a later launch cannot outlive the
+    /// Connector/Bridge request-id tombstone and execute it again.
+    let retryUntil: Date?
 }
 
 private struct DSHPendingTransactionSnapshot: Sendable {
@@ -560,11 +564,14 @@ final class DSHAppModel: ObservableObject {
     /// before the UI changes from an indeterminate spinner to recoverable
     /// "result unknown" state.
     var sessionCreationAckTimeout: TimeInterval = 15
-    /// This mirrors the Connector/Bridge idempotency retention contract.  A
-    /// client-side UUID is not an eternal dedupe key: after this point the UI
-    /// must stop re-executing an unresolved create and ask the user to inspect
-    /// the refreshed session list instead.
+    /// Historical HTTP cache window retained for UI copy and journal metadata.
+    /// It is not a safety cutoff: the Bridge's durable create record remains
+    /// the authority for resuming a committed-but-partially-configured task.
     static let sessionCreationIdempotencyWindow: TimeInterval = 10 * 60
+    /// Matches the Connector/Bridge prompt request-id tombstone window.  A
+    /// queue mirror may be resumed after a crash only while this identity is
+    /// still guaranteed to coalesce at the remote side.
+    static let promptIdempotencyWindow: TimeInterval = 10 * 60
     var sessionCreationRetryWindow: TimeInterval = 10 * 60
     private var sessionCreationRetryDeadlines: [String: Date] = [:]
     private var sessionCreationResultOrder: [String] = []
@@ -1001,14 +1008,14 @@ final class DSHAppModel: ObservableObject {
         DSHStoredFailedSend(id: value.id, text: value.text, receipts: value.receipts,
                             sessionID: value.sessionID, mode: value.mode,
                             messageAttachments: value.messageAttachments,
-                            failure: storedFailure(value.failure))
+                            failure: storedFailure(value.failure), retryUntil: value.retryUntil)
     }
 
     private func failedSend(_ value: DSHStoredFailedSend) -> DSHFailedSend {
         DSHFailedSend(id: value.id, text: value.text, receipts: value.receipts,
                       sessionID: value.sessionID, mode: value.mode,
                       messageAttachments: value.messageAttachments,
-                      failure: failure(value.failure))
+                      failure: failure(value.failure), retryUntil: value.retryUntil)
     }
 
     /// Rebuilds the per-machine durable view from the live request maps. This
@@ -1874,7 +1881,6 @@ final class DSHAppModel: ObservableObject {
             Date().addingTimeInterval(sessionCreationRetryWindow)
         failedSessionCreations.removeValue(forKey: requestId)
         detachedSessionCreationRequestIDs.remove(requestId)
-        armSessionCreationTimeout(requestID: requestId)
         let expectedMachineGeneration = machineStateGeneration
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1899,6 +1905,11 @@ final class DSHAppModel: ObservableObject {
             }
             guard self.machineStateGeneration == expectedMachineGeneration,
                   self.machineID == machineID else { return }
+            // The remote acknowledgement clock starts only after the complete
+            // create transaction (including any staged first-message blobs)
+            // has been durably committed.  Slow local I/O must not turn a
+            // request that has not left the phone into an "unknown" result.
+            self.armSessionCreationTimeout(requestID: requestId)
             self.send(command)
         }
         return true
@@ -2316,7 +2327,7 @@ final class DSHAppModel: ObservableObject {
                     id: prepared.requestID, text: prepared.text, receipts: prepared.receipts,
                     sessionID: prepared.sessionID, mode: prepared.mode,
                     messageAttachments: prepared.messageAttachments,
-                    failure: .local("无法保存待处理请求，消息尚未发送。"))
+                    failure: .local("无法保存待处理请求，消息尚未发送。"), retryUntil: nil)
             }
             errorMessage = "无法保存待处理请求，消息尚未发送。"
             return false
@@ -2420,9 +2431,11 @@ final class DSHAppModel: ObservableObject {
     }
 
     enum DSHSendFailure: Sendable, Equatable, Codable {
-        /// Never left the phone (socket down at send time or at timeout).
+        /// The transport rejected the send before this app attempted to put a
+        /// frame on the wire; this path has no remote side effect to dedupe.
         case local(String)
-        /// Left the phone but the Mac never acknowledged (or rejected it).
+        /// The frame may have left the phone but the Mac never acknowledged
+        /// (or rejected it). Timeouts are intentionally classified here.
         case server(String)
     }
 
@@ -2434,6 +2447,10 @@ final class DSHAppModel: ObservableObject {
         let mode: String
         let messageAttachments: [DSHMessageAttachment]
         let failure: DSHSendFailure
+        /// `nil` means the transport proved that the frame never left the
+        /// phone.  Timeouts use the server's request-id retention window;
+        /// after it expires the original request must not be re-executed.
+        let retryUntil: Date?
     }
 
     private var pendingSendsByRequestID: [String: DSHPendingSend] = [:]
@@ -2475,18 +2492,31 @@ final class DSHAppModel: ObservableObject {
     /// Removes only prompt transactions that have not reached `prompt.send`.
     /// A request already waiting for an acknowledgement may have reached the
     /// Mac and therefore remains protected by its original request id.
-    func supersedePreparingPromptTransactions(for sessionID: String, keeping requestID: String? = nil) {
+    @discardableResult
+    func supersedePreparingPromptTransactions(for sessionID: String,
+                                              keeping requestID: String? = nil) async -> Bool {
         let superseded = pendingSendsByRequestID.values.filter {
             $0.sessionID == sessionID &&
             ($0.phase == .preparing || $0.phase == .readyToSend) &&
             $0.id != requestID
-        }.map(\.id)
-        guard !superseded.isEmpty else { return }
-        for id in superseded {
+        }
+        guard !superseded.isEmpty else { return true }
+        let removed = Dictionary(uniqueKeysWithValues: superseded.map { ($0.id, $0) })
+        let supersededIDs = superseded.map(\.id)
+        for id in supersededIDs {
             cancelledStagedPromptIDs.insert(id)
             pendingSendsByRequestID.removeValue(forKey: id)
         }
-        persistCurrentTransactionsLater(for: machineID)
+        // The replacement queue item must not be accepted until the old
+        // preparing records are durably gone.  Otherwise a crash between the
+        // asynchronous journal write and UserDefaults can resurrect the old
+        // draft and send it alongside the replacement.
+        guard await persistCurrentTransactions(for: machineID) else {
+            pendingSendsByRequestID.merge(removed) { _, current in current }
+            for id in supersededIDs { cancelledStagedPromptIDs.remove(id) }
+            return false
+        }
+        return true
     }
 
     private func armSendAckTimeout(requestId: String, attempt: Int, delay: TimeInterval? = nil) {
@@ -2521,7 +2551,9 @@ final class DSHAppModel: ObservableObject {
         failedSendsByRequestID[requestId] = DSHFailedSend(id: requestId, text: pending.text,
                                                           receipts: pending.receipts,
                                                           sessionID: pending.sessionID, mode: pending.mode,
-                                                          messageAttachments: pending.messageAttachments, failure: failure)
+                                                          messageAttachments: pending.messageAttachments,
+                                                          failure: failure,
+                                                          retryUntil: Date().addingTimeInterval(Self.promptIdempotencyWindow))
         persistCurrentTransactionsLater(for: machineID)
     }
 
@@ -2582,7 +2614,7 @@ final class DSHAppModel: ObservableObject {
             id: command.requestId, text: text, receipts: receipts,
             sessionID: sessionID, mode: mode,
             messageAttachments: messageAttachments,
-            failure: .local(error.localizedDescription))
+            failure: .local(error.localizedDescription), retryUntil: nil)
         persistCurrentTransactionsLater(for: machineID)
     }
 
@@ -2605,6 +2637,10 @@ final class DSHAppModel: ObservableObject {
     func retryFailedSend(requestID: String) {
         guard let failed = failedSendsByRequestID[requestID] else { return }
         guard validatePromptText(failed.text) else { return }
+        if let retryUntil = failed.retryUntil, Date() >= retryUntil {
+            errorMessage = "原消息已超过安全重试窗口，请重新发送以避免重复执行。"
+            return
+        }
         failedSendsByRequestID.removeValue(forKey: requestID)
         persistCurrentTransactionsLater(for: machineID)
         // A timeout means the Mac may already have accepted the side effect.
@@ -2731,8 +2767,19 @@ final class DSHAppModel: ObservableObject {
     /// transaction is durable. A failed journal write leaves the item in the
     /// local queue instead of making the editor and queue both lose it.
     func sendQueuedPrompt(id: String, sessionID: String) {
-        guard let item = queuedPromptsBySession[sessionID]?.first(where: { $0.id == id && !$0.sent }),
+        guard var queue = queuedPromptsBySession[sessionID],
+              let index = queue.firstIndex(where: { $0.id == id && !$0.sent }),
               queuedPromptSendIDs.insert(id).inserted else { return }
+        let item = queue[index]
+        // Assign the request identity before creating the durable prompt
+        // transaction.  The queue mirror and pending-transactions journal can
+        // then be reconciled by the same id after a process kill; leaving Q as
+        // an anonymous `sent=false` item allowed a second request id later.
+        let requestID = item.requestId ?? UUID().uuidString
+        queue[index] = DSHQueuedPrompt(id: item.id, text: item.text, mode: item.mode,
+                                       sentAt: item.sentAt, sent: true, requestId: requestID)
+        queuedPromptsBySession[sessionID] = queue
+        persistQueuedPrompts()
         let generation = machineStateGeneration
         let activeMachineID = machineID
         Task { @MainActor [weak self] in
@@ -2740,10 +2787,12 @@ final class DSHAppModel: ObservableObject {
             defer { self.queuedPromptSendIDs.remove(id) }
             let sent = await self.sendPromptPersisted(
                 item.text, attachments: [], to: sessionID, mode: item.mode,
-                expectedMachineGeneration: generation, expectedMachineID: activeMachineID)
-            if sent {
-                _ = self.takeQueuedPrompt(id: id, sessionID: sessionID)
-            }
+                requestId: requestID, expectedMachineGeneration: generation,
+                expectedMachineID: activeMachineID)
+            // Keep the sent queue mirror until prompt.accepted retires it.  A
+            // failed/unknown send can therefore be retried with this same id
+            // instead of generating a second side effect.
+            _ = sent
         }
     }
 
@@ -3501,21 +3550,13 @@ final class DSHAppModel: ObservableObject {
         }
         guard let command = pendingSessionCreationCommandsByRequestID[requestID],
               pendingSessionCreationRequestIDs.contains(requestID) else { return }
-        if failedSessionCreations[requestID]?.resultUnknown == true,
-           sessionCreationRetryExpired(for: requestID) {
-            let deadline = sessionCreationRetryDeadlines[requestID]
-                ?? Date().addingTimeInterval(sessionCreationRetryWindow)
-            failedSessionCreations[requestID] = DSHSessionCreationFailure(
-                id: requestID,
-                detail: "原创建请求已超过安全恢复窗口，只能刷新任务列表确认结果。",
-                resultUnknown: true,
-                retryUntil: deadline)
-            errorMessage = "原创建请求已超过安全恢复窗口，请刷新任务列表确认是否已创建。"
-            return
-        }
+        // The Bridge keeps the create request/result in its durable journal
+        // and resumes a committed-but-partially-configured session by the
+        // same request id.  Do not apply the old in-memory ten-minute cutoff:
+        // after that HTTP cache expires, refusing this recovery request would
+        // strand a real session whose setup never completed.
         failedSessionCreations.removeValue(forKey: requestID)
         detachedSessionCreationRequestIDs.remove(requestID)
-        armSessionCreationTimeout(requestID: requestID)
         let expectedMachineGeneration = machineStateGeneration
         Task { @MainActor [weak self] in
             guard let self,
@@ -3533,6 +3574,7 @@ final class DSHAppModel: ObservableObject {
             }
             guard self.machineStateGeneration == expectedMachineGeneration,
                   self.machineID == machineID else { return }
+            self.armSessionCreationTimeout(requestID: requestID)
             self.send(command)
         }
     }
@@ -3582,6 +3624,43 @@ final class DSHAppModel: ObservableObject {
         requestWorkspaces()
         requestModes()
         resumeStagedPromptUploads()
+        resumeQueuedPromptTransactions()
+    }
+
+    /// Repairs the one unavoidable boundary between UserDefaults (the local
+    /// queue mirror) and the transaction journal.  A crash after the mirror
+    /// was marked `sent` but before the journal commit leaves no pending map;
+    /// while the remote tombstone window is still valid, replay the same
+    /// stable request id so the prompt is either coalesced or accepted once.
+    private func resumeQueuedPromptTransactions() {
+        guard connectionState == .connected else { return }
+        let generation = machineStateGeneration
+        let activeMachineID = machineID
+        let cutoff = Date().addingTimeInterval(-Self.promptIdempotencyWindow)
+        let candidates = queuedPromptsBySession.flatMap { sessionID, items in
+            items.filter { item in
+                item.sent && item.sentAt >= cutoff && item.requestId != nil &&
+                    pendingSendsByRequestID[item.requestId!] == nil &&
+                    failedSendsByRequestID[item.requestId!] == nil
+            }.map { (sessionID: sessionID, item: $0) }
+        }
+        for candidate in candidates {
+            let sessionID = candidate.sessionID
+            let item = candidate.item
+            guard let requestID = item.requestId,
+                  queuedPromptSendIDs.insert(item.id).inserted else { continue }
+            Task { @MainActor [weak self] in
+                defer { self?.queuedPromptSendIDs.remove(item.id) }
+                guard let self,
+                      self.machineStateGeneration == generation,
+                      self.machineID == activeMachineID else { return }
+                _ = await self.sendPromptPersisted(
+                    item.text, attachments: [], to: sessionID,
+                    mode: item.mode, requestId: requestID,
+                    expectedMachineGeneration: generation,
+                    expectedMachineID: activeMachineID)
+            }
+        }
     }
 
     private func resumeStagedPromptUploads() {
