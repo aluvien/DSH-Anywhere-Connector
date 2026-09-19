@@ -497,6 +497,57 @@ describe('native bridge mutations', () => {
       .resolves.toEqual({ status: 201, body: { workspace: { id: 'workspace-1', path: '/Users/me/Code', title: 'Phone project' } } })
   })
 
+  it('replays a durable command result after the Bridge is restarted', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-command-recovery-'))
+    let firstInvocations = 0
+    const first = mount({
+      dataDir,
+      invoke: async (request) => {
+        if ((request as { namespace?: string }).namespace === 'commands') firstInvocations += 1
+        return { ok: true, value: { matched: true, result: { kind: 'text', text: 'done' } } }
+      },
+    })
+    await expect(first(
+      'POST', '/dsh-anywhere/v1/sessions/s1/command', { line: '/irreversible' }, 'command-recovery',
+    )).resolves.toMatchObject({ status: 202 })
+    expect(firstInvocations).toBe(1)
+
+    let secondInvocations = 0
+    const second = mount({
+      dataDir,
+      invoke: async (request) => {
+        if ((request as { namespace?: string }).namespace === 'commands') secondInvocations += 1
+        return { ok: true, value: { matched: true, result: { kind: 'text', text: 'duplicate' } } }
+      },
+    })
+    await expect(second(
+      'POST', '/dsh-anywhere/v1/sessions/s1/command', { line: '/irreversible' }, 'command-recovery',
+    )).resolves.toMatchObject({ status: 202, body: { ok: true } })
+    expect(secondInvocations).toBe(0)
+  })
+
+  it('replays a durable workspace result after the Bridge is restarted', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-workspace-recovery-'))
+    let firstInvocations = 0
+    const first = mount({
+      dataDir,
+      createWorkspace: async (path, title) => {
+        firstInvocations += 1
+        return { id: 'workspace-recovery', path, title: title ?? 'Code', sessionIds: [] }
+      },
+    })
+    const body = { path: '/Users/me/Recovery', title: 'Recovery' }
+    await expect(first('POST', '/dsh-anywhere/v1/workspaces', body, 'workspace-recovery'))
+      .resolves.toMatchObject({ status: 201, body: { workspace: { id: 'workspace-recovery' } } })
+    expect(firstInvocations).toBe(1)
+
+    let secondInvocations = 0
+    const second = mount({ dataDir })
+    await expect(second('POST', '/dsh-anywhere/v1/workspaces', body, 'workspace-recovery'))
+      .resolves.toMatchObject({ status: 201, body: { workspace: { id: 'workspace-recovery' } } })
+    expect(secondInvocations).toBe(0)
+  })
+
   it('does not rename a blank session, but routes an explicit rename to Harness', async () => {
     const renameCalls: { sessionId: string; title: string }[] = []
     const request = mount({ rename: async (value) => { renameCalls.push(value) } })

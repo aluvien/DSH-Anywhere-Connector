@@ -795,6 +795,10 @@ final class DSHAppModel: ObservableObject {
     /// queue mirror may be resumed after a crash only while this identity is
     /// still guaranteed to coalesce at the remote side.
     static let promptIdempotencyWindow: TimeInterval = 10 * 60
+    /// A second explicit tap is required before replacing an unknown mutation
+    /// whose remote dedupe window has expired. This keeps the at-most-once
+    /// default while still giving the user a durable escape hatch.
+    private static let expiredRemoteMutationConfirmation = "结果未知的操作已过期；再次执行将创建新的请求。"
     /// The Bridge retains completed attachment identities for this period.
     /// Staged uploads use the same deadline so a long-offline phone never
     /// reuses an operation id after the Bridge has safely compacted it.
@@ -3930,11 +3934,27 @@ final class DSHAppModel: ObservableObject {
             $0.command.sessionId == proposed.sessionId &&
             $0.command.payload == proposed.payload
         }) {
-            guard Date() < existing.retryDeadline else {
-                errorMessage = "上一次操作结果仍未确认，请先重新连接 Mac 后再试。"
+            if Date() < existing.retryDeadline {
+                return existing.command
+            }
+
+            if existing.failure != Self.expiredRemoteMutationConfirmation {
+                var updated = existing
+                updated.failure = Self.expiredRemoteMutationConfirmation
+                remoteMutationTransactionsByMachine[machineID]?[existing.command.requestId] = updated
+                persistCurrentTransactionsLater(for: machineID)
+                errorMessage = "上一次操作结果未确认，已过期；再次执行将创建新的请求。"
                 return nil
             }
-            return existing.command
+
+            // The user explicitly confirmed the warning by tapping the same
+            // mutation again. Remove the old tombstone before the new command
+            // is persisted/sent so the replacement cannot race a later flush.
+            remoteMutationTransactionsByMachine[machineID]?.removeValue(
+                forKey: existing.command.requestId)
+            if remoteMutationTransactionsByMachine[machineID]?.isEmpty == true {
+                remoteMutationTransactionsByMachine.removeValue(forKey: machineID)
+            }
         }
         remoteMutationTransactionsByMachine[machineID, default: [:]][proposed.requestId] =
             DSHRemoteMutationTransaction(
@@ -3972,7 +3992,11 @@ final class DSHAppModel: ObservableObject {
                 || code == "unsupported_message" || code == "machine_mismatch"
                 || code == "sender_mismatch" || code == "target_not_allowed"
                 || code == "body_machine_mismatch" || code == "body_device_mismatch"
-        case .notConnected, .eventBufferOverflow, .closed:
+        case .notConnected:
+            // No socket existed at the call boundary, so no bytes could have
+            // crossed Relay. Drop the journal entry and allow a fresh id.
+            return true
+        case .eventBufferOverflow, .closed:
             return false
         }
     }
@@ -4024,7 +4048,10 @@ final class DSHAppModel: ObservableObject {
                         return
                     }
                 }
-                try await self.transport.send(command, notAfter: promptDeadline)
+                let mutationDeadline = self.isDurableRemoteMutation(command)
+                    ? self.remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.retryDeadline
+                    : nil
+                try await self.transport.send(command, notAfter: promptDeadline ?? mutationDeadline)
             }
             catch {
                 guard let self else { return }

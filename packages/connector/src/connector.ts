@@ -1720,7 +1720,11 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
     case "workspace.catalog":
       return { method: "GET", path: "/workspaces" };
     case "workspace.create":
-      return { method: "POST", path: "/workspaces", body: command.payload };
+      return {
+        method: "POST", path: "/workspaces",
+        headers: { "x-dsh-origin-device-id": command.deviceId },
+        body: command.payload,
+      };
     case "directory.list": {
       const encoded = command.payload.path === undefined ? "" : `?path=${encodeURIComponent(command.payload.path)}`;
       return { method: "GET", path: `/directories${encoded}` };
@@ -1739,6 +1743,7 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
       return {
         method: "POST",
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/command`,
+        headers: { "x-dsh-origin-device-id": command.deviceId },
         body: { line: command.payload.line, ...(command.payload.attachments === undefined ? {} : { attachments: command.payload.attachments }) },
       };
     case "permission.set":

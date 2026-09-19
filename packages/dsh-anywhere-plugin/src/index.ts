@@ -49,6 +49,7 @@ const MAX_SESSION_METADATA_BYTES = 32 * 1024 * 1024
 // memory-exhaustion vector.
 const MAX_SESSION_METADATA_LOAD_BYTES = 64 * 1024 * 1024
 const MAX_ATTACHMENT_RECONCILIATION_BATCH = 128
+const MAX_REMOTE_MUTATION_RECORDS = 4_096
 
 interface CapturedHttpResponse {
   readonly status: number
@@ -403,6 +404,18 @@ interface SessionCreationRecord {
   readonly completedAt?: number
 }
 
+/** Durable at-most-once records for native mutations whose Harness APIs do
+ * not expose a lookup operation. A pending record is deliberately fail-closed
+ * after a Bridge restart: replaying it would be less safe than asking an
+ * operator to reconcile the unknown native result. */
+interface RemoteMutationRecord {
+  readonly fingerprint: string | undefined
+  readonly pending?: boolean
+  readonly status?: number
+  readonly response?: unknown
+  readonly completedAt?: number
+}
+
 interface AttachmentUploadRecord {
   readonly fingerprint: string | undefined
   /** Original filename used when an operator reconstructs a receipt. */
@@ -446,6 +459,8 @@ class SessionMetadataStore {
    * idempotency cache is intentionally short-lived, but a lost response must
    * remain queryable after that cache expires or the Bridge restarts. */
   private sessionCreationResults = new Map<string, SessionCreationRecord>()
+  /** Durable command/workspace mutation results. */
+  private remoteMutationResults = new Map<string, RemoteMutationRecord>()
   /** Attachment receipts need the same crash/retry protection as session
    * creation. A pending record fails closed after a native upload response is
    * lost; replaying the upload could otherwise create an orphaned file. */
@@ -569,6 +584,9 @@ class SessionMetadataStore {
     }
     const now = Date.now()
     const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
+    const previousResults = new Map(this.attachmentUploadResults)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     let expiredCount = [...this.attachmentUploadResults.values()]
       .filter((entry) => entry.expired === true && entry.reconciled !== true).length
     let pruned = false
@@ -583,6 +601,7 @@ class SessionMetadataStore {
         // idempotency slot forever.  Keep the operation identity so a later
         // adapter lookup can recover the receipt or prove non-commitment.
         if (expiredCount >= MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
+          this.attachmentUploadResults = previousResults
           throw new HttpError(
             503,
             'attachment upload tombstone capacity is full; reconcile expired uploads before retrying',
@@ -600,7 +619,22 @@ class SessionMetadataStore {
         pruned = true
       }
     }
-    if (pruned) await this.persist()
+    let durableResults = previousResults
+    let durableCapacityExceeded = previousCapacityExceeded
+    let durableMetadataByteLength = previousMetadataByteLength
+    if (pruned) {
+      try {
+        await this.persist()
+        durableResults = new Map(this.attachmentUploadResults)
+        durableCapacityExceeded = this.persistenceCapacityExceeded
+        durableMetadataByteLength = this.metadataByteLength
+      } catch (error) {
+        this.attachmentUploadResults = previousResults
+        this.persistenceCapacityExceeded = previousCapacityExceeded
+        this.metadataByteLength = previousMetadataByteLength
+        throw error
+      }
+    }
     if (!this.attachmentUploadResults.has(key) && expiredCount >= MAX_ATTACHMENT_UPLOAD_TOMBSTONES) {
       // Reconciliation is intentionally required before accepting more
       // unknown operations. Keeping the existing tombstones is safer than
@@ -627,7 +661,14 @@ class SessionMetadataStore {
       createdAt: now,
       ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      this.attachmentUploadResults = durableResults
+      this.persistenceCapacityExceeded = durableCapacityExceeded
+      this.metadataByteLength = durableMetadataByteLength
+      throw error
+    }
   }
 
   async setAttachmentUploadResult(key: string, fingerprint: string | undefined,
@@ -809,7 +850,16 @@ class SessionMetadataStore {
       throw new HttpError(409, 'idempotency key was reused with different request data')
     }
     this.sessionCreationResults.delete(key)
-    await this.persist()
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
+    try {
+      await this.persist()
+    } catch (error) {
+      this.sessionCreationResults.set(key, entry)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
   }
 
   /**
@@ -860,12 +910,23 @@ class SessionMetadataStore {
       // at capacity and require operator reconciliation instead.
       throw new HttpError(503, 'session creation idempotency capacity is full', 'unknown')
     }
+    const previous = this.sessionCreationResults.get(key)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint, pending: true, setup, setupComplete: false,
       ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.sessionCreationResults.delete(key)
+      else this.sessionCreationResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
   }
 
   async setSessionCreationStarted(key: string, fingerprint: string | undefined,
@@ -875,6 +936,9 @@ class SessionMetadataStore {
       throw new HttpError(503, 'session creation metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     this.rejectGrowthWhileOverCapacity('session creation metadata capacity is full')
+    const previous = this.sessionCreationResults.get(key)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint,
@@ -883,7 +947,15 @@ class SessionMetadataStore {
       setupComplete: false,
       ...(nativeOperationId === undefined ? {} : { nativeOperationId }),
     })
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.sessionCreationResults.delete(key)
+      else this.sessionCreationResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
   }
 
   async setSessionCreationResult(key: string, fingerprint: string | undefined,
@@ -893,6 +965,9 @@ class SessionMetadataStore {
     }
     this.rejectGrowthWhileOverCapacity('session creation metadata capacity is full')
     const sessionId = typeof response.sessionId === 'string' ? response.sessionId : undefined
+    const previous = this.sessionCreationResults.get(key)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
     this.sessionCreationResults.set(key, {
       schemaVersion: SESSION_CREATION_RECORD_SCHEMA_VERSION,
       fingerprint,
@@ -902,7 +977,102 @@ class SessionMetadataStore {
       setupComplete: true,
       completedAt: Date.now(),
     })
-    await this.persist()
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.sessionCreationResults.delete(key)
+      else this.sessionCreationResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
+  }
+
+  remoteMutationEntry(key: string, fingerprint: string | undefined): RemoteMutationRecord | undefined {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const entry = this.remoteMutationResults.get(key)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
+      throw new HttpError(409, 'idempotency key was reused with different request data')
+    }
+    return entry
+  }
+
+  async setRemoteMutationPending(key: string, fingerprint: string | undefined): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    this.rejectGrowthWhileOverCapacity('remote mutation metadata capacity is full')
+    if (!this.remoteMutationResults.has(key) && this.remoteMutationResults.size >= MAX_REMOTE_MUTATION_RECORDS) {
+      throw new HttpError(503, 'remote mutation idempotency capacity is full', 'unknown')
+    }
+    const previous = this.remoteMutationResults.get(key)
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
+    this.remoteMutationResults.set(key, { fingerprint, pending: true })
+    try {
+      await this.persist()
+    } catch (error) {
+      if (previous === undefined) this.remoteMutationResults.delete(key)
+      else this.remoteMutationResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
+  }
+
+  async setRemoteMutationResult(key: string, fingerprint: string | undefined,
+                                status: number, response: unknown): Promise<void> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    const previous = this.remoteMutationResults.get(key)
+    if (previous === undefined || previous.pending !== true) {
+      throw new HttpError(409, 'remote mutation journal is missing its pending record', 'unknown')
+    }
+    const previousCapacityExceeded = this.persistenceCapacityExceeded
+    const previousMetadataByteLength = this.metadataByteLength
+    this.remoteMutationResults.set(key, {
+      fingerprint,
+      status,
+      response: response === undefined ? null : response,
+      completedAt: Date.now(),
+    })
+    try {
+      await this.persist()
+    } catch (error) {
+      this.remoteMutationResults.set(key, previous)
+      this.persistenceCapacityExceeded = previousCapacityExceeded
+      this.metadataByteLength = previousMetadataByteLength
+      throw error
+    }
+  }
+
+  async compactRemoteMutationRecords(keys: readonly string[]): Promise<number> {
+    if (this.persistenceUnavailable) {
+      throw new HttpError(503, 'remote mutation metadata is unavailable; repair session-metadata.json', 'unknown')
+    }
+    if (keys.length > 128) throw new HttpError(400, 'at most 128 remote mutation records may be compacted at once')
+    const removed = new Map<string, RemoteMutationRecord>()
+    for (const key of [...new Set(keys)]) {
+      const entry = this.remoteMutationResults.get(key)
+      if (entry === undefined) continue
+      if (entry.pending === true || entry.response === undefined) {
+        throw new HttpError(409, 'only completed remote mutation records may be compacted')
+      }
+      removed.set(key, entry)
+      this.remoteMutationResults.delete(key)
+    }
+    if (removed.size === 0) return 0
+    try {
+      await this.persist()
+    } catch (error) {
+      for (const [key, entry] of removed) this.remoteMutationResults.set(key, entry)
+      throw error
+    }
+    return removed.size
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -1096,6 +1266,52 @@ class SessionMetadataStore {
           }
         }
       }
+      const remoteMutations = parsed.remoteMutations
+      if (remoteMutations !== undefined &&
+          (typeof remoteMutations !== 'object' || remoteMutations === null || Array.isArray(remoteMutations))) {
+        throw new Error('remote mutation metadata must be an object')
+      }
+      if (typeof remoteMutations === 'object' && remoteMutations !== null && !Array.isArray(remoteMutations)) {
+        if (Object.keys(remoteMutations).length > MAX_REMOTE_MUTATION_RECORDS) {
+          throw new Error('remote mutation metadata exceeds its safety capacity')
+        }
+        for (const [key, raw] of Object.entries(remoteMutations)) {
+          if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+            throw new Error('remote mutation metadata contains an invalid record')
+          }
+          if (raw.fingerprint !== undefined && typeof raw.fingerprint !== 'string') {
+            throw new Error('remote mutation fingerprint metadata is invalid')
+          }
+          if (raw.pending !== undefined && typeof raw.pending !== 'boolean') {
+            throw new Error('remote mutation pending metadata is invalid')
+          }
+          if (raw.status !== undefined &&
+              (typeof raw.status !== 'number' || !Number.isSafeInteger(raw.status) || raw.status < 100 || raw.status > 599)) {
+            throw new Error('remote mutation status metadata is invalid')
+          }
+          if (raw.completedAt !== undefined &&
+              (typeof raw.completedAt !== 'number' || !Number.isFinite(raw.completedAt) || raw.completedAt < 0)) {
+            throw new Error('remote mutation completion timestamp is invalid')
+          }
+          const hasResponse = raw.response !== undefined
+          if (raw.pending === true && hasResponse) {
+            throw new Error('remote mutation metadata cannot be pending and completed')
+          }
+          if (raw.pending !== true && !hasResponse) {
+            throw new Error('remote mutation metadata contains an incomplete record')
+          }
+          if (raw.pending !== true && raw.status === undefined) {
+            throw new Error('remote mutation completed record is missing its status')
+          }
+          this.remoteMutationResults.set(key, {
+            fingerprint: typeof raw.fingerprint === 'string' ? raw.fingerprint : undefined,
+            ...(raw.pending === true ? { pending: true } : {}),
+            ...(typeof raw.status === 'number' ? { status: raw.status } : {}),
+            ...(hasResponse ? { response: raw.response } : {}),
+            ...(typeof raw.completedAt === 'number' ? { completedAt: raw.completedAt } : {}),
+          })
+        }
+      }
       const attachmentUploads = parsed.attachmentUploads
       if (attachmentUploads !== undefined &&
           (typeof attachmentUploads !== 'object' || attachmentUploads === null || Array.isArray(attachmentUploads))) {
@@ -1220,6 +1436,7 @@ class SessionMetadataStore {
       titles: Object.fromEntries(this.titles),
       branches: Object.fromEntries(this.branches),
       sessionCreations: Object.fromEntries(this.sessionCreationResults),
+      remoteMutations: Object.fromEntries(this.remoteMutationResults),
       attachmentUploads: Object.fromEntries(this.attachmentUploadResults),
     }, null, 2)
     const snapshotBytes = Buffer.byteLength(snapshot, 'utf8')
@@ -1362,6 +1579,10 @@ function metadataPath(): string {
  */
 function nativeOperationIdFor(durableKey: string): string {
   return createHash('sha256').update(durableKey).digest('hex')
+}
+
+function remoteMutationKeyFor(originDeviceId: string, path: string, requestId: string): string {
+  return `${originDeviceId}\0${path}\0${requestId}`
 }
 
 /** Mirrors the connector's own defaultConfigPath so both resolve one file. */
@@ -2216,6 +2437,21 @@ async function handleHttp(
     return
   }
 
+  if (req.method === 'POST' && path === '/admin/remote-mutations/compact') {
+    if (device.id !== CONNECTOR_DEVICE_ID) {
+      throw new HttpError(403, 'only the Connector may compact remote mutation records')
+    }
+    const body = objectOf(await readJson(req))
+    if (!Array.isArray(body.keys) || body.keys.length > 128 ||
+        body.keys.some((key) => typeof key !== 'string' || key.length === 0 || key.length > 1_024)) {
+      throw new HttpError(400, 'keys must be an array of at most 128 durable remote mutation keys')
+    }
+    const keys = body.keys as string[]
+    const removed = await metadata.compactRemoteMutationRecords(keys)
+    json(res, 200, { removed })
+    return
+  }
+
   const presenceMatch = /^\/devices\/([^/]+)\/presence$/.exec(path)
   if (req.method === 'POST' && presenceMatch !== null) {
     if (device.id !== CONNECTOR_DEVICE_ID) throw new HttpError(403, 'only the Connector may report Relay presence')
@@ -2327,17 +2563,54 @@ async function handleHttp(
     return
   }
   if (req.method === 'POST' && path === '/workspaces') {
+    const requestId = header(req, 'x-dsh-request-id')
+    if (requestId !== undefined && requestId.length > 256) {
+      throw new HttpError(400, 'request id must be at most 256 characters')
+    }
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : undefined
+    const originDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? (header(req, 'x-dsh-origin-device-id') ?? device.id) : device.id
+    if (originDeviceId.length === 0 || originDeviceId.length > 256) {
+      throw new HttpError(400, 'origin device id is invalid')
+    }
+    if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID &&
+        !relayDevices.has(originDeviceId)) {
+      throw new HttpError(403, 'origin device is not connected through Relay')
+    }
     const body = objectOf(await readJson(req))
     const pathValue = stringOf(body.path)
     const title = optionalStringOf(body.title)?.trim().slice(0, 512)
+    const durableKey = requestId === undefined || requestId.length === 0
+      ? undefined : remoteMutationKeyFor(originDeviceId, path, requestId)
+    if (durableKey !== undefined) {
+      const remembered = metadata.remoteMutationEntry(durableKey, fingerprint)
+      if (remembered?.response !== undefined && remembered.status !== undefined) {
+        json(res, remembered.status, remembered.response)
+        return
+      }
+      if (remembered?.pending === true) {
+        throw new HttpError(503, 'remote mutation result is still unknown; reconcile before retrying', 'unknown')
+      }
+    }
     const registry = workspaceRegistryOf(ctx)
-    if (registry?.create === undefined) throw new HttpError(501, 'Harness workspace creation is unavailable')
+    if (registry?.create === undefined) {
+      // A completed durable response remains authoritative even if a later
+      // Bridge process was started without the optional workspace adapter.
+      // Only new native work requires the capability check.
+      throw new HttpError(501, 'Harness workspace creation is unavailable')
+    }
+    if (durableKey !== undefined) await metadata.setRemoteMutationPending(durableKey, fingerprint)
+    let workspace: { id: string; path: string; title: string; sessionIds: readonly string[] }
     try {
-      const workspace = await registry.create(pathValue, title && title.length > 0 ? title : undefined)
-      json(res, 201, { workspace: workspaceProjection(workspace) })
+      workspace = await registry.create(pathValue, title && title.length > 0 ? title : undefined)
     } catch (error) {
       throw new HttpError(400, error instanceof Error ? error.message : String(error))
     }
+    const response = { workspace: workspaceProjection(workspace) }
+    if (durableKey !== undefined) await metadata.setRemoteMutationResult(durableKey, fingerprint, 201, response)
+    json(res, 201, response)
     return
   }
   if (req.method === 'GET' && path === '/directories') {
@@ -2751,11 +3024,41 @@ async function handleHttp(
 
   const commandMatch = /^\/sessions\/([^/]+)\/command$/.exec(path)
   if (req.method === 'POST' && commandMatch !== null) {
+    const requestId = header(req, 'x-dsh-request-id')
+    if (requestId !== undefined && requestId.length > 256) {
+      throw new HttpError(400, 'request id must be at most 256 characters')
+    }
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : undefined
+    const originDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? (header(req, 'x-dsh-origin-device-id') ?? device.id) : device.id
+    if (originDeviceId.length === 0 || originDeviceId.length > 256) {
+      throw new HttpError(400, 'origin device id is invalid')
+    }
+    if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID &&
+        !relayDevices.has(originDeviceId)) {
+      throw new HttpError(403, 'origin device is not connected through Relay')
+    }
     const body = objectOf(await readJson(req))
     const parsed = CommandExecutePayloadSchema.safeParse(body)
     if (!parsed.success) throw new HttpError(400, 'command line is required')
     const sessionId = decodeURIComponent(commandMatch[1]!)
+    const durableKey = requestId === undefined || requestId.length === 0
+      ? undefined : remoteMutationKeyFor(originDeviceId, path, requestId)
+    if (durableKey !== undefined) {
+      const remembered = metadata.remoteMutationEntry(durableKey, fingerprint)
+      if (remembered?.response !== undefined && remembered.status !== undefined) {
+        json(res, remembered.status, remembered.response)
+        return
+      }
+      if (remembered?.pending === true) {
+        throw new HttpError(503, 'remote mutation result is still unknown; reconcile before retrying', 'unknown')
+      }
+      await metadata.setRemoteMutationPending(durableKey, fingerprint)
+    }
     const result = await executeCommand(ctx, sessionId, parsed.data.line, parsed.data.attachments ?? [])
+    if (durableKey !== undefined) await metadata.setRemoteMutationResult(durableKey, fingerprint, 202, result)
     json(res, 202, result)
     return
   }

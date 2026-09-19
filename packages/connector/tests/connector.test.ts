@@ -14,7 +14,7 @@ const config: ConnectorConfig = {
 
 function command(type: "session.list" | "session.open" | "session.create" | "prompt.send" | "turn.cancel" | "approval.decide"
   | "workspace.rename" | "workspace.delete" | "workspace.catalog" | "workspace.create"
-  | "directory.list" | "mode.catalog" | "session.rename") {
+  | "directory.list" | "mode.catalog" | "session.rename" | "command.execute") {
   const base = { version: PROTOCOL_VERSION, requestId: "request-1", machineId: "machine-1", deviceId: "phone-1", timestamp: 1 };
   if (type === "session.list") return { ...base, type, payload: {} } as const;
   if (type === "session.open") return { ...base, type, sessionId: "session-1", payload: { sessionId: "session-1" } } as const;
@@ -27,6 +27,7 @@ function command(type: "session.list" | "session.open" | "session.create" | "pro
   if (type === "workspace.create") return { ...base, type, payload: { path: "/tmp/workspace", title: "Workspace" } } as const;
   if (type === "directory.list") return { ...base, type, payload: { path: "/tmp" } } as const;
   if (type === "session.rename") return { ...base, type, sessionId: "session-1", payload: { title: "Renamed session" } } as const;
+  if (type === "command.execute") return { ...base, type, sessionId: "session-1", payload: { line: "/slow" } } as const;
   return { ...base, type, payload: { approvalId: "approval-1", allow: true } } as const;
 }
 
@@ -67,12 +68,19 @@ describe("bridge command mapping", () => {
     });
     expect(bridgeRequestFor(command("workspace.catalog"))).toEqual({ method: "GET", path: "/workspaces" });
     expect(bridgeRequestFor(command("workspace.create"))).toEqual({
-      method: "POST", path: "/workspaces", body: { path: "/tmp/workspace", title: "Workspace" },
+      method: "POST", path: "/workspaces",
+      headers: { "x-dsh-origin-device-id": "phone-1" },
+      body: { path: "/tmp/workspace", title: "Workspace" },
     });
     expect(bridgeRequestFor(command("directory.list"))).toEqual({ method: "GET", path: "/directories?path=%2Ftmp" });
     expect(bridgeRequestFor(command("mode.catalog"))).toEqual({ method: "GET", path: "/modes" });
     expect(bridgeRequestFor(command("session.rename"))).toEqual({
       method: "POST", path: "/sessions/session-1/rename", body: { title: "Renamed session" },
+    });
+    expect(bridgeRequestFor(command("command.execute"))).toEqual({
+      method: "POST", path: "/sessions/session-1/command",
+      headers: { "x-dsh-origin-device-id": "phone-1" },
+      body: { line: "/slow" },
     });
   });
 
