@@ -873,6 +873,45 @@ describe('native bridge mutations', () => {
       { name: 'a.txt', data: 'YWJj' }, requestId,
     )).resolves.toMatchObject({ status: 201, body: { receiptId: 'receipt-admin' } })
   })
+
+  it('round-robins bounded attachment reconciliation so unknown tombstones do not starve later records', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-attachment-admin-cursor-'))
+    const uploads: Record<string, Record<string, unknown>> = {}
+    const operationIndexes = new Map<string, number>()
+    for (let index = 0; index < 129; index += 1) {
+      const key = `${CONNECTOR_DEVICE_ID}\u0000s1\u0000attachment-cursor-${index}`
+      const nativeOperationId = createHash('sha256')
+        .update(`attachment\0${key}`).digest('hex')
+      operationIndexes.set(nativeOperationId, index)
+      uploads[key] = {
+        name: `file-${index}.txt`, nativeOperationId,
+        expired: true, expiredAt: Date.now(),
+      }
+    }
+    await writeFile(join(dataDir, 'session-metadata.json'), JSON.stringify({ attachmentUploads: uploads }))
+    const request = mount({
+      dataDir,
+      findAttachmentByRequestId: async (operationId) => {
+        // The first 128 entries remain unknown. The final entry is
+        // recoverable and must be reached on the next bounded pass.
+        return operationIndexes.get(operationId) === 128
+          ? { receiptId: 'receipt-after-cursor', file: { size: 3 } }
+          : { state: 'unknown' }
+      },
+    })
+    const first = await request('POST', '/dsh-anywhere/v1/admin/attachments/reconcile', { limit: 128 })
+    expect(first).toMatchObject({
+      status: 200,
+      body: { scanned: 128, found: 0, notCommitted: 0, unknown: 128 },
+    })
+    expect((first.body as { nextCursor?: string }).nextCursor).toBeTruthy()
+
+    await expect(request('POST', '/dsh-anywhere/v1/admin/attachments/reconcile', { limit: 128 }))
+      .resolves.toMatchObject({
+        status: 200,
+        body: { scanned: 128, found: 1, notCommitted: 0 },
+      })
+  })
 })
 
 describe('pairing page material', () => {

@@ -7,6 +7,13 @@ struct PairingView: View {
     @State private var showScanner = false
     @State private var pairingWasInProgress = false
     @State private var pairingRevisionAtStart = 0
+    // Keep the sheet's draft independent from the active profile.  In
+    // particular, cancelling Add Mac must not replace the machine id that the
+    // live socket and pending-request journal still use.
+    @State private var draftServerAddress = ""
+    @State private var draftMachineID = ""
+    @State private var draftPairingSecret = ""
+    @State private var draftsLoaded = false
 
     var body: some View {
         NavigationStack {
@@ -46,20 +53,24 @@ struct PairingView: View {
                     .padding(.vertical, 2)
 
                     VStack(spacing: 12) {
-                        TextField("https://dsh.example.com", text: $model.serverAddress)
+                        TextField("https://dsh.example.com", text: $draftServerAddress)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .keyboardType(.URL)
                             .happyFieldStyle()
-                        TextField("Machine ID", text: $model.machineID)
+                        TextField("Machine ID", text: $draftMachineID)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .happyFieldStyle()
-                        SecureField("Pairing code or secret", text: $model.pairingSecret)
+                        SecureField("Pairing code or secret", text: $draftPairingSecret)
                             .happyFieldStyle()
                     }
 
-                    Button { model.pair() } label: {
+                    Button {
+                        model.pair(serverAddress: draftServerAddress,
+                                  machineID: draftMachineID,
+                                  pairingSecret: draftPairingSecret)
+                    } label: {
                         ZStack {
                             Label("Pair with Mac", systemImage: "link")
                                 .font(.system(size: 17, weight: .semibold))
@@ -70,9 +81,9 @@ struct PairingView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .clipShape(Capsule())
-                    .disabled(model.isPairing || model.machineID.isEmpty
-                              || DSHPairingCredential.detect(model.pairingSecret) == nil
-                              || model.serverAddress.isEmpty)
+                    .disabled(model.isPairing || draftMachineID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || DSHPairingCredential.detect(draftPairingSecret) == nil
+                              || draftServerAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     Text("Your API keys stay on your Mac.")
                         .font(.system(size: 13))
@@ -88,14 +99,28 @@ struct PairingView: View {
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showScanner) {
                 PairingScannerSheet { link in
-                    model.serverAddress = link.relay
-                    model.machineID = link.machineId
+                    draftServerAddress = link.relay
+                    draftMachineID = link.machineId
                     switch link.credential {
-                    case .secret(let value): model.pairingSecret = value
-                    case .code(let value): model.pairingSecret = value
+                    case .secret(let value): draftPairingSecret = value
+                    case .code(let value): draftPairingSecret = value
                     }
                     showScanner = false
-                    model.pair()
+                    model.pair(serverAddress: draftServerAddress,
+                               machineID: draftMachineID,
+                               pairingSecret: draftPairingSecret)
+                }
+            }
+            .onAppear {
+                guard !draftsLoaded else { return }
+                draftsLoaded = true
+                // The first-run form is allowed to use the values restored by
+                // the app model.  Add Mac starts with an isolated draft so a
+                // cancelled sheet cannot mutate the active machine identity.
+                if !model.isPaired {
+                    draftServerAddress = model.serverAddress
+                    draftMachineID = model.machineID
+                    draftPairingSecret = model.pairingSecret
                 }
             }
             .onChange(of: model.isPairing) { _, isPairing in

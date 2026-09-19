@@ -414,6 +414,10 @@ interface AttachmentUploadRecord {
   /** A pending record that outlived the client recovery contract.  It stays
    * as a permanent tombstone until an adapter/operator reconciles it. */
   readonly expired?: boolean
+  /** A reconciled receipt remains tied to its expired tombstone.  Keeping the
+   * record in this state prevents it from becoming an active record and
+   * exceeding the bounded active-idempotency capacity during reconciliation. */
+  readonly reconciled?: boolean
   readonly response?: JsonObject
   readonly createdAt?: number
   readonly completedAt?: number
@@ -446,6 +450,9 @@ class SessionMetadataStore {
    * creation. A pending record fails closed after a native upload response is
    * lost; replaying the upload could otherwise create an orphaned file. */
   private attachmentUploadResults = new Map<string, AttachmentUploadRecord>()
+  /** Round-robin cursor for bounded operator reconciliation.  Unknown early
+   * tombstones must not starve later records that can be recovered. */
+  private attachmentReconciliationCursor: string | undefined
   /** A corrupt metadata file must never make the create dedupe layer forget
    * an already committed session and execute the same request again. */
   private persistenceUnavailable = false
@@ -517,7 +524,7 @@ class SessionMetadataStore {
     if (entry.fingerprint !== undefined && fingerprint !== undefined && entry.fingerprint !== fingerprint) {
       throw new HttpError(409, 'idempotency key was reused with different request data')
     }
-    if (entry.expired === true) {
+    if (entry.expired === true && entry.reconciled !== true) {
       throw new HttpError(409, 'attachment upload recovery expired; reconcile the native operation before retrying')
     }
     if (entry.response === undefined) {
@@ -552,7 +559,7 @@ class SessionMetadataStore {
     }
     const stale = entry.pending === true && entry.createdAt !== undefined &&
       entry.createdAt < Date.now() - ATTACHMENT_UPLOAD_RETENTION_MS
-    return entry.expired === true || stale ? entry : undefined
+    return (entry.expired === true && entry.reconciled !== true) || stale ? entry : undefined
   }
 
   async setAttachmentUploadPending(key: string, fingerprint: string | undefined,
@@ -563,7 +570,7 @@ class SessionMetadataStore {
     const now = Date.now()
     const cutoff = now - ATTACHMENT_UPLOAD_RETENTION_MS
     let expiredCount = [...this.attachmentUploadResults.values()]
-      .filter((entry) => entry.expired === true).length
+      .filter((entry) => entry.expired === true && entry.reconciled !== true).length
     let pruned = false
     for (const [entryKey, entry] of this.attachmentUploadResults) {
       if (entry.response !== undefined && entry.completedAt !== undefined && entry.completedAt < cutoff) {
@@ -636,6 +643,7 @@ class SessionMetadataStore {
     this.attachmentUploadResults.set(key, {
       fingerprint,
       ...(previous?.name === undefined ? {} : { name: previous.name }),
+      ...(previous?.expired === true ? { expired: true, reconciled: true } : {}),
       response,
       completedAt: Date.now(),
       ...(operationId === undefined ? {} : { nativeOperationId: operationId }),
@@ -681,19 +689,36 @@ class SessionMetadataStore {
     findAttachmentByRequestId: ((operationId: string, signal: AbortSignal) =>
       Promise<unknown | undefined | AttachmentUploadRecoveryResult>) | undefined,
     limit = MAX_ATTACHMENT_RECONCILIATION_BATCH,
-  ): Promise<{ scanned: number; found: number; notCommitted: number; unknown: number }> {
+    afterKey?: string,
+  ): Promise<{ scanned: number; found: number; notCommitted: number; unknown: number; nextCursor?: string }> {
     if (this.persistenceUnavailable) {
       throw new HttpError(503, 'attachment upload metadata is unavailable; repair session-metadata.json', 'unknown')
     }
     const boundedLimit = Number.isSafeInteger(limit)
       ? Math.min(Math.max(limit, 1), MAX_ATTACHMENT_RECONCILIATION_BATCH)
       : MAX_ATTACHMENT_RECONCILIATION_BATCH
+    const candidates = [...this.attachmentUploadResults.entries()]
+      .filter(([, entry]) => entry.expired === true && entry.reconciled !== true)
+    if (candidates.length === 0) {
+      this.attachmentReconciliationCursor = undefined
+      return { scanned: 0, found: 0, notCommitted: 0, unknown: 0 }
+    }
+    const cursor = afterKey ?? this.attachmentReconciliationCursor
+    let start = 0
+    if (cursor !== undefined) {
+      const cursorIndex = candidates.findIndex(([key]) => key === cursor)
+      if (cursorIndex >= 0) start = (cursorIndex + 1) % candidates.length
+    }
     let scanned = 0
     let found = 0
     let notCommitted = 0
     let unknown = 0
-    for (const [key, entry] of [...this.attachmentUploadResults.entries()]) {
-      if (scanned >= boundedLimit || entry.expired !== true) continue
+    let lastKey: string | undefined
+    let index = start
+    while (scanned < boundedLimit && scanned < candidates.length) {
+      const [key, entry] = candidates[index]!
+      index = (index + 1) % candidates.length
+      lastKey = key
       scanned += 1
       if (findAttachmentByRequestId === undefined || entry.nativeOperationId === undefined) {
         unknown += 1
@@ -730,7 +755,11 @@ class SessionMetadataStore {
         unknown += 1
       }
     }
-    return { scanned, found, notCommitted, unknown }
+    const nextCursor = scanned < candidates.length ? lastKey : undefined
+    this.attachmentReconciliationCursor = nextCursor
+    return nextCursor === undefined
+      ? { scanned, found, notCommitted, unknown }
+      : { scanned, found, notCommitted, unknown, nextCursor }
   }
 
   /**
@@ -1029,6 +1058,9 @@ class SessionMetadataStore {
           if (raw.expired !== undefined && typeof raw.expired !== 'boolean') {
             throw new Error('attachment upload expiration metadata is invalid')
           }
+          if (raw.reconciled !== undefined && typeof raw.reconciled !== 'boolean') {
+            throw new Error('attachment upload reconciliation metadata is invalid')
+          }
           if (raw.createdAt !== undefined &&
               (typeof raw.createdAt !== 'number' || !Number.isFinite(raw.createdAt) || raw.createdAt < 0)) {
             throw new Error('attachment upload creation timestamp is invalid')
@@ -1046,7 +1078,11 @@ class SessionMetadataStore {
               (typeof response !== 'object' || response === null || Array.isArray(response))) {
             throw new Error('attachment upload response metadata is invalid')
           }
-          if (raw.expired === true && (raw.pending === true || response !== undefined)) {
+          if (raw.reconciled === true && (raw.expired !== true || response === undefined)) {
+            throw new Error('reconciled attachment upload metadata is inconsistent')
+          }
+          if (raw.expired === true && (raw.pending === true ||
+              (response !== undefined && raw.reconciled !== true))) {
             throw new Error('expired attachment upload metadata is inconsistent')
           }
           if (response === undefined && raw.pending !== true && raw.expired !== true) {
@@ -1083,6 +1119,7 @@ class SessionMetadataStore {
             ...(typeof raw.nativeOperationId === 'string' ? { nativeOperationId: raw.nativeOperationId } : {}),
             ...(raw.pending === true ? { pending: true } : {}),
             ...(raw.expired === true ? { expired: true } : {}),
+            ...(raw.reconciled === true ? { reconciled: true } : {}),
             ...(response === undefined ? {} : { response: response as JsonObject }),
             ...(createdAt === undefined ? {} : { createdAt }),
             ...(completedAt === undefined ? {} : { completedAt }),
@@ -2089,8 +2126,12 @@ async function handleHttp(
         requestedLimit < 1 || requestedLimit > MAX_ATTACHMENT_RECONCILIATION_BATCH) {
       throw new HttpError(400, `limit must be an integer between 1 and ${MAX_ATTACHMENT_RECONCILIATION_BATCH}`)
     }
+    const afterKey = body.afterKey === undefined ? undefined : stringOf(body.afterKey)
+    if (afterKey !== undefined && (afterKey.length === 0 || afterKey.length > 2_048)) {
+      throw new HttpError(400, 'afterKey must be between 1 and 2048 characters')
+    }
     const result = await metadata.reconcileExpiredAttachmentUploads(
-      ctx.sessionController.findAttachmentByRequestId, requestedLimit)
+      ctx.sessionController.findAttachmentByRequestId, requestedLimit, afterKey)
     json(res, 200, result)
     return
   }

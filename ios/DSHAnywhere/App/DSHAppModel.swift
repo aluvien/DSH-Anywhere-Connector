@@ -1848,9 +1848,22 @@ final class DSHAppModel: ObservableObject {
     }
 
     func pair() {
-        let trimmedMachineID = machineID.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedSecret = pairingSecret.trimmingCharacters(in: .whitespacesAndNewlines)
-        let address = serverAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        pair(serverAddress: serverAddress, machineID: machineID, pairingSecret: pairingSecret)
+    }
+
+    /// Pairs a profile from an isolated form draft.  The active machine id is
+    /// deliberately not used as the form's storage, so cancelling an Add Mac
+    /// sheet cannot desynchronise the live socket from the selected profile.
+    func pair(serverAddress inputServerAddress: String,
+              machineID inputMachineID: String,
+              pairingSecret inputPairingSecret: String) {
+        let trimmedMachineID = inputMachineID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSecret = inputPairingSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = inputServerAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !removedMachineFenceUnavailable else {
+            errorMessage = "本机删除记录不可读，暂不能修改配对。"
+            return
+        }
         guard !trimmedMachineID.isEmpty else {
             errorMessage = DSHLocalization.string("Enter the machine ID shown by DSH Anywhere Connector.")
             return
@@ -1865,12 +1878,18 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "Enter the HTTPS address for your DSH Anywhere gateway."
             return
         }
+        guard !profiles.profiles.contains(where: { $0.machineId == trimmedMachineID }) else {
+            errorMessage = "这台 Mac 已经配对，请在设置中切换或先移除旧配对。"
+            return
+        }
         isPairing = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isPairing = false }
             let previousProfile = self.activeMachine
             let previousMachineID = previousProfile?.machineId ?? ""
+            let previousServerAddress = self.serverAddress
+            let previousPairingSecret = self.pairingSecret
             let hadActivePair = self.isPaired && !previousMachineID.isEmpty
             if hadActivePair {
                 await self.awaitPendingTransactionStoreLoaded()
@@ -1890,6 +1909,8 @@ final class DSHAppModel: ObservableObject {
                     credential: credential, deviceName: "iPhone"
                 )
                 UserDefaults.standard.set(address, forKey: "dsh-anywhere.server-address")
+                self.serverAddress = address
+                self.pairingSecret = trimmedSecret
                 self.machineName = profile.machineName
                 self.machineID = profile.machineId
                 // Pairing is an explicit new lifecycle. Clear only this
@@ -1908,16 +1929,22 @@ final class DSHAppModel: ObservableObject {
                 // later sidecar clear and final journal write complete the new
                 // pairing lifecycle without exposing a crash window.
                 guard await self.persistPendingTransactionStore() else {
-                    await self.rollbackFailedPairing(profile.machineId)
+                    await self.rollbackFailedPairing(
+                        profile.machineId, restoring: previousProfile,
+                        serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
                     return
                 }
                 self.removedMachineIDs.remove(profile.machineId)
                 guard await self.persistRemovedMachineFence() else {
-                    await self.rollbackFailedPairing(profile.machineId)
+                    await self.rollbackFailedPairing(
+                        profile.machineId, restoring: previousProfile,
+                        serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
                     return
                 }
                 guard await self.persistPendingTransactionStore() else {
-                    await self.rollbackFailedPairing(profile.machineId)
+                    await self.rollbackFailedPairing(
+                        profile.machineId, restoring: previousProfile,
+                        serverAddress: previousServerAddress, pairingSecret: previousPairingSecret)
                     return
                 }
                 self.refreshMachines()
@@ -1947,16 +1974,40 @@ final class DSHAppModel: ObservableObject {
     /// subsequent journal/fence commit fails, remove that provisional profile
     /// instead of leaving an active-but-fenced identity that would reconnect
     /// after relaunch with no durable recovery path.
-    private func rollbackFailedPairing(_ machineID: String) async {
+    private func rollbackFailedPairing(_ machineID: String,
+                                       restoring previousProfile: DSHRemoteProfile? = nil,
+                                       serverAddress previousServerAddress: String? = nil,
+                                       pairingSecret previousPairingSecret: String? = nil) async {
         await transport.rollbackPairing(machineId: machineID)
         removedMachineIDs.insert(machineID)
         _ = await persistRemovedMachineFence()
         refreshMachines()
-        if let active = profiles.activeProfile,
+        if let previousServerAddress {
+            serverAddress = previousServerAddress
+            UserDefaults.standard.set(previousServerAddress, forKey: "dsh-anywhere.server-address")
+        }
+        if let previousPairingSecret {
+            pairingSecret = previousPairingSecret
+        }
+        if let previousProfile,
+           profiles.profiles.contains(where: { $0.machineId == previousProfile.machineId }) {
+            await transport.setActiveMachine(previousProfile.machineId)
+            machineName = previousProfile.machineName
+            self.machineID = previousProfile.machineId
+            resetTransientRequestState()
+            state = DSHStoreState()
+            restoreSessionCreationTransactions(for: previousProfile.machineId)
+            isPaired = true
+            connect()
+        } else if let active = profiles.activeProfile,
            !removedMachineIDs.contains(active.machineId) {
             machineName = active.machineName
             self.machineID = active.machineId
+            resetTransientRequestState()
+            state = DSHStoreState()
+            restoreSessionCreationTransactions(for: active.machineId)
             isPaired = true
+            connect()
         } else {
             machineName = ""
             self.machineID = ""
@@ -2004,6 +2055,10 @@ final class DSHAppModel: ObservableObject {
     }
 
     func removeMachine(_ machine: DSHRemoteProfile) {
+        guard !removedMachineFenceUnavailable else {
+            errorMessage = "本机删除记录不可读，暂不能移除配对。"
+            return
+        }
         let wasActive = machine.machineId == activeMachine?.machineId
         let isPendingSelection = machine.machineId == pendingMachineSelectionID
         let needsRecovery = wasActive || isPendingSelection
@@ -2222,6 +2277,10 @@ final class DSHAppModel: ObservableObject {
     }
 
     func forgetPairing() {
+        guard !removedMachineFenceUnavailable else {
+            errorMessage = "本机删除记录不可读，暂不能解除配对。"
+            return
+        }
         machineSelectionGeneration &+= 1
         pendingMachineSelectionID = nil
         eventTask?.cancel()
