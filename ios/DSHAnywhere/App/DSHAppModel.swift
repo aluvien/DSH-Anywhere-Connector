@@ -752,12 +752,11 @@ final class DSHAppModel: ObservableObject {
     /// side effect. Keep recovery fail-closed until the next launch can read
     /// or recreate the store.
     private var pendingTransactionPersistenceUnavailable = false
-    private enum PendingPersistenceFailure: Equatable {
-        case none
+    private enum PendingPersistenceResult: Equatable {
+        case persisted
         case quotaExceeded
         case unavailable
     }
-    private var lastPendingPersistenceFailure: PendingPersistenceFailure = .none
     private var pendingTransactionStoreLoaded = false
     /// Every mutation waits for the first journal load to merge disk state.
     /// Without this task, a user who switches/removes a Mac immediately after
@@ -1032,39 +1031,40 @@ final class DSHAppModel: ObservableObject {
     }
 
     @discardableResult
-    private func persistPendingTransactionStore() async -> Bool {
-        lastPendingPersistenceFailure = .none
+    private func persistPendingTransactionStoreResult() async -> PendingPersistenceResult {
         await awaitPendingTransactionStoreLoaded()
         guard pendingTransactionStoreLoaded else {
-            lastPendingPersistenceFailure = .unavailable
-            return false
+            return .unavailable
         }
         guard !pendingTransactionPersistenceUnavailable else {
-            lastPendingPersistenceFailure = .unavailable
-            return false
+            return .unavailable
         }
         do {
             let snapshot = try makePendingTransactionSnapshot()
             try await pendingTransactionFileStore.write(snapshot)
-            return true
+            return .persisted
         } catch DSHAttachmentUploadError.quotaExceeded {
             // A valid batch can exceed the aggregate attachment budget while
             // the journal itself is perfectly healthy. Do not poison the
             // process-wide persistence gate: deleting/cancelling an older
             // transaction must be able to free space and persist again.
-            lastPendingPersistenceFailure = .quotaExceeded
             errorMessage = "待处理附件总量已达到上限，请先取消旧请求后重试。"
-            return false
+            return .quotaExceeded
         } catch {
             // Keep the in-memory transaction and surface the loss of durable
             // recovery explicitly. The app refuses further side effects until
             // the next launch can recreate or repair the store; silently
             // dropping the record would turn a process kill into a duplicate.
-            lastPendingPersistenceFailure = .unavailable
             pendingTransactionPersistenceUnavailable = true
             errorMessage = "无法保存待处理请求，暂不安全重试。"
-            return false
+            return .unavailable
         }
+    }
+
+    @discardableResult
+    private func persistPendingTransactionStore() async -> Bool {
+        if case .persisted = await persistPendingTransactionStoreResult() { return true }
+        return false
     }
 
     private func persistPendingTransactionStoreLater() {
@@ -1217,8 +1217,8 @@ final class DSHAppModel: ObservableObject {
         // avoiding a shared on-disk journal entry that could leak between
         // unrelated preview models.
         guard !machineID.isEmpty else { return true }
-        let persisted = await persistPendingTransactionStore()
-        guard !(!persisted && lastPendingPersistenceFailure == .quotaExceeded) else {
+        let persistenceResult = await persistPendingTransactionStoreResult()
+        guard persistenceResult != .quotaExceeded else {
             if let previousCreationSnapshot {
                 sessionCreationTransactionsByMachine[machineID] = previousCreationSnapshot
             } else {
@@ -1246,7 +1246,7 @@ final class DSHAppModel: ObservableObject {
             }
             return false
         }
-        return persisted
+        return persistenceResult == .persisted
     }
 
     /// Every transaction-store mutation must wait for the startup merge.  A
