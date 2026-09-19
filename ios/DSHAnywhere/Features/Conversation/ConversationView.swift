@@ -5,11 +5,18 @@ import UniformTypeIdentifiers
 import ImageIO
 import UIKit
 
-struct DSHStagedAttachment: Identifiable, Sendable {
-    let id = UUID()
+struct DSHStagedAttachment: Identifiable, Sendable, Codable {
+    let id: UUID
     let name: String
     let data: Data
     let isImage: Bool
+
+    init(id: UUID = UUID(), name: String, data: Data, isImage: Bool) {
+        self.id = id
+        self.name = name
+        self.data = data
+        self.isImage = isImage
+    }
 }
 
 private extension URL {
@@ -1478,7 +1485,7 @@ struct ConversationView: View {
             // Failed send: the prompt never got its acceptance. Says whether
             // it died locally or on the Mac side, and offers a retry with the
             // original text (and receipts) intact.
-            if let failed = model.failedSend, failed.sessionID == sessionID {
+            if let failed = model.failedSend(for: sessionID) {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
@@ -1493,11 +1500,11 @@ struct ConversationView: View {
                             .truncationMode(.middle)
                     }
                     Spacer(minLength: 4)
-                    Button("重试") { model.retryFailedSend() }
+                    Button("重试") { model.retryFailedSend(requestID: failed.id) }
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Color.accentColor)
                     Button {
-                        model.dismissFailedSend()
+                        model.dismissFailedSend(requestID: failed.id)
                     } label: {
                         Image(systemName: "xmark")
                             .font(.caption.weight(.semibold))

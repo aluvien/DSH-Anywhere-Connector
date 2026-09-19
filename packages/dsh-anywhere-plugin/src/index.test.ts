@@ -566,6 +566,50 @@ describe('native bridge mutations', () => {
     expect(creates).toBe(1)
   })
 
+  it('resumes incomplete post-create setup instead of replaying partial success', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-setup-recovery-'))
+    let creates = 0
+    const firstRequest = mount({
+      dataDir,
+      create: async () => {
+        creates += 1
+        return { sessionId: 'session-needs-setup' }
+      },
+      invoke: async (request: unknown) => {
+        if ((request as { namespace?: string }).namespace === 'commands') {
+          throw new Error('permission setup failed')
+        }
+        return { ok: true, value: { presets: [] } }
+      },
+    })
+    await expect(firstRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code', permissionMode: 'workspace-write' }, 'setup-recovery',
+    )).resolves.toMatchObject({ status: 500 })
+
+    const restartedRequest = mount({ dataDir })
+    await expect(restartedRequest(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'setup-recovery',
+    )).resolves.toMatchObject({ status: 200, body: { sessionId: 'session-needs-setup' } })
+    expect(creates).toBe(1)
+  })
+
+  it('fails closed when durable session metadata is corrupt', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-corrupt-metadata-'))
+    await writeFile(join(dataDir, 'session-metadata.json'), '{not-json')
+    let creates = 0
+    const request = mount({
+      dataDir,
+      create: async () => {
+        creates += 1
+        return { sessionId: 'should-not-run' }
+      },
+    })
+    await expect(request(
+      'POST', '/dsh-anywhere/v1/sessions', { cwd: '/Users/me/Code' }, 'corrupt-metadata',
+    )).resolves.toMatchObject({ status: 503 })
+    expect(creates).toBe(0)
+  })
+
   it('does not execute a create whose durable operation identity is still pending', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-pending-'))
     const key = `${CONNECTOR_DEVICE_ID}\u0000pending-create`

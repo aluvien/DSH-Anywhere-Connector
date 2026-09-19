@@ -5,11 +5,13 @@ import UserNotifications
 private enum DSHAttachmentUploadError: LocalizedError {
     case timedOut
     case tooLarge
+    case persistenceUnavailable
 
     var errorDescription: String? {
         switch self {
         case .timedOut: return "The attachment upload timed out. Please try again."
         case .tooLarge: return "Attachments must be 10 MiB or smaller."
+        case .persistenceUnavailable: return "待处理请求存储不可用，已停止自动重试。"
         }
     }
 }
@@ -19,7 +21,7 @@ private struct DSHRemoteCommandError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-private struct DSHPendingInitialMessage {
+private struct DSHPendingInitialMessage: Codable {
     let promptRequestID: String
     let text: String
     let attachments: [DSHStagedAttachment]
@@ -29,7 +31,7 @@ private struct DSHPendingInitialMessage {
     var uploadedAttachments: [String: DSHMessageAttachment] = [:]
 }
 
-struct DSHInitialMessageFailure: Identifiable, Equatable {
+struct DSHInitialMessageFailure: Identifiable, Equatable, Codable {
     let id: String
     let sessionID: String
     let text: String
@@ -40,7 +42,7 @@ struct DSHInitialMessageFailure: Identifiable, Equatable {
 /// correlated `session.created` acknowledgement. The original command and
 /// staged first message remain in the pending maps so a retry can reuse the
 /// same request identity instead of silently creating a second session.
-struct DSHSessionCreationFailure: Identifiable, Equatable {
+struct DSHSessionCreationFailure: Identifiable, Equatable, Codable {
     let id: String
     let detail: String
     /// `true` means the request may have reached the Mac but did not produce
@@ -61,7 +63,7 @@ struct DSHSessionCreationFailure: Identifiable, Equatable {
     }
 }
 
-private struct DSHSessionCreationTransaction {
+private struct DSHSessionCreationTransaction: Codable {
     let command: DSHCommand
     let initialMessage: DSHPendingInitialMessage?
     let failure: DSHSessionCreationFailure?
@@ -69,9 +71,15 @@ private struct DSHSessionCreationTransaction {
     let retryDeadline: Date
 }
 
-private struct DSHInitialMessageTransaction {
+private struct DSHInitialMessageTransaction: Codable {
     let pending: DSHPendingInitialMessage
     let failure: DSHInitialMessageFailure?
+}
+
+private struct DSHPendingTransactionStore: Codable {
+    var sessionCreationTransactionsByMachine: [String: [String: DSHSessionCreationTransaction]]
+    var lastSessionCreationRequestIDsByMachine: [String: String]
+    var initialMessageTransactionsByMachine: [String: [String: DSHInitialMessageTransaction]]
 }
 
 /// The reasoning choices exposed by the currently selected Harness model.
@@ -316,12 +324,75 @@ final class DSHAppModel: ObservableObject {
     private var notifiedQuestionIDs: Set<String> = []
     private var notifiedFailedSessions: Set<String> = []
 
-    private func suspendSessionCreationTransactions(for machineID: String) {
-        guard !machineID.isEmpty else { return }
-        var snapshot: [String: DSHSessionCreationTransaction] = [:]
+    private var pendingTransactionStoreURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DSH Anywhere/pending-transactions.json")
+    }
+
+    /// A transaction that cannot be written must never be sent again: after
+    /// an app kill there would be no request identity left to coalesce the
+    /// side effect. Keep recovery fail-closed until the next launch can read
+    /// or recreate the store.
+    private var pendingTransactionPersistenceUnavailable = false
+
+    private func loadPendingTransactionStore() {
+        let url = pendingTransactionStoreURL
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return
+        } catch {
+            pendingTransactionPersistenceUnavailable = true
+            errorMessage = "未能读取待处理请求，已停止自动重试。"
+            return
+        }
+        guard let store = try? JSONDecoder().decode(DSHPendingTransactionStore.self, from: data) else {
+            pendingTransactionPersistenceUnavailable = true
+            errorMessage = "未能读取待处理请求，已停止自动重试。"
+            return
+        }
+        sessionCreationTransactionsByMachine = store.sessionCreationTransactionsByMachine
+        lastSessionCreationRequestIDsByMachine = store.lastSessionCreationRequestIDsByMachine
+        initialMessageTransactionsByMachine = store.initialMessageTransactionsByMachine
+    }
+
+    @discardableResult
+    private func persistPendingTransactionStore() -> Bool {
+        guard !pendingTransactionPersistenceUnavailable else { return false }
+        let store = DSHPendingTransactionStore(
+            sessionCreationTransactionsByMachine: sessionCreationTransactionsByMachine,
+            lastSessionCreationRequestIDsByMachine: lastSessionCreationRequestIDsByMachine,
+            initialMessageTransactionsByMachine: initialMessageTransactionsByMachine)
+        do {
+            let data = try JSONEncoder().encode(store)
+            let directory = pendingTransactionStoreURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: pendingTransactionStoreURL, options: [.atomic, .completeFileProtection])
+            return true
+        } catch {
+            // Keep the in-memory transaction and surface the loss of durable
+            // recovery explicitly. The app refuses further side effects until
+            // the next launch can recreate or repair the store; silently
+            // dropping the record would turn a process kill into a duplicate.
+            pendingTransactionPersistenceUnavailable = true
+            errorMessage = "无法保存待处理请求，暂不安全重试。"
+            return false
+        }
+    }
+
+    /// Rebuilds the per-machine durable view from the live request maps. This
+    /// is called after every mutation that could otherwise be lost if iOS is
+    /// killed without giving the socket a disconnect callback.
+    @discardableResult
+    private func persistCurrentTransactions(for machineID: String) -> Bool {
+        guard !pendingTransactionPersistenceUnavailable else { return false }
+        guard !machineID.isEmpty else { return true }
+        var creationSnapshot: [String: DSHSessionCreationTransaction] = [:]
         for requestID in pendingSessionCreationRequestIDs {
             guard let command = pendingSessionCreationCommandsByRequestID[requestID] else { continue }
-            snapshot[requestID] = DSHSessionCreationTransaction(
+            creationSnapshot[requestID] = DSHSessionCreationTransaction(
                 command: command,
                 initialMessage: pendingInitialMessagesByRequestID[requestID],
                 failure: failedSessionCreations[requestID],
@@ -329,27 +400,24 @@ final class DSHAppModel: ObservableObject {
                 retryDeadline: sessionCreationRetryDeadlines[requestID]
                     ?? Date().addingTimeInterval(sessionCreationRetryWindow))
         }
-        if snapshot.isEmpty {
+        if creationSnapshot.isEmpty {
             sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
             lastSessionCreationRequestIDsByMachine.removeValue(forKey: machineID)
         } else {
-            sessionCreationTransactionsByMachine[machineID] = snapshot
+            sessionCreationTransactionsByMachine[machineID] = creationSnapshot
             if let lastSessionCreationRequestID,
-               snapshot[lastSessionCreationRequestID] != nil {
+               creationSnapshot[lastSessionCreationRequestID] != nil {
                 lastSessionCreationRequestIDsByMachine[machineID] = lastSessionCreationRequestID
             }
         }
 
         var initialSnapshot: [String: DSHInitialMessageTransaction] = [:]
         for (requestID, pending) in pendingInitialMessagesByRequestID {
-            // A message without a session id still belongs to the create
-            // transaction above. The completed-session phase is the one that
-            // needs its own recovery record.
-            guard pending.sessionID != nil else { continue }
+            guard let sessionID = pending.sessionID else { continue }
             let failure = failedInitialMessages[requestID]
                 ?? DSHInitialMessageFailure(
                     id: requestID,
-                    sessionID: pending.sessionID!,
+                    sessionID: sessionID,
                     text: pending.text,
                     detail: "连接已断开，首条消息待重试。")
             initialSnapshot[requestID] = DSHInitialMessageTransaction(
@@ -360,6 +428,12 @@ final class DSHAppModel: ObservableObject {
         } else {
             initialMessageTransactionsByMachine[machineID] = initialSnapshot
         }
+        return persistPendingTransactionStore()
+    }
+
+    @discardableResult
+    private func suspendSessionCreationTransactions(for machineID: String) -> Bool {
+        return persistCurrentTransactions(for: machineID)
     }
 
     private func restoreSessionCreationTransactions(for machineID: String) {
@@ -393,7 +467,10 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func removeStoredSessionCreationTransaction(_ requestID: String, for machineID: String) {
-        guard var snapshot = sessionCreationTransactionsByMachine[machineID] else { return }
+        guard var snapshot = sessionCreationTransactionsByMachine[machineID] else {
+            persistPendingTransactionStore()
+            return
+        }
         snapshot.removeValue(forKey: requestID)
         if snapshot.isEmpty {
             sessionCreationTransactionsByMachine.removeValue(forKey: machineID)
@@ -404,16 +481,21 @@ final class DSHAppModel: ObservableObject {
                 lastSessionCreationRequestIDsByMachine[machineID] = snapshot.keys.sorted().last
             }
         }
+        persistPendingTransactionStore()
     }
 
     private func removeStoredInitialMessageTransaction(_ requestID: String, for machineID: String) {
-        guard var snapshot = initialMessageTransactionsByMachine[machineID] else { return }
+        guard var snapshot = initialMessageTransactionsByMachine[machineID] else {
+            persistPendingTransactionStore()
+            return
+        }
         snapshot.removeValue(forKey: requestID)
         if snapshot.isEmpty {
             initialMessageTransactionsByMachine.removeValue(forKey: machineID)
         } else {
             initialMessageTransactionsByMachine[machineID] = snapshot
         }
+        persistPendingTransactionStore()
     }
 
     /// Drops all in-flight per-machine bookkeeping. History batches belong to
@@ -432,7 +514,7 @@ final class DSHAppModel: ObservableObject {
         pendingSendsByRequestID.removeAll(keepingCapacity: false)
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
-        failedSend = nil
+        failedSendsByRequestID.removeAll(keepingCapacity: false)
         failedInitialMessages.removeAll(keepingCapacity: false)
         failedSessionCreations.removeAll(keepingCapacity: false)
         lastSessionCreationRequestID = nil
@@ -483,6 +565,7 @@ final class DSHAppModel: ObservableObject {
             self.machineName = active.machineName
             self.machineID = active.machineId
         }
+        loadPendingTransactionStore()
         restoreQueuedPrompts()
     }
 
@@ -756,12 +839,16 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
+        guard suspendSessionCreationTransactions(for: previousMachineID) else {
+            pendingMachineSelectionID = nil
+            connect()
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.transport.setActiveMachine(machine.machineId)
             guard self.machineSelectionGeneration == selection else { return }
             self.pendingMachineSelectionID = nil
-            self.suspendSessionCreationTransactions(for: previousMachineID)
             self.machineName = machine.machineName
             self.machineID = machine.machineId
             // Restore only after the active identity changes. Restoring before
@@ -778,11 +865,10 @@ final class DSHAppModel: ObservableObject {
         let wasActive = machine.machineId == activeMachine?.machineId
         let isPendingSelection = machine.machineId == pendingMachineSelectionID
         let needsRecovery = wasActive || isPendingSelection
-        if wasActive || isPendingSelection {
-            sessionCreationTransactionsByMachine.removeValue(forKey: machine.machineId)
-            lastSessionCreationRequestIDsByMachine.removeValue(forKey: machine.machineId)
-            initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
-        }
+        // A pending target is not the machine represented by the live maps;
+        // snapshot only the active machine before deletion. The target's
+        // already-durable records remain untouched until removal succeeds.
+        if wasActive, !persistCurrentTransactions(for: machine.machineId) { return }
         if needsRecovery { machineSelectionGeneration &+= 1 }
         let recoveryGeneration = machineSelectionGeneration
         if isPendingSelection { pendingMachineSelectionID = nil }
@@ -805,6 +891,10 @@ final class DSHAppModel: ObservableObject {
                 self.isPaired = !self.machines.isEmpty
                 return
             }
+            self.sessionCreationTransactionsByMachine.removeValue(forKey: machine.machineId)
+            self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: machine.machineId)
+            self.initialMessageTransactionsByMachine.removeValue(forKey: machine.machineId)
+            self.persistPendingTransactionStore()
             self.refreshMachines()
             guard needsRecovery else {
                 self.isPaired = !self.machines.isEmpty
@@ -834,6 +924,7 @@ final class DSHAppModel: ObservableObject {
             machineID = active.machineId
             resetTransientRequestState()
             state = DSHStoreState()
+            restoreSessionCreationTransactions(for: active.machineId)
             connect()
         } else {
             machineName = ""
@@ -925,7 +1016,7 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        suspendSessionCreationTransactions(for: machineID)
+        guard suspendSessionCreationTransactions(for: machineID) else { return }
         resetTransientRequestState()
         Task { await transport.disconnect() }
         state.transportState = .disconnected
@@ -941,15 +1032,42 @@ final class DSHAppModel: ObservableObject {
         eventTask = nil
         eventFlushTask?.cancel()
         eventFlushTask = nil
-        sessionCreationTransactionsByMachine.removeAll(keepingCapacity: false)
-        lastSessionCreationRequestIDsByMachine.removeAll(keepingCapacity: false)
-        initialMessageTransactionsByMachine.removeAll(keepingCapacity: false)
+        let forgottenMachineID = activeMachine?.machineId ?? machineID
+        guard suspendSessionCreationTransactions(for: forgottenMachineID) else {
+            connect()
+            return
+        }
         resetTransientRequestState()
         Task { @MainActor [weak self] in
-            do { try await self?.transport.forgetPairing() }
-            catch { self?.errorMessage = error.localizedDescription }
-            self?.state = .init()
-            self?.isPaired = false
+            guard let self else { return }
+            do { try await self.transport.forgetPairing() }
+            catch {
+                self.errorMessage = error.localizedDescription
+                self.refreshMachines()
+                self.machineID = self.activeMachine?.machineId ?? forgottenMachineID
+                self.machineName = self.activeMachine?.machineName ?? "My Mac"
+                self.restoreSessionCreationTransactions(for: self.machineID)
+                self.isPaired = !self.machines.isEmpty
+                self.connect()
+                return
+            }
+            self.sessionCreationTransactionsByMachine.removeValue(forKey: forgottenMachineID)
+            self.lastSessionCreationRequestIDsByMachine.removeValue(forKey: forgottenMachineID)
+            self.initialMessageTransactionsByMachine.removeValue(forKey: forgottenMachineID)
+            self.persistPendingTransactionStore()
+            self.refreshMachines()
+            self.state = .init()
+            if let active = self.activeMachine {
+                self.machineName = active.machineName
+                self.machineID = active.machineId
+                self.restoreSessionCreationTransactions(for: active.machineId)
+                self.isPaired = true
+                self.connect()
+            } else {
+                self.machineName = ""
+                self.machineID = ""
+                self.isPaired = false
+            }
         }
     }
 
@@ -973,6 +1091,10 @@ final class DSHAppModel: ObservableObject {
                        permissionMode: String = "workspace-write",
                        initialPrompt: String? = nil,
                        initialAttachments: [DSHStagedAttachment] = []) -> Bool {
+        guard !pendingTransactionPersistenceUnavailable else {
+            errorMessage = "待处理请求存储不可用，已停止创建以避免重复会话。"
+            return false
+        }
         if let initialPrompt, !validatePromptText(initialPrompt) { return false }
         // A mode id is owned by the active Mac.  When its catalog is present,
         // reject stale values before they can cross the machine boundary.  A
@@ -1035,6 +1157,10 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeValue(forKey: requestId)
         detachedSessionCreationRequestIDs.remove(requestId)
         armSessionCreationTimeout(requestID: requestId)
+        guard persistCurrentTransactions(for: machineID) else {
+            cancelSessionCreationTimeout(requestID: requestId)
+            return false
+        }
         send(command)
         return true
     }
@@ -1285,7 +1411,11 @@ final class DSHAppModel: ObservableObject {
     /// Monotonic per-request attempt generations keep an old timeout task from
     /// settling a retried send that reuses the same idempotency key.
     private var sendAttemptGenerations: [String: Int] = [:]
-    @Published var failedSend: DSHFailedSend?
+    @Published private(set) var failedSendsByRequestID: [String: DSHFailedSend] = [:]
+    /// Compatibility accessor for callers that only need one failure. Views
+    /// showing a specific conversation must use `failedSend(for:)` so one
+    /// failed request cannot hide another session's retry action.
+    var failedSend: DSHFailedSend? { failedSendsByRequestID.values.first }
     /// Acceptance window before a send is declared lost. Internal for tests.
     var sendAckTimeout: TimeInterval = 15
 
@@ -1321,10 +1451,10 @@ final class DSHAppModel: ObservableObject {
         } else {
             failure = .server("Mac 未响应")
         }
-        failedSend = DSHFailedSend(id: requestId, text: pending.text,
-                                   receipts: pending.receipts,
-                                   sessionID: pending.sessionID, mode: pending.mode,
-                                   messageAttachments: pending.messageAttachments, failure: failure)
+        failedSendsByRequestID[requestId] = DSHFailedSend(id: requestId, text: pending.text,
+                                                          receipts: pending.receipts,
+                                                          sessionID: pending.sessionID, mode: pending.mode,
+                                                          messageAttachments: pending.messageAttachments, failure: failure)
     }
 
     /// A request id is authoritative.  A message with an id that does not match
@@ -1333,8 +1463,7 @@ final class DSHAppModel: ObservableObject {
     func confirmPendingSend(text: String, sessionID: String, requestID: String? = nil) {
         if let requestID {
             pendingSendsByRequestID.removeValue(forKey: requestID)
-            let clearedFailure = failedSend?.id == requestID
-            if clearedFailure { failedSend = nil }
+            failedSendsByRequestID.removeValue(forKey: requestID)
             return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1343,9 +1472,9 @@ final class DSHAppModel: ObservableObject {
             where: { $0.sessionID == sessionID && $0.text == trimmed })?.id {
             pendingSendsByRequestID.removeValue(forKey: key)
         }
-        if failedSend?.sessionID == sessionID && failedSend?.text == trimmed {
-            failedSend = nil
-        }
+        if let failure = failedSendsByRequestID.values.first(where: {
+            $0.sessionID == sessionID && $0.text == trimmed
+        }) { failedSendsByRequestID.removeValue(forKey: failure.id) }
     }
 
     private func clearPendingMessageAttachments(for requestID: String) {
@@ -1379,10 +1508,11 @@ final class DSHAppModel: ObservableObject {
             ?? pendingMessageAttachmentsByRequestID[command.requestId]
             ?? []
         clearPendingMessageAttachments(for: command.requestId)
-        failedSend = DSHFailedSend(id: command.requestId, text: text, receipts: receipts,
-                                   sessionID: sessionID, mode: mode,
-                                   messageAttachments: messageAttachments,
-                                   failure: .local(error.localizedDescription))
+        failedSendsByRequestID[command.requestId] = DSHFailedSend(
+            id: command.requestId, text: text, receipts: receipts,
+            sessionID: sessionID, mode: mode,
+            messageAttachments: messageAttachments,
+            failure: .local(error.localizedDescription))
     }
 
     private func receiptIds(in value: DSHJSONValue) -> [String] {
@@ -1397,10 +1527,14 @@ final class DSHAppModel: ObservableObject {
         }
     }
 
-    func retryFailedSend() {
-        guard let failed = failedSend else { return }
+    func failedSend(for sessionID: String) -> DSHFailedSend? {
+        failedSendsByRequestID.values.first { $0.sessionID == sessionID }
+    }
+
+    func retryFailedSend(requestID: String) {
+        guard let failed = failedSendsByRequestID[requestID] else { return }
         guard validatePromptText(failed.text) else { return }
-        failedSend = nil
+        failedSendsByRequestID.removeValue(forKey: requestID)
         // A timeout means the Mac may already have accepted the side effect.
         // Reuse the complete original command identity and mode so Connector
         // and Bridge idempotency coalesce the retry instead of executing it
@@ -1410,8 +1544,18 @@ final class DSHAppModel: ObservableObject {
                    mode: failed.mode, requestId: failed.id)
     }
 
+    func retryFailedSend() {
+        guard let failed = failedSend else { return }
+        retryFailedSend(requestID: failed.id)
+    }
+
+    func dismissFailedSend(requestID: String) {
+        failedSendsByRequestID.removeValue(forKey: requestID)
+    }
+
     func dismissFailedSend() {
-        failedSend = nil
+        guard let failed = failedSend else { return }
+        dismissFailedSend(requestID: failed.id)
     }
 
     /// A prompt this device queued while its session was busy. Text-only
@@ -2113,7 +2257,6 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeValue(forKey: requestID)
         sessionCreationRetryDeadlines.removeValue(forKey: requestID)
         let wasDetached = detachedSessionCreationRequestIDs.remove(requestID) != nil
-        removeStoredSessionCreationTransaction(requestID, for: machineID)
         sessionCreationResults[requestID] = session.id
         sessionCreationResultOrder.removeAll { $0 == requestID }
         sessionCreationResultOrder.append(requestID)
@@ -2131,9 +2274,18 @@ final class DSHAppModel: ObservableObject {
         if wasDetached {
             errorMessage = "原创建请求已在 Mac 上完成；已保留原请求以避免重复创建。"
         }
-        guard var pending = pendingInitialMessagesByRequestID[requestID] else { return }
-        pending.sessionID = session.id
-        pendingInitialMessagesByRequestID[requestID] = pending
+        var pending = pendingInitialMessagesByRequestID[requestID]
+        if var pendingMessage = pending {
+            pendingMessage.sessionID = session.id
+            pending = pendingMessage
+            pendingInitialMessagesByRequestID[requestID] = pendingMessage
+        }
+        // Remove the completed create and, when present, install the initial
+        // message phase in one atomic snapshot. If persistence fails, the
+        // previous create transaction remains on disk and can safely replay
+        // its idempotent acknowledgement after the next launch.
+        guard persistCurrentTransactions(for: machineID) else { return }
+        guard let pending else { return }
         let machineGeneration = self.machineStateGeneration
         Task { @MainActor [weak self] in
             await self?.sendInitialMessage(pending, creationRequestID: requestID,
@@ -2190,6 +2342,7 @@ final class DSHAppModel: ObservableObject {
                 ? "创建会话失败。" : detail,
             resultUnknown: resultUnknown,
             retryUntil: retryUntil)
+        persistCurrentTransactions(for: machineID)
         errorMessage = detail
     }
 
@@ -2229,6 +2382,10 @@ final class DSHAppModel: ObservableObject {
     /// so a timeout/unknown result is coalesced by Connector and Bridge
     /// idempotency instead of creating a second session.
     func retrySessionCreation(requestID: String) {
+        guard !pendingTransactionPersistenceUnavailable else {
+            errorMessage = "待处理请求存储不可用，已停止重试以避免重复会话。"
+            return
+        }
         guard let command = pendingSessionCreationCommandsByRequestID[requestID],
               pendingSessionCreationRequestIDs.contains(requestID) else { return }
         if failedSessionCreations[requestID]?.resultUnknown == true,
@@ -2246,6 +2403,7 @@ final class DSHAppModel: ObservableObject {
         failedSessionCreations.removeValue(forKey: requestID)
         detachedSessionCreationRequestIDs.remove(requestID)
         armSessionCreationTimeout(requestID: requestID)
+        guard persistCurrentTransactions(for: machineID) else { return }
         send(command)
     }
 
@@ -2257,6 +2415,7 @@ final class DSHAppModel: ObservableObject {
         guard let failure = failedSessionCreations[requestID], failure.resultUnknown,
               pendingSessionCreationCommandsByRequestID[requestID] != nil else { return }
         detachedSessionCreationRequestIDs.insert(requestID)
+        persistCurrentTransactions(for: machineID)
         errorMessage = "原创建请求结果待确认；已保留它，稍后若 Mac 已创建会话会单独提示。"
     }
 
@@ -2298,6 +2457,10 @@ final class DSHAppModel: ObservableObject {
                                     creationRequestID: String,
                                     to sessionID: String,
                                     machineGeneration: Int? = nil) async {
+        guard !pendingTransactionPersistenceUnavailable else {
+            errorMessage = "待处理请求存储不可用，已停止发送首条消息。"
+            return
+        }
         guard pendingInitialMessageUploads.insert(creationRequestID).inserted else { return }
         defer { pendingInitialMessageUploads.remove(creationRequestID) }
         if let machineGeneration, machineGeneration != self.machineStateGeneration { return }
@@ -2331,6 +2494,9 @@ final class DSHAppModel: ObservableObject {
                                                      receiptId: receipt)
                 pendingMessage.uploadedAttachments[attachmentKey] = uploaded
                 pendingInitialMessagesByRequestID[creationRequestID] = pendingMessage
+                guard persistCurrentTransactions(for: machineID) else {
+                    throw DSHAttachmentUploadError.persistenceUnavailable
+                }
                 receipts.append(receipt)
                 messageAttachments.append(uploaded)
             }
@@ -2345,6 +2511,7 @@ final class DSHAppModel: ObservableObject {
             failedInitialMessages[creationRequestID] = DSHInitialMessageFailure(
                 id: creationRequestID, sessionID: sessionID, text: pendingMessage.text,
                 detail: error.localizedDescription)
+            persistCurrentTransactions(for: machineID)
             errorMessage = error.localizedDescription
         }
     }
@@ -2363,9 +2530,14 @@ final class DSHAppModel: ObservableObject {
     }
 
     func retryFailedInitialMessage(_ failure: DSHInitialMessageFailure) {
+        guard !pendingTransactionPersistenceUnavailable else {
+            errorMessage = "待处理请求存储不可用，已停止重试以避免重复发送。"
+            return
+        }
         guard let pending = pendingInitialMessagesByRequestID[failure.id],
               let sessionID = pending.sessionID else { return }
         failedInitialMessages.removeValue(forKey: failure.id)
+        guard persistCurrentTransactions(for: machineID) else { return }
         let generation = machineStateGeneration
         Task { @MainActor [weak self] in
             await self?.sendInitialMessage(pending, creationRequestID: failure.id,
@@ -2380,6 +2552,7 @@ final class DSHAppModel: ObservableObject {
 
     func dismissFailedInitialMessage(_ failure: DSHInitialMessageFailure) {
         failedInitialMessages.removeValue(forKey: failure.id)
+        persistCurrentTransactions(for: machineID)
     }
 
     func dismissFailedInitialMessage() {

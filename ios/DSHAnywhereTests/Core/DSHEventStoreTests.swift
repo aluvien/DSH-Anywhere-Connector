@@ -1199,7 +1199,10 @@ final class DSHEventStoreTests: XCTestCase {
 
         // The first timer fires during the second attempt's acceptance window;
         // its generation must not remove the replacement pending send.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        // Leave enough margin for the first timer to fire, but keep the
+        // replacement attempt inside its own acceptance window. Waiting
+        // exactly one timeout here races the second timer on a busy runner.
+        try? await Task.sleep(nanoseconds: 35_000_000)
         XCTAssertEqual(model.pendingSendCount(for: sid), 1)
         XCTAssertNil(model.failedSend)
         model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
@@ -1218,6 +1221,26 @@ final class DSHEventStoreTests: XCTestCase {
         model.confirmPendingSend(text: "", sessionID: sid, requestID: requestID)
         model.parkFailedPromptSend(first, error: NSError(domain: "late", code: 1), attempt: 1)
         XCTAssertNil(model.failedSend)
+    }
+
+    @MainActor
+    func testFailedPromptRetriesRemainScopedToTheirSession() {
+        let firstSession = "failed-session-one-\(UUID().uuidString)"
+        let secondSession = "failed-session-two-\(UUID().uuidString)"
+        let firstRequest = "failed-request-one-\(UUID().uuidString)"
+        let secondRequest = "failed-request-two-\(UUID().uuidString)"
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+
+        model.sendPrompt("first", attachments: [], to: firstSession, requestId: firstRequest)
+        model.sendPrompt("second", attachments: [], to: secondSession, requestId: secondRequest)
+        model.timeoutPendingSend(requestId: firstRequest)
+        model.timeoutPendingSend(requestId: secondRequest)
+
+        XCTAssertEqual(model.failedSend(for: firstSession)?.id, firstRequest)
+        XCTAssertEqual(model.failedSend(for: secondSession)?.id, secondRequest)
+        model.dismissFailedSend(requestID: firstRequest)
+        XCTAssertNil(model.failedSend(for: firstSession))
+        XCTAssertEqual(model.failedSend(for: secondSession)?.id, secondRequest)
     }
 
     func testPromptAcceptanceReceiptDecodesAsRequestScopedEvent() {
