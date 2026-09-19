@@ -187,7 +187,8 @@ export class DSHAnywhereConnector {
    * an old event after a reconnect. */
   private readonly commandResults = new Map<string, { events: EventEnvelope[]; expiresAt: number }>();
   private readonly onlineRelayDevices = new Set<string>();
-  private readonly presenceUpdates = new Map<string, Promise<void>>();
+  private readonly presenceUpdates = new Map<string, Promise<boolean>>();
+  private readonly presenceRefreshRequired = new Set<string>();
 
   private readonly webSocketFactory: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   private readonly request: typeof fetch;
@@ -244,6 +245,7 @@ export class DSHAnywhereConnector {
     this.commandResults.clear();
     this.onlineRelayDevices.clear();
     this.presenceUpdates.clear();
+    this.presenceRefreshRequired.clear();
     this.sessionSnapshotGenerationByDevice.clear();
     this.pendingSessionListRequests.clear();
     this.latestSessionListCommands.clear();
@@ -285,6 +287,7 @@ export class DSHAnywhereConnector {
       this.relayEpoch = undefined;
       const disconnectedDevices = [...this.onlineRelayDevices];
       this.onlineRelayDevices.clear();
+      this.presenceRefreshRequired.clear();
       for (const deviceId of disconnectedDevices) {
         void this.reportDevicePresence(deviceId, false, bridgeConnectorId, relayGeneration, relayEpoch);
       }
@@ -481,12 +484,19 @@ export class DSHAnywhereConnector {
     // command from a newly connected phone.  The Bridge uses that reported
     // lease as the origin-authentication proof, so do not race the HTTP
     // presence update with session.create (or another mutation).  The update
-    // is serialized per device; a failed report still resolves and the normal
-    // Bridge response then explains the unavailable origin.
-    const presenceUpdate = this.presenceUpdates.get(command.data.deviceId);
+    // is serialized per device; a failed report yields a retryable protocol
+    // error instead of allowing the Bridge to manufacture a final 403.
+    const presenceUpdate = this.presenceUpdates.get(command.data.deviceId)
+      ?? (this.presenceRefreshRequired.has(command.data.deviceId)
+        ? this.reportDevicePresence(command.data.deviceId, true, this.bridgeConnectorId,
+                                    this.relayLeaseGeneration, this.relayEpoch)
+        : undefined);
     if (presenceUpdate !== undefined) {
-      void presenceUpdate.then(() => {
-        if (this.relay === socket && this.running) this.dispatchCommand(command.data);
+      void presenceUpdate.then((registered) => {
+        if (this.relay !== socket || !this.running) return;
+        if (registered) this.dispatchCommand(command.data);
+        else this.sendProtocolError(command.data, new BridgeRequestError(
+          503, "Relay device presence is not registered with the local bridge", "retryable"));
       });
       return;
     }
@@ -647,19 +657,31 @@ export class DSHAnywhereConnector {
   private reportDevicePresence(deviceId: string, online: boolean,
                                connectorId = this.bridgeConnectorId,
                                relayGeneration = this.relayLeaseGeneration,
-                               relayEpoch = this.relayEpoch): Promise<void> {
-    if (connectorId === undefined || relayGeneration === undefined || relayEpoch === undefined) return Promise.resolve();
-    const previous = this.presenceUpdates.get(deviceId) ?? Promise.resolve();
-    const update = previous.catch(() => undefined).then(async () => {
-      try {
-        await this.callBridge({
-          method: "POST",
-          path: `/devices/${encodeURIComponent(deviceId)}/presence`,
-          body: { online, connectorId, relayGeneration, relayEpoch },
-        });
-      } catch (error) {
-        this.log("warn", `Could not report device presence to local bridge: ${safeError(error, this.config)}`);
+                               relayEpoch = this.relayEpoch): Promise<boolean> {
+    if (connectorId === undefined || relayGeneration === undefined || relayEpoch === undefined) {
+      return Promise.resolve(false);
+    }
+    const previous = this.presenceUpdates.get(deviceId) ?? Promise.resolve(true);
+    const update = previous.catch(() => false).then(async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await this.callBridge({
+            method: "POST",
+            path: `/devices/${encodeURIComponent(deviceId)}/presence`,
+            body: { online, connectorId, relayGeneration, relayEpoch },
+          });
+          this.presenceRefreshRequired.delete(deviceId);
+          return true;
+        } catch (error) {
+          this.log("warn", `Could not report device presence to local bridge: ${safeError(error, this.config)}`);
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+        }
       }
+      // A command waiting on this lease must receive a retryable protocol
+      // error.  Do not let a swallowed 409/5xx turn into a final 403 from the
+      // Bridge's origin-device check or a ten-minute idempotency tombstone.
+      if (online) this.presenceRefreshRequired.add(deviceId);
+      return false;
     });
     this.presenceUpdates.set(deviceId, update);
     void update.finally(() => {

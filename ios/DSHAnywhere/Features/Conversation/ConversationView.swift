@@ -2064,6 +2064,10 @@ struct ConversationView: View {
         // cancellable, auto-fired when the turn settles). Anything with
         // attachments — and every steer — goes to the server immediately.
         if wasRunning && mode == "queue" && staged.isEmpty {
+            // An edited text-only queue submission supersedes any older
+            // preparing attachment transaction for this session.  That old
+            // draft was never sent and must not resume silently later.
+            model.supersedePreparingPromptTransactions(for: sessionID)
             model.holdQueuedPrompt(text: trimmed, for: sessionID)
             isDraftFocused = false
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
@@ -2075,6 +2079,7 @@ struct ConversationView: View {
             ? UUID().uuidString
             : (model.stagedPromptRequestID(text: trimmed, attachments: staged, sessionID: sessionID)
                 ?? UUID().uuidString)
+        model.supersedePreparingPromptTransactions(for: sessionID, keeping: requestId)
 
         // Keep the editor's contents until the prompt transaction is durably
         // accepted. `isSending` prevents a double tap while uploads are in

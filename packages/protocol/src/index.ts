@@ -6,6 +6,15 @@ export const PROTOCOL_VERSION = 1 as const;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 /** Exact maximum length of a padded base64 encoding of MAX_ATTACHMENT_BYTES. */
 export const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4;
+/** Maximum JSON body accepted by the Relay for one prompt command. */
+export const MAX_PROMPT_BODY_BYTES = 16 * 1024 * 1024;
+/**
+ * Inline image data is an exceptional compatibility path; iOS uses receipt
+ * uploads for normal attachments.  Keep the aggregate encoded image data
+ * below the prompt body budget so a schema-valid command is also accepted by
+ * the Bridge HTTP parser and Relay frame limit.
+ */
+export const MAX_PROMPT_INLINE_DATA_CHARS = 8 * 1024 * 1024;
 
 const IdentifierSchema = z.string().min(1).max(256);
 const TimestampSchema = z.number().int().nonnegative();
@@ -500,7 +509,7 @@ export const PromptSendPayloadSchema = StrictObject({
     StrictObject({
       type: z.literal("image"),
       mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
-      data: z.string().min(1),
+      data: z.string().min(1).max(MAX_PROMPT_INLINE_DATA_CHARS),
       name: z.string().min(1).max(512).optional(),
     }),
     StrictObject({ type: z.literal("file"), receiptId: IdentifierSchema }),
@@ -524,6 +533,29 @@ export const PromptSendPayloadSchema = StrictObject({
       inclusive: true,
       path: ["content"],
       message: "a prompt may contain at most 16 file or image attachments",
+    });
+  }
+  const inlineImageDataChars = value.content?.reduce((total, part) =>
+    part.type === "image" ? total + part.data.length : total, 0) ?? 0;
+  if (inlineImageDataChars > MAX_PROMPT_INLINE_DATA_CHARS) {
+    context.addIssue({
+      code: z.ZodIssueCode.too_big,
+      maximum: MAX_PROMPT_INLINE_DATA_CHARS,
+      origin: "string",
+      inclusive: true,
+      path: ["content"],
+      message: "inline image data exceeds the prompt body budget",
+    });
+  }
+  // Keep the shared schema and the Bridge's bounded JSON reader in agreement
+  // even when many text parts and inline images are combined.  Leave room for
+  // the surrounding command/envelope fields carried by Relay.
+  const encodedPromptBytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  if (encodedPromptBytes > MAX_PROMPT_BODY_BYTES - 64 * 1024) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [],
+      message: "prompt body exceeds the transport budget",
     });
   }
 });

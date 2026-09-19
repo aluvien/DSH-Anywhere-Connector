@@ -376,6 +376,22 @@ describe("prompt attachments", () => {
     expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
   });
 
+  it("rejects inline image data that exceeds the shared prompt transport budget", () => {
+    const message = {
+      type: "prompt.send",
+      requestId: "req-inline-image-budget",
+      ...base,
+      payload: {
+        content: [{
+          type: "image" as const,
+          mediaType: "image/jpeg" as const,
+          data: "A".repeat(8 * 1024 * 1024 + 1),
+        }],
+      },
+    };
+    expect(CommandEnvelopeSchema.safeParse(message).success).toBe(false);
+  });
+
   it("still rejects an undeclared field", () => {
     const message = {
       type: "prompt.send",

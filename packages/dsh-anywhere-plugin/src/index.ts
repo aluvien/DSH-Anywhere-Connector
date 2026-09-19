@@ -13,6 +13,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import {
   AttachmentUploadPayloadSchema,
   ChatAttachmentSchema,
+  MAX_PROMPT_BODY_BYTES,
   CommandExecutePayloadSchema,
   EventEnvelopeSchema,
   ModelCatalogPayloadSchema,
@@ -454,31 +455,36 @@ class SessionMetadataStore {
    * device.  Session snapshots use this correlation only to recover a
    * detached create after its live `session.created` event was lost.
    */
-  async sessionCreationRequestIdForSession(deviceId: string, sessionId: string,
-                                           observedCreateRequestId?: string): Promise<string | undefined> {
+  async sessionCreationCorrelationForSession(deviceId: string, sessionId: string,
+                                              observedCreateRequestId?: string): Promise<{
+    requestId?: string
+    suppressNativeOperationId?: boolean
+  }> {
     const prefix = `${deviceId}\0`
-    let match: string | undefined
     for (const [key, entry] of this.sessionCreationResults) {
       if (!key.startsWith(prefix)) continue
       const matchesSession = entry.sessionId === sessionId
       const matchesNativeOperation = observedCreateRequestId !== undefined &&
         entry.nativeOperationId === observedCreateRequestId
       if (!matchesSession && !matchesNativeOperation) continue
-      // A native create may have committed before a later setup stage failed.
-      // That partial record still identifies the session and must be exposed
-      // for snapshot reconciliation; otherwise a lost `session.created`
-      // leaves the iOS transaction detached forever.
-      match = key.slice(prefix.length)
-      if (matchesNativeOperation && entry.sessionId !== sessionId) {
-        // This is the crash window between native create and
-        // setSessionCreationStarted().  Once the authoritative list gives us
-        // the session id, persist that association and project the original
-        // phone request id instead of leaking the internal hash operation id.
-        entry.sessionId = sessionId
-        await this.persist()
+      // A native create may have committed before a later setup stage ran.
+      // Do not project that request to the phone until the setup transaction
+      // is complete: otherwise a crash between native create and the
+      // permission/model/title steps makes iOS send the first prompt under
+      // the wrong sandbox.  Hide the internal operation marker as well; it is
+      // only an adapter recovery key, never a client request id.
+      if (entry.setupComplete !== true) {
+        return { suppressNativeOperationId: true }
       }
+      return { requestId: key.slice(prefix.length) }
     }
-    return match
+    return {}
+  }
+
+  async sessionCreationRequestIdForSession(deviceId: string, sessionId: string,
+                                           observedCreateRequestId?: string): Promise<string | undefined> {
+    return (await this.sessionCreationCorrelationForSession(
+      deviceId, sessionId, observedCreateRequestId)).requestId
   }
 
   async markSessionCreationNotCommitted(key: string, fingerprint: string | undefined): Promise<void> {
@@ -1922,7 +1928,12 @@ async function handleHttp(
             }
           }
           if (recoveredSessionID === undefined && remembered.nativeOperationId !== undefined) {
-            const summaries = await listSummaries(ctx, metadata, true, originDeviceId)
+            // Search the adapter's raw projection before any client-facing
+            // createRequestId correlation is applied.  A partial native
+            // create must stay hidden from iOS until its post-create setup is
+            // complete, so the normal list projection intentionally removes
+            // this operation marker.
+            const summaries = await listSummaries(ctx, metadata, true, undefined, false)
             recoveredSessionID = summaries.find((item) =>
               item.createRequestId === remembered.nativeOperationId)?.id
           }
@@ -2033,7 +2044,10 @@ async function handleHttp(
 
   const promptMatch = /^\/sessions\/([^/]+)\/prompt$/.exec(path)
   if (req.method === 'POST' && promptMatch !== null) {
-    const body = objectOf(await readJson(req))
+    // Prompt content may include a bounded inline image compatibility path.
+    // Its body budget is shared with the protocol/Relay instead of inheriting
+    // the 1 MiB control-request default.
+    const body = objectOf(await readJson(req, MAX_PROMPT_BODY_BYTES))
     const parsed = PromptSendPayloadSchema.safeParse({
       ...(body.text === undefined ? {} : { text: body.text }),
       ...(body.content === undefined ? {} : { content: body.content }),
@@ -2250,14 +2264,19 @@ async function listSummaries(
   metadata: SessionMetadataStore,
   includeArchived: boolean,
   deviceId?: string,
+  projectCreationCorrelation = true,
 ): Promise<ReturnType<typeof normalizeSessionSummary>[]> {
   const result = await ctx.sessionController.list({}, AbortSignal.timeout(15_000))
   const summaries = (await Promise.all(result.items.map(async (item) => {
       const summary = normalizeSessionSummary(item, ctx, metadata)
-      const createRequestId = deviceId === undefined
-        ? summary.createRequestId
-        : await metadata.sessionCreationRequestIdForSession(
-          deviceId, summary.id, summary.createRequestId) ?? summary.createRequestId
+      if (!projectCreationCorrelation || deviceId === undefined) return summary
+      const correlation = await metadata.sessionCreationCorrelationForSession(
+        deviceId, summary.id, summary.createRequestId)
+      if (correlation.suppressNativeOperationId) {
+        const { createRequestId: _internalOperationId, ...withoutCorrelation } = summary
+        return withoutCorrelation
+      }
+      const createRequestId = correlation.requestId ?? summary.createRequestId
       return createRequestId === undefined ? summary : { ...summary, createRequestId }
     })))
     // A subagent session is how the agent delegates its own work, not a
