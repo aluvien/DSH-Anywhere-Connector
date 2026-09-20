@@ -235,3 +235,10 @@
 - 发布隔离：工作目录中已有其他传输及服务端修改，本次从独立源码快照验证和签名，仅纳入本项UI改动。
 - 验证：独立源码完整123项iOS测试通过；覆盖预留容量消耗/低水位补充、宽度变化与上限、旧消息排除及完成后清空。顶部明暗截图已检查，签名归档及导出成功。2026-09-18 11:27（上海时间）Build115上传被Apple拒绝：错误90382，应用上传次数达到上限，要求等待1天后重试；当前未进入TestFlight，不得标记发布成功。
 - 安装包与日志：artifacts/ios/adaptive-height-build115-20260918/；IPA SHA256：031e63a23fe97dbb0a7b962b0312fd088c7f02bf29442910dbdbd4cbd68cbca6。签名源码已确认与f6c9469的ios目录一致。
+
+
+## 48. 2026-09-20 恢复App历史读取：Mac组件运行版本错配
+- 原因：Bridge进程于9月19日启动，Connector进程仍从9月18日09:51运行，未加载后来构建的协议模块。Bridge已在历史事件信封中携带historyBatchId，旧Connector严格校验不认识该字段，持续记录Ignored invalid event并丢弃历史；网页直连Bridge正常。此前历史接收方路由修复仍然有效。
+- 处理：确认没有运行中的会话后，构建当前Protocol/Bridge插件/Connector并同时重启两个LaunchAgent；未修改应用或Relay业务代码。128项相关后端测试及三个包build通过。
+- 实际验证：经公网Relay以临时测试设备执行session.open，完整收到history.started、2条非空历史消息和history.completed，目标设备正确；测试设备已撤销。重启后未再出现invalid event警告。离线目标会产生target_unavailable通知，与本次协议丢弃原因不同。
+- 用户操作：重新进入会话即可重取历史，不需要重新配对或更新App。以后更新Mac协议/插件时必须配套构建并重启Connector，单纯写入新lib文件不会更新已有Node进程。
