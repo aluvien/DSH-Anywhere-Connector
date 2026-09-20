@@ -877,6 +877,35 @@ final class DSHAppModel: ObservableObject {
     private var uploadWaitRequestIDs: Set<String> = []
     /// Last `openSession` per session, to collapse duplicate replays.
     private var lastOpenSessionAt: [String: Date] = [:]
+    /// The visible screen, unlike `lastOpenSessionAt`, is cleared when the
+    /// user returns home. Replay recovery must not reopen a stale transcript
+    /// behind the session list.
+    private var visibleConversationSessionID: String?
+    /// A Connector can explicitly say that its replay window no longer covers
+    /// this phone's cursor. That is a recoverable cache miss, rather than a
+    /// failed user command: once the current socket and Mac are ready again,
+    /// request fresh authoritative projections. Keep this state per active
+    /// machine generation so a delayed recovery can never read from a newly
+    /// selected Mac.
+    private var pendingReplayResynchronizationGeneration: Int?
+    private var pendingReplayResynchronizationSessionIDs: Set<String> = []
+    private var replayResynchronizationTask: Task<Void, Never>?
+    /// Read-only requests can race construction of the initial socket. Store
+    /// only the latest desired projections and replay them after readiness;
+    /// no task mutation ever enters this queue.
+    private var pendingReadOnlyRecoveryGeneration: Int?
+    /// A local `.notConnected` can race a stale `.connected` UI state while
+    /// URLSession is replacing its task. Do not retry until a *new* handshake
+    /// readiness event has been observed, or the queue would spin on that
+    /// stale state.
+    private var readOnlyRecoveryReadinessRevision = 0
+    private var requiredReadOnlyRecoveryReadinessRevision: Int?
+    private var pendingSessionListRecovery = false
+    private var pendingWorkspaceCatalogRecovery = false
+    private var pendingModeCatalogRecovery = false
+    private var pendingModelCatalogRecovery = false
+    private var pendingSessionOpenRecoveryIDs: Set<String> = []
+    private var readOnlyRecoveryTask: Task<Void, Never>?
     /// Force-merge tasks for history batches whose closing bracket never
     /// arrives (bridge died mid-stream). Keyed by the session and batch so a
     /// late callback from an older overlapping replay cannot cancel or clear
@@ -1656,6 +1685,21 @@ final class DSHAppModel: ObservableObject {
     /// state reset already drops any carried-over rows).
     private func resetTransientRequestState() {
         machineStateGeneration += 1
+        replayResynchronizationTask?.cancel()
+        replayResynchronizationTask = nil
+        pendingReplayResynchronizationGeneration = nil
+        pendingReplayResynchronizationSessionIDs.removeAll(keepingCapacity: false)
+        visibleConversationSessionID = nil
+        readOnlyRecoveryTask?.cancel()
+        readOnlyRecoveryTask = nil
+        pendingReadOnlyRecoveryGeneration = nil
+        readOnlyRecoveryReadinessRevision = 0
+        requiredReadOnlyRecoveryReadinessRevision = nil
+        pendingSessionListRecovery = false
+        pendingWorkspaceCatalogRecovery = false
+        pendingModeCatalogRecovery = false
+        pendingModelCatalogRecovery = false
+        pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
         pendingEvents.removeAll(keepingCapacity: false)
         transcriptEntriesCache.removeAll(keepingCapacity: false)
         transcriptSectionsCache.removeAll(keepingCapacity: false)
@@ -2728,6 +2772,16 @@ final class DSHAppModel: ObservableObject {
         lastOpenSessionAt[sessionID] = now
         send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
                                     sessionId: sessionID, streaming: true))
+    }
+
+    func setConversationVisible(_ sessionID: String, visible: Bool) {
+        if visible {
+            visibleConversationSessionID = sessionID
+        } else if visibleConversationSessionID == sessionID {
+            visibleConversationSessionID = nil
+            pendingReplayResynchronizationSessionIDs.remove(sessionID)
+            pendingSessionOpenRecoveryIDs.remove(sessionID)
+        }
     }
 
     func sendModelCatalog() {
@@ -4149,6 +4203,7 @@ final class DSHAppModel: ObservableObject {
             : nil
         let machineGeneration = self.machineStateGeneration
         let expectedMachineID = self.machineID
+        let readOnlyReadinessAtAttempt = self.readOnlyRecoveryReadinessRevision
         Task { @MainActor [weak self] in
             do {
                 guard let self,
@@ -4190,10 +4245,100 @@ final class DSHAppModel: ObservableObject {
                 if command.type == "prompt.send" {
                     self.parkFailedPromptSend(command, error: error, attempt: attempt,
                                                machineGeneration: machineGeneration)
+                } else if self.deferReadOnlyRequestAfterReconnect(command, error: error,
+                                                                   machineGeneration: machineGeneration,
+                                                                   readinessAtAttempt: readOnlyReadinessAtAttempt) {
+                    // The command was a projection read that never left this
+                    // phone. It is reissued once the current socket is ready.
                 } else {
                     self.errorMessage = error.localizedDescription
                 }
             }
+        }
+    }
+
+    /// `.notConnected` proves a read did not reach Relay. Queue only commands
+    /// that cannot mutate remote state; prompts and other actions retain their
+    /// normal, durable failure paths and are never silently retried here.
+    private func deferReadOnlyRequestAfterReconnect(_ command: DSHCommand, error: Error,
+                                                     machineGeneration: Int,
+                                                     readinessAtAttempt: Int) -> Bool {
+        guard machineGeneration == self.machineStateGeneration,
+              command.machineId == machineID,
+              (error as? DSHWebSocketError) == .notConnected,
+              ["session.list", "workspace.catalog", "mode.catalog", "model.catalog", "session.open"]
+                .contains(command.type) else { return false }
+        if pendingReadOnlyRecoveryGeneration != machineGeneration {
+            pendingReadOnlyRecoveryGeneration = machineGeneration
+            requiredReadOnlyRecoveryReadinessRevision = readinessAtAttempt + 1
+            pendingSessionListRecovery = false
+            pendingWorkspaceCatalogRecovery = false
+            pendingModeCatalogRecovery = false
+            pendingModelCatalogRecovery = false
+            pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
+        }
+        switch command.type {
+        case "session.list": pendingSessionListRecovery = true
+        case "workspace.catalog": pendingWorkspaceCatalogRecovery = true
+        case "mode.catalog": pendingModeCatalogRecovery = true
+        case "model.catalog": pendingModelCatalogRecovery = true
+        case "session.open":
+            if let sessionID = command.sessionId, !sessionID.isEmpty {
+                pendingSessionOpenRecoveryIDs.insert(sessionID)
+            }
+        default:
+            break
+        }
+        scheduleReadOnlyRecoveryAttempt()
+        return true
+    }
+
+    private func scheduleReadOnlyRecoveryAttempt() {
+        guard readOnlyRecoveryTask == nil else { return }
+        readOnlyRecoveryTask = Task { @MainActor [weak self] in
+            // Commands from one appearance pass join one replacement batch.
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.readOnlyRecoveryTask = nil
+            self.performPendingReadOnlyRecoveryIfReady()
+        }
+    }
+
+    private func performPendingReadOnlyRecoveryIfReady() {
+        guard pendingReadOnlyRecoveryGeneration != nil else { return }
+        guard pendingReadOnlyRecoveryGeneration == machineStateGeneration else {
+            pendingReadOnlyRecoveryGeneration = nil
+            requiredReadOnlyRecoveryReadinessRevision = nil
+            pendingSessionListRecovery = false
+            pendingWorkspaceCatalogRecovery = false
+            pendingModeCatalogRecovery = false
+            pendingModelCatalogRecovery = false
+            pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
+            return
+        }
+        guard let requiredReadiness = requiredReadOnlyRecoveryReadinessRevision,
+              readOnlyRecoveryReadinessRevision >= requiredReadiness else { return }
+        guard state.transportState == .connected, state.machineOnline else { return }
+        let wantsSessions = pendingSessionListRecovery
+        let wantsWorkspaces = pendingWorkspaceCatalogRecovery
+        let wantsModes = pendingModeCatalogRecovery
+        let wantsModels = pendingModelCatalogRecovery
+        let sessionIDs = pendingSessionOpenRecoveryIDs
+        pendingReadOnlyRecoveryGeneration = nil
+        requiredReadOnlyRecoveryReadinessRevision = nil
+        pendingSessionListRecovery = false
+        pendingWorkspaceCatalogRecovery = false
+        pendingModeCatalogRecovery = false
+        pendingModelCatalogRecovery = false
+        pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
+
+        if wantsSessions { refreshSessions(includeArchived: showArchivedSessions) }
+        if wantsWorkspaces { requestWorkspaces() }
+        if wantsModes { requestModes() }
+        if wantsModels { sendModelCatalog() }
+        for sessionID in sessionIDs {
+            send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
+                                        sessionId: sessionID, streaming: true))
         }
     }
 
@@ -4276,6 +4421,10 @@ final class DSHAppModel: ObservableObject {
         for event in acceptedEvents {
             switch event.kind {
             case .transportState(let connection) where connection != .connected:
+                // The socket actor keeps one event stream across reconnects.
+                // Re-arm per-connection catalogs here so a resumed Connector
+                // cannot leave Home using only an old workspace/mode cache.
+                requestedCatalogsForConnection = false
                 markPendingSessionCreationsUnknown(
                     detail: "连接已断开，创建结果待确认。")
             case .machinePresence(false):
@@ -4302,7 +4451,7 @@ final class DSHAppModel: ObservableObject {
             }
             handleSessionCreated(event)
             handleRemoteRequestCompletion(event)
-            requestRemoteCatalogsWhenConnected(event)
+            requestRemoteCatalogsWhenConnected()
             retireQueuedPrompt(event)
             confirmPromptAccepted(event)
             if !historyEvent { flushQueueOnSettle(event) }
@@ -4315,6 +4464,21 @@ final class DSHAppModel: ObservableObject {
             if case .historyCompleted(let batch) = event.kind {
                 endHistoryReplay(batch)
             }
+            observeReadOnlyRecoveryReadiness(event)
+        }
+        // A connector can report both replay-window and offline-queue loss in
+        // one buffered delivery. Resolve the accumulated intent once, after
+        // the whole batch has contributed its readiness state.
+        performReplayResynchronizationIfReady()
+        performPendingReadOnlyRecoveryIfReady()
+    }
+
+    private func observeReadOnlyRecoveryReadiness(_ event: DSHEvent) {
+        switch event.kind {
+        case .transportState(.connected), .connectionReady:
+            readOnlyRecoveryReadinessRevision &+= 1
+        default:
+            break
         }
     }
 
@@ -4465,7 +4629,102 @@ final class DSHAppModel: ObservableObject {
     private func surfaceProtocolError(_ event: DSHEvent) {
         guard case .protocolError(let error) = event.kind else { return }
         guard !uploadWaitRequestIDs.contains(event.envelope.messageId) else { return }
+        if isReplayResynchronizationNotice(error) {
+            scheduleReplayResynchronization(for: event)
+            return
+        }
         errorMessage = error.message
+    }
+
+    /// The two notices are emitted by Connector after it has discarded old
+    /// relay/replay frames. They describe stale local projections, not a
+    /// rejected action, so rehydrate them silently. Keep the match to stable
+    /// protocol codes; translated/error text remains free to change.
+    private func isReplayResynchronizationNotice(_ error: DSHProtocolError) -> Bool {
+        error.code == "replay-window-exceeded" || error.code == "offline-queue-exceeded"
+    }
+
+    /// Coalesce one or many replay-overflow notices into a single read-only
+    /// refresh. A replay notice can arrive before `connection.ready`, so the
+    /// scheduled task yields one event turn and then leaves the pending marker
+    /// in place until the normal readiness events reach this model.
+    private func scheduleReplayResynchronization(for event: DSHEvent) {
+        guard event.envelope.machineId == machineID, !machineID.isEmpty else { return }
+        let generation = machineStateGeneration
+        if pendingReplayResynchronizationGeneration != generation {
+            pendingReplayResynchronizationGeneration = generation
+            pendingReplayResynchronizationSessionIDs.removeAll(keepingCapacity: false)
+        }
+        if let sessionID = event.envelope.sessionId, !sessionID.isEmpty {
+            pendingReplayResynchronizationSessionIDs.insert(sessionID)
+        } else if let visibleSessionID = visibleConversationSessionID {
+            pendingReplayResynchronizationSessionIDs.insert(visibleSessionID)
+        }
+        guard replayResynchronizationTask == nil else { return }
+        replayResynchronizationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.replayResynchronizationTask = nil
+            self.performReplayResynchronizationIfReady()
+        }
+    }
+
+    /// Sends no mutations and deliberately bypasses the two-second
+    /// `openSession` gesture collapse: the missing history is precisely what
+    /// needs a new read after an overflow. Waiting for both Relay readiness
+    /// and Mac presence prevents these requests from becoming a second burst
+    /// of `target_unavailable` protocol errors during startup.
+    private func performReplayResynchronizationIfReady() {
+        guard pendingReplayResynchronizationGeneration == machineStateGeneration else {
+            pendingReplayResynchronizationGeneration = nil
+            pendingReplayResynchronizationSessionIDs.removeAll(keepingCapacity: false)
+            return
+        }
+        guard state.transportState == .connected, state.machineOnline else { return }
+        var sessionIDs = pendingReplayResynchronizationSessionIDs
+        pendingReplayResynchronizationGeneration = nil
+        pendingReplayResynchronizationSessionIDs.removeAll(keepingCapacity: false)
+
+        // This recovery covers every read-only projection. If a local
+        // notConnected race queued the same work in this event batch, consume
+        // it here so the second coordinator cannot issue duplicate opens or
+        // catalogs after this method returns.
+        if pendingReadOnlyRecoveryGeneration == machineStateGeneration {
+            let needsWorkspaceCatalog = pendingWorkspaceCatalogRecovery
+            let needsModeCatalog = pendingModeCatalogRecovery
+            let handshakeCatalogsMissing = !requestedCatalogsForConnection
+            pendingReadOnlyRecoveryGeneration = nil
+            requiredReadOnlyRecoveryReadinessRevision = nil
+            pendingSessionListRecovery = false
+            pendingWorkspaceCatalogRecovery = false
+            pendingModeCatalogRecovery = false
+            pendingModelCatalogRecovery = false
+            sessionIDs.formUnion(pendingSessionOpenRecoveryIDs)
+            pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
+            if handshakeCatalogsMissing || needsWorkspaceCatalog {
+                requestedCatalogsForConnection = true
+                requestWorkspaces()
+            }
+            if handshakeCatalogsMissing || needsModeCatalog {
+                requestedCatalogsForConnection = true
+                requestModes()
+            }
+        }
+
+        refreshSessions(includeArchived: showArchivedSessions)
+        // A fresh relay handshake has already asked for these two catalogs.
+        // If this notice arrived without that control event (for example a
+        // test transport's direct Connector event), request them ourselves.
+        if !requestedCatalogsForConnection {
+            requestedCatalogsForConnection = true
+            requestWorkspaces()
+            requestModes()
+        }
+        sendModelCatalog()
+        for sessionID in sessionIDs {
+            send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
+                                        sessionId: sessionID, streaming: true))
+        }
     }
 
     private func attachPendingMessageThumbnails(to state: inout DSHStoreState,
@@ -4743,8 +5002,8 @@ final class DSHAppModel: ObservableObject {
     /// the server-owned workspace and mode catalogs at the actual connection
     /// boundary as well, so empty projects do not depend on a SwiftUI timing
     /// race. The transport's schema gate keeps this harmless on older Relays.
-    private func requestRemoteCatalogsWhenConnected(_ event: DSHEvent) {
-        guard case .transportState(.connected) = event.kind,
+    private func requestRemoteCatalogsWhenConnected() {
+        guard state.transportState == .connected, state.machineOnline,
               !requestedCatalogsForConnection else { return }
         requestedCatalogsForConnection = true
         requestWorkspaces()

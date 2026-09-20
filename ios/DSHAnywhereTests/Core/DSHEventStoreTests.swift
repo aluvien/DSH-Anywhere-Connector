@@ -1524,6 +1524,146 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testReplayGapNoticeCoalescesIntoOneSilentReadOnlyResynchronization() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(30))
+        model.setConversationVisible("active-session", visible: true)
+        model.openSession("active-session")
+        try? await Task.sleep(for: .milliseconds(30))
+
+        await transport.emit(event(type: "transport.state", messageID: "connected", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "presence", sequence: 0,
+                                   payload: .bool(true)))
+        // Connector can emit both notices from the same buffered reconnect.
+        await transport.emit(event(type: "protocol.error", messageID: "gap-1", sequence: 1,
+                                   payload: .object([
+                                    "code": .string("replay-window-exceeded"),
+                                    "message": .string("Some offline events expired; reopen the session to resynchronize."),
+                                    "retryable": .bool(true),
+                                   ])))
+        await transport.emit(event(type: "protocol.error", messageID: "gap-2", sequence: 2,
+                                   payload: .object([
+                                    "code": .string("offline-queue-exceeded"),
+                                    "message": .string("Some offline events expired; reopen active sessions to resynchronize."),
+                                    "retryable": .bool(true),
+                                   ])))
+        try? await Task.sleep(for: .milliseconds(140))
+
+        XCTAssertNil(model.errorMessage)
+        let sessionLists = await transport.commandCount(ofType: "session.list")
+        let workspaceCatalogs = await transport.commandCount(ofType: "workspace.catalog")
+        let modeCatalogs = await transport.commandCount(ofType: "mode.catalog")
+        let modelCatalogs = await transport.commandCount(ofType: "model.catalog")
+        let sessionOpens = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(sessionLists, 1)
+        XCTAssertEqual(workspaceCatalogs, 1,
+                       "Handshake and replay recovery must not duplicate the catalog batch")
+        XCTAssertEqual(modeCatalogs, 1)
+        XCTAssertEqual(modelCatalogs, 1)
+        XCTAssertEqual(sessionOpens, 2,
+                       "The visible transcript is read once normally and once to resynchronize")
+        model.disconnect()
+    }
+
+    @MainActor
+    func testReadOnlyNotConnectedWaitsForNewReadinessWithoutRetryLoop() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        var state = DSHStoreState()
+        // Model state can briefly remain connected while URLSession has
+        // already dropped its task. The coordinator must wait for a new
+        // readiness control event instead of Task.yield retrying forever.
+        state.transportState = .connected
+        state.connectionState = .connected
+        state.machineOnline = true
+        let transport = CorrelationTransport(failFirstTypes: ["session.open"])
+        let model = DSHAppModel(transport: transport, initialState: state, isPaired: true)
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(30))
+        await transport.emit(event(type: "transport.state", messageID: "initial-ready", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "initial-presence", sequence: 0,
+                                   payload: .bool(true)))
+        try? await Task.sleep(for: .milliseconds(80))
+
+        model.openSession("pending-session")
+        try? await Task.sleep(for: .milliseconds(100))
+        let beforeNewReadiness = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(beforeNewReadiness, 1)
+        XCTAssertNil(model.errorMessage)
+
+        await transport.emit(event(type: "transport.state", messageID: "fresh-ready", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "fresh-presence", sequence: 0,
+                                   payload: .bool(true)))
+        try? await Task.sleep(for: .milliseconds(100))
+        let afterNewReadiness = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(afterNewReadiness, 2)
+        XCTAssertNil(model.errorMessage)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testReplayRecoveryDoesNotReopenConversationAfterExitOrConnectionReset() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(40))
+        model.setConversationVisible("no-longer-visible", visible: true)
+        await transport.emit(event(type: "protocol.error", messageID: "pending-gap", sequence: 1,
+                                   payload: .object([
+                                    "code": .string("replay-window-exceeded"),
+                                    "message": .string("Some offline events expired."),
+                                    "retryable": .bool(true),
+                                   ])))
+        try? await Task.sleep(for: .milliseconds(80))
+        model.setConversationVisible("no-longer-visible", visible: false)
+        model.disconnect()
+        try? await Task.sleep(for: .milliseconds(100))
+
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "transport.state", messageID: "ready-after-reset", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "presence-after-reset", sequence: 0,
+                                   payload: .bool(true)))
+        try? await Task.sleep(for: .milliseconds(100))
+        let reopenedSessions = await transport.commandCount(ofType: "session.open")
+        let replayLists = await transport.commandCount(ofType: "session.list")
+        XCTAssertEqual(reopenedSessions, 0)
+        XCTAssertEqual(replayLists, 0,
+                       "A reset drops stale replay recovery instead of using it on the new socket")
+        XCTAssertNil(model.errorMessage)
+        model.disconnect()
+    }
+
+    @MainActor
+    func testOrdinaryProtocolErrorStillSurfacesToTheUser() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        try? await Task.sleep(for: .milliseconds(30))
+        await transport.emit(event(type: "protocol.error", messageID: "real-error", sequence: 1,
+                                   payload: .object([
+                                    "code": .string("permission-denied"),
+                                    "message": .string("Permission was denied."),
+                                    "retryable": .bool(false),
+                                   ])))
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.errorMessage, "Permission was denied.")
+        model.disconnect()
+    }
+
+    @MainActor
     func testWorkspaceCreationDismissesOnlyForMatchingRemoteAcknowledgement() async throws {
         let transport = CorrelationTransport()
         let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
@@ -1621,6 +1761,32 @@ final class DSHEventStoreTests: XCTestCase {
         ])
     }
 
+    /// DSHAppModel deliberately reconciles pairing/profile state while its
+    /// pending transaction ledger loads. These transport tests need a real
+    /// matching active profile so that guard is exercised instead of bypassed.
+    private func installCorrelationTestProfile() -> () -> Void {
+        let defaults = UserDefaults.standard
+        let previousProfiles = defaults.object(forKey: DSHProfileStore.profilesKey)
+        let previousActiveMachine = defaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!,
+                                       deviceId: "test-device", machineId: "machine",
+                                       machineName: "Test Mac")
+        defaults.set(try! JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey)
+        defaults.set(profile.machineId, forKey: DSHProfileStore.activeMachineKey)
+        return {
+            if let previousProfiles {
+                defaults.set(previousProfiles, forKey: DSHProfileStore.profilesKey)
+            } else {
+                defaults.removeObject(forKey: DSHProfileStore.profilesKey)
+            }
+            if let previousActiveMachine {
+                defaults.set(previousActiveMachine, forKey: DSHProfileStore.activeMachineKey)
+            } else {
+                defaults.removeObject(forKey: DSHProfileStore.activeMachineKey)
+            }
+        }
+    }
+
     private func event(type: String, messageID: String, sequence: Int64,
                        payload: DSHJSONValue) -> DSHEvent {
         DSHEvent(envelope: DSHEnvelope(messageId: messageID, deviceId: "device", machineId: "machine",
@@ -1632,8 +1798,12 @@ private actor CorrelationTransport: DSHAppTransport {
     private var continuation: AsyncThrowingStream<DSHEvent, Error>.Continuation?
     private var commands: [DSHCommand] = []
     private let failingTypes: Set<String>
+    private var failFirstTypes: Set<String>
 
-    init(failingTypes: Set<String> = []) { self.failingTypes = failingTypes }
+    init(failingTypes: Set<String> = [], failFirstTypes: Set<String> = []) {
+        self.failingTypes = failingTypes
+        self.failFirstTypes = failFirstTypes
+    }
 
     func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential,
               deviceName: String) async throws -> DSHRemoteProfile {
@@ -1652,6 +1822,9 @@ private actor CorrelationTransport: DSHAppTransport {
     func send(_ command: DSHCommand) async throws {
         commands.append(command)
         if failingTypes.contains(command.type) {
+            throw DSHWebSocketError.notConnected
+        }
+        if failFirstTypes.remove(command.type) != nil {
             throw DSHWebSocketError.notConnected
         }
     }

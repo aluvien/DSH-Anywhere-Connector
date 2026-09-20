@@ -1228,12 +1228,16 @@ struct ConversationView: View {
                 }
             .background(Color(.systemBackground))
             .onAppear {
+                model.setConversationVisible(sessionID, visible: true)
                 scrollCoordinator.followingChanged = { following in
                     withAnimation(.easeInOut(duration: 0.25)) { isFollowingLatest = following }
                 }
                 scrollCoordinator.schedulePin()
             }
-            .onDisappear { scrollCoordinator.followingChanged = nil }
+            .onDisappear {
+                model.setConversationVisible(sessionID, visible: false)
+                scrollCoordinator.followingChanged = nil
+            }
             .toolbar(.hidden, for: .navigationBar)
             // The custom Happy header intentionally hides SwiftUI's navigation
             // bar. Re-enable UIKit's native edge-swipe pop gesture so the
