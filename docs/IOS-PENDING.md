@@ -248,5 +248,5 @@
 - 现象：打开App出现replay-window-exceeded离线事件过期弹窗，偶尔提示Relay WebSocket尚未连接。重启Connector后旧续传位置超出内存窗口是可恢复情况；页面自动读取也可能先于连接完成。
 - 要求：自动重取远端状态与当前会话历史，并在连接就绪后发起读取；不能仅隐藏错误，也不能自动重发具有副作用的操作。真正需要处理的失败仍保留提示。
 - 实现：按机器连接代次合并只读恢复意图；仅重开当前可见会话，退出/重置时清理。`notConnected` 等待请求发起之后的真实就绪信号，避免旧 connected 状态导致重试空转。目录请求等待 Relay 与 Mac 同时在线；发送消息和其他修改操作保留原有事务保护。
-- 验证：新增 4 项 Debug 回归通过；隔离源码的 Release 协议/配置及恢复测试 47 项通过，退出/重置用例另行补验。未修改基线的全量测试已有失败（旧用例未准备新的配对事务状态，另有 WebSocket 缓冲溢出测试失败），不能声称全量通过。日志 `/tmp/dsh116-baseline.log`、`/tmp/dsh116-validation.log`。
-- 发布：1.0（116）已完成签名归档和导出；IPA SHA-256 `6954915273477692e483df4d8cc15d4463e5c2b1eb152fad535d95243a2cdc46`，待上传回执。构建从隔离目录 `/tmp/dsh-build116-source` 完成，未纳入已有 Localizable/Relay 未提交修改。
+- 验证：新增 4 项 Debug 回归通过；隔离源码的 Release 协议/配置及恢复测试共 48 项通过（47 项主验证 + 1 项退出/重置补验）。未修改基线的全量测试已有失败（旧用例未准备新的配对事务状态，另有 WebSocket 缓冲溢出测试失败），不能声称全量通过。日志 `/tmp/dsh116-baseline.log`、`/tmp/dsh116-validation.log`。
+- 发布：1.0（116）已完成签名归档和导出；IPA SHA-256 `6954915273477692e483df4d8cc15d4463e5c2b1eb152fad535d95243a2cdc46`，2026-09-20 08:45（上海）Apple 返回 `UPLOAD SUCCEEDED with no errors`，Delivery UUID `c65286f4-3844-4893-ba81-910783266201`，等待 TestFlight 处理；源码提交 `c629c96` 已推送 GitHub。构建从隔离目录 `/tmp/dsh-build116-source` 完成，未纳入已有 Localizable/Relay 未提交修改。
