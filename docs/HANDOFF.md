@@ -164,10 +164,27 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
 - 个人直连测试曾验证 `https://dsh.biaozhu.me/dsh-anywhere/v1/health` 返回 200，但这不是多人 Relay 架构。
 - `scripts/run-bridge.sh` 默认端口已切到 3080。
 
+### 2026-09-21 一条命令安装部署
+
+- GitHub 源码提交：`dc007b0`。
+- Relay 已在 `dsh.biaozhu.me` 启用 `/install` 和 `/v1/machines/enroll`，健康信息返回
+  `publicEnrollment: true`；线上脚本通过 Shell 语法、凭证占位符替换和固定源码下载检查。
+- 完整工作区 152 项测试、所有 TypeScript 类型检查和构建通过。Connector 覆盖环境传递安装
+  凭证与终端二维码；Relay 覆盖单次消费、重复拒绝和来源限流。
+- 服务器部署前备份：`/opt/dsh-backup-one-command-20260921-134010`；旧镜像标签
+  `relay-relay:before-one-command-20260921-134010`。配对注册表与原 `.env` 均已保留。
+
 ## 当前私测的连接步骤
 
-当前版本没有 `.pkg`/`.dmg` 一键安装器。每台 Mac 需要保留本项目源码、Node.js 22+
-和 pnpm，并运行 DSH Anywhere Connector；服务器只运行 Relay，不运行 DSH Harness。
+Mac 已支持免账号的一条命令安装：
+
+```sh
+curl -fsSL https://dsh.biaozhu.me/install | sh
+```
+
+Relay 为每次脚本下载签发短时、单次、来源限流的安装凭证；脚本自动准备私有 Node.js、pnpm
+和 DSH 环境，注册 Mac、安装 launchd 服务并显示二维码。服务器只运行 Relay，不运行用户的
+DSH Harness。
 
 ### 服务器
 
@@ -274,11 +291,8 @@ xcodebuild \
 
 ### P0：下一步必须完成
 
-1. Connector 的生产启动体验：
-   - `setup` 后能安全启动带 `DSH_ANYWHERE_CONNECTOR_TOKEN` 的 DSH bridge。
-   - launchd 脚本已有源码私测版本；还需在真实机器验证权限、自动重启和升级流程。
-2. 把 `dsh.biaozhu.me` 的 Nginx upstream 改到服务器 Relay，并在服务器上运行 Docker Compose。
-3. Relay 的 pairing secret 应改为一次性或可轮换凭证，避免长期复用。
+1. 为公开安装入口增加数据库级配额、封禁和审计；当前使用进程内来源限流，适合小规模使用。
+2. 为 Mac 安装包增加开发者签名、公证和自动更新；当前脚本从固定 Git 提交下载并在本机构建。
 
 ### 已完成但仍需真实环境冒烟
 
@@ -301,9 +315,9 @@ xcodebuild \
 
 ### P2：产品发布
 
-- macOS 安装器/签名/自动更新。
+- macOS 图形安装器、签名、公证和自动更新。
 - iOS TestFlight/App Store 发布。
-- 二维码和深链配对，不再让用户手填 machineId/secret。
+- App 内完善首次扫码引导；二维码和深链协议已可用。
 - Relay 水平扩展、Redis presence、监控、日志轮转和版本回滚。
 - 自托管 Relay 文档与官方 Relay 的配置切换。
 
@@ -332,7 +346,7 @@ xcodebuild \
 
 ## 安全边界
 
-- 当前版本只适合个人或受控测试，不能把现有个人域名公开给其他人。
+- 当前公开安装入口适合小规模免账号使用；在数据库配额、封禁和审计完成前，不适合作为无限制公共服务。
 - API key 和 Harness 凭证必须留在 Mac；Relay 不应接收 provider secret。
 - 公网必须强制 HTTPS/WSS；明文 HTTP 只允许 localhost 开发。
 - 六位配对码不是公开产品级身份认证；必须有速率限制、失败审计和更强的一次性配对凭证。
