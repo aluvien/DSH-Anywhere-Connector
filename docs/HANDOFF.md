@@ -174,6 +174,15 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
 - 服务器部署前备份：`/opt/dsh-backup-one-command-20260921-134010`；旧镜像标签
   `relay-relay:before-one-command-20260921-134010`。配对注册表与原 `.env` 均已保留。
 
+### 2026-09-21 Linux / Windows 一条命令安装
+
+- Relay 增加 `/install-linux` 与 `/install-windows`，沿用短时、单次、同来源绑定的公开注册
+  凭证；`/install` 继续专用于 macOS。
+- Linux 安装器支持 x64/arm64，安装 systemd 用户服务并尝试为当前用户启用 linger；Windows
+  安装器支持 x64/arm64，使用当前用户启动目录与隐藏监护进程，无需管理员权限。
+- 三个平台都会准备独立 Node.js/DSH 运行环境、保留已有机器注册、启动 Bridge 与 Connector，
+  随后显示一次性二维码并打开本机配对页。
+
 ## 当前私测的连接步骤
 
 Mac 已支持免账号的一条命令安装：

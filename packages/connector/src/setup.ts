@@ -56,7 +56,7 @@ export async function setupConnector(options: SetupOptions, dependencies: SetupD
   return await finishSetup(options, registration, dependencies);
 }
 
-/** Registers a Mac with a short-lived token embedded in the public installer. */
+/** Registers a computer with a short-lived token embedded in a public installer. */
 export async function enrollConnector(options: EnrollmentOptions,
                                       dependencies: SetupDependencies = {}): Promise<SetupResult> {
   const machineName = options.machineName.trim();

@@ -23,10 +23,15 @@ if (isEntrypoint) {
   const publicBaseURL = process.env.DSH_RELAY_PUBLIC_URL?.trim();
   const publicInstallSourceURL = process.env.DSH_RELAY_INSTALL_SOURCE_URL?.trim();
   const publicInstallScriptPath = process.env.DSH_RELAY_INSTALL_SCRIPT?.trim();
+  const publicLinuxInstallScriptPath = process.env.DSH_RELAY_INSTALL_LINUX_SCRIPT?.trim();
+  const publicWindowsInstallScriptPath = process.env.DSH_RELAY_INSTALL_WINDOWS_SCRIPT?.trim();
   const publicInstallerConfigured = publicBaseURL !== undefined && publicBaseURL !== "" &&
     publicInstallSourceURL !== undefined && publicInstallSourceURL !== "";
-  const publicInstallScript = !publicInstallerConfigured || publicInstallScriptPath === undefined || publicInstallScriptPath === ""
-    ? undefined : readFileSync(publicInstallScriptPath, "utf8");
+  const readInstaller = (path: string | undefined): string | undefined =>
+    !publicInstallerConfigured || path === undefined || path === "" ? undefined : readFileSync(path, "utf8");
+  const publicInstallScript = readInstaller(publicInstallScriptPath);
+  const publicLinuxInstallScript = readInstaller(publicLinuxInstallScriptPath);
+  const publicWindowsInstallScript = readInstaller(publicWindowsInstallScriptPath);
 
   const relay = await createRelayServer({
     bootstrapToken,
@@ -39,6 +44,8 @@ if (isEntrypoint) {
     ...(publicBaseURL === undefined || publicBaseURL === "" ? {} : { publicBaseURL }),
     ...(publicInstallSourceURL === undefined || publicInstallSourceURL === "" ? {} : { publicInstallSourceURL }),
     ...(publicInstallScript === undefined ? {} : { publicInstallScript }),
+    ...(publicLinuxInstallScript === undefined ? {} : { publicLinuxInstallScript }),
+    ...(publicWindowsInstallScript === undefined ? {} : { publicWindowsInstallScript }),
   });
   console.log(`DSH Anywhere Relay listening at ${relay.url}`);
 }

@@ -75,10 +75,12 @@ export interface RelayServerOptions {
   readonly pairIpRateLimit?: number;
   readonly pairRateWindowMs?: number;
   readonly pairRateMaxBuckets?: number;
-  /** Enables the no-account, one-command Mac installer. The script is served
-   * only when all three public installer values are supplied. */
+  /** Enables no-account, one-command installers. At least one platform script,
+   * the public Relay URL, and the pinned source archive URL are required. */
   readonly publicBaseURL?: string;
   readonly publicInstallScript?: string;
+  readonly publicLinuxInstallScript?: string;
+  readonly publicWindowsInstallScript?: string;
   readonly publicInstallSourceURL?: string;
   readonly enrollmentTokenTTLms?: number;
   readonly enrollmentRateWindowMs?: number;
@@ -162,11 +164,16 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const enrollmentTokenTTLms = options.enrollmentTokenTTLms ?? DEFAULT_ENROLLMENT_TOKEN_TTL_MS;
   const enrollmentRateWindowMs = options.enrollmentRateWindowMs ?? DEFAULT_ENROLLMENT_RATE_WINDOW_MS;
   const enrollmentRateLimit = options.enrollmentRateLimit ?? DEFAULT_ENROLLMENT_RATE_LIMIT;
+  const publicInstallScripts = [
+    options.publicInstallScript,
+    options.publicLinuxInstallScript,
+    options.publicWindowsInstallScript,
+  ].filter((value): value is string => value !== undefined);
   const publicEnrollmentEnabled = options.publicBaseURL !== undefined &&
-    options.publicInstallScript !== undefined && options.publicInstallSourceURL !== undefined;
-  if ([options.publicBaseURL, options.publicInstallScript, options.publicInstallSourceURL]
+    options.publicInstallSourceURL !== undefined && publicInstallScripts.length > 0;
+  if ([options.publicBaseURL, options.publicInstallSourceURL, ...publicInstallScripts]
       .filter((value) => value !== undefined).length !== 0 && !publicEnrollmentEnabled) {
-    throw new Error("public installer requires base URL, source URL, and script");
+    throw new Error("public installers require a base URL, source URL, and at least one platform script");
   }
   if (publicEnrollmentEnabled) {
     for (const [name, value] of [["public base URL", options.publicBaseURL!],
@@ -178,9 +185,11 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         throw new Error(`${name} must be an absolute HTTPS URL without credentials`);
       }
     }
-    for (const placeholder of ["__DSH_RELAY_URL__", "__DSH_ENROLLMENT_TOKEN__", "__DSH_SOURCE_ARCHIVE_URL__"]) {
-      if (!options.publicInstallScript!.includes(placeholder)) {
-        throw new Error(`public installer script is missing ${placeholder}`);
+    for (const script of publicInstallScripts) {
+      for (const placeholder of ["__DSH_RELAY_URL__", "__DSH_ENROLLMENT_TOKEN__", "__DSH_SOURCE_ARCHIVE_URL__"]) {
+        if (!script.includes(placeholder)) {
+          throw new Error(`public installer script is missing ${placeholder}`);
+        }
       }
     }
   }
@@ -438,8 +447,9 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       });
       return;
     }
-    if (request.method === "GET" && (url.pathname === "/install" || url.pathname === "/install.sh")) {
-      if (!publicEnrollmentEnabled) {
+    const installer = publicInstallerForPath(url.pathname, options);
+    if (request.method === "GET" && installer.recognized) {
+      if (!publicEnrollmentEnabled || installer.script === undefined) {
         respondJson(response, 404, { error: "not_found" });
         return;
       }
@@ -462,11 +472,12 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         clientIp: ip,
         expiresAt: now + enrollmentTokenTTLms,
       });
-      const script = options.publicInstallScript!
-        .replaceAll("__DSH_RELAY_URL__", shellSingleQuotedContents(options.publicBaseURL!))
-        .replaceAll("__DSH_ENROLLMENT_TOKEN__", shellSingleQuotedContents(enrollmentToken))
-        .replaceAll("__DSH_SOURCE_ARCHIVE_URL__", shellSingleQuotedContents(options.publicInstallSourceURL!));
-      respondShell(response, script);
+      const quote = installer.kind === "powershell" ? powershellSingleQuotedContents : shellSingleQuotedContents;
+      const script = installer.script
+        .replaceAll("__DSH_RELAY_URL__", quote(options.publicBaseURL!))
+        .replaceAll("__DSH_ENROLLMENT_TOKEN__", quote(enrollmentToken))
+        .replaceAll("__DSH_SOURCE_ARCHIVE_URL__", quote(options.publicInstallSourceURL!));
+      respondInstaller(response, script, installer.kind);
       return;
     }
     if (request.method === "POST" && url.pathname === "/v1/machines/register") {
@@ -759,11 +770,29 @@ const respondJson = (response: ServerResponse, status: number, value: unknown): 
   response.end(JSON.stringify(value));
 };
 
-const respondShell = (response: ServerResponse, script: string): void => {
+type InstallerKind = "shell" | "powershell";
+
+const publicInstallerForPath = (
+  path: string,
+  options: Pick<RelayServerOptions, "publicInstallScript" | "publicLinuxInstallScript" | "publicWindowsInstallScript">,
+): { recognized: boolean; kind: InstallerKind; script?: string } => {
+  if (path === "/install" || path === "/install.sh") {
+    return { recognized: true, kind: "shell", ...(options.publicInstallScript === undefined ? {} : { script: options.publicInstallScript }) };
+  }
+  if (path === "/install-linux" || path === "/install-linux.sh") {
+    return { recognized: true, kind: "shell", ...(options.publicLinuxInstallScript === undefined ? {} : { script: options.publicLinuxInstallScript }) };
+  }
+  if (path === "/install-windows" || path === "/install-windows.ps1") {
+    return { recognized: true, kind: "powershell", ...(options.publicWindowsInstallScript === undefined ? {} : { script: options.publicWindowsInstallScript }) };
+  }
+  return { recognized: false, kind: "shell" };
+};
+
+const respondInstaller = (response: ServerResponse, script: string, kind: InstallerKind): void => {
   response.writeHead(200, {
-    "content-type": "text/x-shellscript; charset=utf-8",
+    "content-type": kind === "powershell" ? "text/plain; charset=utf-8" : "text/x-shellscript; charset=utf-8",
     "cache-control": "no-store, max-age=0",
-    "content-disposition": "inline; filename=install-dsh-anywhere.sh",
+    "content-disposition": `inline; filename=install-dsh-anywhere.${kind === "powershell" ? "ps1" : "sh"}`,
     "x-content-type-options": "nosniff",
   });
   response.end(script);
@@ -774,6 +803,7 @@ const hashTransientToken = (value: string): string =>
 
 /** Values replace placeholders that already sit inside single quotes. */
 const shellSingleQuotedContents = (value: string): string => value.replaceAll("'", "'\\''");
+const powershellSingleQuotedContents = (value: string): string => value.replaceAll("'", "''");
 
 const sweepEnrollmentTokens = (tokens: Map<string, EnrollmentTokenRecord>, now: number): void => {
   for (const [key, record] of tokens) {

@@ -13,6 +13,8 @@ services:
       DSH_RELAY_PUBLIC_URL: ${DSH_RELAY_PUBLIC_URL:-}
       DSH_RELAY_INSTALL_SOURCE_URL: ${DSH_RELAY_INSTALL_SOURCE_URL:-}
       DSH_RELAY_INSTALL_SCRIPT: ${DSH_RELAY_INSTALL_SCRIPT:-/app/public-install.sh}
+      DSH_RELAY_INSTALL_LINUX_SCRIPT: ${DSH_RELAY_INSTALL_LINUX_SCRIPT:-/app/public-install-linux.sh}
+      DSH_RELAY_INSTALL_WINDOWS_SCRIPT: ${DSH_RELAY_INSTALL_WINDOWS_SCRIPT:-/app/public-install-windows.ps1}
     volumes:
       - relay-data:/data
     ports:

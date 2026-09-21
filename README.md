@@ -1,7 +1,7 @@
 # DSH Anywhere
 
-DSH Anywhere 让你通过 iPhone 远程使用 Mac 上运行的
-[DeepSeek Harness](https://github.com/deepseek-ai)。Mac 主动连接自托管 Relay，不需要公网
+DSH Anywhere 让你通过 iPhone 远程使用电脑上运行的
+[DeepSeek Harness](https://github.com/deepseek-ai)。电脑主动连接自托管 Relay，不需要公网
 IP、端口映射或对外开放 Harness 端口。
 
 > [!IMPORTANT]
@@ -15,7 +15,7 @@ IP、端口映射或对外开放 Harness 端口。
 | 部分 | 状态 | 说明 |
 |---|---|---|
 | iOS App | 主线开发 | 当前唯一受支持的移动客户端，部署目标为 iOS 17+ |
-| Mac Connector / Bridge | 主线开发 | 连接 Relay，并把手机请求转交给本机 Harness |
+| macOS / Linux / Windows Connector 与 Bridge | 主线开发 | 连接 Relay，并把手机请求转交给本机 Harness |
 | Relay | 主线开发 | 自托管的设备鉴权与消息转发服务 |
 | Android App | **暂停开发** | 半成品，不属于当前审计、验收或发布对象 |
 
@@ -25,7 +25,7 @@ IP、端口映射或对外开放 Harness 端口。
 ## 工作方式
 
 ```text
-iPhone ── HTTPS/WSS ──▶ Relay（你的服务器） ◀── WSS 出站 ── Mac Connector
+iPhone ── HTTPS/WSS ──▶ Relay（你的服务器） ◀── WSS 出站 ── Computer Connector
                                                                │
                                                                ▼
                                                     Bridge / Harness :3080
@@ -35,8 +35,8 @@ iPhone ── HTTPS/WSS ──▶ Relay（你的服务器） ◀── WSS 出�
 |---|---|---|
 | iOS App | iPhone | 浏览会话、发送消息、上传附件、处理提问与审批 |
 | Relay | 自托管服务器 | 注册机器、配对设备、验证凭据并转发消息 |
-| Connector | Mac | 主动建立到 Relay 的出站连接并转发请求与事件 |
-| Bridge | Mac | 运行 DSH Anywhere 插件，将 Harness 能力暴露给本机 Connector |
+| Connector | macOS / Linux / Windows | 主动建立到 Relay 的出站连接并转发请求与事件 |
+| Bridge | macOS / Linux / Windows | 运行 DSH Anywhere 插件，将 Harness 能力暴露给本机 Connector |
 
 Relay 是受信任组件。HTTPS/WSS 只保护链路，当前协议**不是端到端加密**；Relay 在转发时
 能够读取和校验明文业务消息。Relay 不主动持久化会话正文，但 Relay 主机及其管理员仍然属于
@@ -74,21 +74,35 @@ curl -s https://你的域名/health
 响应中的 `ok` 应为 `true`。`schemaRevision` 代表 Relay 支持的转发消息结构；修改共享协议
 后必须同步部署 Relay。
 
-### 2. 一条命令安装 Mac 服务
+### 2. 一条命令安装电脑端服务
 
-已启用公开安装入口的 Relay 上，Mac 用户只需执行：
+已启用公开安装入口的 Relay 上，选择对应系统执行一条命令。
+
+macOS：
 
 ```sh
 curl -fsSL https://你的域名/install | sh
 ```
 
-脚本会在 `~/Library/Application Support/DSH Anywhere` 内准备私有的 Node.js、pnpm 和
-DeepSeek Harness 运行环境，下载并构建 DSH Anywhere，使用本次下载专属的短时单次凭证注册
-Mac，安装两个 launchd 服务，最后在终端显示二维码并打开本机配对页。用户不需要账号、
-bootstrap token、Git、Homebrew 或手动填写 Relay 地址。同一台 Mac 再次运行会保留原注册并
-更新本机程序。
+Linux（x64 或 arm64，使用 systemd）：
 
-Relay 的 `/install` 每次只签发一个随机安装凭证；凭证不写入磁盘、不能重复使用，并受来源
+```sh
+curl -fsSL https://你的域名/install-linux | sh
+```
+
+Windows 10/11（PowerShell）：
+
+```powershell
+irm https://你的域名/install-windows | iex
+```
+
+脚本会为当前用户准备私有的 Node.js、pnpm 和 DeepSeek Harness 运行环境，下载并构建 DSH
+Anywhere，使用本次下载专属的短时单次凭证注册电脑，安装该系统的后台启动项，最后在终端
+显示二维码并打开本机配对页。用户不需要账号、bootstrap token、Git、Homebrew 或手动填写
+Relay 地址。重复运行会保留原注册并更新本机程序。macOS 使用 launchd，Linux 使用 systemd
+用户服务，Windows 使用当前用户启动项及隐藏的自动重启监护进程。
+
+Relay 的每个平台安装入口每次只签发一个随机安装凭证；凭证不写入磁盘、不能重复使用，并受来源
 限流。管理员的 bootstrap token 不会进入脚本或用户机器。
 
 仅在维护或私有部署中需要手工安装。建议将仓库放在 `~/DSH-ANYWHERE` 等普通开发目录，

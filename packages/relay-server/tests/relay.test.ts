@@ -53,6 +53,8 @@ async function publicEnrollmentRelay(rateLimit = 5): Promise<RunningRelayServer>
     publicBaseURL: "https://relay.example.test",
     publicInstallSourceURL: "https://downloads.example.test/source.tar.gz",
     publicInstallScript: "relay='__DSH_RELAY_URL__'\ntoken='__DSH_ENROLLMENT_TOKEN__'\nsource='__DSH_SOURCE_ARCHIVE_URL__'\n",
+    publicLinuxInstallScript: "linux_relay='__DSH_RELAY_URL__'\nlinux_token='__DSH_ENROLLMENT_TOKEN__'\nlinux_source='__DSH_SOURCE_ARCHIVE_URL__'\n",
+    publicWindowsInstallScript: "$relay = '__DSH_RELAY_URL__'\n$token = '__DSH_ENROLLMENT_TOKEN__'\n$source = '__DSH_SOURCE_ARCHIVE_URL__'\n",
     enrollmentRateLimit: rateLimit,
   });
   servers.push(server);
@@ -75,7 +77,7 @@ async function register(base: string, machineName: string): Promise<Registration
 }
 
 describe("public one-command enrollment", () => {
-  it("serves a private one-use installer token and registers one Mac", async () => {
+  it("serves private one-use installers for macOS, Linux, and Windows", async () => {
     const server = await publicEnrollmentRelay();
     const installer = await fetch(`${server.url}/install`);
     expect(installer.status).toBe(200);
@@ -88,6 +90,20 @@ describe("public one-command enrollment", () => {
     const token = /token='([^']+)'/.exec(script)?.[1];
     expect(token).toBeDefined();
 
+    const linuxInstaller = await fetch(`${server.url}/install-linux`);
+    expect(linuxInstaller.status).toBe(200);
+    expect(linuxInstaller.headers.get("content-type")).toContain("text/x-shellscript");
+    const linuxScript = await linuxInstaller.text();
+    expect(linuxScript).toContain("linux_relay='https://relay.example.test'");
+    expect(linuxScript).not.toContain("__DSH_");
+
+    const windowsInstaller = await fetch(`${server.url}/install-windows.ps1`);
+    expect(windowsInstaller.status).toBe(200);
+    expect(windowsInstaller.headers.get("content-type")).toContain("text/plain");
+    const windowsScript = await windowsInstaller.text();
+    expect(windowsScript).toContain("$relay = 'https://relay.example.test'");
+    expect(windowsScript).not.toContain("__DSH_");
+
     const enrolled = await post<Registration>(server.url, "/v1/machines/enroll",
       { machineName: "New Mac" }, token);
     expect(enrolled.status).toBe(201);
@@ -98,6 +114,23 @@ describe("public one-command enrollment", () => {
       { machineName: "Second Mac" }, token);
     expect(replay.status).toBe(401);
     expect(replay.body.error).toBe("invalid_or_expired_enrollment");
+  });
+
+  it("returns 404 for a recognized platform whose installer is not configured", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-mac-only-relay-"));
+    directories.push(directory);
+    const server = await createRelayServer({
+      bootstrapToken: "bootstrap-token",
+      registryPath: join(directory, "registry.json"),
+      host: "127.0.0.1",
+      port: 0,
+      publicBaseURL: "https://relay.example.test",
+      publicInstallSourceURL: "https://downloads.example.test/source.tar.gz",
+      publicInstallScript: "relay='__DSH_RELAY_URL__'\ntoken='__DSH_ENROLLMENT_TOKEN__'\nsource='__DSH_SOURCE_ARCHIVE_URL__'\n",
+    });
+    servers.push(server);
+    expect((await fetch(`${server.url}/install-linux`)).status).toBe(404);
+    expect((await fetch(`${server.url}/install-windows`)).status).toBe(404);
   });
 
   it("rate limits public installer grants without affecting existing registration", async () => {

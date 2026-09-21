@@ -25,5 +25,11 @@ describe("connector config", () => {
     expect(defaultConfigPath({}, "darwin", "/tmp/test-home")).toBe(
       "/tmp/test-home/Library/Application Support/DSH Anywhere/connector.json",
     );
+    expect(defaultConfigPath({ LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local" }, "win32", "C:\\Users\\test")).toBe(
+      "C:\\Users\\test\\AppData\\Local\\DSH Anywhere\\connector.json",
+    );
+    expect(defaultConfigPath({ XDG_CONFIG_HOME: "/tmp/config" }, "linux", "/tmp/test-home")).toBe(
+      "/tmp/config/dsh-anywhere/connector.json",
+    );
   });
 });

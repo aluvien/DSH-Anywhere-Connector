@@ -6,7 +6,7 @@ on the server itself; do not proxy this domain directly to one user's Mac.
 1. Copy `.env.example` to `.env`, replace the bootstrap token with at least
    32 random bytes, and set `DSH_RELAY_PUBLIC_URL` plus
    `DSH_RELAY_INSTALL_SOURCE_URL` to the public HTTPS Relay and the source
-   archive that the Mac installer should deploy.
+   archive that platform installers should deploy.
 2. Start the service:
 
    ```sh
@@ -18,14 +18,23 @@ on the server itself; do not proxy this domain directly to one user's Mac.
 4. Verify `https://your-relay.example/health` returns `{ "ok": true }`.
 
 When the two public installer URLs are configured, users install and register a
-Mac without receiving the bootstrap token:
+computer without receiving the bootstrap token:
 
 ```sh
+# macOS
 curl -fsSL https://your-relay.example/install | sh
+
+# Linux
+curl -fsSL https://your-relay.example/install-linux | sh
+```
+
+```powershell
+# Windows PowerShell
+irm https://your-relay.example/install-windows | iex
 ```
 
 The returned script contains a random, short-lived enrollment token. Relay
-limits issuance per source, consumes the token before creating the machine, and
+limits issuance per source across all platforms, consumes the token before creating the machine, and
 never persists or returns the administrator bootstrap token. Public enrollment
 is disabled when the public URLs are omitted.
 

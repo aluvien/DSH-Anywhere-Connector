@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { readFile } from "node:fs/promises";
 
 export interface ConnectorConfig {
@@ -42,6 +42,9 @@ export function defaultConfigPath(
 ): string {
   if (environment.DSH_ANYWHERE_CONFIG !== undefined) return environment.DSH_ANYWHERE_CONFIG;
   if (platform === "darwin") return join(home, "Library", "Application Support", "DSH Anywhere", "connector.json");
+  if (platform === "win32") {
+    return win32.join(environment.LOCALAPPDATA ?? win32.join(home, "AppData", "Local"), "DSH Anywhere", "connector.json");
+  }
   return join(environment.XDG_CONFIG_HOME ?? join(home, ".config"), "dsh-anywhere", "connector.json");
 }
 
