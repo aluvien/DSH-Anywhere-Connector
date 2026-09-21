@@ -176,7 +176,7 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
 
 ### 2026-09-21 Linux / Windows 一条命令安装
 
-- GitHub 与线上 Relay 使用提交 `9d4e536`。生产入口 `/install`、`/install-linux`、
+- GitHub 主线与线上 Relay 使用功能提交 `4de225c`。生产入口 `/install`、`/install-linux`、
   `/install-windows` 均返回 200、禁止缓存、完成占位符替换并固定下载该提交；源码归档返回 200。
 - Relay 增加 `/install-linux` 与 `/install-windows`，沿用短时、单次、同来源绑定的公开注册
   凭证；`/install` 继续专用于 macOS。
@@ -184,10 +184,10 @@ Relay 应部署在自己的服务器上。现在的 `dsh.biaozhu.me` 仍曾经�
   安装器支持 x64/arm64，使用当前用户启动目录与隐藏监护进程，无需管理员权限。
 - 三个平台都会准备独立 Node.js/DSH 运行环境、保留已有机器注册、启动 Bridge 与 Connector，
   随后显示一次性二维码并打开本机配对页。
-- 完整工作区 153 项测试、类型检查、构建和生产 Docker 构建通过。生产备份位于
-  `/opt/dsh-backup-platform-installers-20260921-165516`，旧源码为
-  `/opt/dsh-anywhere-before-platform-20260921-165516`，旧镜像标签为
-  `relay-relay:before-platform-20260921-165516`。
+- 完整工作区 153 项测试、类型检查、构建、生产 Docker 构建与 PowerShell AST 解析通过。
+  最新生产备份位于 `/opt/dsh-backup-platform-installers-20260921-170010`，旧源码为
+  `/opt/dsh-anywhere-before-platform-20260921-170010`，旧镜像标签为
+  `relay-relay:before-platform-20260921-170010`。
 
 ## 当前私测的连接步骤
 
