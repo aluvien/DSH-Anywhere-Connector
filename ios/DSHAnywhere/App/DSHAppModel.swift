@@ -1784,6 +1784,15 @@ final class DSHAppModel: ObservableObject {
     var pendingQuestions: [DSHQuestionRequest] { state.pendingQuestions }
     var connectionState: DSHConnectionState { state.connectionState }
 
+    /// A paired launch first restores the local transaction journal, then
+    /// starts Relay. During that short handoff the transport still reports
+    /// `disconnected`, but no connection attempt has failed and the Mac has
+    /// not been confirmed offline. Keep Home in its connecting presentation
+    /// instead of flashing the actionable "unreachable" state.
+    var isPreparingInitialConnection: Bool {
+        isPaired && !state.hasLoadedSessions && !pendingTransactionStoreLoaded
+    }
+
     /// Per-session traffic light, same hues as the header status dot:
     /// red = turn died on an error, yellow = the Mac is waiting on the
     /// user (approval or questions), green = unread or running activity.

@@ -1293,6 +1293,7 @@ struct DSHRemoteHomeView: View {
     /// actionable unreachable state instead of spinning forever.
     private var isLoadingTasks: Bool {
         guard !model.hasLoadedSessions else { return false }
+        if model.isPreparingInitialConnection { return true }
         switch model.connectionState {
         case .connecting, .reconnecting:
             return true
@@ -1524,7 +1525,7 @@ struct DSHRemoteHomeView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop(opacity: 0.75))
+        .background(DSHHeaderBackdrop(opacity: 0.82))
         .overlay(alignment: .bottom) {
             if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }

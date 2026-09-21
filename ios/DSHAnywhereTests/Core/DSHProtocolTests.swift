@@ -694,7 +694,7 @@ final class DSHConversationViewportTests: XCTestCase {
                             .font(.system(size: 20))
                     }
                 }.padding(.horizontal, 16)
-                DSHHeaderBackdrop(opacity: 0.75)
+                DSHHeaderBackdrop(opacity: 0.82)
                     .frame(height: 110)
             })
         window.rootViewController = host

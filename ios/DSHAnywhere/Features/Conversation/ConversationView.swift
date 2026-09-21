@@ -1372,7 +1372,7 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop(opacity: 0.75))
+        .background(DSHHeaderBackdrop(opacity: 0.82))
         .overlay(alignment: .bottom) {
             if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }

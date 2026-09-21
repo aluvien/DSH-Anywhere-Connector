@@ -2,6 +2,15 @@ import XCTest
 @testable import DSHAnywhere
 
 final class DSHEventStoreTests: XCTestCase {
+    @MainActor
+    func testPairedLaunchTreatsTransactionRestoreAsConnectionPreparation() {
+        let model = DSHAppModel(transport: DSHPreviewTransport(),
+                                initialState: DSHStoreState(), isPaired: true)
+
+        XCTAssertTrue(model.isPreparingInitialConnection,
+                      "A paired launch must not flash the unreachable state before Relay starts")
+    }
+
     func testStreamingHeadroomConsumesMeasuredGrowthBeforeRefilling() {
         var plan = DSHStreamingHeadroomPlan()
         plan.record(streamID: "stream-live", size: CGSize(width: 320, height: 50))
