@@ -42,6 +42,23 @@ async function relay(pairRateLimit?: number, trustedProxyAddresses?: readonly st
   return server;
 }
 
+async function publicEnrollmentRelay(rateLimit = 5): Promise<RunningRelayServer> {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-anywhere-public-relay-"));
+  directories.push(directory);
+  const server = await createRelayServer({
+    bootstrapToken: "bootstrap-token",
+    registryPath: join(directory, "registry.json"),
+    host: "127.0.0.1",
+    port: 0,
+    publicBaseURL: "https://relay.example.test",
+    publicInstallSourceURL: "https://downloads.example.test/source.tar.gz",
+    publicInstallScript: "relay='__DSH_RELAY_URL__'\ntoken='__DSH_ENROLLMENT_TOKEN__'\nsource='__DSH_SOURCE_ARCHIVE_URL__'\n",
+    enrollmentRateLimit: rateLimit,
+  });
+  servers.push(server);
+  return server;
+}
+
 async function post<T>(base: string, path: string, body: unknown, token?: string): Promise<{ status: number; body: T }> {
   const response = await fetch(`${base}${path}`, {
     method: "POST",
@@ -56,6 +73,40 @@ async function register(base: string, machineName: string): Promise<Registration
   expect(result.status).toBe(201);
   return result.body;
 }
+
+describe("public one-command enrollment", () => {
+  it("serves a private one-use installer token and registers one Mac", async () => {
+    const server = await publicEnrollmentRelay();
+    const installer = await fetch(`${server.url}/install`);
+    expect(installer.status).toBe(200);
+    expect(installer.headers.get("content-type")).toContain("text/x-shellscript");
+    expect(installer.headers.get("cache-control")).toContain("no-store");
+    const script = await installer.text();
+    expect(script).toContain("relay='https://relay.example.test'");
+    expect(script).toContain("source='https://downloads.example.test/source.tar.gz'");
+    expect(script).not.toContain("__DSH_");
+    const token = /token='([^']+)'/.exec(script)?.[1];
+    expect(token).toBeDefined();
+
+    const enrolled = await post<Registration>(server.url, "/v1/machines/enroll",
+      { machineName: "New Mac" }, token);
+    expect(enrolled.status).toBe(201);
+    expect(enrolled.body.machineId).toMatch(/^machine_/);
+    expect(enrolled.body.machineToken).not.toBe("");
+
+    const replay = await post<{ error: string }>(server.url, "/v1/machines/enroll",
+      { machineName: "Second Mac" }, token);
+    expect(replay.status).toBe(401);
+    expect(replay.body.error).toBe("invalid_or_expired_enrollment");
+  });
+
+  it("rate limits public installer grants without affecting existing registration", async () => {
+    const server = await publicEnrollmentRelay(1);
+    expect((await fetch(`${server.url}/install.sh`)).status).toBe(200);
+    expect((await fetch(`${server.url}/install.sh`)).status).toBe(429);
+    expect((await register(server.url, "Admin Mac")).machineId).toMatch(/^machine_/);
+  });
+});
 
 async function pair(base: string, machine: Registration, deviceName = "iPhone"): Promise<Pairing> {
   const result = await post<Pairing>(base, "/v1/pair", {

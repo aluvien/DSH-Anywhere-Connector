@@ -10,6 +10,7 @@ RUN pnpm install --frozen-lockfile
 
 COPY packages/protocol packages/protocol
 COPY packages/relay-server packages/relay-server
+COPY scripts/install-public.sh /app/public-install.sh
 RUN pnpm --filter @dsh-anywhere/protocol build \
     && pnpm --filter @dsh-anywhere/relay-server build
 
@@ -26,6 +27,7 @@ COPY --from=build /app/packages/protocol/node_modules ./packages/protocol/node_m
 COPY --from=build /app/packages/relay-server/package.json ./packages/relay-server/package.json
 COPY --from=build /app/packages/relay-server/dist ./packages/relay-server/dist
 COPY --from=build /app/packages/relay-server/node_modules ./packages/relay-server/node_modules
+COPY --from=build /app/public-install.sh /app/public-install.sh
 
 RUN mkdir -p /data && chown -R node:node /data
 # Bake the image build day where /health reads it from. Every rebuild

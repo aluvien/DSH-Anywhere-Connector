@@ -74,20 +74,25 @@ curl -s https://你的域名/health
 响应中的 `ok` 应为 `true`。`schemaRevision` 代表 Relay 支持的转发消息结构；修改共享协议
 后必须同步部署 Relay。
 
-### 2. 安装 Mac 服务
+### 2. 一条命令安装 Mac 服务
 
-前置条件：
+已启用公开安装入口的 Relay 上，Mac 用户只需执行：
 
-- macOS
-- Node.js 22.19+
-- pnpm
-- `dsh` 命令可用
-- Relay 的管理员 bootstrap token
+```sh
+curl -fsSL https://你的域名/install | sh
+```
 
-建议将仓库放在 `~/DSH-ANYWHERE` 等普通开发目录，不要放在 `~/Documents`。macOS 隐私权限
-可能阻止 launchd 执行“文稿”目录中的脚本。
+脚本会在 `~/Library/Application Support/DSH Anywhere` 内准备私有的 Node.js、pnpm 和
+DeepSeek Harness 运行环境，下载并构建 DSH Anywhere，使用本次下载专属的短时单次凭证注册
+Mac，安装两个 launchd 服务，最后在终端显示二维码并打开本机配对页。用户不需要账号、
+bootstrap token、Git、Homebrew 或手动填写 Relay 地址。同一台 Mac 再次运行会保留原注册并
+更新本机程序。
 
-首次注册并安装：
+Relay 的 `/install` 每次只签发一个随机安装凭证；凭证不写入磁盘、不能重复使用，并受来源
+限流。管理员的 bootstrap token 不会进入脚本或用户机器。
+
+仅在维护或私有部署中需要手工安装。建议将仓库放在 `~/DSH-ANYWHERE` 等普通开发目录，
+不要放在 `~/Documents`。首次手工注册并安装：
 
 ```sh
 cd ~/DSH-ANYWHERE
@@ -104,7 +109,7 @@ export DSH_ANYWHERE_MACHINE_NAME='My Mac'
 3. 将 Connector 配置保存到 `~/Library/Application Support/DSH Anywhere/connector.json`；
 4. 安装并启动 `com.dsh-anywhere.connector` 与 `com.dsh-anywhere.bridge` 两个用户级服务。
 
-bootstrap token 只用于注册 Mac，不会写入 launchd 配置。不要把它放进 App、仓库或公开日志。
+bootstrap token 只用于手工注册 Mac，不会写入 launchd 配置。不要把它放进 App、仓库或公开日志。
 
 已经注册过的 Mac 不要重复注册：
 
@@ -126,7 +131,7 @@ node packages/connector/lib/cli.js pair
 配对码十分钟内有效且只能使用一次。在 iOS App 的配对页输入输出中的 Relay 地址、
 `machineId` 和 `pairingCode`。
 
-也可以在 Mac 上打开本机配对页并使用 App 内置扫描器：
+一键安装会自动显示二维码并打开本机配对页。以后也可以手动打开：
 
 ```text
 http://127.0.0.1:3080/dsh-anywhere/v1/pairing

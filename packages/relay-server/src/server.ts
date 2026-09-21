@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isIP, type AddressInfo } from "node:net";
@@ -20,6 +20,11 @@ const MAX_INITIALIZATION_BUFFER_MESSAGES = 32;
 const INITIALIZATION_TIMEOUT_MS = 10_000;
 const DEFAULT_PAIR_RATE_BUCKETS = 10_000;
 const PROVISIONAL_DEVICE_SWEEP_INTERVAL_MS = 60_000;
+// Dependency installation and a first TypeScript build can take several
+// minutes on a new Mac. Keep the grant bounded but long enough for that work.
+const DEFAULT_ENROLLMENT_TOKEN_TTL_MS = 30 * 60_000;
+const DEFAULT_ENROLLMENT_RATE_WINDOW_MS = 60 * 60_000;
+const DEFAULT_ENROLLMENT_RATE_LIMIT = 5;
 /**
  * Bumped whenever the routed `WireMessage` union changes shape. The Relay
  * validates every forwarded body against that union, so a Relay older than the
@@ -70,6 +75,14 @@ export interface RelayServerOptions {
   readonly pairIpRateLimit?: number;
   readonly pairRateWindowMs?: number;
   readonly pairRateMaxBuckets?: number;
+  /** Enables the no-account, one-command Mac installer. The script is served
+   * only when all three public installer values are supplied. */
+  readonly publicBaseURL?: string;
+  readonly publicInstallScript?: string;
+  readonly publicInstallSourceURL?: string;
+  readonly enrollmentTokenTTLms?: number;
+  readonly enrollmentRateWindowMs?: number;
+  readonly enrollmentRateLimit?: number;
   /** Exact socket addresses of reverse proxies whose X-Forwarded-For header is trusted. */
   readonly trustedProxyAddresses?: readonly string[];
 }
@@ -90,6 +103,11 @@ interface RelayConnection {
 interface PairAttempt {
   readonly startedAt: number;
   count: number;
+}
+
+interface EnrollmentTokenRecord {
+  readonly clientIp: string;
+  readonly expiresAt: number;
 }
 
 const RegisterMachineRequestSchema = (value: unknown): { machineName: string } | undefined => {
@@ -136,9 +154,36 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const relayEpoch = randomUUID();
   const pairAttempts = new Map<string, PairAttempt>();
   const pairIpAttempts = new Map<string, PairAttempt>();
+  const enrollmentAttempts = new Map<string, PairAttempt>();
+  const enrollmentTokens = new Map<string, EnrollmentTokenRecord>();
   const pairRateLimit = options.pairRateLimit ?? 5;
   const pairIpRateLimit = options.pairIpRateLimit ?? pairRateLimit * 20;
   const pairRateWindowMs = options.pairRateWindowMs ?? 60_000;
+  const enrollmentTokenTTLms = options.enrollmentTokenTTLms ?? DEFAULT_ENROLLMENT_TOKEN_TTL_MS;
+  const enrollmentRateWindowMs = options.enrollmentRateWindowMs ?? DEFAULT_ENROLLMENT_RATE_WINDOW_MS;
+  const enrollmentRateLimit = options.enrollmentRateLimit ?? DEFAULT_ENROLLMENT_RATE_LIMIT;
+  const publicEnrollmentEnabled = options.publicBaseURL !== undefined &&
+    options.publicInstallScript !== undefined && options.publicInstallSourceURL !== undefined;
+  if ([options.publicBaseURL, options.publicInstallScript, options.publicInstallSourceURL]
+      .filter((value) => value !== undefined).length !== 0 && !publicEnrollmentEnabled) {
+    throw new Error("public installer requires base URL, source URL, and script");
+  }
+  if (publicEnrollmentEnabled) {
+    for (const [name, value] of [["public base URL", options.publicBaseURL!],
+                                 ["public install source URL", options.publicInstallSourceURL!]] as const) {
+      let parsed: URL;
+      try { parsed = new URL(value); }
+      catch { throw new Error(`${name} must be an absolute HTTPS URL`); }
+      if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") {
+        throw new Error(`${name} must be an absolute HTTPS URL without credentials`);
+      }
+    }
+    for (const placeholder of ["__DSH_RELAY_URL__", "__DSH_ENROLLMENT_TOKEN__", "__DSH_SOURCE_ARCHIVE_URL__"]) {
+      if (!options.publicInstallScript!.includes(placeholder)) {
+        throw new Error(`public installer script is missing ${placeholder}`);
+      }
+    }
+  }
   const httpServer = createServer((request, response) => {
     void handleHttp(request, response).catch((error: unknown) => {
       respondJson(response, 500, { error: "internal_error", message: error instanceof Error ? error.message : "Unexpected error" });
@@ -389,7 +434,39 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         deviceManagement: true,
         oneTimePairingCodes: true,
         provisionalPairing: true,
+        publicEnrollment: publicEnrollmentEnabled,
       });
+      return;
+    }
+    if (request.method === "GET" && (url.pathname === "/install" || url.pathname === "/install.sh")) {
+      if (!publicEnrollmentEnabled) {
+        respondJson(response, 404, { error: "not_found" });
+        return;
+      }
+      const now = Date.now();
+      const ip = clientIp(request, trustedProxyAddresses);
+      sweepPairAttempts(enrollmentAttempts, now, enrollmentRateWindowMs);
+      sweepEnrollmentTokens(enrollmentTokens, now);
+      if (!enrollmentAttempts.has(ip) && enrollmentAttempts.size >= pairRateMaxBuckets) {
+        respondJson(response, 429, { error: "rate_limited", message: "Installer capacity reached. Try again later." });
+        return;
+      }
+      const attempt = enrollmentAttempts.get(ip);
+      if (attempt !== undefined && attempt.count >= enrollmentRateLimit) {
+        respondJson(response, 429, { error: "rate_limited", message: "Too many installers requested. Try again later." });
+        return;
+      }
+      recordPairAttempt(enrollmentAttempts, ip, now);
+      const enrollmentToken = randomBytes(32).toString("base64url");
+      enrollmentTokens.set(hashTransientToken(enrollmentToken), {
+        clientIp: ip,
+        expiresAt: now + enrollmentTokenTTLms,
+      });
+      const script = options.publicInstallScript!
+        .replaceAll("__DSH_RELAY_URL__", shellSingleQuotedContents(options.publicBaseURL!))
+        .replaceAll("__DSH_ENROLLMENT_TOKEN__", shellSingleQuotedContents(enrollmentToken))
+        .replaceAll("__DSH_SOURCE_ARCHIVE_URL__", shellSingleQuotedContents(options.publicInstallSourceURL!));
+      respondShell(response, script);
       return;
     }
     if (request.method === "POST" && url.pathname === "/v1/machines/register") {
@@ -402,6 +479,33 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
         respondJson(response, 400, { error: "invalid_request", message: "machineName is required." });
         return;
       }
+      const registration = await registry.registerMachine(body.machineName);
+      respondJson(response, 201, registration);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/machines/enroll") {
+      if (!publicEnrollmentEnabled) {
+        respondJson(response, 404, { error: "not_found" });
+        return;
+      }
+      const body = RegisterMachineRequestSchema(await readJson(request));
+      if (body === undefined) {
+        respondJson(response, 400, { error: "invalid_request", message: "machineName is required." });
+        return;
+      }
+      const token = bearerToken(request);
+      const tokenKey = token === undefined ? undefined : hashTransientToken(token);
+      const now = Date.now();
+      sweepEnrollmentTokens(enrollmentTokens, now);
+      const record = tokenKey === undefined ? undefined : enrollmentTokens.get(tokenKey);
+      const ip = clientIp(request, trustedProxyAddresses);
+      if (record === undefined || record.clientIp !== ip || now >= record.expiresAt) {
+        respondJson(response, 401, { error: "invalid_or_expired_enrollment" });
+        return;
+      }
+      // Consume before persistence. A response lost after registration must
+      // not let the same public grant create another independent machine.
+      enrollmentTokens.delete(tokenKey!);
       const registration = await registry.registerMachine(body.machineName);
       respondJson(response, 201, registration);
       return;
@@ -653,6 +757,28 @@ const readJson = async (request: IncomingMessage): Promise<unknown> => {
 const respondJson = (response: ServerResponse, status: number, value: unknown): void => {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(value));
+};
+
+const respondShell = (response: ServerResponse, script: string): void => {
+  response.writeHead(200, {
+    "content-type": "text/x-shellscript; charset=utf-8",
+    "cache-control": "no-store, max-age=0",
+    "content-disposition": "inline; filename=install-dsh-anywhere.sh",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(script);
+};
+
+const hashTransientToken = (value: string): string =>
+  createHash("sha256").update(value, "utf8").digest("hex");
+
+/** Values replace placeholders that already sit inside single quotes. */
+const shellSingleQuotedContents = (value: string): string => value.replaceAll("'", "'\\''");
+
+const sweepEnrollmentTokens = (tokens: Map<string, EnrollmentTokenRecord>, now: number): void => {
+  for (const [key, record] of tokens) {
+    if (now >= record.expiresAt) tokens.delete(key);
+  }
 };
 
 const clientIp = (request: IncomingMessage, trustedProxies: ReadonlySet<string>): string => {

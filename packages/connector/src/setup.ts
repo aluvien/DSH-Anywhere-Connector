@@ -12,6 +12,14 @@ export interface SetupOptions {
   readonly bridgeBaseURL?: string;
 }
 
+export interface EnrollmentOptions {
+  readonly relay: string;
+  readonly enrollmentToken: string;
+  readonly machineName: string;
+  readonly configPath: string;
+  readonly bridgeBaseURL?: string;
+}
+
 export interface SetupResult {
   readonly machineId: string;
   readonly pairingSecret: string;
@@ -36,17 +44,39 @@ const DEFAULT_BRIDGE_BASE_URL = "http://127.0.0.1:3080/dsh-anywhere/v1";
 
 /** Register a machine once, then keep all long-lived secrets on its local disk. */
 export async function setupConnector(options: SetupOptions, dependencies: SetupDependencies = {}): Promise<SetupResult> {
-  const relayURL = relayWebSocketURL(options.relay);
   const machineName = options.machineName.trim();
   if (machineName.length === 0 || machineName.length > 256) throw new ConfigError("machine-name must be between 1 and 256 characters");
   if (options.bootstrapToken.trim().length === 0) throw new ConfigError("bootstrap-token is required");
-
   const registration = await registerMachine(
     options.relay,
     options.bootstrapToken,
     machineName,
     dependencies.fetch ?? fetch,
   );
+  return await finishSetup(options, registration, dependencies);
+}
+
+/** Registers a Mac with a short-lived token embedded in the public installer. */
+export async function enrollConnector(options: EnrollmentOptions,
+                                      dependencies: SetupDependencies = {}): Promise<SetupResult> {
+  const machineName = options.machineName.trim();
+  if (machineName.length === 0 || machineName.length > 256) throw new ConfigError("machine-name must be between 1 and 256 characters");
+  if (options.enrollmentToken.trim().length === 0) throw new ConfigError("enrollment-token is required");
+  const registration = await enrollMachine(
+    options.relay,
+    options.enrollmentToken,
+    machineName,
+    dependencies.fetch ?? fetch,
+  );
+  return await finishSetup(options, registration, dependencies);
+}
+
+async function finishSetup(
+  options: Omit<SetupOptions, "bootstrapToken"> | Omit<EnrollmentOptions, "enrollmentToken">,
+  registration: Registration,
+  dependencies: SetupDependencies,
+): Promise<SetupResult> {
+  const relayURL = relayWebSocketURL(options.relay);
   const bridgeToken = dependencies.randomToken?.() ?? randomBytes(32).toString("base64url");
   if (Buffer.byteLength(bridgeToken, "utf8") < 32) throw new SetupError("generated bridge token is unexpectedly short");
   const config = parseConfig({
@@ -113,6 +143,33 @@ export async function registerMachine(
   return registration;
 }
 
+export async function enrollMachine(
+  relay: string,
+  enrollmentToken: string,
+  machineName: string,
+  request: typeof fetch,
+): Promise<Registration> {
+  const response = await request(relayEnrollmentURL(relay), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${enrollmentToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ machineName }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new SetupError(`Relay enrollment failed (HTTP ${response.status})`);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new SetupError("Relay enrollment returned invalid JSON");
+  }
+  const registration = asRegistration(body);
+  if (registration === undefined) throw new SetupError("Relay enrollment returned an invalid response");
+  return registration;
+}
+
 export function relayRegistrationURL(relay: string): string {
   let url: URL;
   try {
@@ -122,6 +179,17 @@ export function relayRegistrationURL(relay: string): string {
   }
   if (url.protocol !== "https:") throw new ConfigError("relay must use https");
   return new URL("v1/machines/register", trailingSlash(url.toString())).toString();
+}
+
+export function relayEnrollmentURL(relay: string): string {
+  let url: URL;
+  try {
+    url = new URL(relay);
+  } catch {
+    throw new ConfigError("relay must be an absolute HTTPS URL");
+  }
+  if (url.protocol !== "https:") throw new ConfigError("relay must use https");
+  return new URL("v1/machines/enroll", trailingSlash(url.toString())).toString();
 }
 
 export async function writeSetupFiles(configPath: string, bridgeEnvPath: string, config: ConnectorConfig): Promise<void> {
