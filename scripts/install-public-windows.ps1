@@ -1,3 +1,6 @@
+# Invoke-Expression runs in the caller's session. Keep the one-use token and
+# temporary installer settings inside a child scope so nothing remains there.
+& {
 $ErrorActionPreference = 'Stop'
 
 # Served by Relay with a short-lived one-use enrollment grant. Usage:
@@ -163,4 +166,5 @@ try {
   throw
 } finally {
   Remove-Item $temporaryDir, $nextBundle -Recurse -Force -ErrorAction SilentlyContinue
+}
 }
