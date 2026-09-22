@@ -103,10 +103,6 @@ fun SettingsScreen(onDismiss: () -> Unit) {
                         DSHLocalization.string("Show session usage"),
                         model.showUsageFooter,
                     ) { model.setShowUsageFooter(it) }
-                    ToggleRow(
-                        DSHLocalization.string("Show turn usage beside Thinking"),
-                        model.showTurnUsage,
-                    ) { model.setShowTurnUsage(it) }
                 }
 
                 SettingsSection(

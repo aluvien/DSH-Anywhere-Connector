@@ -18,6 +18,7 @@ import com.dshanywhere.core.protocol.DSHRelayRole
 import com.dshanywhere.core.protocol.DSHToolActivity
 import com.dshanywhere.core.protocol.DSHTranscriptEntry
 import com.dshanywhere.core.protocol.transcriptEntries
+import com.dshanywhere.core.protocol.withTaskTimelines
 import com.dshanywhere.core.store.DSHEventReducer
 import com.dshanywhere.core.store.DSHStoreState
 import kotlinx.serialization.json.jsonObject
@@ -65,6 +66,24 @@ class EnvelopeAndCommandTest {
         assertTrue("\"hello\"" in content)
         assertTrue("r1" in content.toString())
     }
+
+    @Test fun openSessionRequestsStreamingDurableHistory() {
+        val command = DSHCommand.openSession("d", "m", "s")
+        assertEquals("session.open", command.type)
+        assertEquals("s", command.sessionId)
+        assertEquals("s", command.payload.jsonObject["sessionId"]!!.jsonPrimitive.content)
+        assertEquals("true", command.payload.jsonObject["streaming"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun remoteWorkspaceCommandsUseMacOwnedPaths() {
+        val list = DSHCommand.directoryList("d", "m", "/Users/me")
+        assertEquals("directory.list", list.type)
+        assertEquals("/Users/me", list.payload.jsonObject["path"]!!.jsonPrimitive.content)
+        val create = DSHCommand.createWorkspace("d", "m", "/Users/me/project")
+        assertEquals("workspace.create", create.type)
+        assertEquals("/Users/me/project", create.payload.jsonObject["path"]!!.jsonPrimitive.content)
+        assertEquals("mode.catalog", DSHCommand.modeCatalog("d", "m").type)
+    }
 }
 
 class RelayMessageTest {
@@ -109,6 +128,9 @@ class EventKindTest {
         assertEquals("s1", (snapshot.kind as DSHEventKind.SessionSnapshot).sessions.single().id)
         val delta = event("assistant.message.delta", """{"messageId":"m","text":"hi"}""")
         assertEquals("hi", (delta.kind as DSHEventKind.AssistantMessageDelta).delta.text)
+        val workspaces = event("workspace.catalog",
+            """{"workspaces":[{"id":"w","title":"Project","path":"/tmp/p"}]}""")
+        assertEquals("Project", (workspaces.kind as DSHEventKind.WorkspaceCatalog).workspaces.single().name)
     }
 
     @Test fun unknownAndMalformedFallToUnknown() {
@@ -168,6 +190,36 @@ class ReducerTest {
         val tools = state.toolsBySession.getValue("s")
         assertEquals(4, tools.first { it.id == "t" }.sequence)
         assertEquals(9, tools.first { it.id == "u" }.sequence)
+    }
+
+    @Test fun historicalTurnStateCannotSettleLiveTurn() {
+        var state = reduce(DSHStoreState(),
+            envelope(1, "turn.state.changed", """{"sessionId":"s","state":"running"}"""))
+        val historical = DSHEvent(DSHEnvelope(
+            version = 1, messageId = "m2", deviceId = "d", machineId = "mac",
+            sessionId = "s", sequence = 2, timestamp = 100,
+            type = "turn.state.changed",
+            payload = DSHJson.parseToJsonElement("""{"sessionId":"s","state":"completed"}"""),
+            historyBatchId = "history-1",
+        ))
+        state = reduce(state, historical)
+        assertEquals("running", state.turnStateBySession["s"])
+    }
+
+    @Test fun liveTurnCompletionStampsOneTaskEnd() {
+        var state = reduce(DSHStoreState(),
+            DSHEvent(DSHEnvelope(1, "u", "d", "mac", "s", 1, 1_000,
+                "user.message.accepted", DSHJson.parseToJsonElement(
+                    """{"id":"u","role":"user","markdown":"go"}"""))),
+            envelope(2, "turn.state.changed", """{"sessionId":"s","state":"running"}"""),
+            DSHEvent(DSHEnvelope(1, "a", "d", "mac", "s", 3, 1_500,
+                "assistant.message.completed", DSHJson.parseToJsonElement(
+                    """{"id":"a","role":"assistant","markdown":"done"}"""))),
+        )
+        state = reduce(state, DSHEvent(DSHEnvelope(1, "end", "d", "mac", "s", 4, 4_000,
+            "turn.state.changed", DSHJson.parseToJsonElement(
+                """{"sessionId":"s","state":"completed"}"""))))
+        assertEquals(4_000, state.messagesBySession.getValue("s").last().taskCompletedAt)
     }
 
     @Test fun approvalsAndQuestionsDedupeAndRemove() {
@@ -316,6 +368,21 @@ class TranscriptTest {
         )
         assertEquals(1, block.visibleMessages.size)
         assertEquals("one", block.reasoning)
+    }
+
+    @Test fun oneTaskGetsOneTotalTimelineAcrossToolSplitReplies() {
+        val messages = listOf(
+            msg("u", DSHMessageRole.user, 1).copy(timestamp = 1_000),
+            msg("a1", DSHMessageRole.assistant, 2),
+            msg("a2", DSHMessageRole.assistant, 4).copy(taskCompletedAt = 5_000),
+        )
+        val entries = messages.transcriptEntries(
+            listOf(DSHToolActivity("t", "read", "completed", sequence = 3)),
+        ).withTaskTimelines()
+        val assistant = entries.filterIsInstance<DSHTranscriptEntry.Turn>()
+            .filterNot { it.block.isUserTurn }
+        assertEquals(1, assistant.count { it.block.taskTimeline != null })
+        assertEquals(4 to false, assistant.first().block.taskTimeline!!.duration())
     }
 }
 

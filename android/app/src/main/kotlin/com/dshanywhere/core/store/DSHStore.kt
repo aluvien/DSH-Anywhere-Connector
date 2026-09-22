@@ -39,6 +39,9 @@ data class DSHStoreState(
     val pendingQuestions: List<DSHQuestionRequest> = emptyList(),
     val turnStateBySession: Map<String, String> = emptyMap(),
     val modelCatalog: DSHModelCatalog? = null,
+    val workspaceCatalog: List<DSHWorkspaceOption> = emptyList(),
+    val modeCatalog: DSHModeCatalog? = null,
+    val directoryListing: DSHDirectoryListing? = null,
     val usageBySession: Map<String, DSHSessionUsage> = emptyMap(),
     val permissionBySession: Map<String, DSHPermissionUpdate> = emptyMap(),
     val metadataBySession: Map<String, DSHSessionMetadataUpdate> = emptyMap(),
@@ -47,6 +50,7 @@ data class DSHStoreState(
     val attachmentsBySession: Map<String, List<DSHUploadedAttachment>> = emptyMap(),
     /** Errors keyed by the request id carried as the error envelope's message id. */
     val protocolErrorsByRequestID: Map<String, String> = emptyMap(),
+    val historyCarryOverBySession: Map<String, DSHHistoryCarryOver> = emptyMap(),
     val unknownEvents: List<DSHEnvelope> = emptyList(),
     val lastSequence: Long = 0,
     /**
@@ -56,12 +60,29 @@ data class DSHStoreState(
      */
     val transportState: DSHConnectionState = DSHConnectionState.Disconnected,
     val machineOnline: Boolean = false,
+    val confirmedMachinePresence: Boolean? = null,
     /**
      * `null` means the Connector is present but the local Harness bridge has not
      * answered yet; existing protocol events prove whether it is usable.
      */
     val bridgeReachable: Boolean? = null,
     val connectionState: DSHConnectionState = DSHConnectionState.Disconnected,
+) {
+    val isAwaitingInitialSessions: Boolean
+        get() = if (hasLoadedSessions) false else when (transportState) {
+            is DSHConnectionState.Failed -> false
+            is DSHConnectionState.Connecting, is DSHConnectionState.Reconnecting -> true
+            DSHConnectionState.Disconnected, DSHConnectionState.Connected ->
+                confirmedMachinePresence != false && bridgeReachable != false
+        }
+}
+
+data class DSHHistoryCarryOver(
+    val batchId: String,
+    val messages: List<DSHChatMessage> = emptyList(),
+    val tools: List<DSHToolActivity> = emptyList(),
+    val commandResults: List<DSHCommandResult> = emptyList(),
+    val modelChanges: List<DSHModelChangeNotice> = emptyList(),
 )
 
 /**
@@ -80,6 +101,7 @@ object DSHEventReducer {
                 if (control.state != DSHConnectionState.Connected) {
                     controlled = controlled.copy(
                         machineOnline = false,
+                        confirmedMachinePresence = null,
                         bridgeReachable = null,
                         connectionState = control.state,
                     )
@@ -91,6 +113,7 @@ object DSHEventReducer {
                 if (!control.online || !state.machineOnline) controlled = controlled.copy(bridgeReachable = null)
                 controlled = controlled.copy(
                     machineOnline = control.online,
+                    confirmedMachinePresence = control.online,
                     connectionState = if (control.online) DSHConnectionState.Connected else DSHConnectionState.Disconnected,
                 )
                 return controlled
@@ -116,6 +139,7 @@ object DSHEventReducer {
                 next = next.copy(
                     transportState = DSHConnectionState.Connected,
                     machineOnline = true,
+                    confirmedMachinePresence = true,
                     bridgeReachable = true,
                     connectionState = DSHConnectionState.Connected,
                 )
@@ -143,7 +167,16 @@ object DSHEventReducer {
             }
 
             is DSHEventKind.UserMessageAccepted -> {
-                val stamped = kind.message.copy(sequence = event.envelope.sequence)
+                val existing = event.envelope.sessionId?.let { sid ->
+                    next.messagesBySession[sid]?.firstOrNull { it.id == kind.message.id }
+                }
+                val stamped = kind.message.copy(
+                    attachments = if (kind.message.attachments.isEmpty()) {
+                        existing?.attachments.orEmpty()
+                    } else kind.message.attachments,
+                    sequence = existing?.sequence ?: kind.message.sequence ?: event.envelope.sequence,
+                    timestamp = existing?.timestamp ?: kind.message.timestamp ?: event.envelope.timestamp,
+                )
                 next = next.copy(
                     messagesBySession = appendOrReplace(
                         next.messagesBySession, event.envelope.sessionId, stamped,
@@ -159,20 +192,38 @@ object DSHEventReducer {
                 val existing = sessionId?.let { sid ->
                     next.messagesBySession[sid]?.firstOrNull { it.id == kind.message.id }
                 }
-                val completed = if (existing != null) {
-                    // Keep where the message started rather than where it
-                    // finished, so interleaving with tool calls stays
-                    // chronological.
-                    kind.message.copy(reasoning = existing.reasoning, sequence = existing.sequence)
-                } else {
-                    kind.message.copy(sequence = event.envelope.sequence)
+                val replaced = kind.message.replacesMessageId?.let { id ->
+                    sessionId?.let { sid -> next.messagesBySession[sid]?.firstOrNull { it.id == id } }
+                }
+                val first = listOfNotNull(existing, replaced).minByOrNull { it.sequence ?: Long.MAX_VALUE }
+                val completed = kind.message.copy(
+                    reasoning = kind.message.reasoning ?: existing?.reasoning ?: replaced?.reasoning,
+                    sequence = first?.sequence ?: event.envelope.sequence,
+                    timestamp = first?.timestamp ?: event.envelope.timestamp,
+                    completedAt = existing?.completedAt ?: replaced?.completedAt
+                        ?: if (event.envelope.historyBatchId == null) event.envelope.timestamp else null,
+                    taskCompletedAt = existing?.taskCompletedAt ?: replaced?.taskCompletedAt,
+                )
+                var messageStore = next.messagesBySession
+                if (sessionId != null && kind.message.replacesMessageId != null &&
+                    kind.message.replacesMessageId != kind.message.id) {
+                    messageStore = messageStore + (sessionId to messageStore
+                        .getOrDefault(sessionId, emptyList())
+                        .filterNot { it.id == kind.message.replacesMessageId })
                 }
                 next = next.copy(
                     messagesBySession = appendOrReplace(
-                        next.messagesBySession, event.envelope.sessionId, completed,
+                        messageStore, event.envelope.sessionId, completed,
                         key = { it.id },
                     ),
                 )
+            }
+
+            is DSHEventKind.AssistantMessageDiscarded -> {
+                val sessionId = event.envelope.sessionId ?: ""
+                next = next.copy(messagesBySession = next.messagesBySession +
+                    (sessionId to next.messagesBySession.getOrDefault(sessionId, emptyList())
+                        .filterNot { it.id == kind.discarded.messageId }))
             }
 
             is DSHEventKind.AssistantReasoning -> {
@@ -189,6 +240,7 @@ object DSHEventReducer {
                             markdown = "",
                             reasoning = kind.reasoning.text,
                             sequence = event.envelope.sequence,
+                            timestamp = event.envelope.timestamp,
                         ),
                     )
                 }
@@ -208,6 +260,7 @@ object DSHEventReducer {
                             role = DSHMessageRole.assistant,
                             markdown = kind.delta.text,
                             sequence = event.envelope.sequence,
+                            timestamp = event.envelope.timestamp,
                         ),
                     )
                 }
@@ -215,7 +268,13 @@ object DSHEventReducer {
             }
 
             is DSHEventKind.ToolStarted -> {
-                val stamped = kind.tool.copy(sequence = event.envelope.sequence)
+                val existing = event.envelope.sessionId?.let { sid ->
+                    next.toolsBySession[sid]?.firstOrNull { it.id == kind.tool.id }
+                }
+                val stamped = kind.tool.copy(
+                    sequence = existing?.sequence ?: kind.tool.sequence ?: event.envelope.sequence,
+                    arguments = kind.tool.arguments ?: kind.tool.detail,
+                )
                 next = next.copy(
                     toolsBySession = appendOrReplace(
                         next.toolsBySession, event.envelope.sessionId, stamped,
@@ -231,7 +290,10 @@ object DSHEventReducer {
                 val existing = event.envelope.sessionId?.let { sid ->
                     next.toolsBySession[sid]?.firstOrNull { it.id == kind.tool.id }
                 }
-                val stamped = kind.tool.copy(sequence = existing?.sequence ?: event.envelope.sequence)
+                val stamped = kind.tool.copy(
+                    sequence = existing?.sequence ?: event.envelope.sequence,
+                    arguments = kind.tool.arguments ?: existing?.arguments,
+                )
                 next = next.copy(
                     toolsBySession = appendOrReplace(
                         next.toolsBySession, event.envelope.sessionId, stamped,
@@ -258,11 +320,39 @@ object DSHEventReducer {
             is DSHEventKind.QuestionResolved ->
                 next = next.copy(pendingQuestions = next.pendingQuestions.filterNot { it.id == kind.resolution.id })
 
-            is DSHEventKind.TurnStateChanged ->
-                next = next.copy(turnStateBySession = next.turnStateBySession + (kind.turn.sessionId to kind.turn.state))
+            is DSHEventKind.TurnStateChanged -> if (event.envelope.historyBatchId == null) {
+                val previous = next.turnStateBySession[kind.turn.sessionId]
+                var messageStore = next.messagesBySession
+                if (previous == "running" && kind.turn.state != "running") {
+                    val values = messageStore.getOrDefault(kind.turn.sessionId, emptyList()).toMutableList()
+                    val lastAssistant = values.indexOfLast { it.role == DSHMessageRole.assistant }
+                    val lastUser = values.indexOfLast { it.role == DSHMessageRole.user }
+                    if (lastAssistant > lastUser) {
+                        values[lastAssistant] = values[lastAssistant].copy(
+                            taskCompletedAt = values[lastAssistant].taskCompletedAt ?: event.envelope.timestamp,
+                        )
+                        messageStore = messageStore + (kind.turn.sessionId to values)
+                    }
+                }
+                next = next.copy(
+                    turnStateBySession = next.turnStateBySession + (kind.turn.sessionId to kind.turn.state),
+                    messagesBySession = messageStore,
+                )
+            }
 
             is DSHEventKind.ModelCatalog ->
                 next = next.copy(modelCatalog = kind.catalog)
+
+            is DSHEventKind.WorkspaceCatalog ->
+                next = next.copy(workspaceCatalog = kind.workspaces)
+
+            is DSHEventKind.WorkspaceCreated -> Unit
+
+            is DSHEventKind.ModeCatalog ->
+                next = next.copy(modeCatalog = kind.catalog)
+
+            is DSHEventKind.DirectoryListing ->
+                next = next.copy(directoryListing = kind.listing)
 
             is DSHEventKind.UsageUpdated -> {
                 val index = next.sessions.indexOfFirst { it.id == kind.update.sessionId }
@@ -276,6 +366,7 @@ object DSHEventReducer {
             }
 
             is DSHEventKind.PermissionUpdated -> {
+                if (event.envelope.historyBatchId != null) return next
                 val index = next.sessions.indexOfFirst { it.id == kind.update.sessionId }
                 val sessions = if (index >= 0) {
                     next.sessions.toMutableList().also { it[index] = it[index].copy(permissionMode = kind.update.mode) }
@@ -287,6 +378,7 @@ object DSHEventReducer {
             }
 
             is DSHEventKind.SessionMetadataUpdated -> {
+                if (event.envelope.historyBatchId != null) return next
                 val index = next.sessions.indexOfFirst { it.id == kind.update.sessionId }
                 val sessions = if (index >= 0) {
                     val s = next.sessions[index]
@@ -343,6 +435,8 @@ object DSHEventReducer {
                 }
             }
 
+            is DSHEventKind.PromptAccepted -> Unit
+
             is DSHEventKind.ProtocolError -> {
                 next = next.copy(
                     protocolErrorsByRequestID = next.protocolErrorsByRequestID +
@@ -350,6 +444,44 @@ object DSHEventReducer {
                 )
                 if (kind.error.code == "bridge-request-failed") {
                     next = next.copy(bridgeReachable = false)
+                }
+            }
+
+            is DSHEventKind.HistoryStarted -> {
+                val sessionId = kind.batch.sessionId
+                val current = next.historyCarryOverBySession[sessionId]
+                val carry = if (current == null) {
+                    DSHHistoryCarryOver(
+                        batchId = kind.batch.batchId,
+                        messages = next.messagesBySession[sessionId].orEmpty(),
+                        tools = next.toolsBySession[sessionId].orEmpty(),
+                        commandResults = next.commandResultsBySession[sessionId].orEmpty(),
+                        modelChanges = next.modelChangesBySession[sessionId].orEmpty(),
+                    )
+                } else current.copy(
+                    messages = appendMissing(current.messages, next.messagesBySession[sessionId].orEmpty()) { it.id },
+                    tools = appendMissing(current.tools, next.toolsBySession[sessionId].orEmpty()) { it.id },
+                    commandResults = appendMissing(current.commandResults, next.commandResultsBySession[sessionId].orEmpty()) { it.id },
+                    modelChanges = appendMissing(current.modelChanges, next.modelChangesBySession[sessionId].orEmpty()) { it.id },
+                )
+                next = next.copy(historyCarryOverBySession = next.historyCarryOverBySession + (sessionId to carry))
+            }
+
+            is DSHEventKind.HistoryCompleted -> {
+                val sessionId = kind.batch.sessionId
+                val carry = next.historyCarryOverBySession[sessionId]
+                if (carry != null && carry.batchId == kind.batch.batchId) {
+                    next = next.copy(
+                        messagesBySession = next.messagesBySession + (sessionId to appendMissing(
+                            next.messagesBySession[sessionId].orEmpty(), carry.messages) { it.id }),
+                        toolsBySession = next.toolsBySession + (sessionId to appendMissing(
+                            next.toolsBySession[sessionId].orEmpty(), carry.tools) { it.id }),
+                        commandResultsBySession = next.commandResultsBySession + (sessionId to appendMissing(
+                            next.commandResultsBySession[sessionId].orEmpty(), carry.commandResults) { it.id }),
+                        modelChangesBySession = next.modelChangesBySession + (sessionId to appendMissing(
+                            next.modelChangesBySession[sessionId].orEmpty(), carry.modelChanges) { it.id }),
+                        historyCarryOverBySession = next.historyCarryOverBySession - sessionId,
+                    )
                 }
             }
 
@@ -378,5 +510,11 @@ object DSHEventReducer {
         val index = values.indexOfFirst { key(it) == key(value) }
         if (index >= 0) values[index] = value else values.add(value)
         return store + (mapKey to values)
+    }
+
+    private fun <T> appendMissing(base: List<T>, values: List<T>, key: (T) -> String): List<T> {
+        val result = base.toMutableList()
+        values.forEach { value -> if (result.none { key(it) == key(value) }) result.add(value) }
+        return result
     }
 }

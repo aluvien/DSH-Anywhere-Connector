@@ -39,6 +39,8 @@ data class DSHEnvelope(
     val timestamp: Long,
     val type: String,
     val payload: JsonElement,
+    /** Non-null only for events emitted by a durable history replay. */
+    val historyBatchId: String? = null,
 )
 
 /**
@@ -123,9 +125,40 @@ data class DSHCommand(
             new(deviceId, machineId, "session.list",
                 buildJsonObject { put("includeArchived", JsonPrimitive(includeArchived)) })
 
+        fun openSession(
+            deviceId: String,
+            machineId: String,
+            sessionId: String,
+            streaming: Boolean = true,
+        ) = new(deviceId, machineId, "session.open", buildJsonObject {
+            put("sessionId", JsonPrimitive(sessionId))
+            if (streaming) put("streaming", JsonPrimitive(true))
+        }, sessionId)
+
         fun archiveSession(deviceId: String, machineId: String, sessionId: String, archived: Boolean) =
             new(deviceId, machineId, "session.archive",
                 buildJsonObject { put("archived", JsonPrimitive(archived)) }, sessionId)
+
+        fun renameSession(deviceId: String, machineId: String, sessionId: String, title: String) =
+            new(deviceId, machineId, "session.rename",
+                buildJsonObject { put("title", JsonPrimitive(title)) }, sessionId)
+
+        fun directoryList(deviceId: String, machineId: String, path: String? = null) =
+            new(deviceId, machineId, "directory.list", buildJsonObject {
+                if (!path.isNullOrBlank()) put("path", JsonPrimitive(path))
+            })
+
+        fun workspaceCatalog(deviceId: String, machineId: String) =
+            new(deviceId, machineId, "workspace.catalog")
+
+        fun createWorkspace(deviceId: String, machineId: String, path: String, title: String? = null) =
+            new(deviceId, machineId, "workspace.create", buildJsonObject {
+                put("path", JsonPrimitive(path))
+                if (!title.isNullOrBlank()) put("title", JsonPrimitive(title))
+            })
+
+        fun modeCatalog(deviceId: String, machineId: String) =
+            new(deviceId, machineId, "mode.catalog")
 
         fun selectModel(deviceId: String, machineId: String, sessionId: String,
                         provider: String, model: String, reasoningEffort: String? = null) =

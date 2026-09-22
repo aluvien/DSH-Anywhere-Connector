@@ -47,13 +47,18 @@ import androidx.compose.material.icons.filled.LaptopMac
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -112,6 +117,8 @@ fun ConversationScreen(sessionID: String) {
     var showCommandMenu by remember { mutableStateOf(false) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showPermissionPicker by remember { mutableStateOf(false) }
+    var showRenameSession by remember { mutableStateOf(false) }
+    var renameText by remember { mutableStateOf("") }
     var draftAttachments by remember { mutableStateOf(emptyList<DraftAttachment>()) }
     var isSending by remember { mutableStateOf(false) }
     // False once the reader scrolls away from the newest output, so auto-follow
@@ -151,6 +158,7 @@ fun ConversationScreen(sessionID: String) {
     // `.task(id: sessionID) { model.markSessionRead(sessionID); model.sendModelCatalog() }`
     LaunchedEffect(sessionID) {
         model.markSessionRead(sessionID)
+        model.openSession(sessionID)
         model.sendModelCatalog()
     }
 
@@ -360,7 +368,10 @@ fun ConversationScreen(sessionID: String) {
             title = conversationTitle,
             subtitle = conversationSubtitle,
             onBack = { backDispatcher?.onBackPressed() },
-            onSelectModel = { showModelPicker = true },
+            onRename = {
+                renameText = conversationTitle
+                showRenameSession = true
+            },
             onPermission = { showPermissionPicker = true },
             onRefresh = { refreshSession() },
             onArchive = { archiveSession() },
@@ -536,6 +547,30 @@ fun ConversationScreen(sessionID: String) {
     if (showPermissionPicker) {
         PermissionPickerSheet(sessionID = sessionID, onDismiss = { showPermissionPicker = false })
     }
+    if (showRenameSession) {
+        AlertDialog(
+            onDismissRequest = { showRenameSession = false },
+            title = { Text(DSHLocalization.string("Rename session")) },
+            text = {
+                TextField(
+                    value = renameText,
+                    onValueChange = { renameText = it },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    model.renameSession(sessionID, renameText)
+                    showRenameSession = false
+                }) { Text(DSHLocalization.string("Save")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRenameSession = false }) {
+                    Text(DSHLocalization.string("Cancel"))
+                }
+            },
+        )
+    }
 }
 
 // MARK: - Header
@@ -550,7 +585,7 @@ private fun ConversationHeader(
     title: String,
     subtitle: String,
     onBack: () -> Unit,
-    onSelectModel: () -> Unit,
+    onRename: () -> Unit,
     onPermission: () -> Unit,
     onRefresh: () -> Unit,
     onArchive: () -> Unit,
@@ -559,6 +594,7 @@ private fun ConversationHeader(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .background(DSHColors.systemBackground().copy(alpha = 0.82f))
             .statusBarsPadding()
             .padding(horizontal = 16.dp)
             .padding(top = 4.dp, bottom = 8.dp),
@@ -572,18 +608,13 @@ private fun ConversationHeader(
             onClick = onBack,
         )
 
-        Spacer(Modifier.weight(1f).widthIn(min = 0.dp))
-
         Column(
             modifier = Modifier
-                .widthIn(max = 210.dp)
+                .weight(1f)
                 .heightIn(min = 44.dp)
-                .clip(CircleShape)
-                .background(DSHColors.thinMaterial())
-                .border(0.75.dp, DSHColors.label().copy(alpha = 0.14f), CircleShape)
-                .padding(horizontal = 14.dp),
+                .padding(horizontal = 4.dp),
             verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
+            horizontalAlignment = Alignment.Start,
         ) {
             Text(
                 title,
@@ -600,22 +631,30 @@ private fun ConversationHeader(
             )
         }
 
-        Spacer(Modifier.weight(1f).widthIn(min = 0.dp))
-
-        Box {
-            GlassCircleButton(
-                icon = Icons.Filled.Settings, // gearshape
-                label = DSHLocalization.string("Session settings"),
-                iconSize = 19,
-                onClick = { menuExpanded = true },
-            )
+        Row(
+            Modifier
+                .size(width = 88.dp, height = 44.dp)
+                .clip(CircleShape)
+                .background(DSHColors.thinMaterial())
+                .border(0.75.dp, DSHColors.label().copy(alpha = 0.14f), CircleShape),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(44.dp).clickable(onClick = onRename), contentAlignment = Alignment.Center) {
+                Icon(Icons.Filled.Edit, contentDescription = DSHLocalization.string("Rename session"),
+                    modifier = Modifier.size(19.dp))
+            }
+            Box {
+                Box(Modifier.size(44.dp).clickable { menuExpanded = true }, contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.MoreHoriz, contentDescription = DSHLocalization.string("More actions"),
+                        modifier = Modifier.size(20.dp))
+                }
             DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                 DropdownMenuItem(
-                    leadingIcon = { Icon(Icons.Filled.Memory, contentDescription = null) }, // cpu
-                    text = { Text(DSHLocalization.string("Select model")) },
+                    leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                    text = { Text(DSHLocalization.string("Rename session")) },
                     onClick = {
                         menuExpanded = false
-                        onSelectModel()
+                        onRename()
                     },
                 )
                 DropdownMenuItem(
@@ -651,6 +690,7 @@ private fun ConversationHeader(
                         onArchive()
                     },
                 )
+            }
             }
         }
     }

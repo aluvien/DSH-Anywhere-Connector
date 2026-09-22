@@ -2,6 +2,7 @@ package com.dshanywhere.core.store
 
 import com.dshanywhere.core.protocol.DSHLocalization
 import com.dshanywhere.core.protocol.DSHSessionSummary
+import kotlinx.serialization.Serializable
 
 /** How the sessions list arranges what it shows. */
 enum class DSHSessionGrouping(val key: String) {
@@ -29,7 +30,31 @@ data class DSHSessionGroup(
 )
 
 /** A workspace the user can start a session in. */
-data class DSHWorkspaceOption(val id: String, val name: String)
+@Serializable
+data class DSHWorkspaceOption(
+    val id: String,
+    val name: String = "",
+    val title: String? = null,
+    val path: String? = null,
+) {
+    val resolvedName: String get() = title?.takeIf { it.isNotBlank() } ?: name
+}
+
+@Serializable
+data class DSHDirectoryEntry(val name: String, val path: String)
+
+@Serializable
+data class DSHDirectoryListing(
+    val path: String,
+    val parentPath: String? = null,
+    val directories: List<DSHDirectoryEntry> = emptyList(),
+)
+
+@Serializable
+data class DSHModeOption(val id: String, val name: String, val description: String? = null)
+
+@Serializable
+data class DSHModeCatalog(val defaultMode: String? = null, val modes: List<DSHModeOption> = emptyList())
 
 const val FLAT_GROUP_ID = "__flat__"
 const val UNFILED_GROUP_ID = "__unfiled__"

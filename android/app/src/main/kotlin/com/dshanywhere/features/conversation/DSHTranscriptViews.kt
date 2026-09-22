@@ -93,7 +93,6 @@ private fun bubbleGray(): Color = DSHColors.secondaryLabel().copy(alpha = 0.12f)
 /** SwiftUI: `AssistantTurnView` — every answer of a turn, then one merged disclosure. */
 @Composable
 internal fun AssistantTurnView(sessionID: String, block: DSHTranscriptBlock, streaming: Boolean) {
-    val model = LocalAppModel.current
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -102,12 +101,20 @@ internal fun AssistantTurnView(sessionID: String, block: DSHTranscriptBlock, str
         block.visibleMessages.forEach { message ->
             MessageBubble(sessionID = sessionID, message = message)
         }
-        if (block.reasoning.isNotEmpty()) {
+        val timeline = block.taskTimeline
+        if (timeline != null) {
+            val details = buildList {
+                if (timeline.reasoning.isNotBlank()) add(timeline.reasoning)
+                timeline.tools.forEach { tool ->
+                    val detail = tool.arguments ?: tool.detail
+                    add(if (detail.isNullOrBlank()) tool.name else "${tool.name}\n$detail")
+                }
+            }.joinToString("\n\n")
             ThinkingDisclosure(
-                text = block.reasoning,
-                answerCount = block.visibleMessages.size,
-                usage = block.visibleMessages.lastOrNull()?.usage,
-                showUsage = model.showTurnUsage,
+                text = details,
+                title = taskDurationLabel(
+                    timeline.duration(if (streaming) System.currentTimeMillis() else null),
+                ),
                 streaming = streaming,
             )
         }
@@ -133,11 +140,14 @@ internal fun MessageBubble(sessionID: String, message: DSHChatMessage) {
             Box(
                 modifier = Modifier
                     .background(
-                        if (isUser) accent else bubbleGray(),
+                        if (isUser) accent else Color.Transparent,
                         RoundedCornerShape(16.dp),
                     )
                     .clip(RoundedCornerShape(16.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                    .padding(
+                        horizontal = if (isUser) 14.dp else 0.dp,
+                        vertical = if (isUser) 10.dp else 2.dp,
+                    ),
             ) {
                 // .foregroundStyle(user ? .white : .primary)
                 CompositionLocalProvider(
@@ -342,9 +352,7 @@ private fun MessageAttachmentPreview(attachment: DSHMessageAttachment) {
 @Composable
 private fun ThinkingDisclosure(
     text: String,
-    answerCount: Int,
-    usage: DSHSessionUsage?,
-    showUsage: Boolean,
+    title: String,
     streaming: Boolean,
 ) {
     var isExpanded by remember(text.isNotEmpty()) { mutableStateOf(false) }
@@ -375,11 +383,7 @@ private fun ThinkingDisclosure(
                 tint = DSHColors.secondaryLabel(),
             )
             Text(
-                if (isExpanded) {
-                    DSHLocalization.string("Hide thinking")
-                } else {
-                    DSHLocalization.string("Thinking")
-                },
+                title,
                 style = caption2,
                 color = DSHColors.secondaryLabel(),
             )
@@ -411,17 +415,6 @@ private fun ThinkingDisclosure(
                 tint = DSHColors.secondaryLabel(),
             )
             Spacer(Modifier.weight(1f).widthIn(min = 0.dp))
-            if (showUsage && usage != null) {
-                Text(
-                    turnStats(usage),
-                    style = caption2.copy(
-                        fontFamily = FontFamily.Monospace,
-                        color = DSHColors.tertiaryLabel(),
-                    ),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
 
         AnimatedVisibility(
@@ -448,6 +441,17 @@ private fun ThinkingDisclosure(
             }
         }
     }
+}
+
+private fun taskDurationLabel(duration: Pair<Int, Boolean>?): String {
+    if (duration == null) return DSHLocalization.string("Thinking")
+    val (seconds, estimated) = duration
+    val value = when {
+        seconds >= 3_600 -> "${seconds / 3_600} hr ${(seconds % 3_600) / 60} min"
+        seconds >= 60 -> "${seconds / 60} min ${seconds % 60} sec"
+        else -> "$seconds sec"
+    }
+    return DSHLocalization.format("Took %@", "${if (estimated) "≈" else ""}$value")
 }
 
 /** SwiftUI: `Color.secondary.opacity(0.08)`. */

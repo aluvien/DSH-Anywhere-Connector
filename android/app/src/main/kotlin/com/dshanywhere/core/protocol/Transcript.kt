@@ -49,6 +49,8 @@ sealed interface DSHTranscriptEntry {
 data class DSHTranscriptBlock(
     val id: String,
     val messages: List<DSHChatMessage>,
+    /** Present only on the first assistant block of one user task. */
+    val taskTimeline: DSHTaskTimeline? = null,
 ) {
     val isUserTurn: Boolean get() = messages.firstOrNull()?.role == DSHMessageRole.user
 
@@ -70,6 +72,35 @@ data class DSHTranscriptBlock(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .joinToString("\n\n")
+}
+
+data class DSHTaskTimeline(
+    val promptID: String?,
+    val startedAt: Long?,
+    val messages: List<DSHChatMessage>,
+    val tools: List<DSHToolActivity>,
+) {
+    val reasoning: String
+        get() = messages.mapNotNull { it.reasoning }.filter { it.isNotBlank() }.joinToString("\n\n")
+
+    /** Returns seconds and whether it was estimated from output speed. */
+    fun duration(now: Long? = null): Pair<Int, Boolean>? {
+        val end = now ?: messages.mapNotNull { it.taskCompletedAt }.maxOrNull()
+            ?: messages.mapNotNull { it.completedAt }.maxOrNull()
+        if (startedAt != null && startedAt > 0 && end != null && end >= startedAt) {
+            return (((end - startedAt) / 1_000L).toInt()) to false
+        }
+        val estimates = messages.mapNotNull { message ->
+            val speed = message.usage?.tokensPerSecond
+            val tokens = message.usage?.outputTokens
+            if (speed != null && speed.isFinite() && speed > 0 &&
+                tokens != null && tokens.isFinite() && tokens > 0) tokens / speed else null
+        }
+        if (estimates.isEmpty()) return null
+        val total = estimates.sum()
+        if (!total.isFinite()) return null
+        return kotlin.math.max(1, kotlin.math.round(total).toInt()) to true
+    }
 }
 
 /**
@@ -137,4 +168,48 @@ fun List<DSHChatMessage>.transcriptEntries(
     }
     flushRun()
     return entries
+}
+
+/** Adds one total timeline to the first visible assistant block of each task. */
+fun List<DSHTranscriptEntry>.withTaskTimelines(): List<DSHTranscriptEntry> {
+    val result = toMutableList()
+    var prompt: DSHChatMessage? = null
+    var assistantIndices = mutableListOf<Int>()
+    var taskTools = mutableListOf<DSHToolActivity>()
+
+    fun flush() {
+        if (assistantIndices.isEmpty()) {
+            taskTools.clear()
+            return
+        }
+        val blocks = assistantIndices.mapNotNull { (result[it] as? DSHTranscriptEntry.Turn)?.block }
+        val messages = blocks.flatMap { it.messages }
+        val headerIndex = assistantIndices.firstOrNull {
+            (result[it] as? DSHTranscriptEntry.Turn)?.block?.visibleMessages?.isNotEmpty() == true
+        } ?: assistantIndices.first()
+        val entry = result[headerIndex] as DSHTranscriptEntry.Turn
+        result[headerIndex] = DSHTranscriptEntry.Turn(entry.block.copy(
+            taskTimeline = DSHTaskTimeline(
+                promptID = prompt?.id,
+                startedAt = prompt?.timestamp ?: messages.firstOrNull()?.timestamp,
+                messages = messages,
+                tools = taskTools.toList(),
+            ),
+        ))
+        assistantIndices = mutableListOf()
+        taskTools = mutableListOf()
+    }
+
+    result.indices.forEach { index ->
+        when (val entry = result[index]) {
+            is DSHTranscriptEntry.Turn -> if (entry.block.isUserTurn) {
+                flush()
+                prompt = entry.block.messages.firstOrNull()
+            } else assistantIndices += index
+            is DSHTranscriptEntry.Tool -> taskTools += entry.tool
+            else -> Unit
+        }
+    }
+    flush()
+    return result
 }

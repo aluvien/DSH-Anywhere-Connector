@@ -35,6 +35,7 @@ import com.dshanywhere.core.protocol.DSHTranscriptEntry
 import com.dshanywhere.core.protocol.DSHUploadedAttachment
 import com.dshanywhere.core.protocol.epochMillisNow
 import com.dshanywhere.core.protocol.transcriptEntries
+import com.dshanywhere.core.protocol.withTaskTimelines
 import com.dshanywhere.core.store.DSHEventReducer
 import com.dshanywhere.core.store.DSHProfileStore
 import com.dshanywhere.core.store.DSHSessionGroup
@@ -118,8 +119,6 @@ class DSHAppModel(
     /** Conversation presentation choices. Local UI preferences only. */
     @set:JvmName("putShowUsageFooter")
     var showUsageFooter by mutableStateOf(prefs.getBoolean(KEY_USAGE_FOOTER, true))
-    @set:JvmName("putShowTurnUsage")
-    var showTurnUsage by mutableStateOf(prefs.getBoolean(KEY_TURN_USAGE, false))
     @set:JvmName("putCollapseComposerControls")
     var collapseComposerControls by mutableStateOf(prefs.getBoolean(KEY_COMPOSER_COLLAPSED, true))
 
@@ -178,6 +177,7 @@ class DSHAppModel(
     /** The `session.create` request whose reply should open a session, if any. */
     private var awaitingCreatedSession: String? = null
     private var pendingInitialMessagesByRequestID = mutableMapOf<String, PendingInitialMessage>()
+    private val lastOpenSessionAt = mutableMapOf<String, Long>()
 
     private class PendingInitialMessage(val text: String, val attachments: List<DSHStagedAttachment>)
 
@@ -195,9 +195,12 @@ class DSHAppModel(
     val sessions: List<DSHSessionSummary> get() = state.sessions
     val hasLoadedSessions: Boolean get() = state.hasLoadedSessions
     val modelCatalog: DSHModelCatalog? get() = state.modelCatalog
+    val modeCatalog get() = state.modeCatalog
+    val directoryListing get() = state.directoryListing
     val pendingApprovals: List<DSHApprovalRequest> get() = state.pendingApprovals
     val pendingQuestions: List<DSHQuestionRequest> get() = state.pendingQuestions
     val connectionState: DSHConnectionState get() = state.connectionState
+    val isPreparingInitialConnection: Boolean get() = state.isAwaitingInitialSessions
 
     val deviceStatus: DSHDeviceStatus
         get() {
@@ -269,6 +272,7 @@ class DSHAppModel(
                 commandResults = commandResultsFor(sessionID),
                 modelChanges = modelChangesFor(sessionID),
             )
+            .withTaskTimelines()
 
     /** Hides one message on this device; does not mutate the Mac's history. */
     fun hideMessage(messageID: String, sessionID: String) {
@@ -523,10 +527,11 @@ class DSHAppModel(
      * immediately after a rename while the authoritative snapshot is in flight.
      */
     val workspaces: List<DSHWorkspaceOption>
-        get() = sessions.workspaceOptions().map { workspace ->
+        get() = (state.workspaceCatalog.ifEmpty { sessions.workspaceOptions() }).map { workspace ->
             DSHWorkspaceOption(
                 id = workspace.id,
-                name = workspaceAliases[workspace.id] ?: workspace.name,
+                name = workspaceAliases[workspace.id] ?: workspace.resolvedName,
+                path = workspace.path,
             )
         }
 
@@ -619,6 +624,42 @@ class DSHAppModel(
     fun refreshSessions(includeArchived: Boolean? = null) {
         val include = includeArchived ?: showArchivedSessions
         send(DSHCommand.listSessions(deviceId = deviceID, machineId = machineID, includeArchived = include))
+        send(DSHCommand.workspaceCatalog(deviceID, machineID))
+        send(DSHCommand.modeCatalog(deviceID, machineID))
+    }
+
+    fun listDirectories(path: String? = null) {
+        send(DSHCommand.directoryList(deviceID, machineID, path))
+    }
+
+    fun createWorkspace(path: String, title: String? = null) {
+        if (path.isBlank()) return
+        send(DSHCommand.createWorkspace(deviceID, machineID, path, title))
+    }
+
+    /** Session snapshots contain metadata only; opening fetches durable remote history. */
+    fun openSession(sessionID: String) {
+        val now = epochMillisNow()
+        if (now - (lastOpenSessionAt[sessionID] ?: 0L) < 2_000L) return
+        lastOpenSessionAt[sessionID] = now
+        send(DSHCommand.openSession(
+            deviceId = deviceID,
+            machineId = machineID,
+            sessionId = sessionID,
+            streaming = true,
+        ))
+    }
+
+    fun renameSession(sessionID: String, title: String) {
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) return
+        val index = state.sessions.indexOfFirst { it.id == sessionID }
+        if (index >= 0) {
+            val values = state.sessions.toMutableList()
+            values[index] = values[index].copy(title = trimmed)
+            state = state.copy(sessions = values)
+        }
+        send(DSHCommand.renameSession(deviceID, machineID, sessionID, trimmed))
     }
 
     fun sendModelCatalog() {
@@ -649,11 +690,6 @@ class DSHAppModel(
     fun setShowUsageFooter(value: Boolean) {
         showUsageFooter = value
         prefs.edit().putBoolean(KEY_USAGE_FOOTER, value).apply()
-    }
-
-    fun setShowTurnUsage(value: Boolean) {
-        showTurnUsage = value
-        prefs.edit().putBoolean(KEY_TURN_USAGE, value).apply()
     }
 
     fun setCollapseComposerControls(value: Boolean) {
@@ -1119,7 +1155,6 @@ class DSHAppModel(
         const val KEY_LANGUAGE = "dsh-anywhere.language"
         const val KEY_COLLAPSED_GROUPS = "dsh-anywhere.collapsed-groups"
         const val KEY_USAGE_FOOTER = "dsh-anywhere.show-session-usage"
-        const val KEY_TURN_USAGE = "dsh-anywhere.show-turn-usage"
         const val KEY_COMPOSER_COLLAPSED = "dsh-anywhere.collapse-composer-controls"
         const val KEY_WORKSPACE_ALIASES = "dsh-anywhere.workspace-aliases"
         const val KEY_HIDDEN_WORKSPACES = "dsh-anywhere.hidden-workspaces"

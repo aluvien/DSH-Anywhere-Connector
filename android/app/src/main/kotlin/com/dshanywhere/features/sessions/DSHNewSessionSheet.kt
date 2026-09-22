@@ -191,6 +191,15 @@ internal fun DSHNewSessionSheet(initialWorkspaceID: String?, onDismiss: () -> Un
         }
     }
 
+    LaunchedEffect(model.modeCatalog) {
+        val catalog = model.modeCatalog ?: return@LaunchedEffect
+        if (catalog.modes.none { it.id == sessionMode }) {
+            sessionMode = catalog.defaultMode
+                ?: catalog.modes.firstOrNull()?.id
+                ?: sessionMode
+        }
+    }
+
     // Swift: `displayedWorkingDirectory`
     val displayedWorkingDirectory: String = {
         val path = workingDirectory.trim()
@@ -224,11 +233,13 @@ internal fun DSHNewSessionSheet(initialWorkspaceID: String?, onDismiss: () -> Un
         }
     }()
 
-    val sessionModeLabel: String = when (sessionMode) {
-        "ptc" -> "PTC 模式"
-        "custom" -> "自建模式"
-        else -> "标准模式"
-    }
+    val sessionModeLabel: String = model.modeCatalog?.modes
+        ?.firstOrNull { it.id == sessionMode }?.name
+        ?: when (sessionMode) {
+            "ptc" -> "PTC 模式"
+            "custom" -> "自建模式"
+            else -> "标准模式"
+        }
 
     // Swift: `selectedModelReasoning` / `effectiveReasoningEffort`
     val selectedModelReasoning: DSHModelReasoning? = model.modelCatalog?.let { catalog ->
@@ -335,7 +346,7 @@ internal fun DSHNewSessionSheet(initialWorkspaceID: String?, onDismiss: () -> Un
                         selectWorkspace(it)
                     }
                     BranchSelector(branch, branchOptions) { branch = it }
-                    ModeSelector(sessionMode, sessionModeLabel) { sessionMode = it }
+                    ModeSelector(model, sessionMode, sessionModeLabel) { sessionMode = it }
                 }
 
                 if (initialAttachments.isNotEmpty()) {
@@ -587,7 +598,12 @@ private fun BranchSelector(branch: String, branchOptions: List<String>, onSelect
 }
 
 @Composable
-private fun ModeSelector(sessionMode: String, sessionModeLabel: String, onSelect: (String) -> Unit) {
+private fun ModeSelector(
+    model: DSHAppModel,
+    sessionMode: String,
+    sessionModeLabel: String,
+    onSelect: (String) -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
     DSHSessionsSelectorRow(
         icon = Icons.Filled.Memory, // cpu
@@ -596,25 +612,24 @@ private fun ModeSelector(sessionMode: String, sessionModeLabel: String, onSelect
         onOpenMenu = { expanded = true },
         onDismissMenu = { expanded = false },
     ) {
-        // Swift modeButton(_ mode:title:icon:)
-        DSHMenuRow(
-            icon = Icons.Filled.AutoAwesome, // sparkles
-            checkmark = sessionMode == "standard",
-            text = "标准模式",
-            onClick = { expanded = false; onSelect("standard") },
+        val remoteModes = model.modeCatalog?.modes.orEmpty()
+        val modes = if (remoteModes.isNotEmpty()) remoteModes.map { it.id to it.name } else listOf(
+            "standard" to "标准模式",
+            "ptc" to "PTC 模式",
+            "custom" to "自建模式",
         )
-        DSHMenuRow(
-            icon = Icons.Filled.Assignment, // list.clipboard
-            checkmark = sessionMode == "ptc",
-            text = "PTC 模式",
-            onClick = { expanded = false; onSelect("ptc") },
-        )
-        DSHMenuRow(
-            icon = Icons.Filled.Tune, // slider.horizontal.3
-            checkmark = sessionMode == "custom",
-            text = "自建模式",
-            onClick = { expanded = false; onSelect("custom") },
-        )
+        modes.forEachIndexed { index, option ->
+            DSHMenuRow(
+                icon = when (index) {
+                    0 -> Icons.Filled.AutoAwesome
+                    1 -> Icons.Filled.Assignment
+                    else -> Icons.Filled.Tune
+                },
+                checkmark = sessionMode == option.first,
+                text = option.second,
+                onClick = { expanded = false; onSelect(option.first) },
+            )
+        }
     }
 }
 

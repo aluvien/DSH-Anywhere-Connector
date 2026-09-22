@@ -30,9 +30,13 @@ cd android
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-流程与 iOS 相同：Mac 上跑 Connector → 手机扫 pairing code（或手输 relay 地址 /
+流程与 iOS 相同：电脑上跑 Connector → 手机扫 pairing code（或手输 relay 地址 /
 machine ID / 8 位码或 43 位 secret）→ 连接。relay 必须 HTTPS（本机联调允许 HTTP
 localhost）。
+
+当前 Android 预览版已使用 iOS Remote 风格：远程设备状态工具栏、搜索与聊天底栏、同规格
+会话编辑器、远端历史恢复、任务级总用时、会话重命名、归档分类、远端工作区目录选择以及
+由电脑提供的模式列表。会话与项目数据以远端为准，本地状态只用于界面加速与离线恢复。
 
 ## 本地端到端测试床
 
@@ -53,7 +57,8 @@ localhost）。
 | 字段 | 含义 |
 |---|---|
 | `transportState` | 手机 ↔ relay 的 socket 状态 |
-| `machineOnline` | relay 上报的 Mac Connector 在线状态 |
+| `machineOnline` | relay 上报的电脑 Connector 在线状态 |
+| `confirmedMachinePresence` | 当前 Relay 连接是否已返回权威设备在线状态 |
 | `bridgeReachable` | `null` 未知 / `true` Harness 已应答 / `false` bridge 请求失败 |
 
 派生出的 `DSHDeviceStatus`（Offline / Error / Online / ApprovalRequired）驱动首页状态点、

@@ -11,9 +11,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -37,6 +41,9 @@ import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.LaptopMac
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -45,6 +52,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,6 +64,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -99,6 +108,7 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
     // argument; MainActivity's `--es dsh-preview …` fixtures do not include
     // that flag, so the port starts closed.
     var showNewSession by remember { mutableStateOf(false) }
+    var showNewProject by remember { mutableStateOf(false) }
     var newSessionWorkspaceID by remember { mutableStateOf<String?>(null) }
     var showRenameWorkspace by remember { mutableStateOf(false) }
     var renameWorkspaceID by remember { mutableStateOf("") }
@@ -107,6 +117,8 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
     var showDeleteWorkspaceConfirmation by remember { mutableStateOf(false) }
     // Dedup guard equivalent to Swift `if navigationPath.last != sessionID`.
     var lastOpenedSessionID by remember { mutableStateOf<String?>(null) }
+    var searchText by remember { mutableStateOf("") }
+    var isSearching by remember { mutableStateOf(false) }
 
     // .onChange(of: model.selectedSessionID) — programmatic navigation
     // (fires after `session.created` resolves on the model).
@@ -160,6 +172,12 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
             }
             group.copy(title = title)
         }
+        .mapNotNull { group ->
+            if (searchText.isBlank()) group else group.copy(sessions = group.sessions.filter {
+                it.title.contains(searchText, ignoreCase = true) ||
+                    it.workspaceName.orEmpty().contains(searchText, ignoreCase = true)
+            }).takeIf { it.sessions.isNotEmpty() }
+        }
 
     /// Happy's phone home is a single activity-sorted chat column. Grouping
     /// remains available from the filter menu, but the flat view is the
@@ -171,21 +189,31 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
             val workspaceID = session.workspaceId
             workspaceID == null || !model.hiddenWorkspaceIDs.contains(workspaceID)
         }
+        .filter { searchText.isBlank() ||
+            it.title.contains(searchText, ignoreCase = true) ||
+            it.workspaceName.orEmpty().contains(searchText, ignoreCase = true) }
 
     val hasVisibleSessions =
         if (model.groupsSessionsByWorkspace) groups.isNotEmpty() else flatSessions.isNotEmpty()
     val hasArchivedSessions = model.sessions.any { it.archived == true }
+    val activeFlatSessions = flatSessions.filter { it.archived != true }
+    val archivedFlatSessions = flatSessions.filter { it.archived == true }
 
     Column(
         Modifier
             .fillMaxSize()
-            .background(DSHColors.systemBackground()),
+            .background(DSHColors.systemBackground())
+            .imePadding(),
     ) {
-        HappyHeader(
+        RemoteHeader(
             model = model,
             didRefresh = didRefresh,
             onNewSession = { openNewSession() },
             onNewSessionIn = { openNewSession(it) },
+            onNewProject = {
+                showNewProject = true
+                model.listDirectories()
+            },
             onRefresh = { refreshSessions() },
             onShowSettings = { showSettings = true },
         )
@@ -216,20 +244,15 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
                             },
                         )
                     }
-                    if (hasArchivedSessions && !model.showArchivedSessions && groups.isNotEmpty()) {
-                        item(key = "archived-more") {
-                            ArchivedSessionsButton(onShow = { model.setShowArchived(true) })
-                        }
-                    }
                 } else {
-                    itemsIndexed(flatSessions, key = { _, session -> "s-${session.id}" }) { index, session ->
+                    itemsIndexed(activeFlatSessions, key = { _, session -> "s-${session.id}" }) { index, session ->
                         Column {
                             SessionRow(
                                 session = session,
                                 showWorkspaceName = true,
                                 openSession = { openSession(session.id) },
                             )
-                            if (index < flatSessions.lastIndex) {
+                            if (index < activeFlatSessions.lastIndex) {
                                 // Divider().padding(.leading, 48).opacity(0.52)
                                 HorizontalDivider(
                                     modifier = Modifier.padding(start = 48.dp),
@@ -239,12 +262,31 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
                             }
                         }
                     }
-                    if (hasArchivedSessions) {
-                        item(key = "archived-toggle") {
-                            FlatShowHideArchivedButton(
-                                showArchived = model.showArchivedSessions,
-                                onToggle = { model.setShowArchived(!model.showArchivedSessions) },
+                    if (model.showArchivedSessions && archivedFlatSessions.isNotEmpty()) {
+                        item(key = "archived-heading") {
+                            Text(
+                                DSHLocalization.string("Archived"),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = dshSecondary(),
+                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 14.dp),
                             )
+                        }
+                        itemsIndexed(archivedFlatSessions, key = { _, session -> "archived-${session.id}" }) { index, session ->
+                            Column {
+                                SessionRow(
+                                    session = session,
+                                    showWorkspaceName = true,
+                                    openSession = { openSession(session.id) },
+                                )
+                                if (index < archivedFlatSessions.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(start = 48.dp),
+                                        thickness = 0.7.dp,
+                                        color = DSHColors.separator().copy(alpha = 0.52f),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -263,7 +305,16 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
             }
         }
 
-        HomeDock(onNewSession = { openNewSession() })
+        HomeDock(
+            searchText = searchText,
+            isSearching = isSearching,
+            onSearchTextChange = { searchText = it },
+            onSearchingChange = {
+                isSearching = it
+                if (!it) searchText = ""
+            },
+            onNewSession = { openNewSession() },
+        )
     }
 
     // .sheet(isPresented: $showSettings) { SettingsView()… } — spec: presented
@@ -294,6 +345,17 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
                 onDismiss = { showNewSession = false },
             )
         }
+    }
+
+    if (showNewProject) {
+        RemoteDirectoryPickerDialog(
+            model = model,
+            onDismiss = { showNewProject = false },
+            onSelect = { path ->
+                model.createWorkspace(path)
+                showNewProject = false
+            },
+        )
     }
 
     // .alert("重命名项目", …) — hard-coded Chinese strings kept verbatim.
@@ -359,6 +421,115 @@ fun SessionListScreen(onOpenSession: (String) -> Unit) {
 // ---------------------------------------------------------------------------
 // happyHeader
 // ---------------------------------------------------------------------------
+
+/** Remote-style home toolbar shared with the iOS client. */
+@Composable
+private fun RemoteHeader(
+    model: DSHAppModel,
+    didRefresh: Boolean,
+    onNewSession: () -> Unit,
+    onNewSessionIn: (DSHWorkspaceOption) -> Unit,
+    onNewProject: () -> Unit,
+    onRefresh: () -> Unit,
+    onShowSettings: () -> Unit,
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+    val deviceName = model.machineName.trim().ifEmpty { "Mac" }
+    val statusColor = deviceStatusColor(model)
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .background(DSHColors.systemBackground().copy(alpha = 0.82f))
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+    ) {
+        Column(
+            Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            Text(
+                DSHLocalization.string("Remote"),
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = dshPrimary(),
+            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Box(Modifier.size(6.dp).clip(CircleShape).background(statusColor))
+                DSHLocalIcon(Icons.Filled.LaptopMac, null, 12, tint = dshSecondary())
+                Text(deviceName, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = dshSecondary())
+            }
+        }
+
+        Box(
+            Modifier
+                .align(Alignment.CenterStart)
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(DSHColors.thinMaterial())
+                .border(0.75.dp, dshPrimary().copy(alpha = 0.14f), CircleShape)
+                .clickableRow(onRefresh),
+            contentAlignment = Alignment.Center,
+        ) {
+            DSHLocalIcon(if (didRefresh) Icons.Filled.Check else Icons.Filled.Refresh,
+                DSHLocalization.string("Refresh"), 20)
+        }
+
+        Row(
+            Modifier
+                .align(Alignment.CenterEnd)
+                .size(width = 88.dp, height = 44.dp)
+                .clip(CircleShape)
+                .background(DSHColors.thinMaterial())
+                .border(0.75.dp, dshPrimary().copy(alpha = 0.14f), CircleShape),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(44.dp).clickableRow(onNewSession), contentAlignment = Alignment.Center) {
+                DSHLocalIcon(Icons.Filled.Edit, DSHLocalization.string("New session"), 19)
+            }
+            Box {
+                Box(Modifier.size(44.dp).clickableRow { menuExpanded = true }, contentAlignment = Alignment.Center) {
+                    DSHLocalIcon(Icons.Filled.MoreHoriz, DSHLocalization.string("More actions"), 20)
+                }
+                DSHDropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                    width = 260.dp,
+                    offsetX = -180,
+                ) {
+                    DSHMenuRow(Icons.Filled.Add, DSHLocalization.string("New session"), onClick = {
+                        menuExpanded = false; onNewSession()
+                    })
+                    DSHMenuRow(Icons.Filled.Folder, DSHLocalization.string("New project"), onClick = {
+                        menuExpanded = false; onNewProject()
+                    })
+                    model.workspaces.take(5).forEach { workspace ->
+                        DSHMenuRow(Icons.Filled.Folder, workspace.name, onClick = {
+                            menuExpanded = false; onNewSessionIn(workspace)
+                        })
+                    }
+                    DSHMenuDivider()
+                    DSHMenuToggleRow(
+                        Icons.Filled.Archive,
+                        DSHLocalization.string("Show archived"),
+                        model.showArchivedSessions,
+                    ) { model.setShowArchived(it) }
+                    DSHMenuToggleRow(
+                        Icons.Filled.GridView,
+                        DSHLocalization.string("Group by workspace"),
+                        model.groupsSessionsByWorkspace,
+                    ) { model.setGroupsSessionsByWorkspace(it) }
+                    DSHMenuRow(Icons.Filled.Refresh, DSHLocalization.string("Refresh"), onClick = {
+                        menuExpanded = false; onRefresh()
+                    })
+                    DSHMenuRow(Icons.Filled.Settings, DSHLocalization.string("Settings"), onClick = {
+                        menuExpanded = false; onShowSettings()
+                    })
+                }
+            }
+        }
+    }
+}
 
 /// Happy's navigation bar: a 44pt workspace button, a centred title, and an
 /// 88pt filter/settings capsule. The line below the title is deliberately
@@ -950,72 +1121,141 @@ private fun EmptyStateIcon(reachable: Boolean) {
     }
 }
 
+/** Folder browser backed entirely by the paired computer's directory catalog. */
+@Composable
+private fun RemoteDirectoryPickerDialog(
+    model: DSHAppModel,
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit,
+) {
+    val listing = model.directoryListing
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(DSHLocalization.string("New project"), color = dshPrimary()) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    listing?.path ?: DSHLocalization.string("Loading folders…"),
+                    fontSize = 13.sp,
+                    color = dshSecondary(),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
+                    listing?.parentPath?.let { parent ->
+                        item(key = "directory-parent") {
+                            Row(
+                                Modifier.fillMaxWidth().clickableRow { model.listDirectories(parent) }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                DSHLocalIcon(Icons.Filled.KeyboardArrowUp, null, 18, tint = dshSecondary())
+                                Text("..", color = dshPrimary())
+                            }
+                        }
+                    }
+                    items(
+                        listing?.directories.orEmpty().filterNot { it.name.startsWith(".") },
+                        key = { it.path },
+                    ) { directory ->
+                        Row(
+                            Modifier.fillMaxWidth().clickableRow { model.listDirectories(directory.path) }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            DSHLocalIcon(Icons.Filled.Folder, null, 19, tint = dshSecondary())
+                            Text(directory.name, color = dshPrimary(), maxLines = 1,
+                                overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !listing?.path.isNullOrBlank(),
+                onClick = { listing?.path?.let(onSelect) },
+            ) { Text(DSHLocalization.string("Select folder")) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(DSHLocalization.string("Cancel")) }
+        },
+        containerColor = DSHColors.systemBackground(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // homeDock
 // ---------------------------------------------------------------------------
 
-/// A compact, always-visible entry point is the part of Happy's home screen
-/// that makes starting work feel immediate. It deliberately opens the native
-/// New Session sheet on tap, so the first prompt never bypasses the
-/// device/workspace/branch/model choices.
 @Composable
-private fun HomeDock(onNewSession: () -> Unit) {
-    Column(
+private fun HomeDock(
+    searchText: String,
+    isSearching: Boolean,
+    onSearchTextChange: (String) -> Unit,
+    onSearchingChange: (Boolean) -> Unit,
+    onNewSession: () -> Unit,
+) {
+    Row(
         Modifier
             .fillMaxWidth()
-            .background(DSHColors.systemBackground().copy(alpha = 0.92f))
+            .background(DSHColors.systemBackground().copy(alpha = 0.82f))
             .padding(horizontal = 16.dp)
-            .padding(top = 8.dp, bottom = 8.dp),
+            .padding(top = 8.dp, bottom = 8.dp)
+            .navigationBarsPadding(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        TextField(
+            value = searchText,
+            onValueChange = {
+                onSearchingChange(true)
+                onSearchTextChange(it)
+            },
+            modifier = Modifier
+                .weight(1f)
+                .height(52.dp)
+                .onFocusChanged { if (it.isFocused) onSearchingChange(true) }
+                .clip(CircleShape)
+                .border(0.75.dp, dshPrimary().copy(alpha = 0.12f), CircleShape),
+            placeholder = { Text(DSHLocalization.string("Search chats"), color = dshSecondary()) },
+            leadingIcon = { DSHLocalIcon(Icons.Filled.Search, null, 21, tint = dshSecondary()) },
+            singleLine = true,
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = DSHColors.thinMaterial(),
+                unfocusedContainerColor = DSHColors.thinMaterial(),
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+            ),
+        )
         Box(
             Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(28.dp))
-                .background(dshMaterial())
-                .border(0.75.dp, dshPrimary().copy(alpha = 0.08f), RoundedCornerShape(28.dp))
-                .clickableRow(onNewSession)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .height(52.dp)
+                .clip(CircleShape)
+                .background(if (isSearching) DSHColors.thinMaterial() else DSHColors.systemBlue())
+                .border(0.75.dp, dshPrimary().copy(alpha = 0.10f), CircleShape)
+                .clickableRow { if (isSearching) onSearchingChange(false) else onNewSession() }
+                .padding(horizontal = if (isSearching) 15.dp else 18.dp),
+            contentAlignment = Alignment.Center,
         ) {
             Row(
-                Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Box(
-                    Modifier.size(44.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    DSHLocalIcon(Icons.Filled.Add, null, 22) // plus
-                }
-                // Divider().frame(height: 24).overlay(primary@16) + h 9 padding
-                Box(Modifier.padding(horizontal = 9.dp)) {
-                    Box(
-                        Modifier
-                            .width(0.7.dp)
-                            .height(24.dp)
-                            .background(dshPrimary().copy(alpha = 0.16f)),
-                    )
-                }
-                Text(
-                    DSHLocalization.string("Plan, ask, build…"),
-                    fontSize = 17.sp,
-                    color = dshSecondary(),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                DSHLocalIcon(
+                    if (isSearching) Icons.Filled.Close else Icons.Filled.Edit,
+                    null,
+                    if (isSearching) 24 else 18,
+                    tint = if (isSearching) dshPrimary() else Color.White,
                 )
-                Spacer(Modifier.weight(1f))
-                Box(
-                    Modifier
-                        .padding(start = 8.dp) // Spacer(minLength: 8)
-                        .size(44.dp)
-                        .clip(CircleShape)
-                        .background(DSHColors.tertiarySystemBackground()),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    DSHLocalIcon(
-                        Icons.Filled.ArrowUpward, // arrow.up
-                        DSHLocalization.string("New session"),
-                        17,
-                        tint = dshSecondary(),
+                if (!isSearching) {
+                    Text(
+                        DSHLocalization.string("Chat"),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White,
                     )
                 }
             }

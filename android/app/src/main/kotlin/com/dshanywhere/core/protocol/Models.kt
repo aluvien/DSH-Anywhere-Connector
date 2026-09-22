@@ -128,6 +128,12 @@ data class DSHChatMessage(
     val reasoning: String? = null,
     /** Sequence of the event that produced this message. Client-side only. */
     val sequence: Long? = null,
+    val replacesMessageId: String? = null,
+    /** First arrival time in epoch milliseconds. */
+    val timestamp: Long? = null,
+    /** Live completion times; replay delivery timestamps are not used here. */
+    val completedAt: Long? = null,
+    val taskCompletedAt: Long? = null,
 )
 
 @Serializable
@@ -150,7 +156,18 @@ data class DSHToolActivity(
     val detail: String? = null,
     /** Sequence of the event that produced this call. Client-side only. */
     val sequence: Long? = null,
+    /** Original call arguments, retained when completion replaces detail with output. */
+    val arguments: String? = null,
 )
+
+@Serializable
+data class DSHDiscardedMessage(val messageId: String)
+
+@Serializable
+data class DSHHistoryBatch(val sessionId: String, val batchId: String)
+
+@Serializable
+data class DSHPromptAccepted(val sessionId: String, val requestId: String)
 
 @Serializable
 data class DSHApprovalRequest(
