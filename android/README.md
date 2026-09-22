@@ -1,5 +1,9 @@
 # DSH Anywhere — Android 客户端
 
+> [!IMPORTANT]
+> Android 客户端现已暂停开发，公开预览 APK 已撤回，当前不提供下载或发布支持。本目录保留
+> 现有源码，仅供日后恢复开发使用，不代表当前可用的发行版本。
+
 与 `ios/` 功能、UI 对齐的原生 Android 客户端（Kotlin + Jetpack Compose + OkHttp）。
 独立工程：只共享线上协议（WSS/HTTPS + JSON），**不引用、不修改任何 iOS 代码**。
 

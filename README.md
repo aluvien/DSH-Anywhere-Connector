@@ -2,13 +2,13 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-DSH Anywhere 让你通过 iPhone 或 Android 手机远程使用 macOS、Linux 或 Windows 电脑上运行的
+DSH Anywhere 让你通过 iPhone 远程使用 macOS、Linux 或 Windows 电脑上运行的
 [DeepSeek Harness](https://github.com/deepseek-ai)。电脑主动连接自托管 Relay，不需要公网
 IP、端口映射，也不需要向公网开放 Harness 端口。
 
 > [!IMPORTANT]
-> iOS 17+ 是当前稳定客户端。Android 原生客户端已恢复开发并进入功能对齐预览阶段，适合
-> 本地构建与受控测试；正式发布前仍需完成独立安全审计与真机兼容验收。
+> iOS 17+ 是当前稳定客户端。Android 客户端的开发和公开下载现已暂停，之前发布的预览 APK
+> 已撤回。仓库暂时保留 Android 源码，以便日后恢复开发；当前请勿将其视为可用发行版。
 
 ## 支持状态
 
@@ -19,7 +19,7 @@ IP、端口映射，也不需要向公网开放 Harness 端口。
 | Linux Connector / Bridge | 主线开发 | x64/arm64，systemd 用户服务 |
 | Windows Connector / Bridge | 主线开发 | Windows 10/11，当前用户启动项 |
 | Relay | 主线开发 | 自托管的鉴权和消息转发服务 |
-| Android App | 主线开发预览 | Kotlin + Jetpack Compose，正在与 iOS 对齐 |
+| Android App | 暂停 | 保留源码，暂无公开 APK 下载或发布支持 |
 
 项目目前适合个人使用和受控测试。账号体系、组织权限、公共多租户隔离、端到端加密和大规模
 运维能力仍未完成。
@@ -35,7 +35,7 @@ IP、端口映射，也不需要向公网开放 Harness 端口。
 
 | 组件 | 运行位置 | 职责 |
 |---|---|---|
-| iOS / Android App | 手机 | 浏览会话、发送消息和附件、处理提问与审批 |
+| iOS App | 手机 | 浏览会话、发送消息和附件、处理提问与审批 |
 | Relay | 自托管服务器 | 注册机器、配对设备、验证凭据并转发消息 |
 | Connector | macOS / Linux / Windows | 主动连接 Relay，转发请求和实时事件 |
 | Bridge | macOS / Linux / Windows | 将本机 Harness 能力提供给 Connector |
@@ -87,7 +87,7 @@ irm https://dsh.biaozhu.me/install-windows | iex
 
 ## 配对手机
 
-一键安装完成后，使用 iOS 或 Android App 扫描终端或浏览器中的二维码。配对码十分钟内有效，只能使用
+一键安装完成后，使用 iOS App 扫描终端或浏览器中的二维码。配对码十分钟内有效，只能使用
 一次。以后需要配对其他手机时，再次执行当前系统的一键安装命令即可；安装器会保留原有
 机器身份，并生成新的二维码。
 
@@ -150,16 +150,10 @@ open ios/DSHAnywhere.xcodeproj
 在 Xcode 中选择自己的 Apple Developer Team 后安装到 iPhone。扫码需要真机；模拟器可以
 使用手工配对。
 
-## 构建 Android App
+## Android 状态
 
-```sh
-cd android
-./build.sh :app:testDebugUnitTest :app:assembleDebug
-```
-
-调试 APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`。Android 版使用与 iOS
-相同的 Relay、配对凭据和远端会话协议，界面与交互以当前 Remote 风格为准。详细的模拟器、
-本地测试床和安装说明见 [`android/README.md`](android/README.md)。
+Android 客户端现已暂停开发，公开预览 APK 已撤回，当前不提供下载或发布支持。现有源码仍保留在
+[`android/`](android/) 中，仅供后续恢复开发时使用。
 
 ## 当前能力
 
@@ -233,7 +227,7 @@ packages/
   connector/            跨平台出站连接、命令转发和 CLI
   dsh-anywhere-plugin/  Harness Bridge、会话 API、事件和本机配对页
 ios/DSHAnywhere/        稳定的 iOS 客户端
-android/                正在与 iOS 对齐的原生 Android 客户端
+android/                已暂停开发并保留源码的原生 Android 客户端
 deploy/relay/           Docker Compose、Dockerfile 和 Nginx 配置
 scripts/                各平台安装器、后台服务和发布辅助脚本
 ```
@@ -252,4 +246,4 @@ scripts/                各平台安装器、后台服务和发布辅助脚本
 - 账号、组织、权限分层和公共多租户隔离尚未完成。
 - Linux 需要 systemd；Windows 后台进程在当前用户登录后启动。
 - `dshanywhere://` 尚未作为通用系统深链路开放。
-- Android 尚未完成独立安全与隐私审计，当前仅用于开发和受控测试。
+- Android 开发与分发现已暂停；保留的源码尚未完成独立安全与隐私审计。

@@ -3,14 +3,15 @@
 [简体中文](README.md) | [English](README.en.md)
 
 DSH Anywhere lets you remotely use [DeepSeek Harness](https://github.com/deepseek-ai)
-running on a macOS, Linux, or Windows computer from an iPhone or Android phone. The computer
+running on a macOS, Linux, or Windows computer from an iPhone. The computer
 connects outward to a self-hosted Relay, so it does not need a public IP, port
 forwarding, or a publicly exposed Harness port.
 
 > [!IMPORTANT]
-> iOS 17+ is the current stable client. Native Android development has resumed
-> as a feature-parity preview for local builds and controlled testing. It still
-> requires an independent security review and device compatibility pass before release.
+> iOS 17+ is the current stable client. Android development and public downloads
+> are temporarily paused, and the previously published preview APK has been withdrawn.
+> The Android source remains in the repository for possible future development; it
+> should not currently be treated as an available release.
 
 ## Support status
 
@@ -21,7 +22,7 @@ forwarding, or a publicly exposed Harness port.
 | Linux Connector / Bridge | Active development | x64/arm64, systemd user services |
 | Windows Connector / Bridge | Active development | Windows 10/11, current-user startup |
 | Relay | Active development | Self-hosted authentication and message routing |
-| Android app | Active preview | Kotlin + Jetpack Compose, aligning with iOS |
+| Android app | Paused | Source retained; no public APK download or release support |
 
 The project is currently intended for personal use and controlled testing.
 Accounts, organization-level permissions, public multi-tenant isolation,
@@ -38,7 +39,7 @@ Phone ─── HTTPS/WSS ──▶ Relay (your server) ◀── outbound WSS �
 
 | Component | Runs on | Responsibility |
 |---|---|---|
-| iOS / Android app | Phone | Browse sessions, send messages and attachments, answer questions, and handle approvals |
+| iOS app | Phone | Browse sessions, send messages and attachments, answer questions, and handle approvals |
 | Relay | Self-hosted server | Register machines, pair devices, authenticate credentials, and route messages |
 | Connector | macOS / Linux / Windows | Connect outward to Relay and forward requests and live events |
 | Bridge | macOS / Linux / Windows | Expose local Harness capabilities to Connector |
@@ -95,7 +96,7 @@ administrator bootstrap token is never sent to user computers.
 ## Pair a phone
 
 After installation, scan the QR code shown in the terminal or browser with the
-iOS or Android app. Its pairing code expires after ten minutes and can be used only once.
+iOS app. Its pairing code expires after ten minutes and can be used only once.
 To pair another phone later, run the one-command installer for that operating
 system again. It preserves the existing machine identity and issues a new QR code.
 
@@ -163,6 +164,12 @@ open ios/DSHAnywhere.xcodeproj
 Select your Apple Developer Team in Xcode and install the app on an iPhone. QR
 scanning requires a physical device; the simulator can use manual pairing.
 
+## Android status
+
+Android client development is paused. The public preview APK has been withdrawn,
+and no Android download or release support is currently provided. The existing
+source remains under [`android/`](android/) for possible future development.
+
 ## Current capabilities
 
 - Pair, switch, manage, and revoke multiple computers and phones
@@ -229,17 +236,6 @@ xcodebuild build-for-testing \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-Android build and unit tests:
-
-```sh
-cd android
-./build.sh :app:testDebugUnitTest :app:assembleDebug
-```
-
-The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
-Android uses the same Relay, pairing credentials, and remote session protocol as
-iOS. See [`android/README.md`](android/README.md) for emulator and testbed setup.
-
 ## Repository layout
 
 ```text
@@ -249,7 +245,7 @@ packages/
   connector/            Cross-platform outbound connection, command forwarding, and CLI
   dsh-anywhere-plugin/  Harness Bridge, session API, events, and local pairing page
 ios/DSHAnywhere/        Stable iOS client
-android/                Native Android client aligning with iOS
+android/                Paused native Android client with source retained
 deploy/relay/           Docker Compose, Dockerfile, and Nginx configuration
 scripts/                Platform installers, background services, and release helpers
 ```
@@ -268,7 +264,7 @@ Whenever a routed shared message changes, bump the revision and redeploy Relay.
 - Accounts, organizations, permission tiers, and public multi-tenant isolation are incomplete.
 - Linux requires systemd; Windows background processes start after the current user logs in.
 - `dshanywhere://` is not exposed as a general-purpose system deep link.
-- Android has not completed its independent security and privacy review and is currently limited to development and controlled testing.
+- Android development and distribution are paused; its retained source has not completed an independent security and privacy review.
 
 Before Android development resumes, its product scope and protocol compatibility
 target must be confirmed again. The `android/` tree also needs an independent
