@@ -1292,16 +1292,7 @@ struct DSHRemoteHomeView: View {
     /// restored. Once the machine is known to be offline/failed, switch to the
     /// actionable unreachable state instead of spinning forever.
     private var isLoadingTasks: Bool {
-        guard !model.hasLoadedSessions else { return false }
-        if model.isPreparingInitialConnection { return true }
-        switch model.connectionState {
-        case .connecting, .reconnecting:
-            return true
-        case .connected:
-            return model.deviceStatus != .offline && model.deviceStatus != .error
-        case .disconnected, .failed:
-            return false
-        }
+        model.isPreparingInitialConnection
     }
 
     var body: some View {
@@ -1525,7 +1516,7 @@ struct DSHRemoteHomeView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop(opacity: 0.82))
+        .background(DSHHeaderBackdrop())
         .overlay(alignment: .bottom) {
             if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
         }

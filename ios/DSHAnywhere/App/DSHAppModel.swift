@@ -1784,13 +1784,12 @@ final class DSHAppModel: ObservableObject {
     var pendingQuestions: [DSHQuestionRequest] { state.pendingQuestions }
     var connectionState: DSHConnectionState { state.connectionState }
 
-    /// A paired launch first restores the local transaction journal, then
-    /// starts Relay. During that short handoff the transport still reports
-    /// `disconnected`, but no connection attempt has failed and the Mac has
-    /// not been confirmed offline. Keep Home in its connecting presentation
-    /// instead of flashing the actionable "unreachable" state.
+    /// Covers transaction restoration, Relay handshake, presence discovery,
+    /// and the first Bridge snapshot. Unknown readiness is not an offline
+    /// result; only authoritative absence or failure ends this loading phase.
     var isPreparingInitialConnection: Bool {
-        isPaired && !state.hasLoadedSessions && !pendingTransactionStoreLoaded
+        isPaired && !removedMachineFenceUnavailable && !pendingTransactionPersistenceUnavailable
+            && state.isAwaitingInitialSessions
     }
 
     /// Per-session traffic light, same hues as the header status dot:
@@ -2416,6 +2415,7 @@ final class DSHAppModel: ObservableObject {
         state.connectionState = .connecting
         state.transportState = .connecting
         state.machineOnline = false
+        state.confirmedMachinePresence = nil
         state.bridgeReachable = nil
         eventTask = Task { @MainActor [weak self] in
             guard let self else { return }

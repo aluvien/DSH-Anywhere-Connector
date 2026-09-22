@@ -2,6 +2,48 @@ import XCTest
 @testable import DSHAnywhere
 
 final class DSHEventStoreTests: XCTestCase {
+    func testStartupWaitsForPresenceAndBridgeInsteadOfReportingUnreachable() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func control(_ type: String, _ payload: DSHJSONValue) {
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: UUID().uuidString,
+                deviceId: "phone", machineId: "mac", sequence: 0,
+                type: type, payload: payload)), into: &state)
+        }
+        XCTAssertTrue(state.isAwaitingInitialSessions)
+        control("transport.state", .object(["state": .string("connecting")]))
+        XCTAssertTrue(state.isAwaitingInitialSessions)
+        control("transport.state", .object(["state": .string("connected")]))
+        XCTAssertTrue(state.isAwaitingInitialSessions, "Relay ready is not a Mac offline result")
+        control("machine.presence", .bool(true))
+        XCTAssertNil(state.bridgeReachable)
+        XCTAssertTrue(state.isAwaitingInitialSessions, "Online Mac still needs its Bridge snapshot")
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "snapshot", deviceId: "phone",
+            machineId: "mac", sequence: 1, type: "session.snapshot",
+            payload: .array([]))), into: &state)
+        XCTAssertTrue(state.hasLoadedSessions)
+        XCTAssertFalse(state.isAwaitingInitialSessions)
+    }
+
+    func testConfirmedOfflineAndFailuresRemainVisibleButReconnectClearsOldPresence() {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "offline", deviceId: "phone",
+            machineId: "mac", sequence: 0, type: "machine.presence", payload: .bool(false))), into: &state)
+        XCTAssertFalse(state.isAwaitingInitialSessions)
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "retry", deviceId: "phone",
+            machineId: "mac", sequence: 0, type: "transport.state",
+            payload: .object(["state": .string("reconnecting"), "attempt": .number(1)]))), into: &state)
+        XCTAssertNil(state.confirmedMachinePresence)
+        XCTAssertTrue(state.isAwaitingInitialSessions)
+        state.transportState = .failed("Connection failed")
+        XCTAssertFalse(state.isAwaitingInitialSessions)
+        state.transportState = .connected
+        state.confirmedMachinePresence = true
+        state.bridgeReachable = false
+        XCTAssertFalse(state.isAwaitingInitialSessions)
+    }
+
     @MainActor
     func testPairedLaunchTreatsTransactionRestoreAsConnectionPreparation() {
         let model = DSHAppModel(transport: DSHPreviewTransport(),

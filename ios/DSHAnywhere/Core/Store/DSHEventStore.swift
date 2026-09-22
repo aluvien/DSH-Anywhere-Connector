@@ -37,10 +37,22 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     /// offline Mac look reachable.
     public var transportState: DSHConnectionState = .disconnected
     public var machineOnline: Bool = false
+    /// nil until this Relay connection has supplied authoritative presence.
+    public var confirmedMachinePresence: Bool?
     /// `nil` means the Connector is present but the local Harness bridge has
     /// not answered yet. Existing protocol events prove whether it is usable.
     public var bridgeReachable: Bool?
     public var connectionState: DSHConnectionState = .disconnected
+
+    public var isAwaitingInitialSessions: Bool {
+        guard !hasLoadedSessions else { return false }
+        switch transportState {
+        case .failed: return false
+        case .connecting, .reconnecting: return true
+        case .disconnected, .connected:
+            return confirmedMachinePresence != false && bridgeReachable != false
+        }
+    }
 
     public init() {}
 }
@@ -72,11 +84,13 @@ public struct DSHEventReducer: Sendable {
             state.transportState = value
             if value != .connected {
                 state.machineOnline = false
+                state.confirmedMachinePresence = nil
                 state.bridgeReachable = nil
                 state.connectionState = value
             }
             return true
         case .machinePresence(let online):
+            state.confirmedMachinePresence = online
             if !online || !state.machineOnline { state.bridgeReachable = nil }
             state.machineOnline = online
             state.connectionState = online ? .connected : .disconnected
@@ -107,6 +121,7 @@ public struct DSHEventReducer: Sendable {
         case .connectionReady:
             state.transportState = .connected
             state.machineOnline = true
+            state.confirmedMachinePresence = true
             state.bridgeReachable = true
             state.connectionState = .connected
         case .sessionSnapshot(let sessions):

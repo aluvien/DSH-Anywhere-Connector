@@ -1,11 +1,12 @@
 import SwiftUI
 import UIKit
 
-/// Page-colored translucency without a blur or material tint.
+/// Shared system blur for Home and Conversation, including the status bar.
 struct DSHHeaderBackdrop: View {
-    var opacity = 0.5
     var body: some View {
-        Color(.systemBackground).opacity(opacity)
+        Rectangle()
+            .fill(.regularMaterial)
+            .overlay(Color(.systemBackground).opacity(0.12))
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
     }
