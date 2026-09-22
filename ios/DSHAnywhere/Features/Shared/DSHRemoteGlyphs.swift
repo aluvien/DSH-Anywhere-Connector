@@ -1,14 +1,71 @@
 import SwiftUI
 import UIKit
 
-/// Shared system blur for Home and Conversation, including the status bar.
+/// Light frosting keeps passing text visible as soft outlines, while the
+/// background-colour veil prevents dense text from tinting the header grey.
 struct DSHHeaderBackdrop: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     var body: some View {
-        Rectangle()
-            .fill(.regularMaterial)
-            .overlay(Color(.systemBackground).opacity(0.12))
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
+        Group {
+            if reduceTransparency {
+                Color(.systemBackground)
+            } else {
+                DSHHeaderBlur()
+                    .overlay(Color(.systemBackground).opacity(0.64))
+            }
+        }
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Interpolate the native blur itself, rather than lowering the effect view's
+/// alpha (which would reveal sharp text). Keep the paused animator alive for
+/// as long as the header is mounted.
+private struct DSHHeaderBlur: UIViewRepresentable {
+    func makeUIView(context: Context) -> BlurView { BlurView() }
+    func updateUIView(_ view: BlurView, context: Context) {}
+    static func dismantleUIView(_ view: BlurView, coordinator: ()) {
+        view.clearBlur()
+    }
+
+    final class BlurView: UIVisualEffectView {
+        private var animator: UIViewPropertyAnimator?
+
+        init() {
+            super.init(effect: nil)
+            isUserInteractionEnabled = false
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            clearBlur()
+            setNeedsDisplay()
+        }
+
+        override func draw(_ rect: CGRect) {
+            super.draw(rect)
+            guard window != nil, animator == nil else { return }
+            // The backdrop must exist before interpolation; configuring it in
+            // didMoveToWindow makes UIKit render the full-strength blur.
+            let animator = UIViewPropertyAnimator(duration: 1, curve: .linear) { [weak self] in
+                self?.effect = UIBlurEffect(style: .regular)
+            }
+            animator.pausesOnCompletion = true
+            animator.startAnimation()
+            animator.pauseAnimation()
+            animator.fractionComplete = 0.10
+            self.animator = animator
+        }
+
+        func clearBlur() {
+            animator?.stopAnimation(true)
+            animator = nil
+            effect = nil
+        }
     }
 }
 
