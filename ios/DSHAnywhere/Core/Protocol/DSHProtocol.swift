@@ -635,12 +635,9 @@ public extension Array where Element == DSHTranscriptSection {
     /// and tools, with only the final answers outside.
     /// A trailing reasoning-only turn (live streaming, tools still running)
     /// is kept as its own section so live progress is never hidden. Nothing
-    /// else breaks the fold — not user turns, command cards, or model-change
-    /// notices: an interruption between a think step and its answer must not
-    /// strand a lone "思考" row, so those rows render in place while the
-    /// pending think attaches to the next visible assistant turn. (A think
-    /// step from a cancelled turn can land in the next timeline in that
-    /// rare case; it stays folded shut, which beats a permanent stray row.)
+    /// Commands and model notices stay in place. A new user message closes
+    /// the task, so cancelled reasoning cannot leak into the next task's
+    /// disclosure or elapsed time.
     /// Orphan tools do NOT break the fold either: with pending think around,
     /// the tool belongs to it.
     func mergingReasoningOnlyTurns() -> [DSHTranscriptSection] {
@@ -669,6 +666,9 @@ public extension Array where Element == DSHTranscriptSection {
                     tools: pendingTools + tools))
                 pendingMessages = []
                 pendingTools = []
+            case .row(.turn(let block)) where block.isUserTurn:
+                flushPendingAsOwnSection()
+                merged.append(section)
             case .row(.turn), .row(.modelChange), .row(.command):
                 merged.append(section)
             case .row(.tool(let tool)) where !pendingMessages.isEmpty || !pendingTools.isEmpty:
@@ -982,6 +982,10 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     /// Stamped from the envelope (first sighting wins, like `sequence`) so
     /// the reply timestamp survives replays. Client-side only.
     public var timestamp: Int64?
+    /// Live completion times, preserved through replay. History envelope
+    /// timestamps describe delivery, so they must never populate these.
+    public var completedAt: Int64?
+    public var taskCompletedAt: Int64?
 
     public init(id: String, role: DSHMessageRole, markdown: String,
                 attachments: [DSHMessageAttachment] = [],
@@ -998,7 +1002,7 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case id, role, markdown, attachments, usage, provider, model, replacesMessageId,
-             reasoningEffort, contextWindow, reasoning, sequence, timestamp
+             reasoningEffort, contextWindow, reasoning, sequence, timestamp, completedAt, taskCompletedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -1018,6 +1022,8 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         sequence = try container.decodeIfPresent(Int64.self, forKey: .sequence)
         timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
+        completedAt = try container.decodeIfPresent(Int64.self, forKey: .completedAt)
+        taskCompletedAt = try container.decodeIfPresent(Int64.self, forKey: .taskCompletedAt)
     }
 }
 
@@ -1030,6 +1036,8 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
 public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
     public let id: String
     public var messages: [DSHChatMessage]
+    /// Assigned only to the first rendered assistant section of a user task.
+    public var taskTimeline: DSHTaskTimeline?
 
     public init(id: String, messages: [DSHChatMessage]) {
         self.id = id; self.messages = messages
@@ -1055,6 +1063,85 @@ public struct DSHTranscriptBlock: Identifiable, Sendable, Equatable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+    }
+}
+
+public struct DSHTaskTimeline: Sendable, Equatable {
+    public let promptID: String?
+    public let startedAt: Int64?
+    public let messages: [DSHChatMessage]
+    public let tools: [DSHToolActivity]
+
+    public var reasoning: String {
+        messages.compactMap(\.reasoning).filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    /// Historical records without live timing can only estimate generation
+    /// time. Do not treat replay delivery times or input-token processing as
+    /// elapsed task time; include every available step, not just the last one.
+    public func duration(now: Date? = nil) -> (seconds: Int, estimated: Bool)? {
+        let end = now.map { Int64($0.timeIntervalSince1970 * 1_000) }
+            ?? messages.compactMap(\.taskCompletedAt).max()
+            ?? messages.compactMap(\.completedAt).max()
+        if let start = startedAt, start > 0, let end, end >= start {
+            return (Int((end - start) / 1_000), false)
+        }
+        let estimates = messages.compactMap { message -> Double? in
+            guard let usage = message.usage, let speed = usage.tokensPerSecond,
+                  speed.isFinite, speed > 0, let tokens = usage.outputTokens,
+                  tokens.isFinite, tokens > 0 else { return nil }
+            return tokens / speed
+        }
+        let total = estimates.reduce(0, +)
+        guard !estimates.isEmpty, total.isFinite, total < Double(Int.max) else { return nil }
+        return (max(1, Int(total.rounded())), true)
+    }
+}
+
+public extension Array where Element == DSHTranscriptSection {
+    /// Preserve message/command order and section IDs. Only the first answer
+    /// owns a header, which discloses all reasoning and tools for that task.
+    func withTaskTimelines() -> [DSHTranscriptSection] {
+        var result = self
+        var prompt: DSHChatMessage?
+        var indices: [Int] = []
+        func flush() {
+            guard !indices.isEmpty else { return }
+            let blocks = indices.compactMap { index -> DSHTranscriptBlock? in
+                if case .turn(let block, _) = result[index] { return block }
+                return nil
+            }
+            let messages = blocks.flatMap(\.messages)
+            let tools = indices.flatMap { index -> [DSHToolActivity] in
+                if case .turn(_, let tools) = result[index] { return tools }
+                return []
+            }
+            // A reasoning-only section can be hidden while streaming. Anchor
+            // to the first visible answer when there is one.
+            let headerIndex = indices.first { index in
+                if case .turn(let block, _) = result[index] { return !block.visibleMessages.isEmpty }
+                return false
+            } ?? indices[0]
+            if case .turn(var block, let ownTools) = result[headerIndex] {
+                block.taskTimeline = DSHTaskTimeline(promptID: prompt?.id,
+                    startedAt: prompt?.timestamp ?? messages.first?.timestamp,
+                    messages: messages, tools: tools)
+                result[headerIndex] = .turn(block: block, tools: ownTools)
+            }
+            indices = []
+        }
+        for index in result.indices {
+            switch result[index] {
+            case .row(.turn(let block)) where block.isUserTurn:
+                flush()
+                prompt = block.messages.first
+            case .turn(let block, _) where !block.isUserTurn:
+                indices.append(index)
+            default: break
+            }
+        }
+        flush()
+        return result
     }
 }
 

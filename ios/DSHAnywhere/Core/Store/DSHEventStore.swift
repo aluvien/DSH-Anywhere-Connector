@@ -175,6 +175,9 @@ public struct DSHEventReducer: Sendable {
             completed.reasoning = message.reasoning ?? canonical?.reasoning ?? partial?.reasoning
             completed.sequence = first?.sequence ?? event.envelope.sequence
             completed.timestamp = first?.timestamp ?? event.envelope.timestamp
+            completed.completedAt = canonical?.completedAt ?? partial?.completedAt
+                ?? (event.envelope.historyBatchId == nil ? event.envelope.timestamp : nil)
+            completed.taskCompletedAt = canonical?.taskCompletedAt ?? partial?.taskCompletedAt
             if let replaced = message.replacesMessageId, replaced != message.id {
                 state.messagesBySession[sessionId]?.removeAll { $0.id == replaced }
                 state.historyCarryOverBySession[sessionId]?.messages.removeAll { $0.id == replaced }
@@ -257,7 +260,15 @@ public struct DSHEventReducer: Sendable {
             // bridge tags every replay event explicitly, so only untagged
             // live events update the projection.
             if event.envelope.historyBatchId == nil {
+                let previous = state.turnStateBySession[turn.sessionId]
                 state.turnStateBySession[turn.sessionId] = turn.state
+                if previous == "running", turn.state != "running",
+                   var messages = state.messagesBySession[turn.sessionId],
+                   let last = messages.indices.last(where: { messages[$0].role == .assistant }),
+                   last > (messages.indices.last(where: { messages[$0].role == .user }) ?? -1) {
+                    messages[last].taskCompletedAt = messages[last].taskCompletedAt ?? event.envelope.timestamp
+                    state.messagesBySession[turn.sessionId] = messages
+                }
             }
         case .modelCatalog(let catalog):
             state.modelCatalog = catalog

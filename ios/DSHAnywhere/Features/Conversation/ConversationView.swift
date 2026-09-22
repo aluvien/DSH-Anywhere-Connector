@@ -1055,13 +1055,13 @@ struct ConversationView: View {
     @ViewBuilder
     private func transcriptSectionView(_ section: DSHTranscriptSection) -> some View {
         switch section {
-        case .turn(let block, let tools):
+        case .turn(let block, _):
             if block.isUserTurn {
                 MessageBubble(sessionID: sessionID, message: block.messages[0]).id(section.id)
             } else {
                 AssistantTurnView(sessionID: sessionID,
                                   block: block,
-                                  tools: tools,
+                                  isTaskRunning: isRunning && block.taskTimeline?.promptID == model.messages(for: sessionID).last(where: { $0.role == .user })?.id,
                                   streamingMessage: activeStreamingMessage,
                                   streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
                                     ? streamingHeadroom.reservedReplyHeight : nil,
@@ -1075,7 +1075,7 @@ struct ConversationView: View {
                 } else {
                     AssistantTurnView(sessionID: sessionID,
                                       block: block,
-                                      tools: [],
+                                      isTaskRunning: false,
                                       streamingMessage: activeStreamingMessage,
                                       streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
                                         ? streamingHeadroom.reservedReplyHeight : nil,
@@ -3670,7 +3670,7 @@ private struct MarkdownTableView: View {
 private struct AssistantTurnView: View {
     let sessionID: String
     let block: DSHTranscriptBlock
-    let tools: [DSHToolActivity]
+    let isTaskRunning: Bool
     let streamingMessage: DSHActiveStreamingMessage?
     let streamingMinimumHeight: CGFloat?
     let onBranch: () -> Void
@@ -3681,9 +3681,10 @@ private struct AssistantTurnView: View {
     /// bury the conversation; a manually opened trace stays as left.
     @State private var manualExpansion = false
 
-    private var text: String { block.reasoning }
-    private var answerCount: Int { block.visibleMessages.count }
-    private var usage: DSHSessionUsage? { block.visibleMessages.last?.usage }
+    private var timeline: DSHTaskTimeline? { block.taskTimeline }
+    private var text: String { timeline?.reasoning ?? "" }
+    private var tools: [DSHToolActivity] { timeline?.tools ?? [] }
+    private var answerCount: Int { timeline?.messages.filter { !$0.markdown.isEmpty }.count ?? 0 }
 
     /// Live means literally running: failed/error/cancelled tools are
     /// settled, not live. Counting them as live kept turns (and the live
@@ -3694,7 +3695,7 @@ private struct AssistantTurnView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if isExpandable || turnDurationText(usage) != nil {
+            if timeline != nil {
                 timelineRow
                 // Same width as the reply text: no full-bleed. The old
                 // -16 bleed drew the rule past the text on both sides.
@@ -3728,7 +3729,7 @@ private struct AssistantTurnView: View {
     }
 
     private var isExpandable: Bool {
-        !block.reasoning.isEmpty || !tools.isEmpty
+        !text.isEmpty || !tools.isEmpty
     }
 
     /// Reference layout: timing text with the chevron tucked right behind
@@ -3782,9 +3783,17 @@ private struct AssistantTurnView: View {
     @ViewBuilder
     private var timelineLabel: some View {
         HStack(spacing: 6) {
-            Text(timelineTitle)
-                .font(.body)
-                .foregroundStyle(.secondary)
+            Group {
+                if isTaskRunning {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(timelineTitle(now: context.date))
+                    }
+                } else {
+                    Text(timelineTitle(now: nil))
+                }
+            }
+            .font(.body)
+            .foregroundStyle(.secondary)
             if isExpandable {
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -3794,17 +3803,14 @@ private struct AssistantTurnView: View {
         }
     }
 
-    private var timelineTitle: String {
-        turnDurationText(usage) ?? DSHLocalization.string("Thinking")
+    private func timelineTitle(now: Date?) -> String {
+        guard let duration = timeline?.duration(now: now) else {
+            return DSHLocalization.string("Thinking")
+        }
+        return (duration.estimated ? "≈ " : "") + turnDurationText(duration.seconds)
     }
 
-    /// Wall-clock estimate from the turn's own counters: tokens ÷ speed.
-    private func turnDurationText(_ usage: DSHSessionUsage?) -> String? {
-        guard let usage,
-              let speed = usage.tokensPerSecond, speed > 0 else { return nil }
-        let total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
-        guard total > 0 else { return nil }
-        let seconds = Int((total / speed).rounded())
+    private func turnDurationText(_ seconds: Int) -> String {
         if seconds < 60 {
             return String(format: DSHLocalization.string("Took %lld sec"), seconds)
         }

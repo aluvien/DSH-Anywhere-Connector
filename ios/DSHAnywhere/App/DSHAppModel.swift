@@ -1863,7 +1863,7 @@ final class DSHAppModel: ObservableObject {
     /// Render units: assistant turns with their tool calls folded in.
     func transcriptSections(for sessionID: String) -> [DSHTranscriptSection] {
         if let cached = transcriptSectionsCache[sessionID] { return cached }
-        let sections = transcriptEntries(for: sessionID).groupedTurns()
+        let sections = transcriptEntries(for: sessionID).groupedTurns().withTaskTimelines()
         transcriptSectionsCache[sessionID] = sections
         return sections
     }

@@ -1311,6 +1311,84 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(receipt.requestId, "prompt-1")
     }
 
+
+    func testTaskTimelineCombinesStepsWithoutMovingMessagesOrCommands() {
+        let messages = [
+            DSHChatMessage(id: "u", role: .user, markdown: "task", sequence: 1, timestamp: 1_000),
+            DSHChatMessage(id: "a", role: .assistant, markdown: "progress", reasoning: "first", sequence: 2),
+            DSHChatMessage(id: "b", role: .assistant, markdown: "more", reasoning: "second", sequence: 4),
+            DSHChatMessage(id: "c", role: .assistant, markdown: "done", sequence: 6),
+            DSHChatMessage(id: "u2", role: .user, markdown: "next", sequence: 7),
+            DSHChatMessage(id: "d", role: .assistant, markdown: "next answer", sequence: 8),
+        ]
+        let sections = messages.transcriptEntries(with: [
+            DSHToolActivity(id: "t", name: "bash", status: "succeeded", sequence: 3)
+        ], commandResults: [DSHCommandResult(sessionId: "s", requestId: "cmd", matched: true, sequence: 5)])
+            .groupedTurns()
+        let annotated = sections.withTaskTimelines()
+        XCTAssertEqual(annotated.map(\.id), sections.map(\.id))
+        let headers = annotated.compactMap { section -> DSHTaskTimeline? in
+            if case .turn(let block, _) = section { return block.taskTimeline }
+            return nil
+        }
+        XCTAssertEqual(headers.count, 2)
+        XCTAssertEqual(headers[0].promptID, "u")
+        XCTAssertEqual(headers[0].messages.map(\.id), ["a", "b", "c"])
+        XCTAssertEqual(headers[0].reasoning, "first\n\nsecond")
+        XCTAssertEqual(headers[0].tools.map(\.id), ["t"])
+        XCTAssertEqual(headers[1].messages.map(\.id), ["d"])
+    }
+
+    func testTaskDurationUsesWallClockAndMarksHistoricalEstimate() throws {
+        var a = DSHChatMessage(id: "a", role: .assistant, markdown: "first")
+        a.completedAt = 3_000
+        var b = DSHChatMessage(id: "b", role: .assistant, markdown: "done")
+        b.completedAt = 8_000
+        b.taskCompletedAt = 12_000 // Includes the final tool execution.
+        let live = DSHTaskTimeline(promptID: "u", startedAt: 1_000, messages: [a, b], tools: [])
+        XCTAssertEqual(live.duration()?.seconds, 11)
+        XCTAssertEqual(live.duration()?.estimated, false)
+        XCTAssertEqual(live.duration(now: Date(timeIntervalSince1970: 20))?.seconds, 19)
+        a.completedAt = nil
+        b.completedAt = nil
+        b.taskCompletedAt = nil
+        a.usage = DSHSessionUsage(inputTokens: 99_999, outputTokens: 20, tokensPerSecond: 10)
+        b.usage = DSHSessionUsage(inputTokens: 99_999, outputTokens: 70, tokensPerSecond: 10)
+        let history = DSHTaskTimeline(promptID: "u", startedAt: 1_000, messages: [a, b], tools: [])
+        XCTAssertEqual(history.duration()?.seconds, 9)
+        XCTAssertEqual(history.duration()?.estimated, true)
+        XCTAssertNil(DSHTaskTimeline(promptID: nil, startedAt: nil, messages: [], tools: []).duration())
+    }
+
+    func testTaskCompletionTimeSurvivesReplayAndOldPayloadDecoding() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        var sequence: Int64 = 0
+        func emit(_ type: String, _ payload: DSHJSONValue, at timestamp: Int64, history: Bool = false) {
+            sequence += 1
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "evt-\(sequence)", deviceId: "d",
+                machineId: "m", sessionId: "s", historyBatchId: history ? "history" : nil,
+                sequence: sequence, timestamp: timestamp, type: type, payload: payload)), into: &state)
+        }
+        let answer: DSHJSONValue = .object(["id": .string("a"), "role": .string("assistant"), "markdown": .string("done")])
+        emit("user.message.accepted", .object(["id": .string("u"), "role": .string("user"), "markdown": .string("go")]), at: 1_000)
+        emit("turn.state.changed", .object(["sessionId": .string("s"), "state": .string("running")]), at: 1_001)
+        emit("assistant.message.delta", .object(["messageId": .string("a"), "text": .string("d")]), at: 2_000)
+        emit("assistant.message.completed", answer, at: 5_000)
+        emit("turn.state.changed", .object(["sessionId": .string("s"), "state": .string("idle")]), at: 9_000)
+        emit("assistant.message.completed", answer, at: 100_000, history: true)
+        let completed = try XCTUnwrap(state.messagesBySession["s"]?.last)
+        XCTAssertEqual(completed.timestamp, 2_000)
+        XCTAssertEqual(completed.completedAt, 5_000)
+        XCTAssertEqual(completed.taskCompletedAt, 9_000)
+        let decoded = try JSONDecoder().decode(DSHChatMessage.self, from: JSONEncoder().encode(completed))
+        XCTAssertEqual(decoded.taskCompletedAt, 9_000)
+        let legacy = try JSONDecoder().decode(DSHChatMessage.self, from: Data(#"{"id":"old","role":"assistant","markdown":"done"}"#.utf8))
+        XCTAssertNil(legacy.completedAt)
+        emit("assistant.message.completed", .object(["id": .string("old"), "role": .string("assistant"), "markdown": .string("old")]), at: 200_000, history: true)
+        XCTAssertNil(state.messagesBySession["s"]?.last?.completedAt)
+    }
+
     func testToolsFoldIntoPrecedingAssistantTurn() {
         let entries: [DSHTranscriptEntry] = [
             .turn(DSHTranscriptBlock(id: "q", messages: [
@@ -1376,11 +1454,8 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(tools.map(\.id), ["t1", "t2"])
     }
 
-    func testInterruptionsDoNotSplitReasoningFold() {
-        // think → user message → /command card → answer must render ONE
-        // timeline row: interruptions render in place, the pending think
-        // attaches to the next visible assistant turn instead of stranding
-        // a lone "思考" row above the duration row.
+    func testNewUserTaskDoesNotInheritPreviousReasoning() {
+        // A new prompt closes the previous task, even if it only reasoned.
         let entries: [DSHTranscriptEntry] = [
             .turn(DSHTranscriptBlock(id: "r", messages: [
                 DSHChatMessage(id: "r", role: .assistant, markdown: "",
@@ -1396,11 +1471,11 @@ final class DSHEventStoreTests: XCTestCase {
             ])),
         ]
         let sections = entries.groupedTurns()
-        XCTAssertEqual(sections.count, 3)
-        guard case .turn(let block, _) = sections[2] else {
+        XCTAssertEqual(sections.count, 4)
+        guard case .turn(let block, _) = sections[3] else {
             return XCTFail("Think step should fold into the answer turn")
         }
-        XCTAssertEqual(block.messages.map(\.id), ["r", "a"])
+        XCTAssertEqual(block.messages.map(\.id), ["a"])
         XCTAssertEqual(block.visibleMessages.map(\.id), ["a"])
     }
 
