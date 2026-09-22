@@ -1532,8 +1532,9 @@ struct DSHRemoteHomeView: View {
                     toggleGroup(group, expanded: expanded)
                 } label: {
                     DSHRemoteFolderGlyph(expanded: expanded)
-                        .font(.system(size: 20, weight: .regular))
+                        .frame(width: 24, height: 24)
                         .frame(width: 28, height: 36)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
