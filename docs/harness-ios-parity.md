@@ -259,3 +259,10 @@ Build 127 发布记录：1.0 (127)，签名归档和导出成功，2026-10-30 �
 - 模拟器编译及 5 项定向测试通过，覆盖旧格式 409、权威快照移除、草稿保留、禁止自动重发、回答/取消失败恢复、目标暂停继续的 revision，以及浅色/深色底部布局。结果为 `/tmp/dsh-decision-dock-v3.xcresult`；截图为本地 `artifacts/ios/harness-parity/goal-direct-actions-*.png`。本轮仅修改 iOS，不需要更改协议或更新电脑组件。这些修复已随 Build 128 上传。
 
 Build 128 发布记录：1.0 (128)，2026-10-30 03:20（本地时间）完成签名归档、IPA 导出和上传，Apple 返回 `UPLOAD SUCCEEDED with no errors`。上传接收编号为 `cf41fa4a-12e8-45b9-9601-72ba92d341fb`。上传后首次 App Store Connect 查询尚未列出此构建，等待 Apple 处理；不将接收成功等同已可安装。
+
+
+### 新版 Harness 电脑配置读取兼容（2026-10-30，待重启实测）
+
+生产 Connector 日志确认 settings、plugins、providers 的配置读取返回 HTTP 502。核对当前桌面 0.2.1-rc.3 的原生实现，设置 namespace 增加 autoGenerate，插件目录增加 managementAvailable 与 entry/row meta；这些新增字段会被旧版严格手机 wire 校验拒绝。Bridge 现对原生设置、插件和提供方目录显式投影到既定协议字段，再作严格结果校验；设置的 schema/value/base/user JSON 保持完整，保存前快照和保存后 namespace 回执也使用相同投影。凭据内容仍不进入普通错误或日志。
+
+配置定向 7 项测试及完整 pnpm check 通过，覆盖新增元数据、原样保留配置 JSON、CAS 保存回执、隐藏 Host 元数据和非法必需字段拒绝。修复已安装到本机桌面组件并保留备份；当前 Harness 有运行任务，尚未重启加载，三项生产读取恢复仍待实测。本轮无 iOS 或协议变更，无需重新上传 TestFlight。

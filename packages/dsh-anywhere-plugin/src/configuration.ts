@@ -1,16 +1,32 @@
-import { ConfigurationDiscoverySchema, ConfigurationModelsSchema, ConfigurationInvalidatedSchema, ConfigurationReadSchema, ConfigurationResultSchema, ConfigurationUpdateSchema, ConfigurationUpdatedSchema, SettingsSnapshotSchema } from '@dsh-anywhere/protocol'
+import { ConfigurationDiscoverySchema, ConfigurationModelsSchema, ConfigurationInvalidatedSchema, ConfigurationReadSchema, ConfigurationResultSchema, ConfigurationUpdateSchema, ConfigurationUpdatedSchema, SettingsSnapshotSchema, SettingsNamespaceSchema, PluginInventorySchema, ProviderDirectorySchema } from '@dsh-anywhere/protocol'
 import { HttpError } from './http.js'
 
 type Invoke = (namespace: string, method: string, args: Record<string, unknown>) => Promise<unknown>
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+
+// Native controllers may add Host-only metadata. Project only the agreed wire
+// fields at these boundaries; keep schema/value/base/user JSON intact, and
+// still validate every required field before anything reaches the phone.
+const NativeNamespace = SettingsNamespaceSchema.strip()
+const NativeSettings = SettingsSnapshotSchema.strip().extend({ namespaces: NativeNamespace.array() })
+const NativePlugins = PluginInventorySchema.strip().extend({
+  entries: PluginInventorySchema.shape.entries.element.strip().array(),
+  agentPresets: PluginInventorySchema.shape.agentPresets.unwrap().element.strip().extend({
+    rows: PluginInventorySchema.shape.agentPresets.unwrap().element.shape.rows.element.strip().array(),
+  }).array().optional(),
+})
+const NativeProviders = ProviderDirectorySchema.strip().extend({
+  registered: ProviderDirectorySchema.shape.registered.element.strip().array(),
+  configurable: ProviderDirectorySchema.shape.configurable.element.strip().array(),
+})
 
 export async function readConfiguration(input: unknown, invoke: Invoke) {
   const request = ConfigurationReadSchema.parse(input)
   try {
     let value
     switch (request.section) {
-      case 'settings': value = await invoke('settings', 'describe', {}); break
-      case 'plugins': value = await invoke('pluginInventory', 'list', {}); break
+      case 'settings': value = NativeSettings.parse(await invoke('settings', 'describe', {})); break
+      case 'plugins': value = NativePlugins.parse(await invoke('pluginInventory', 'list', {})); break
       case 'credentials': {
         value = await invoke('credentials', 'describe', { refs: request.refs })
         const keys = Object.keys(object(value)), refs = new Set(request.refs)
@@ -21,7 +37,7 @@ export async function readConfiguration(input: unknown, invoke: Invoke) {
         const [registered, configurable] = await Promise.allSettled([invoke('llm', 'listProviders', {}), invoke('llm', 'listConfigurableProviders', {})])
         if (registered.status === 'rejected') throw registered.reason
         if (configurable.status === 'rejected') throw configurable.reason
-        value = { registered: registered.value, configurable: configurable.value }; break
+        value = NativeProviders.parse({ registered: registered.value, configurable: configurable.value }); break
       }
     }
     return ConfigurationResultSchema.parse({ section: request.section, value })
@@ -39,7 +55,7 @@ export async function readConfiguration(input: unknown, invoke: Invoke) {
 export async function updateConfiguration(input: unknown, requestId: string, invoke: Invoke) {
   const request = ConfigurationUpdateSchema.parse(input)
   if (request.kind === 'settings') {
-    const snapshot = SettingsSnapshotSchema.parse(await invoke('settings', 'describe', {}))
+    const snapshot = NativeSettings.parse(await invoke('settings', 'describe', {}))
     const current = snapshot.namespaces.find((item) => item.ns === request.ns)
     if (!snapshot.writable) throw new HttpError(403, '此电脑的配置来源只读')
     if (current === undefined) throw new HttpError(404, '配置项目已不存在，请刷新')
@@ -50,7 +66,7 @@ export async function updateConfiguration(input: unknown, requestId: string, inv
         throw new HttpError(400, '此修改会覆盖包含隐藏密钥的配置，请逐字段编辑；含密钥的数组需在电脑端编辑')
       }
     }
-    const namespace = await invoke('settings', 'mutate', { ns: request.ns, ops: request.ops, expectedRevision: request.expectedRevision })
+    const namespace = NativeNamespace.parse(await invoke('settings', 'mutate', { ns: request.ns, ops: request.ops, expectedRevision: request.expectedRevision }))
     const receipt = ConfigurationUpdatedSchema.parse({ kind: 'settings', requestId, namespace })
     if (receipt.kind !== 'settings' || receipt.namespace.ns !== request.ns || receipt.namespace.revision < request.expectedRevision) throw new Error('Invalid native settings acknowledgement')
     return receipt

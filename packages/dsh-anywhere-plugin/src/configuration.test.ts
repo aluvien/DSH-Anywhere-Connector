@@ -13,6 +13,27 @@ describe('native computer configuration', () => {
       rows: [{ entryId: null, moduleName: 'conditional', enabled: 'conditional', condition: 'platform === darwin', fiberPhase: null }] }] }
     expect(await readConfiguration({ section: 'plugins' }, async () => plugins)).toEqual({ section: 'plugins', value: plugins })
   })
+  it('projects new Host metadata while preserving editable JSON and CAS receipts', async () => {
+    const nativeNamespace = { ...namespace, autoGenerate: true }
+    const invoke = vi.fn(async (_ns: string, method: string) => method === 'describe'
+      ? { ...snapshot, namespaces: [nativeNamespace] } : { ...nativeNamespace, revision: 5 })
+    expect(await readConfiguration({ section: 'settings' }, invoke)).toEqual({ section: 'settings', value: snapshot })
+    expect(await updateConfiguration({ kind: 'settings', ns: namespace.ns, expectedRevision: 4,
+      ops: [{ op: 'set', path: ['baseURL'], value: 'https://new.invalid' }] }, 'r', invoke))
+      .toMatchObject({ namespace: { ...namespace, revision: 5 } })
+    const plugins = { entries: [{ entryId: 'e', moduleName: 'p', enabled: true, fiberPhase: null, meta: { privateHostPath: 'never-forward' } }],
+      managementAvailable: true, agentPresets: [{ id: 'a', trust: 'user', isDefault: false, extra: 'never-forward',
+        rows: [{ entryId: null, moduleName: 'p', enabled: true, fiberPhase: null, meta: { privateHostPath: 'never-forward' } }] }] }
+    const projected = await readConfiguration({ section: 'plugins' }, async () => plugins)
+    expect(JSON.stringify(projected)).not.toContain('never-forward')
+    expect(JSON.stringify(projected)).not.toContain('managementAvailable')
+    const providers = await readConfiguration({ section: 'providers' }, async (_ns, method) => method === 'listProviders'
+      ? [{ id: 'p', name: 'Provider', extra: 'never-forward' }]
+      : [{ provider: 'p', displayName: 'Provider', settingsNs: 'llm-test', settingsPath: [], extra: 'never-forward' }])
+    expect(JSON.stringify(providers)).not.toContain('never-forward')
+    await expect(readConfiguration({ section: 'settings' }, async () => ({ ...snapshot, namespaces: [{ ...nativeNamespace, revision: 'bad' }] })))
+      .rejects.toMatchObject({ status: 502 })
+  })
   it('publishes only identifiers for raw/resolved settings, credentials, adapters and plugin lifecycle changes', () => {
     const handlers = new Map<string, (...args: unknown[]) => void>(), publish = vi.fn()
     observeConfigurationChanges((event, listener) => { handlers.set(event, listener) }, publish)
