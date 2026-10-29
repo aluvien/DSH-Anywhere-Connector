@@ -201,7 +201,7 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(Color(.systemBackground))
             .listRowSeparator(.hidden)
-            .safeAreaInset(edge: .top, spacing: 0) { settingsHeader }
+            .dshTopScrollBar { settingsHeader }
             .toolbar(.hidden, for: .navigationBar)
             .task { model.refreshPairedDevices() }
             .confirmationDialog("Disconnect this iPhone?",
@@ -250,7 +250,6 @@ struct SettingsView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop())
     }
 
     /// Keep every section on the same quiet grouped surface. Connection state

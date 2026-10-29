@@ -678,6 +678,78 @@ describe("Relay and bridge forwarding", () => {
   });
 });
 
+describe("desktop endpoint and failure handling", () => {
+  it("re-resolves both HTTP and WebSocket after the desktop port changes", async () => {
+    const relay = new FakeSocket();
+    const bridges: FakeSocket[] = [];
+    const urls: string[] = [];
+    const requests: string[] = [];
+    let port = 59656;
+    const connector = new DSHAnywhereConnector(config, {
+      resolveBridgeBaseURL: async () => `http://127.0.0.1:${port}/dsh-anywhere/v1`,
+      webSocketFactory: url => {
+        urls.push(url);
+        if (urls.length === 1) return relay as unknown as import("../src/connector.js").WebSocketLike;
+        const bridge = new FakeSocket(); bridges.push(bridge); return bridge as unknown as import("../src/connector.js").WebSocketLike;
+      },
+      fetch: (async url => { requests.push(String(url)); return Response.json({ modes: [] }); }) as typeof fetch,
+      reconnectBaseMs: 1, heartbeatMs: 60_000, logger: { info() {}, warn() {} },
+    });
+    try {
+      connector.start(); relay.emit("open");
+      await vi.waitFor(() => expect(bridges.length).toBe(1));
+      expect(urls[1]).toContain(':59656/');
+      port = 59657;
+      bridges[0]!.emit("close");
+      await vi.waitFor(() => expect(bridges.length).toBe(2));
+      expect(urls[2]).toContain(':59657/');
+      relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1",
+        messageId: "modes", sender: "device", body: command("mode.catalog") }));
+      await vi.waitFor(() => expect(requests.some(url => url.includes(':59657/dsh-anywhere/v1/modes'))).toBe(true));
+    } finally { await connector.stop(); }
+  });
+
+  it("does not open a late resolved socket after stop", async () => {
+    let resolve!: (url: string) => void;
+    const urls: string[] = [];
+    const connector = new DSHAnywhereConnector(config, {
+      resolveBridgeBaseURL: () => new Promise<string>(done => { resolve = done; }),
+      webSocketFactory: url => { urls.push(url); return new FakeSocket() as unknown as import("../src/connector.js").WebSocketLike; },
+      logger: { info() {}, warn() {} },
+    });
+    connector.start();
+    await vi.waitFor(() => expect(resolve).toBeDefined());
+    await connector.stop();
+    resolve('http://127.0.0.1:59656/dsh-anywhere/v1');
+    await new Promise(done => setTimeout(done, 10));
+    expect(urls).toHaveLength(1);
+  });
+
+  it.each(['http', 'timeout'])("reports a catalog %s failure without unknown mutation wording", async failure => {
+    const relay = new FakeSocket();
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      webSocketFactory: () => (++sockets === 1 ? relay : new FakeSocket()) as unknown as import("../src/connector.js").WebSocketLike,
+      fetch: (async () => {
+        if (failure === 'timeout') throw new DOMException('deadline', 'TimeoutError');
+        return new Response('{}', { status: 500, headers: { 'x-dsh-idempotency-outcome': 'unknown' } });
+      }) as typeof fetch,
+      logger: { info() {}, warn() {} }, heartbeatMs: 60_000,
+    });
+    try {
+      connector.start(); relay.emit('open');
+      relay.emit('message', JSON.stringify({ type: 'relay.payload', machineId: 'machine-1',
+        messageId: 'modes', sender: 'device', body: command('mode.catalog') }));
+      const error = () => relay.sent.map(raw => JSON.parse(raw).body).find(body => body?.type === 'protocol.error');
+      await vi.waitFor(() => expect(error()).toBeDefined());
+      expect(error().payload).toMatchObject({ code: 'bridge-request-failed', retryable: true });
+      expect(error().payload.message).toContain('mode.catalog');
+      expect(error().payload.message).not.toContain('result is unknown');
+      expect(error().payload.message).toContain(failure === 'timeout' ? 'timed out' : 'HTTP 500');
+    } finally { await connector.stop(); }
+  });
+});
+
 class FakeSocket {
   readyState = 1;
   readonly sent: string[] = [];

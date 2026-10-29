@@ -420,6 +420,8 @@ describe('native bridge mutations', () => {
     createWorkspace?: (path: string, title?: string) => Promise<{ id: string; path: string; title: string; sessionIds: readonly string[] }>
     directoryPicker?: unknown
     invoke?: (request: unknown) => Promise<unknown>
+    connection?: unknown
+    responseHeaders?: (headers: unknown) => void
     findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined | { state: 'found' | 'not-committed' | 'unknown'; response?: unknown }>
     dataDir?: string
   } = {}) {
@@ -459,6 +461,7 @@ describe('native bridge mutations', () => {
         archivedSessionIds: [],
         archiveSession: async () => undefined,
       },
+      ...(options.connection === undefined ? {} : { connection: options.connection }),
       typertGateway: {
         invoke: options.invoke ?? (async () => ({ ok: true, value: { presets: [] } })),
       },
@@ -482,13 +485,45 @@ describe('native bridge mutations', () => {
       let status = 0
       let response = ''
       const reply = {
-        writeHead: (value: number) => { status = value },
+        writeHead: (value: number, headers: unknown) => { status = value; options.responseHeaders?.(headers) },
         end: (value?: string) => { response = value ?? '' },
       } as unknown as ServerResponse
       await handler!(request, reply)
       return { status, body: response.length === 0 ? undefined : JSON.parse(response) }
     }
   }
+
+  it('reads modes through a Host-created Peer on the new gateway', async () => {
+    const peer = { signal: new AbortController().signal, dispose: async () => undefined }
+    let calls = 0
+    const request = mount({
+      connection: { createPeer: () => peer },
+      invoke: async (value) => {
+        const call = value as { namespace: string; peer: typeof peer }
+        expect(call.namespace).toBe('agentPresets')
+        expect(call.peer).toBe(peer)
+        expect(call.peer.signal.aborted).toBe(false)
+        calls += 1
+        return { presets: [{ id: 'standard', name: 'Standard', isDefault: true }] }
+      },
+    })
+    await expect(request('GET', '/dsh-anywhere/v1/modes', undefined, undefined, 'Bearer invalid'))
+      .resolves.toMatchObject({ status: 401 })
+    expect(calls).toBe(0)
+    await expect(request('GET', '/dsh-anywhere/v1/modes')).resolves.toMatchObject({
+      status: 200, body: { defaultMode: 'standard', modes: [{ id: 'standard', name: 'Standard' }] },
+    })
+  })
+
+  it('marks catalog failures retryable without claiming an unknown mutation', async () => {
+    let headers: unknown
+    const request = mount({
+      invoke: async () => { throw new Error('native catalog failed') },
+      responseHeaders: value => { headers = value },
+    })
+    await expect(request('GET', '/dsh-anywhere/v1/modes')).resolves.toMatchObject({ status: 500 })
+    expect(headers).toMatchObject({ 'x-dsh-idempotency-outcome': 'retryable' })
+  })
 
   it('creates a durable native workspace from the selected absolute host folder', async () => {
     const createWorkspace = async (path: string, title?: string) => ({ id: 'workspace-1', path, title: title ?? 'Code', sessionIds: [] })

@@ -7,6 +7,7 @@
         - workspaceRegistry
         - typertGateway
         - directoryPicker
+        - connection
       config:
         routePrefix: /dsh-anywhere/v1
         approvalTimeoutMs: 120000

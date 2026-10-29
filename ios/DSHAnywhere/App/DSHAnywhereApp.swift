@@ -70,8 +70,10 @@ struct DSHRootView: View {
         }
         .task {
             #if DEBUG
-            // Keep the disconnected fixture stable long enough for visual QA.
-            if ProcessInfo.processInfo.arguments.contains("--dsh-preview-home-unreachable") {
+            // Keep static preview fixtures stable; their data is intentionally
+            // self-contained and must not be replaced by a transport snapshot.
+            if ProcessInfo.processInfo.arguments.contains("--dsh-preview-home-unreachable")
+                || ProcessInfo.processInfo.arguments.contains("--dsh-preview-conversation") {
                 return
             }
             #endif

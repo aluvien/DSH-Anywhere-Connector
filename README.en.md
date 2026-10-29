@@ -1,159 +1,89 @@
 # DSH Anywhere
 
-[简体中文](README.md) | [English](README.en.md)
+**Take your DeepSeek Harness sessions with you.** Browse sessions, send tasks, follow live replies, and handle questions and approvals from your iPhone.
 
-DSH Anywhere lets you remotely use [DeepSeek Harness](https://github.com/deepseek-ai)
-running on a macOS, Linux, or Windows computer from an iPhone. The computer
-connects outward to a self-hosted Relay, so it does not need a public IP, port
-forwarding, or a publicly exposed Harness port.
+[简体中文](README.md) · [English](README.en.md) · [Product page (available after GitHub Pages is enabled)](https://aluvien.github.io/DSH-ANYWHERE-Connector/) · [Join the iOS TestFlight](https://testflight.apple.com/join/cnkGqHtp)
 
-> [!IMPORTANT]
-> iOS 17+ is the current stable client. Android development and public downloads
-> are temporarily paused, and the previously published preview APK has been withdrawn.
-> The Android source remains in the repository for possible future development; it
-> should not currently be treated as an available release.
+DSH Anywhere consists of an iOS app, a computer-side Connector, and a Relay. The computer initiates an encrypted connection to the Relay, so you do not need to expose Harness ports or configure port forwarding. iOS 17+ is the current mobile client. Android development and public downloads are paused.
 
-## Support status
+## iOS screenshots
 
-| Component | Status | Notes |
-|---|---|---|
-| iOS app | Active development | Current stable mobile client |
-| macOS Connector / Bridge | Active development | launchd user services |
-| Linux Connector / Bridge | Active development | x64/arm64, systemd user services |
-| Windows Connector / Bridge | Active development | Windows 10/11, current-user startup |
-| Relay | Active development | Self-hosted authentication and message routing |
-| Android app | Paused | Source retained; no public APK download or release support |
+| Sessions | Conversation and usage example | Pair a computer |
+| --- | --- | --- |
+| ![iOS sessions screen](site/assets/ios-home.png) | ![iOS conversation with usage footer example](site/assets/ios-conversation.png) | ![iOS pairing screen](site/assets/ios-pairing.png) |
 
-The project is currently intended for personal use and controlled testing.
-Accounts, organization-level permissions, public multi-tenant isolation,
-end-to-end encryption, and large-scale operations are not complete.
+## Quick start
 
-## How it works
+### 1. Install the iOS app
 
-```text
-Phone ─── HTTPS/WSS ──▶ Relay (your server) ◀── outbound WSS ── Connector
-                                                                 │
-                                                                 ▼
-                                                      Bridge / Harness :3080
-```
+Open the [TestFlight invitation](https://testflight.apple.com/join/cnkGqHtp) on your iPhone, join the test, and install DSH Anywhere.
 
-| Component | Runs on | Responsibility |
-|---|---|---|
-| iOS app | Phone | Browse sessions, send messages and attachments, answer questions, and handle approvals |
-| Relay | Self-hosted server | Register machines, pair devices, authenticate credentials, and route messages |
-| Connector | macOS / Linux / Windows | Connect outward to Relay and forward requests and live events |
-| Bridge | macOS / Linux / Windows | Expose local Harness capabilities to Connector |
+### 2. Install the Connector on your computer
 
-Relay is part of the trust boundary. HTTPS/WSS protects data in transit, but the
-current protocol is not end-to-end encrypted. Relay can read and validate routed
-messages. It does not intentionally persist session contents.
+On the computer running DeepSeek Harness, run the command for its operating system. The installer prepares the computer-side environment, registers the computer, and starts Bridge and Connector.
 
-## One-command installation
-
-To use the project's current public Relay, run the command for the computer's
-operating system.
-
-### macOS
+**macOS**
 
 ```sh
 curl -fsSL https://dsh.biaozhu.me/install | sh
 ```
 
-### Linux
-
-x64, arm64, and systemd are supported:
+**Linux (x64 / arm64)**
 
 ```sh
 curl -fsSL https://dsh.biaozhu.me/install-linux | sh
 ```
 
-### Windows
-
-Run this in Windows 10/11 PowerShell:
+**Windows 10/11 PowerShell**
 
 ```powershell
 irm https://dsh.biaozhu.me/install-windows | iex
 ```
 
-The installer automatically:
+When installation finishes, the terminal shows a one-time pairing QR code and opens a local pairing page.
 
-1. prepares a private Node.js, pnpm, and DeepSeek Harness environment for the current user;
-2. downloads and builds DSH Anywhere from a pinned Git commit;
-3. registers the computer with a short-lived, single-use, source-bound enrollment grant;
-4. installs and starts the Bridge and Connector background processes; and
-5. prints a one-time QR code and opens the local pairing page.
+### 3. Pair your iPhone
 
-The user does not need an account, Git, Homebrew, or manual Relay configuration.
-Running the command again preserves the existing machine identity and updates the
-local software. macOS uses launchd, Linux uses systemd user services, and Windows
-uses current-user startup shortcuts with hidden restart supervisors.
+Open DSH Anywhere, choose the QR scanner, and scan the code on your computer. Pairing codes expire after ten minutes and can only be used once. To add another computer, run its installer again.
 
-Installer source files live in [`scripts/`](scripts/). Relay injects a random
-one-time enrollment grant when a script is requested. That grant is never stored
-statically in GitHub, an installer source file, or the user's configuration. The
-administrator bootstrap token is never sent to user computers.
+### 4. Use the app
 
-## Pair a phone
+- Choose a computer and workspace, then open a session or create one.
+- Send a task from the composer. You can attach images or files and follow live replies and tool activity.
+- Answer Harness questions and approve operations when prompted.
+- Use Settings to switch computers, manage paired devices, choose a language, and adjust interface options.
 
-After installation, scan the QR code shown in the terminal or browser with the
-iOS app. Its pairing code expires after ten minutes and can be used only once.
-To pair another phone later, run the one-command installer for that operating
-system again. It preserves the existing machine identity and issues a new QR code.
-
-You can also open the local pairing page:
+## How it works
 
 ```text
-http://127.0.0.1:3080/dsh-anywhere/v1/pairing
+iPhone app ── HTTPS / WSS ──▶ Relay ◀── outbound WSS ── Connector
+                                                         │
+                                                         ▼
+                                                 Bridge / Harness
 ```
 
-The pairing page accepts loopback connections only. Do not expose it through a
-public reverse proxy.
+| Component | Runs on | Responsibility |
+| --- | --- | --- |
+| iOS app | iPhone | Browse and manage sessions, send messages and attachments, handle questions and approvals |
+| Relay | Project service or your server | Pair devices, authenticate credentials, and route messages |
+| Connector / Bridge | macOS, Linux, or Windows computer | Connect to Relay and forward requests to the local Harness |
 
-## Self-host Relay
+## Features
 
-You need a Linux server with a domain, a valid TLS certificate, Docker Engine,
-and the Docker Compose plugin.
+- Manage multiple computers and paired phones
+- Organize sessions by workspace; create, open, rename, and archive sessions
+- View Markdown, code blocks, tables, tool calls, and streaming output
+- Handle questions, approvals, permission modes, and model selection
+- Send image and file attachments
+- Simplified Chinese, English, and system-language selection
 
-```sh
-git clone https://github.com/aluvien/DSH-Anywhere-Connector.git DSH-ANYWHERE
-cd DSH-ANYWHERE/deploy/relay
-cp .env.example .env
-openssl rand -base64 48
-```
+## Security and scope
 
-Edit `.env` and set at least:
+The project is intended for personal use and controlled testing. HTTPS/WSS protects data in transit, but the protocol is not end-to-end encrypted. Relay is part of the trust boundary and can read routed messages. It does not intentionally persist session contents. Accounts, organization permissions, and public multi-tenant isolation are not complete. Only install Connector on computers you control.
 
-```dotenv
-DSH_RELAY_BOOTSTRAP_TOKEN=the-random-value-generated-above
-DSH_RELAY_PUBLIC_URL=https://your-domain.example
-DSH_RELAY_INSTALL_SOURCE_URL=https://github.com/aluvien/DSH-Anywhere-Connector/archive/a-pinned-commit.tar.gz
-```
+## Self-hosting Relay
 
-Pinning a commit prevents public installers from downloading an unreviewed branch
-update. Start Relay after saving the configuration:
-
-```sh
-chmod 600 .env
-docker compose --env-file .env -f compose.yaml up -d --build
-```
-
-The container listens on `127.0.0.1:8787` by default. Publish it through an HTTPS
-reverse proxy with WebSocket Upgrade support. See
-[`deploy/relay/README.md`](deploy/relay/README.md) for the Nginx template and full
-deployment instructions.
-
-If the reverse proxy sends `X-Forwarded-For`, set `DSH_RELAY_TRUSTED_PROXIES` to
-the exact source addresses the proxy uses to reach Relay. Relay ignores forwarded
-headers from all other peers so clients cannot spoof their address to bypass
-pairing or installer rate limits.
-
-Verify the deployment:
-
-```sh
-curl -s https://your-domain.example/health
-```
-
-Both `ok` and `publicEnrollment` should be `true`.
+See [`deploy/relay/README.md`](deploy/relay/README.md) to run your own Relay. Self-hosting requires a Linux server, a domain, a TLS certificate, Docker Engine, and Docker Compose.
 
 ## Build the iOS app
 
@@ -161,112 +91,20 @@ Both `ok` and `publicEnrollment` should be `true`.
 open ios/DSHAnywhere.xcodeproj
 ```
 
-Select your Apple Developer Team in Xcode and install the app on an iPhone. QR
-scanning requires a physical device; the simulator can use manual pairing.
-
-## Android status
-
-Android client development is paused. The public preview APK has been withdrawn,
-and no Android download or release support is currently provided. The existing
-source remains under [`android/`](android/) for possible future development.
-
-## Current capabilities
-
-- Pair, switch, manage, and revoke multiple computers and phones
-- Organize sessions by workspace; create, open, rename, and archive sessions
-- Render Markdown, code blocks, tables, tool calls, and streaming output
-- Handle questions, approvals, permission modes, and model selection
-- Send image and file attachments
-- Simplified Chinese, English, and system-language selection
-- Remote data as the source of truth, with local caching for faster startup and recovery
-
-## Runtime and logs
-
-### macOS
-
-```sh
-launchctl list | grep dsh-anywhere
-curl -s http://127.0.0.1:3080/dsh-anywhere/v1/health
-tail -f ~/Library/Logs/DSH\ Anywhere/connector.log
-tail -f ~/Library/Logs/DSH\ Anywhere/bridge.log
-```
-
-### Linux
-
-```sh
-systemctl --user status dsh-anywhere-bridge dsh-anywhere-connector
-journalctl --user -u dsh-anywhere-bridge -u dsh-anywhere-connector -f
-curl -s http://127.0.0.1:3080/dsh-anywhere/v1/health
-```
-
-The installer attempts to enable systemd lingering for the current Linux user.
-If host policy prevents a regular user from enabling it, the services still run
-during that user's login session and start automatically on later logins.
-
-### Windows
-
-```powershell
-Get-Content "$env:LOCALAPPDATA\DSH Anywhere\logs\connector.log" -Wait
-Get-Content "$env:LOCALAPPDATA\DSH Anywhere\logs\bridge.log" -Wait
-Invoke-WebRequest http://127.0.0.1:3080/dsh-anywhere/v1/health
-```
-
-When upgrading Relay, preserve `deploy/relay/.env` and the `relay-data` Docker
-volume. Machine registrations and device credentials live in that volume, so a
-normal `docker compose up -d --build` does not require pairing again.
-
-## Development and validation
-
-```sh
-pnpm install
-pnpm build
-pnpm check
-```
-
-`pnpm check` runs type checking and tests for the protocol, Relay, Connector,
-and Bridge plugin.
-
-Unsigned iOS build check:
-
-```sh
-xcodebuild build-for-testing \
-  -project ios/DSHAnywhere.xcodeproj \
-  -scheme DSHAnywhere \
-  -destination 'generic/platform=iOS Simulator' \
-  CODE_SIGNING_ALLOWED=NO
-```
+Select your Apple Developer Team in Xcode and install the app on an iPhone. QR pairing requires a physical device; the simulator can use manual pairing.
 
 ## Repository layout
 
 ```text
-packages/
-  protocol/             Shared message types and Zod validation
-  relay-server/         Machine registration, pairing, authentication, and routing
-  connector/            Cross-platform outbound connection, command forwarding, and CLI
-  dsh-anywhere-plugin/  Harness Bridge, session API, events, and local pairing page
-ios/DSHAnywhere/        Stable iOS client
-android/                Paused native Android client with source retained
-deploy/relay/           Docker Compose, Dockerfile, and Nginx configuration
-scripts/                Platform installers, background services, and release helpers
+site/                     Product page and iOS screenshots
+ios/DSHAnywhere/          iOS client
+packages/protocol/        Shared message types and validation
+packages/relay-server/    Relay service
+packages/connector/       Cross-platform computer connector
+packages/dsh-anywhere-plugin/ Harness Bridge
+deploy/relay/             Self-hosted Relay files
+scripts/                  macOS, Linux, and Windows installers
+android/                  Paused Android source
 ```
 
-`RELAY_SCHEMA_REVISION` is defined in `packages/relay-server/src/server.ts`.
-Whenever a routed shared message changes, bump the revision and redeploy Relay.
-
-## Security boundary and known limitations
-
-- Relay can read routed plaintext messages; end-to-end encryption is not implemented.
-- Relay persists machine and device registrations, but not session contents by design.
-- Connector and Bridge can operate the local Harness on the user's behalf and should run only on a user-controlled computer.
-- Enrollment grants and pairing codes are protected by expiration, single use, source binding, and rate limits.
-- Local credential files should remain readable only by the current user. Never expose the loopback pairing page publicly.
-- The current single-file JSON registry is suitable for personal or small controlled deployments, not a public multi-tenant service.
-- Accounts, organizations, permission tiers, and public multi-tenant isolation are incomplete.
-- Linux requires systemd; Windows background processes start after the current user logs in.
-- `dshanywhere://` is not exposed as a general-purpose system deep link.
-- Android development and distribution are paused; its retained source has not completed an independent security and privacy review.
-
-Before Android development resumes, its product scope and protocol compatibility
-target must be confirmed again. The `android/` tree also needs an independent
-code, security, and privacy review; unit, integration, physical-device, and
-network-failure tests; and restored release gates.
+The product page is in [`site/`](site/). Automatic GitHub Pages deployment is configured. In the repository, go to **Settings → Pages → Build and deployment → Source**, choose **GitHub Actions**, then push to `main` to publish it.

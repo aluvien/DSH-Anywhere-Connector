@@ -58,7 +58,12 @@ fi
   echo "Missing connector config: $config_path (run dsh-anywhere setup first)" >&2
   exit 1
 }
-[ -n "$dsh_bin" ] || { echo "Cannot find dsh in PATH." >&2; exit 1; }
+desktop=0
+if [ "${DSH_ANYWHERE_HOST:-auto}" != "web" ] && [ -f "${DSH_HOME:-$HOME/.dsh}/profiles/desktop/package.json" ]; then
+  desktop=1
+else
+  [ -n "$dsh_bin" ] || { echo "Cannot find dsh in PATH." >&2; exit 1; }
+fi
 [ -n "$node_bin" ] || { echo "Cannot find node in PATH." >&2; exit 1; }
 
 mkdir -p "$launch_agents_dir" "$log_dir"
@@ -96,6 +101,19 @@ write_plist() {
 EOF
   /usr/bin/plutil -lint "$output" >/dev/null
 }
+
+if [ "$desktop" -eq 1 ]; then
+  "$node_bin" "$project_root/scripts/install-desktop.mjs" --config "$config_path"
+  write_plist "$connector_label" "$(dirname -- "$config_path")/connector-desktop/run-connector.sh" "$connector_plist" \
+    "$log_dir/connector.log" "$log_dir/connector.err.log"
+  unload "$bridge_plist"
+  if [ -f "$bridge_plist" ]; then mv "$bridge_plist" "${bridge_plist}.disabled.$(date +%s)"; fi
+  unload "$connector_plist"
+  launchctl bootstrap "$domain" "$connector_plist"
+  launchctl kickstart -k "${domain}/${connector_label}"
+  echo "Installed Desktop Connector. Restart Harness after active tasks finish."
+  exit 0
+fi
 
 write_plist "$bridge_label" "$project_root/scripts/run-bridge.sh" "$bridge_plist" \
   "$log_dir/bridge.log" "$log_dir/bridge.err.log"

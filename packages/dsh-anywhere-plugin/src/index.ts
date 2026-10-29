@@ -25,6 +25,8 @@ import {
   type EventEnvelope,
   type QuestionAnswerItem,
 } from '@dsh-anywhere/protocol'
+import { invokeNative } from './gateway.js'
+import { publishBridgeEndpoint, registeredBridgeToken } from './desktop.js'
 import { PairingAuthority } from './auth.js'
 import { HttpError, json, readJson, RetryableHttpError } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
@@ -242,7 +244,7 @@ export function isSilentSetupEcho(sessionId: string, rawEvent: unknown): boolean
 // follow-up, not a bigger cap.
 const HISTORY_EVENT_LIMIT = 10_000
 
-export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway', 'directoryPicker']
+export const inject = ['webServer', 'sessionController', 'workspaceRegistry', 'typertGateway', 'directoryPicker', 'connection']
 
 export interface Config {
   readonly routePrefix?: string
@@ -338,6 +340,7 @@ export type AttachmentUploadRecoveryResult =
 
 interface NativeContext extends Context {
   readonly webServer: {
+    readonly origin?: string
     register(route: {
       kind: 'exact' | 'prefix'
       path: string
@@ -1805,6 +1808,9 @@ function defaultConnectorConfigPath(): string {
   if (process.platform === 'darwin') {
     return join(homedir(), 'Library', 'Application Support', 'DSH Anywhere', 'connector.json')
   }
+  if (process.platform === 'win32') {
+    return join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'DSH Anywhere', 'connector.json')
+  }
   return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'dsh-anywhere', 'connector.json')
 }
 
@@ -2014,10 +2020,14 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const ctx = baseCtx as NativeContext
   const prefix = config.routePrefix ?? '/dsh-anywhere/v1'
   const machineId = `machine_${hostname()}`
+  const configPath = config.connectorConfigPath ?? defaultConnectorConfigPath()
   const connectorToken = config.connectorToken ?? process.env.DSH_ANYWHERE_CONNECTOR_TOKEN
+    ?? registeredBridgeToken(configPath)
   if (connectorToken !== undefined && connectorToken.length > 0 && connectorToken.length < 32) {
     throw new Error('connectorToken must be at least 32 characters when provided')
   }
+  const stopPublishing = publishBridgeEndpoint(ctx.webServer, configPath, prefix, (message) => ctx.logger.warn(message))
+  ctx.effect(() => stopPublishing)
   const announcePairingCode = (snapshot: { code: string; expiresAt: number }): void => {
     const message = `DSH Anywhere pairing code: ${snapshot.code} (expires ${new Date(snapshot.expiresAt).toISOString()})`
     ctx.logger.info(message)
@@ -2124,7 +2134,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           )
         } catch (error) {
           const status = error instanceof HttpError ? error.status : 500
-          const outcome = error instanceof HttpError ? error.idempotencyOutcome : 'unknown'
+          const outcome = req.method === 'GET'
+            ? (status >= 500 ? 'retryable' : 'final')
+            : error instanceof HttpError ? error.idempotencyOutcome : 'unknown'
           json(target, status, { error: error instanceof Error ? error.message : String(error) }, {
             'x-dsh-idempotency-outcome': outcome,
           })
@@ -2924,7 +2936,7 @@ async function handleHttp(
   }
   if (req.method === 'GET' && path === '/modes') {
     if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness mode catalog is unavailable')
-    const result = await ctx.typertGateway.invoke({ namespace: 'agentPresets', method: 'list', args: {}, signal: AbortSignal.timeout(15_000) })
+    const result = await invokeNative(ctx, { namespace: 'agentPresets', method: 'list', args: {}, signal: AbortSignal.timeout(15_000) })
     const failure = remoteFailureOf(result)
     if (failure !== undefined) throw new HttpError(502, failure)
     json(res, 200, modeCatalogFromRemote(result))
@@ -3686,7 +3698,7 @@ async function executeCommand(
   attachments: readonly unknown[],
 ): Promise<unknown> {
   if (ctx.typertGateway !== undefined) {
-    return ctx.typertGateway.invoke({
+    return invokeNative(ctx, {
       namespace: 'commands',
       method: 'execute',
       args: { agentId: sessionId, line, submittedAttachments: attachments },
@@ -3709,7 +3721,7 @@ async function uploadAttachment(
   nativeOperationId?: string,
 ): Promise<Record<string, unknown>> {
   if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness file upload service is unavailable')
-  const result = await ctx.typertGateway.invoke({
+  const result = await invokeNative(ctx, {
     namespace: 'fileUploads',
     method: 'upload',
     args: {

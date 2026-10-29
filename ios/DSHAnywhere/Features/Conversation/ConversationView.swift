@@ -61,8 +61,7 @@ enum DSHLiveTurnStatusProjection {
                 return (message, preview.isEmpty ? "正在输出…" : "正在输出 · \(preview)")
             }
             if let reasoning = message.reasoning, !reasoning.isEmpty {
-                let preview = previewLine(reasoning)
-                return (message, preview.isEmpty ? "思考中…" : "思考中 · \(preview)")
+                return (message, "思考中…")
             }
             return nil
         }, by: { $0.message.sequence })
@@ -83,10 +82,8 @@ enum DSHLiveTurnStatusProjection {
         }
     }
 
-    /// A currently running tool is an independent proof that a turn is live,
-    /// even if the matching `turn.state.changed` arrives late.  Completed
-    /// activity deliberately does not keep the status row visible after the
-    /// turn settles.
+    /// Historical tools may retain this status after a turn has settled;
+    /// only the authoritative turn state decides whether to show a live clock.
     static func hasRunningTool(messages: [DSHChatMessage], tools: [DSHToolActivity]) -> Bool {
         guard let turnStart = currentTurnStart(messages) else { return false }
         return tools.contains {
@@ -96,7 +93,7 @@ enum DSHLiveTurnStatusProjection {
 
     static func shouldShow(turnState: String, messages: [DSHChatMessage],
                            tools: [DSHToolActivity]) -> Bool {
-        turnState.lowercased() == "running" || hasRunningTool(messages: messages, tools: tools)
+        turnState.lowercased() == "running"
     }
 
     private static func currentTurnStart(_ messages: [DSHChatMessage]) -> Int64? {
@@ -910,7 +907,6 @@ struct ConversationView: View {
 
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
-    @State private var headerOverlapsContent = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showCamera = false
     @State private var capturedPhoto: UIImage?
@@ -1182,7 +1178,6 @@ struct ConversationView: View {
             .padding(.horizontal)
             .padding(.vertical, 12)
             .background(DSHScrollFinder(coordinator: scrollCoordinator))
-            .background(DSHHeaderScrollProbe(overlaps: $headerOverlapsContent))
         }
         // Let the transcript pass behind the floating material while the
         // real safe-area insets keep its resting first/last rows unobscured.
@@ -1219,7 +1214,7 @@ struct ConversationView: View {
     var body: some View {
         ScrollViewReader { proxy in
             transcriptScrollView(proxy: proxy)
-                .safeAreaInset(edge: .top, spacing: 0) {
+                .dshTopScrollBar {
                     happyConversationHeader
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -1372,10 +1367,6 @@ struct ConversationView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop())
-        .overlay(alignment: .bottom) {
-            if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
-        }
     }
 
     /// Happy's empty conversation state is intentionally sparse: a laptop,
@@ -3676,22 +3667,11 @@ private struct AssistantTurnView: View {
     let onBranch: () -> Void
 
     @State private var isExpanded = false
-    /// Whether the open state came from the reader's own tap. Auto-opened
-    /// traces collapse again when their tools settle, so finished steps never
-    /// bury the conversation; a manually opened trace stays as left.
-    @State private var manualExpansion = false
 
     private var timeline: DSHTaskTimeline? { block.taskTimeline }
     private var text: String { timeline?.reasoning ?? "" }
     private var tools: [DSHToolActivity] { timeline?.tools ?? [] }
     private var answerCount: Int { timeline?.messages.filter { !$0.markdown.isEmpty }.count ?? 0 }
-
-    /// Live means literally running: failed/error/cancelled tools are
-    /// settled, not live. Counting them as live kept turns (and the live
-    /// trail) stuck open forever after any failure.
-    private var hasRunningTools: Bool {
-        tools.contains { $0.status.lowercased() == "running" }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -3713,19 +3693,6 @@ private struct AssistantTurnView: View {
                     .padding(.top, 12)
             }
         }
-        .onAppear {
-            if hasRunningTools { isExpanded = true }
-        }
-        .onChange(of: hasRunningTools) { _, running in
-            // Never hide live work: a newly started tool reopens the trace.
-            // When the tools settle, an auto-opened trace folds itself away;
-            // one the reader opened by hand stays as left.
-            if running {
-                withAnimation(.easeOut(duration: 0.2)) { isExpanded = true; manualExpansion = false }
-            } else if !manualExpansion {
-                withAnimation(.easeOut(duration: 0.2)) { isExpanded = false }
-            }
-        }
     }
 
     private var isExpandable: Bool {
@@ -3738,7 +3705,7 @@ private struct AssistantTurnView: View {
     private var timelineRow: some View {
         if isExpandable {
             Button {
-                withAnimation(.easeOut(duration: 0.2)) { isExpanded.toggle(); manualExpansion = true }
+                withAnimation(.easeOut(duration: 0.2)) { isExpanded.toggle() }
             } label: {
                 timelineLabel
                     .frame(maxWidth: .infinity, alignment: .leading)

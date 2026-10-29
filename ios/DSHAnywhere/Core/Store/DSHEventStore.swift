@@ -132,6 +132,14 @@ public struct DSHEventReducer: Sendable {
             // anyway made SwiftUI re-diff every row on the home screen, which is
             // what showed up as flicker each time data refreshed.
             if sessions != state.sessions { state.sessions = sessions }
+            for session in sessions {
+                guard let running = session.running else { continue }
+                if running {
+                    state.turnStateBySession[session.id] = "running"
+                } else if state.turnStateBySession[session.id]?.lowercased() == "running" {
+                    state.turnStateBySession[session.id] = "idle"
+                }
+            }
             state.hasLoadedSessions = true
         case .sessionCreated(let session):
             upsert(session, into: &state.sessions)

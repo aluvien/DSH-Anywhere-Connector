@@ -234,7 +234,7 @@ final class DSHProtocolTests: XCTestCase {
         let completed = DSHToolActivity(id: "done", name: "read", status: "completed",
                                         detail: #"{"path":"old.swift"}"#, sequence: 102)
         XCTAssertEqual(DSHLiveTurnStatusProjection.trail(messages: messages, tools: [completed]),
-                       "思考中 · 正在检查 Harness 轨迹")
+                       "思考中…")
 
         let running = DSHToolActivity(id: "running", name: "read", status: "running",
                                       detail: #"{"path":"live.swift"}"#, sequence: 103)
@@ -253,6 +253,20 @@ final class DSHProtocolTests: XCTestCase {
                                       detail: #"{"path":"old.swift"}"#, sequence: 11)
         XCTAssertNil(DSHLiveTurnStatusProjection.trail(messages: messages, tools: [oldTool]))
         XCTAssertFalse(DSHLiveTurnStatusProjection.hasRunningTool(messages: messages, tools: [oldTool]))
+    }
+
+    func testHistoricalRunningToolDoesNotStartAClockWhenOpeningACompletedConversation() {
+        let messages = [
+            DSHChatMessage(id: "user", role: .user, markdown: "build", sequence: 100),
+            DSHChatMessage(id: "answer", role: .assistant, markdown: "Done", sequence: 104),
+        ]
+        let staleTool = DSHToolActivity(id: "stale", name: "bash", status: "running", sequence: 102)
+        for state in ["idle", "completed", "cancelled", "failed"] {
+            XCTAssertFalse(DSHLiveTurnStatusProjection.shouldShow(turnState: state,
+                messages: messages, tools: [staleTool]))
+        }
+        XCTAssertTrue(DSHLiveTurnStatusProjection.shouldShow(turnState: "running",
+            messages: messages, tools: []))
     }
 
     func testOpenSessionCommandCarriesTheSessionID() {
@@ -877,9 +891,12 @@ final class DSHConversationViewportTests: XCTestCase {
         assertViewport()
         XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, oldHeight)
         capture("conversation-composer-expanded")
-        // Headless simulators can have a hardware keyboard attached. Exercise
-        // a full keyboard-sized safe-area change even when no software keyboard
-        // is rendered, independently of the composer's 48-point expansion.
+        // Exercise a keyboard-sized safe-area change independently of the
+        // simulator's hardware/software keyboard setting. Dismiss the real
+        // keyboard first: UIKit overlaps these insets rather than adding them.
+        editor.resignFirstResponder()
+        try await Task.sleep(for: .milliseconds(800))
+        window.layoutIfNeeded()
         let expandedHeight = scroll.bounds.inset(by: scroll.adjustedContentInset).height
         host.additionalSafeAreaInsets.bottom = 320
         try await Task.sleep(for: .milliseconds(500))
@@ -920,29 +937,6 @@ private struct DSHHomeSearchFixtureView: View {
 
 @MainActor
 final class DSHHomeLayoutTests: XCTestCase {
-    func testHeaderSeparatorTracksContentPassingHeaderAndReturnsToHidden() async throws {
-        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
-        scroll.contentInset.top = 80
-        scroll.contentSize = CGSize(width: 390, height: 1400)
-        scroll.contentOffset.y = -80
-        let probe = DSHHeaderScrollProbe.Probe()
-        var overlaps = true
-        probe.publish = { overlaps = $0 }
-        scroll.addSubview(probe)
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(overlaps)
-        scroll.contentOffset.y = -60
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertTrue(overlaps)
-        scroll.contentOffset.y = -95
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(overlaps)
-        scroll.contentSize = .zero
-        scroll.contentOffset.y = 0
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(overlaps)
-    }
-
     func testArchivedTasksStaySeparateAndSearchableWithoutAProject() {
         let sessions = [
             DSHSessionSummary(id: "active", title: "Active", updatedAt: 40, workspaceName: "Project"),

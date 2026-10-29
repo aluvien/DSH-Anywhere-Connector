@@ -1616,6 +1616,29 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.turnStateBySession["s"], "completed")
     }
 
+    func testFreshSessionSnapshotReconcilesRunningStateAfterOpeningOrReconnect() {
+        var state = DSHStoreState()
+        state.turnStateBySession = ["settled": "running", "failed": "failed", "unknown": "running"]
+        let snapshot = DSHEvent(envelope: DSHEnvelope(
+            messageId: "snapshot", deviceId: "d", machineId: "m", sequence: 1,
+            type: "session.snapshot", payload: .array([
+                .object(["id": .string("active"), "title": .string("Active"),
+                         "updatedAt": .number(1), "running": .bool(true)]),
+                .object(["id": .string("settled"), "title": .string("Settled"),
+                         "updatedAt": .number(1), "running": .bool(false)]),
+                .object(["id": .string("failed"), "title": .string("Failed"),
+                         "updatedAt": .number(1), "running": .bool(false)]),
+                .object(["id": .string("unknown"), "title": .string("Legacy"),
+                         "updatedAt": .number(1)]),
+            ])
+        ))
+        DSHEventReducer().reduce(snapshot, into: &state)
+        XCTAssertEqual(state.turnStateBySession["active"], "running")
+        XCTAssertEqual(state.turnStateBySession["settled"], "idle")
+        XCTAssertEqual(state.turnStateBySession["failed"], "failed")
+        XCTAssertEqual(state.turnStateBySession["unknown"], "running")
+    }
+
     @MainActor
     func testSessionDotPrioritizesErrorOverApprovalOverActivity() {
         var state = DSHStoreState()

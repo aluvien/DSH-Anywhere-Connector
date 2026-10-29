@@ -126,7 +126,8 @@ echo
 echo "Scan this one-time QR code with DSH Anywhere on iPhone:"
 "$node_command" "$bundle_dir/packages/connector/lib/cli.js" pair-qr --config "$config_path"
 
-pairing_page="http://127.0.0.1:3080/dsh-anywhere/v1/pairing"
+"$node_command" "$bundle_dir/packages/connector/lib/cli.js" status --config "$config_path" > "${temporary_dir}/status.json" || true
+pairing_page=$("$node_command" -e 'const s=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(s.config.bridgeBaseURL+"/pairing")' "${temporary_dir}/status.json")
 attempt=0
 while [ "$attempt" -lt 30 ]; do
   if /usr/bin/curl -fsS "$pairing_page" >/dev/null 2>&1; then

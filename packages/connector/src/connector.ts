@@ -57,6 +57,7 @@ export interface WebSocketLike {
 }
 
 export interface ConnectorDependencies {
+  readonly resolveBridgeBaseURL?: () => Promise<string>;
   readonly webSocketFactory?: (url: string, headers: Readonly<Record<string, string>>) => WebSocketLike;
   readonly fetch?: typeof fetch;
   readonly logger?: Logger;
@@ -100,6 +101,8 @@ export class DSHAnywhereConnector {
   /** A new Bridge socket gets a new lease identity.  Presence requests from a
    * dead socket must not be mistaken for requests from its replacement. */
   private bridgeConnectorId: string | undefined;
+  private bridgeConnectGeneration = 0;
+  private readonly resolveBridgeBaseURL: (() => Promise<string>) | undefined;
   /** Server-issued monotonic lease for the current Relay machine socket. */
   private relayLeaseGeneration: number | undefined;
   private relayEpoch: string | undefined;
@@ -213,6 +216,7 @@ export class DSHAnywhereConnector {
     this.reconnectMaxMs = dependencies.reconnectMaxMs ?? 30_000;
     this.heartbeatMs = dependencies.heartbeatMs ?? 25_000;
     this.pairingCodePath = dependencies.pairingCodePath;
+    this.resolveBridgeBaseURL = dependencies.resolveBridgeBaseURL;
   }
 
   get status(): ConnectorState {
@@ -229,6 +233,7 @@ export class DSHAnywhereConnector {
   }
 
   async stop(): Promise<void> {
+    ++this.bridgeConnectGeneration;
     this.running = false;
     this.state = "stopped";
     this.clearTimers();
@@ -315,12 +320,28 @@ export class DSHAnywhereConnector {
 
   private connectBridge(): void {
     if (!this.running) return;
+    const generation = ++this.bridgeConnectGeneration;
+    if (this.resolveBridgeBaseURL === undefined) {
+      this.openBridge(this.config.bridgeBaseURL);
+      return;
+    }
+    void Promise.resolve().then(() => this.resolveBridgeBaseURL!()).then(baseURL => {
+      if (this.running && generation === this.bridgeConnectGeneration) this.openBridge(baseURL);
+    }).catch(error => {
+      if (!this.running || generation !== this.bridgeConnectGeneration) return;
+      this.log("warn", `Could not resolve local Bridge endpoint: ${safeError(error, this.config)}`);
+      this.scheduleBridgeReconnect();
+    });
+  }
+
+  private openBridge(baseURL: string): void {
+    if (!this.running) return;
     const connectorId = randomUUID();
     this.bridgeConnectorId = connectorId;
     this.bridgeReady = false;
     this.bridgeBufferedEvents = [];
     const socket = this.webSocketFactory(
-      bridgeEventsURL(this.config.bridgeBaseURL, connectorId, this.bridgeAfterSequence),
+      bridgeEventsURL(baseURL, connectorId, this.bridgeAfterSequence),
       authorization(this.config.bridgeToken),
     );
     this.bridge = socket;
@@ -341,6 +362,7 @@ export class DSHAnywhereConnector {
     socket.on("close", () => {
       if (this.bridge !== socket) return;
       this.bridge = undefined;
+      ++this.bridgeConnectGeneration;
       if (this.bridgeConnectorId === connectorId) this.bridgeConnectorId = undefined;
       // Bridge removes every presence lease owned by a disconnected socket.
       // Keep the Relay-online set, but fence all session.create delivery until
@@ -671,7 +693,13 @@ export class DSHAnywhereConnector {
     const bodyHash = encodedBody === undefined
       ? undefined
       : createHash("sha256").update(encodedBody).digest("hex");
-    const response = await this.request(bridgeAPIURL(this.config.bridgeBaseURL, request.path), {
+    const signal = AbortSignal.timeout(timeoutMs);
+    const generation = this.bridgeConnectGeneration;
+    const baseURL = this.resolveBridgeBaseURL === undefined
+      ? this.config.bridgeBaseURL : await this.resolveBridgeBaseURL();
+    signal.throwIfAborted();
+    if (!this.running || generation !== this.bridgeConnectGeneration) throw new Error("Bridge connection changed before request dispatch");
+    const response = await this.request(bridgeAPIURL(baseURL, request.path), {
       method: request.method,
       headers: {
         ...authorization(this.config.bridgeToken),
@@ -683,11 +711,11 @@ export class DSHAnywhereConnector {
         }),
       },
       ...(encodedBody === undefined ? {} : { body: encodedBody }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
     });
     if (!response.ok) {
       const outcomeHeader = response.headers.get("x-dsh-idempotency-outcome");
-      const outcome = outcomeHeader === "retryable" || outcomeHeader === "retryable-committed"
+      const outcome = request.method === "GET" ? undefined : outcomeHeader === "retryable" || outcomeHeader === "retryable-committed"
         || outcomeHeader === "retryable-durable" || outcomeHeader === "unknown"
         ? outcomeHeader : undefined;
       throw new BridgeRequestError(response.status, `HTTP ${response.status}`, outcome);
@@ -1173,7 +1201,9 @@ export class DSHAnywhereConnector {
       // dispatchCommand, so session.create is definitely unaccepted too.
       (error.status >= 500 && error.outcome === "retryable")
     );
-    const resultUnknown = !definitelyRejected && (
+    const readOnly = ["session.list", "workspace.catalog", "directory.list", "mode.catalog", "model.catalog"].includes(command.type);
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
+    const resultUnknown = !readOnly && !definitelyRejected && (
       (error instanceof Error && error.name === "TimeoutError")
       || (error instanceof BridgeRequestError && error.outcome === "unknown")
       || (error instanceof BridgeRequestError && error.outcome === "retryable-committed")
@@ -1182,8 +1212,10 @@ export class DSHAnywhereConnector {
     );
     const reason = resultUnknown
       ? "Local operation did not confirm completion before the deadline; its result is unknown"
-      : error instanceof BridgeRequestError
-        ? `Local DSH bridge request failed (HTTP ${error.status})`
+      : readOnly && timedOut
+        ? `Local DSH bridge read timed out (${command.type}); please retry`
+        : error instanceof BridgeRequestError
+        ? `Local DSH bridge request failed (${command.type}, HTTP ${error.status})`
         : "Local DSH bridge request failed";
     this.log("warn", `${reason} for ${command.type}: ${safeError(error, this.config)}`);
     // A Connector-side timeout is safe to retry with the same id: the Bridge

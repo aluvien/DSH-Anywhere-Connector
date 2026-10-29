@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
+import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { pairingLink } from "@dsh-anywhere/protocol";
 import { loadConfig, defaultConfigPath, redactSecrets, type ConnectorConfig } from "./config.js";
+import { endpointFileResolver } from "./bridge-endpoint-file.js";
 import { DSHAnywhereConnector, bridgeAPIURL } from "./connector.js";
 import { enrollConnector, setupConnector, requestPairingCode, writePairingCodeFile } from "./setup.js";
 
@@ -22,7 +25,7 @@ export async function runCli(
   }
   try {
     if (parsed.command === "pair" || parsed.command === "pair-qr") {
-      const config = await loadConfig(parsed.configPath);
+      const config = await loadConfig(parsed.configPath, dependencies.environment ?? process.env);
       const issued = await requestPairingCode(config, dependencies.fetch ?? fetch);
       await writePairingCodeFile(join(dirname(parsed.configPath), "pairing-code.json"), {
         machineId: config.machineId,
@@ -82,13 +85,19 @@ export async function runCli(
       }));
       return 0;
     }
-    const config = await loadConfig(parsed.configPath);
+    const config = await loadConfig(parsed.configPath, dependencies.environment ?? process.env);
+    const environment = dependencies.environment ?? process.env;
+    const resolveBridgeBaseURL = environment.DSH_ANYWHERE_BRIDGE_BASE_URL !== undefined
+      ? async () => config.bridgeBaseURL
+      : endpointFileResolver(environment.DSH_ANYWHERE_BRIDGE_ENDPOINT
+          ?? join(dirname(parsed.configPath), "bridge-endpoint.json"), config.bridgeBaseURL);
     if (parsed.command === "status") {
-      const result = await connectorStatus(config, dependencies.fetch ?? fetch);
+      const result = await connectorStatus({ ...config, bridgeBaseURL: await resolveBridgeBaseURL() }, dependencies.fetch ?? fetch);
       stdout(JSON.stringify(result));
       return result.ok ? 0 : 1;
     }
     const connector = new DSHAnywhereConnector(config, {
+      resolveBridgeBaseURL,
       // Publish a fresh single-use code beside the config so the local pairing
       // page shows a code instead of the long-lived secret.
       pairingCodePath: join(dirname(parsed.configPath), "pairing-code.json"),
@@ -157,7 +166,7 @@ function parseArgs(args: readonly string[], environment: NodeJS.ProcessEnv): Par
   const [command, ...rest] = args;
   if (command !== "start" && command !== "status" && command !== "setup" && command !== "enroll" &&
       command !== "pair" && command !== "pair-qr") return undefined;
-  let configPath = defaultConfigPath();
+  let configPath = defaultConfigPath(environment);
   const options: Record<string, string> = {};
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
@@ -226,7 +235,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   void runCli(process.argv.slice(2)).then((code) => {
     if (code !== 0) process.exitCode = code;
   });

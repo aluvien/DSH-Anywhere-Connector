@@ -1195,7 +1195,6 @@ struct DSHRemoteHomeView: View {
     @State private var showSettings = false
     @State private var showSearch = false
     @State private var searchText = ""
-    @State private var headerOverlapsContent = false
     @State private var showNewTask = {
         #if DEBUG
         return ProcessInfo.processInfo.arguments.contains("--dsh-preview-new-session")
@@ -1335,7 +1334,6 @@ struct DSHRemoteHomeView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 18)
-                .background(DSHHeaderScrollProbe(overlaps: $headerOverlapsContent, topSpacing: 14))
                 .id(model.groupsSessionsByWorkspace ? "remote-workspaces" : "remote-flat")
             }
             .scrollIndicators(.hidden)
@@ -1347,7 +1345,7 @@ struct DSHRemoteHomeView: View {
                 model.sendModelCatalog()
             }
             .background(Color(.systemBackground))
-            .safeAreaInset(edge: .top, spacing: 0) {
+            .dshTopScrollBar {
                 if !showSearch { remoteHeader }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -1516,10 +1514,6 @@ struct DSHRemoteHomeView: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(DSHHeaderBackdrop())
-        .overlay(alignment: .bottom) {
-            if headerOverlapsContent { Color.primary.opacity(0.1).frame(height: 0.5) }
-        }
     }
 
     @ViewBuilder

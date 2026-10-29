@@ -41,3 +41,32 @@ export DSH_ANYWHERE_MACHINE_NAME='My Mac'
 仅当前用户可读写。压缩包不包含任何 token、pairing secret 或服务器配置。
 
 本机仍需预先安装：Node.js 22+、pnpm，以及 DeepSeek Harness 的 `dsh` 命令。
+# Harness 桌面版（0.2.1）
+
+桌面版默认使用系统分配的本机端口。Mac 安装脚本检测到已初始化的
+`~/.dsh/profiles/desktop` 后，会安装桌面 Bridge 和独立 Connector，停用旧的
+Web Bridge 启动服务。设置 `DSH_ANYWHERE_HOST=web` 可显式选择原来的 Web 方式。
+
+Bridge 使用现有 `connector.json` 中的认证信息，并把实际地址原子写入同目录的
+`bridge-endpoint.json`。Connector 在连接、重连、HTTP 请求和 `status` 检查时读取它；
+显式设置 `DSH_ANYWHERE_BRIDGE_BASE_URL` 时优先使用指定地址。
+手机仍然通过 Relay 连接，无需更新或重新配对。
+
+更新本机安装：
+
+```sh
+./scripts/sync-mac-live.sh
+```
+
+脚本备份现有桌面安装、更新 Connector 并重启它。等待 Harness 中的任务结束后，
+退出并重新打开 Harness，以加载新的 Bridge。不要将当前随机端口手工写死。
+安装备份位于 `~/Library/Application Support/DSH Anywhere/backups/`。
+
+检查实际连接地址：
+
+```sh
+node packages/connector/lib/cli.js status
+```
+
+新版 Gateway 的模式列表、命令和上传调用使用 Host 创建的 Peer；旧版继续使用原有调用格式。
+读取失败会显示接口和 HTTP 状态，只有可能已执行的写入操作保留“结果未知”语义。

@@ -1,10 +1,43 @@
 import SwiftUI
 import UIKit
 
-/// Light frosting keeps passing text visible as soft outlines, while the
-/// background-colour veil prevents dense text from tinting the header grey.
+/// Register the custom header with the native scroll edge on modern iOS.
+/// Only older systems render the standalone compatibility backdrop.
+private struct DSHTopScrollBar<Header: View>: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    let header: Header
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            if reduceTransparency {
+                content
+                    .scrollEdgeEffectHidden(true, for: .top)
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        header.background(Color(.systemBackground).ignoresSafeArea(edges: .top))
+                    }
+            } else {
+                content
+                    .scrollEdgeEffectStyle(.soft, for: .top)
+                    .safeAreaBar(edge: .top, spacing: 0) { header }
+            }
+        } else {
+            content.safeAreaInset(edge: .top, spacing: 0) {
+                header.background(DSHHeaderBackdrop())
+            }
+        }
+    }
+}
+
+extension View {
+    func dshTopScrollBar<Header: View>(@ViewBuilder content: () -> Header) -> some View {
+        modifier(DSHTopScrollBar(header: content()))
+    }
+}
+
 struct DSHHeaderBackdrop: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    private let fadeHeight: CGFloat = 24
 
     var body: some View {
         Group {
@@ -12,7 +45,26 @@ struct DSHHeaderBackdrop: View {
                 Color(.systemBackground)
             } else {
                 DSHHeaderBlur()
-                    .overlay(Color(.systemBackground).opacity(0.64))
+                    .overlay {
+                        LinearGradient(stops: [
+                            .init(color: Color(.systemBackground).opacity(0.14), location: 0),
+                            .init(color: Color(.systemBackground).opacity(0.08), location: 0.65),
+                            .init(color: Color(.systemBackground).opacity(0), location: 1),
+                        ], startPoint: .top, endPoint: .bottom)
+                    }
+                    .mask {
+                        // Keep full blur behind both title lines. Only the
+                        // extension below the header fades into the transcript.
+                        VStack(spacing: 0) {
+                            Color.black
+                            LinearGradient(colors: [.black, .clear],
+                                           startPoint: .top, endPoint: .bottom)
+                                .frame(height: fadeHeight)
+                        }
+                    }
+                    // Extend only the backdrop; keep content insets and the
+                    // header's controls at their existing layout positions.
+                    .padding(.bottom, -fadeHeight)
             }
         }
         .ignoresSafeArea(edges: .top)
@@ -20,107 +72,13 @@ struct DSHHeaderBackdrop: View {
     }
 }
 
-/// Interpolate the native blur itself, rather than lowering the effect view's
-/// alpha (which would reveal sharp text). Keep the paused animator alive for
-/// as long as the header is mounted.
 private struct DSHHeaderBlur: UIViewRepresentable {
-    func makeUIView(context: Context) -> BlurView { BlurView() }
-    func updateUIView(_ view: BlurView, context: Context) {}
-    static func dismantleUIView(_ view: BlurView, coordinator: ()) {
-        view.clearBlur()
+    func makeUIView(context: Context) -> UIVisualEffectView {
+        let view = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
+        view.isUserInteractionEnabled = false
+        return view
     }
-
-    final class BlurView: UIVisualEffectView {
-        private var animator: UIViewPropertyAnimator?
-
-        init() {
-            super.init(effect: nil)
-            isUserInteractionEnabled = false
-        }
-
-        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            clearBlur()
-            setNeedsDisplay()
-        }
-
-        override func draw(_ rect: CGRect) {
-            super.draw(rect)
-            guard window != nil, animator == nil else { return }
-            // The backdrop must exist before interpolation; configuring it in
-            // didMoveToWindow makes UIKit render the full-strength blur.
-            let animator = UIViewPropertyAnimator(duration: 1, curve: .linear) { [weak self] in
-                self?.effect = UIBlurEffect(style: .regular)
-            }
-            animator.pausesOnCompletion = true
-            animator.startAnimation()
-            animator.pauseAnimation()
-            animator.fractionComplete = 0.10
-            self.animator = animator
-        }
-
-        func clearBlur() {
-            animator?.stopAnimation(true)
-            animator = nil
-            effect = nil
-        }
-    }
-}
-
-/// Observes only its enclosing scroll view, including programmatic scrolling.
-/// Publishing on the next run-loop avoids state changes during UIKit layout.
-struct DSHHeaderScrollProbe: UIViewRepresentable {
-    @Binding var overlaps: Bool
-    var topSpacing: CGFloat = 12
-
-    func makeUIView(context: Context) -> Probe { Probe() }
-    func updateUIView(_ view: Probe, context: Context) {
-        view.topSpacing = topSpacing
-        view.publish = { overlaps = $0 }
-        view.attach()
-    }
-
-    final class Probe: UIView {
-        var publish: ((Bool) -> Void)?
-        var topSpacing: CGFloat = 12
-        private weak var scroll: UIScrollView?
-        private var observations: [NSKeyValueObservation] = []
-        private var lastValue: Bool?
-        override func didMoveToSuperview() { super.didMoveToSuperview(); attach() }
-        override func didMoveToWindow() { super.didMoveToWindow(); attach() }
-        func attach() {
-            isUserInteractionEnabled = false
-            var ancestor = superview
-            while let view = ancestor {
-                if let found = view as? UIScrollView {
-                    if scroll !== found {
-                        scroll = found
-                        observations = [
-                            found.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in self?.refresh() },
-                            found.observe(\.adjustedContentInset, options: [.new]) { [weak self] _, _ in self?.refresh() },
-                            found.observe(\.contentSize, options: [.new]) { [weak self] _, _ in self?.refresh() }
-                        ]
-                    }
-                    refresh()
-                    return
-                }
-                ancestor = view.superview
-            }
-        }
-        private func refresh() {
-            guard let scroll else { return }
-            let value = scroll.contentSize.height > 0
-                && scroll.contentOffset.y + scroll.adjustedContentInset.top > topSpacing
-            guard lastValue != value else { return }
-            lastValue = value
-            DispatchQueue.main.async { [weak self] in
-                guard let self, let latest = self.lastValue else { return }
-                self.publish?(latest)
-            }
-        }
-    }
+    func updateUIView(_ view: UIVisualEffectView, context: Context) {}
 }
 
 /// Floating glass chrome (Liquid Glass, iOS 26+). Below 26 the same call

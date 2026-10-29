@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP, type AddressInfo } from "node:net";
 import {
   PROTOCOL_VERSION,
+  CommandEnvelopeSchema,
+  EventEnvelopeSchema,
   RelayErrorMessageSchema,
   RelayMessageSchema,
   type RelayMessage,
@@ -153,6 +155,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
   const registry = new Registry(options.registryPath);
   await registry.load();
   const connections = new Set<RelayConnection>();
+  const diagnosedConnections = new WeakSet<RelayConnection>();
   const relayEpoch = randomUUID();
   const pairAttempts = new Map<string, PairAttempt>();
   const pairIpAttempts = new Map<string, PairAttempt>();
@@ -351,6 +354,22 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     }
     const parsed = RelayMessageSchema.safeParse(decoded);
     if (!parsed.success) {
+      // One diagnostic per connection, without message contents or credentials.
+      if (!diagnosedConnections.has(source)) {
+        diagnosedConnections.add(source);
+        const body = typeof decoded === "object" && decoded !== null && "body" in decoded
+          ? decoded.body : undefined;
+        const bodyResult = (source.principal.role === "device"
+          ? CommandEnvelopeSchema : EventEnvelopeSchema).safeParse(body);
+        const issues = bodyResult.success ? parsed.error.issues : bodyResult.error.issues;
+        console.warn("Relay schema rejection", JSON.stringify({
+          role: source.principal.role,
+          issues: issues.slice(0, 8).map((issue) => ({
+            code: issue.code,
+            path: issue.path.map((part) => String(part).slice(0, 80)),
+          })),
+        }));
+      }
       const context = malformedRelayRequestContext(decoded);
       sendError(source, "invalid_message", "Relay message does not match the protocol schema.",
         context.machineId, context.messageId);

@@ -1766,12 +1766,28 @@ final class DSHAppModel: ObservableObject {
             self.machineName = active.machineName
             self.machineID = active.machineId
         }
-        let loadTask: Task<Void, Never> = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.loadPendingTransactionStore()
+        #if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        let isStaticPreview = [
+            "--dsh-preview-home-unreachable", "--dsh-preview-conversation",
+            "--dsh-preview-new-session", "--dsh-preview-home-grouped", "--dsh-preview-home",
+        ].contains(where: arguments.contains)
+        #else
+        let isStaticPreview = false
+        #endif
+        if isStaticPreview {
+            // Preview models carry their own fixture data; don't load a real
+            // device's profile or pending requests over that state.
+            self.pendingTransactionStoreLoaded = true
+            self.pendingTransactionStoreLoadTask = nil
+        } else {
+            let loadTask: Task<Void, Never> = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.loadPendingTransactionStore()
+            }
+            self.pendingTransactionStoreLoadTask = loadTask
+            restoreQueuedPrompts()
         }
-        self.pendingTransactionStoreLoadTask = loadTask
-        restoreQueuedPrompts()
     }
 
     /// The Mac the app is currently talking to.
@@ -5363,6 +5379,18 @@ final class DSHAppModel: ObservableObject {
             DSHChatMessage(id: "preview-assistant", role: .assistant, markdown: "I can help you plan and implement the native client.")
         ]
         #if DEBUG
+        // Keep a deterministic usage sample available for screenshots and
+        // layout checks without connecting to a real Harness session.
+        if ProcessInfo.processInfo.arguments.contains("--dsh-preview-usage") {
+            state.usageBySession[session.id] = DSHSessionUsage(
+                rounds: 7, steps: 19, inputTokens: 31_200, outputTokens: 4_600,
+                totalTokens: 35_800, cacheReadTokens: 21_000, cacheWriteTokens: 2_400,
+                cacheHitPercent: 87.4, tokensPerSecond: 56,
+                contextUsed: 62_000, contextWindow: 128_000
+            )
+        }
+        #endif
+        #if DEBUG
         if longConversation || ProcessInfo.processInfo.arguments.contains("--dsh-preview-long-conversation") {
             state.messagesBySession[session.id] = (0..<12).flatMap { index in
                 [DSHChatMessage(id: "user-\(index)", role: .user, markdown: "第 \(index + 1) 轮：测试长对话布局"),
@@ -5374,7 +5402,30 @@ final class DSHAppModel: ObservableObject {
         state.toolsBySession[session.id] = [
             DSHToolActivity(id: "preview-tool", name: "read_project", status: "completed", detail: "Read 12 files")
         ]
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--dsh-preview-historical-tools") {
+            state.sessions[0] = DSHSessionSummary(id: session.id, title: "安装包逆向分析咨询",
+                updatedAt: now, workspaceName: "MagicAuto", running: false)
+            state.turnStateBySession[session.id] = "completed"
+            var answer = DSHChatMessage(id: "history-answer", role: .assistant,
+                markdown: (1...12).map { "第 \($0) 项已完成。打开历史对话只展示回答；思考详情由点击展开。" }.joined(separator: "\n\n"),
+                reasoning: "思考详情仅在点击后显示。历史工具记录不会启动当前任务计时。",
+                sequence: 103, timestamp: now - 60_000)
+            answer.completedAt = now - 60_000
+            answer.taskCompletedAt = now - 60_000
+            state.messagesBySession[session.id] = [
+                DSHChatMessage(id: "history-user", role: .user, markdown: "检查已完成的任务。",
+                    sequence: 100, timestamp: now - 120_000),
+                answer,
+            ]
+            state.toolsBySession[session.id] = [
+                DSHToolActivity(id: "history-tool", name: "bash", status: "running",
+                    detail: "Bundle app and relaunch", sequence: 102),
+            ]
+        }
+        #endif
         let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+        model.machineID = "preview-machine"
         model.machineName = "macmini"
         model.selectedSessionID = session.id
         model.showMessageActionsByDefault = true

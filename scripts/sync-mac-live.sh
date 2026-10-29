@@ -35,6 +35,15 @@ discover_live_dir() {
   printf '%s' "${HOME}/DSH-ANYWHERE"
 }
 
+if [ "${DSH_ANYWHERE_HOST:-auto}" != "web" ] && [ -f "${DSH_HOME:-$HOME/.dsh}/profiles/desktop/package.json" ]; then
+  config_path=${DSH_ANYWHERE_CONFIG:-"${HOME}/Library/Application Support/DSH Anywhere/connector.json"}
+  pnpm --dir "$SRC_DIR" --filter @dsh-anywhere/protocol --filter @dsh-anywhere/plugin --filter @dsh-anywhere/connector build
+  node "$SRC_DIR/scripts/install-desktop.mjs" --config "$config_path"
+  launchctl kickstart -k "gui/${UID_NUM}/com.dsh-anywhere.connector"
+  echo "Connector restarted. Restart Harness after active tasks finish to load the Bridge."
+  exit 0
+fi
+
 LIVE_DIR=$(discover_live_dir)
 echo "source: $SRC_DIR"
 echo "live:   $LIVE_DIR"

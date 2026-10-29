@@ -14,7 +14,9 @@ cd "$project_root"
 
 command -v node >/dev/null 2>&1 || { echo "Missing Node.js 22+." >&2; exit 1; }
 command -v pnpm >/dev/null 2>&1 || { echo "Missing pnpm." >&2; exit 1; }
-command -v dsh >/dev/null 2>&1 || { echo "Missing the DeepSeek Harness 'dsh' command." >&2; exit 1; }
+if [ ! -f "${DSH_HOME:-$HOME/.dsh}/profiles/desktop/package.json" ] || [ "${DSH_ANYWHERE_HOST:-auto}" = "web" ]; then
+  command -v dsh >/dev/null 2>&1 || { echo "Missing the DeepSeek Harness 'dsh' command." >&2; exit 1; }
+fi
 
 node -e 'const major=Number(process.versions.node.split(".")[0]); if (major < 22) { console.error(`Node.js 22+ required; found ${process.versions.node}`); process.exit(1); }'
 
