@@ -26,8 +26,8 @@ const envelopeFields = {
 describe("collaboration controls", () => {
   it("requires an explicit safe schema revision, keeping the main wire version pinned", () => {
     expect(PROTOCOL_VERSION).toBe(1);
-    for (const revision of [undefined, null, true, "", "11garbage", "11.5", "1e2", 10, 11.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) expect(supportsSchemaRevision(revision)).toBe(false);
-    for (const revision of [11, "11", 12, "12"]) expect(supportsSchemaRevision(revision)).toBe(true);
+    for (const revision of [undefined, null, true, "", "11garbage", "11.5", "1e2", 10, 11, "11", 11.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) expect(supportsSchemaRevision(revision)).toBe(false);
+    for (const revision of [12, "12", 13, "13"]) expect(supportsSchemaRevision(revision)).toBe(true);
   });
   it("keeps discovery overrides private to requests and invalidations limited to identifiers", () => {
     const base = { version: 1, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1, type: "configuration.discover" };
@@ -93,6 +93,11 @@ describe("collaboration controls", () => {
       sessionId: "s", inTranscript: false, run: { id: "r", name: "Review", status: "completed", nativeSequence: 2, updatedNativeSequence: 10,
         members: [{ seq: 1, label: "A", childId: "a", status: "completed" }, { seq: 2, label: "B", childId: "b", phase: "", status: "failed" }] } } });
     expect(parsed.payload).toMatchObject({ inTranscript: false, run: { members: [{ childId: "a" }, { childId: "b", phase: "" }] } });
+  });
+  it("creates a goal through its Native endpoint without a fictitious previous ref", () => {
+    const command = { version: 1, requestId: "create", machineId: "m", deviceId: "d", sessionId: "s", timestamp: 1, type: "goal.update" };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "create", objective: "Ship", maxGoalRounds: 12 } }).success).toBe(true);
+    for (const payload of [{ action: "create", objective: " " }, { action: "create", objective: "Ship", maxGoalRounds: 0 }, { action: "create", objective: "Ship", ref: { id: "fake", revision: 1 } }]) expect(CommandEnvelopeSchema.safeParse({ ...command, payload }).success).toBe(false);
   });
   it("requires an exact valid goal revision and a nonempty edit", () => {
     const command = { version: PROTOCOL_VERSION, requestId: "goal", machineId: "mac-1", deviceId: "phone-1",

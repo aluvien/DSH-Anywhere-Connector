@@ -54,6 +54,7 @@ const DEFAULT_ENROLLMENT_RATE_LIMIT = 5;
  *     workflows, decision recovery, execution records, workspace file transfer,
  *     structured tool outcomes, per-answer feedback and native references.
  *     Attachment hostPath is optional but requires a matching Relay schema.
+ * 12: Native goal creation via goal.update action=create and its receipt.
  */
 const RELAY_SCHEMA_REVISION = SCHEMA_REVISION;
 

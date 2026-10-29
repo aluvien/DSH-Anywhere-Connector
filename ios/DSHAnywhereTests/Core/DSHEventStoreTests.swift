@@ -746,6 +746,35 @@ final class DSHEventStoreTests: XCTestCase {
         try await retry.value
     }
 
+    @MainActor
+    func testNativeGoalCreationKeepsUnknownRequestAndUsesCreateReceipt() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let live = makeModel(transport: transport, isPaired: true)
+        _ = await live.preparePromptPersistence(expectedMachineGeneration: live.currentMachineGeneration, expectedMachineID: live.machineID)
+        live.connect(); defer { live.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(60))
+        let create = Task { @MainActor in try await live.createGoal(in: "s", objective: "Read all Native information", maxGoalRounds: 7) }
+        defer { create.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "goal.update"), command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload, .object(["action": .string("create"), "objective": .string("Read all Native information"), "maxGoalRounds": .number(7)]))
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown create"), "retryable": .bool(false)])))
+        do { try await create.value; XCTFail("Unknown creation must retain its original identity") } catch { }
+        let retry = Task { @MainActor in try await live.createGoal(in: "s", objective: "Read all Native information", maxGoalRounds: 7) }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let repeated = await transport.lastCommand(ofType: "goal.update")
+        XCTAssertEqual(repeated?.requestId, command.requestId)
+        await transport.emit(event(type: "goal.updated", messageID: command.requestId, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(command.requestId), "action": .string("create"), "ref": .object(["id": .string("native"), "revision": .number(1)])])))
+        try await retry.value
+    }
+
     func testLiveGoalStateSurvivesHistoricalReplayAndClearedGoalCannotReappear() throws {
         var state = DSHStoreState()
         let reducer = DSHEventReducer()

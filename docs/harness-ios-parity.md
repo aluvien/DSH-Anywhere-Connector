@@ -2,6 +2,15 @@
 
 目标：还原电脑端实际提供的信息和操作，并适配手机阅读。以下全部完成且经过验证后，才可声明整体完成。代码已实现不等于跨端验收通过。
 
+## 当前进度（2026-10-30）
+
+- 开发分支 `codex/harness-ios-parity`，草稿 PR #1；此前提交已推送到 `91278df`，本轮目标创建及真实联调修复尚待最终回归后提交。
+- 生产 Relay、已加载的桌面 Bridge 与已安装 Connector 均为 schema 11；Harness 已按用户确认重启，4 个原有会话保留。本轮开发修订号升为 12，协议主版本仍为 1；用户已明确授权验证后按 Relay → 电脑组件 → App 顺序更新，不可将本地构建视为线上已更新。
+- 原生目标创建使用 `goals.create({agentId, request})`，提供目标和可选总轮次上限；不需要伪造 GoalRef，也不依赖 `/goal` 是否注册。当前存在未完成目标时禁止覆盖；已完成目标可按 Native 语义直接替换，新目标轮次从 0 开始。创建回执、未知结果和重试使用同一持久请求；已存在目标沿用原生 CAS 控制。静态 profile 的 disabled 值不能代表最终运行目录，不据此推断命令实际缺失。
+- 真实联调发现并修复：Native 无目标直接返回 undefined 时需保留空基线；手机根目录空路径需转换为 Native `.`；Native 文件异常可能直接抛出，需映射到明确能力/访问错误。独立 AppModel 注入配对存储，使测试不使用或改变开发者的手机配对。
+- TypeScript 构建、类型检查和 293 项回归通过（协议 37、Relay 23、Bridge 177、Connector 56），覆盖旧 schema 11 拒绝与新的创建请求。完整 iOS 回归及当前修订的真实 Native 流程最终结果待下方记录。
+- 独立 Native CRUD 验收禁用测试实例的 goal-round-driver，避免目标测试触发真实模型请求；测试目标控制并不证明自动推进/真实模型输出已验收。生产 Harness 不修改此插件。
+
 ## 当前已实现，仍需跨端验收
 
 - 电脑配置入口：读取 Native `settings.describe` 的 schema/value/base/user、隐藏密钥位置、版本和 live/restart 生效方式；配置与回执只供对应页面读取，不写入聊天 Store、Connector 重放和手机普通事务日志。字符串、数字、布尔、常量枚举、对象、字典与模型数组按原生定义编辑，保留未知字段；数组整体提交，支持增删与调整顺序，避免把数字路径错误地写成对象。未知结构可显式进入 JSON 编辑并校验后应用；隐藏密钥所在数组明确只读，不能用脱敏副本覆盖完整配置。字段可清除用户覆盖，基础值由 Host 合并恢复。保存只调用 `settings.mutate`，保留 expectedRevision 的原子 CAS；发现新版本或字段定义变化时保留草稿并要求显式核对、合并。尚需真实主机配置、重启生效和双端冲突验收。
@@ -155,3 +164,14 @@
 - Native 模型发现经真正的 llm-pi-ai 适配器请求独立 loopback 模型目录，验证 API 地址与临时测试凭据、模型 ID/上下文/输出限制映射；畸形目录错误不回显凭据。官方 llm-deepseek 当前没有发现适配器，修正为 501 和手动添加提示；请求参数不完整为 400。结果：`artifacts/ios/harness-parity/native-discovery-20261029.json`。
 - 上述发现能力回退修复后，`pnpm build`、`pnpm check` 全部通过：288 项 TypeScript。iOS 最新完整回归为 239 项通过；提供方标签改为“可配置，尚未添加”后，布局定向测试通过，结果位于 `/tmp/DSHAnywhere-parity-build/Logs/Test/Test-DSHAnywhere-2026.10.29_23-11-22-+0800.xcresult`。
 - 这些证据不等同已完成实体 iPhone 双向、系统分享和动态滚动验收。线上电脑仍需加载匹配 Bridge/Connector，新 App 仍需发布。
+
+
+## 2026-10-30 schema 12 与真实 iOS Native 链路
+
+- 目标创建扩展 `goal.update action=create`，沿用 `goal.updated` 回执；协议主版本仍为 1，修订号 12。新 Connector/Bridge 拒绝 schema 11 的不匹配组合，iOS 创建前检查 Relay 至少为 12。创建调用 Native goals.create，返回真实 ref；已存在未完成目标不能覆盖，已完成目标可按 Native 语义替换并从 0 轮开始。创建未知时保留原请求，不再次调用 Native 生成重复目标。
+- 真实 iOS 使用 URLSession WebSocket、原生 Keychain、独立 ProfileStore 和独立事务目录，完成真实 Relay → Connector → Bridge → Harness 请求。验证手机创建会话、动态命令、14 个配置命名空间、插件和提供方目录、配置保存及相同请求回执、根目录浏览、中文完整文件下载、空目标基线、计划进入/退出、执行生命周期读取、目标创建/暂停/编辑/恢复/完成/替换/清除，以及断开重连后重新读取。
+- 全部 241 项完整 iOS 回归首次运行中 240 项通过；唯一失败是新增联调用例将恢复后的解析默认值与未填写的 base 字段比较。改为比较原始解析值后，真实链路和新增目标未知结果恢复 2 项定向测试全部通过，结果为 `/tmp/dsh-native-ios-final-schema12.xcresult`；没有通过削弱产品校验或改动 Native 返回值来迁就测试。完整回归证据为 `/tmp/dsh-native-ios-full-schema12.xcresult`。
+- 已从真实 Native 链路采集配置、目标创建和目标管理的浅色/深色大字截图。320 点大字截图发现目标阶段被单行省略，已将阶段独立显示，并移除已有未完成目标时无效的创建按钮；最后视觉定向结果和截图另行记录。
+- TypeScript 最终 293 项、桌面安装器独立测试通过。真实 iOS Native 验收不访问用户原有会话；测试实例关闭 goal-round-driver，避免产生真实模型调用，因此不把 CRUD 验收等同自动推进/流式模型/子任务实测。
+
+最终视觉定向通过：`/tmp/dsh-native-ios-goal-layout-final.xcresult`，1 项真实 Native 链路测试通过。最终 6 张截图保存在 `artifacts/ios/harness-parity/live-native-*.png`；深色辅助大字目标阶段“已暂停”完整可见，正文与轮次可换行，目标管理不显示无效创建按钮。

@@ -3080,21 +3080,24 @@ async function handleHttp(
     const sessionId = decodeURIComponent(workspaceFileMatch[1]!)
     const signal = AbortSignal.timeout(15_000)
     const call = async (method: string, args: Record<string, unknown>): Promise<JsonObject> => {
-      const raw = await invokeNative(ctx, { namespace: 'workspaceFiles', method,
-        args: { workspaceFileScopeId: sessionId, ...args }, signal })
-      const failure = recordOf(raw)
-      if (failure.ok === false) {
-        const code = recordOf(failure.error).code
-        throw new HttpError(code === 'gateway/method-not-found' || code === 'gateway/namespace-not-found' ? 501 : 400,
-          remoteFailureOf(raw) ?? 'Harness could not read this file')
+      const failure = (value: unknown): HttpError => {
+        const error = recordOf(value), code = error.code
+        return new HttpError(code === 'gateway/method-not-found' || code === 'gateway/namespace-not-found' ? 501 : 400,
+          optionalStringOf(error.message) ?? 'Harness could not read this file')
       }
+      let raw: unknown
+      try { raw = await invokeNative(ctx, { namespace: 'workspaceFiles', method,
+        args: { workspaceFileScopeId: sessionId, ...args }, signal }) }
+      catch (error) { throw failure(error) }
+      if (recordOf(raw).ok === false) throw failure(recordOf(raw).error)
       return remoteValueOf(raw)
     }
     const filePath = url.searchParams.get('path') ?? ''
     if (workspaceFileMatch[2] === 'files') {
       const request = WorkspaceFilesCommandSchema.safeParse({ path: filePath })
       if (!request.success) throw new HttpError(400, 'invalid workspace directory request')
-      const listing = await call('list', request.data)
+      // Native accepts '.' for the root but rejects an empty input path.
+      const listing = await call('list', { path: request.data.path || '.' })
       json(res, 200, WorkspaceFilesPayloadSchema.parse({ sessionId, ...listing }))
     } else {
       const request = WorkspaceBytesCommandSchema.safeParse({ path: filePath,
@@ -3862,24 +3865,24 @@ async function handleHttp(
     if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
     if (remembered?.pending) throw new HttpError(503, 'goal mutation result is unknown', 'unknown')
     const current = await readNativeGoalState(ctx, sessionId)
-    if (current.goal?.id !== parsed.data.ref.id || current.goal.revision !== parsed.data.ref.revision) {
+    if (parsed.data.action === 'create' ? (current.goal !== null && current.goal.phase !== 'complete') : (current.goal?.id !== parsed.data.ref.id || current.goal.revision !== parsed.data.ref.revision)) {
       throw new HttpError(409, '目标已在其他端更新，请重新载入后再操作。')
     }
     await metadata.setRemoteMutationPending(key, fingerprint)
     let response
     try {
-      const request = parsed.data.action === 'edit' ? {
+      const request = parsed.data.action === 'edit' || parsed.data.action === 'create' ? {
         ...(parsed.data.objective === undefined ? {} : { objective: parsed.data.objective }),
         ...(parsed.data.maxGoalRounds === undefined ? {} : { maxGoalRounds: parsed.data.maxGoalRounds }),
       } : undefined
       const raw = recordOf(await invokeNative(ctx, { namespace: 'goals', method: parsed.data.action,
-        args: { agentId: sessionId, ref: parsed.data.ref, ...(request === undefined ? {} : { request }) },
+        args: { agentId: sessionId, ...(parsed.data.action === 'create' ? {} : { ref: parsed.data.ref }), ...(request === undefined ? {} : { request }) },
         signal: AbortSignal.timeout(15_000) }))
       if (raw.ok === false) throw recordOf(raw.error)
       const result = recordOf(raw.value ?? raw)
       response = GoalUpdatedPayloadSchema.parse({ sessionId, requestId, action: parsed.data.action,
-        ref: { id: result.id, revision: result.revision } })
-      if (response.ref.id !== parsed.data.ref.id || response.ref.revision <= parsed.data.ref.revision) throw new Error('invalid native goal revision acknowledgement')
+        ref: parsed.data.action === 'create' ? recordOf(result.ref) : { id: result.id, revision: result.revision } })
+      if (parsed.data.action !== 'create' && (response.ref.id !== parsed.data.ref.id || response.ref.revision <= parsed.data.ref.revision)) throw new Error('invalid native goal revision acknowledgement')
     } catch (error) {
       const code = recordOf(error).code
       const message = error instanceof Error ? error.message : optionalStringOf(recordOf(error).message) ?? 'goal mutation failed'
@@ -4419,10 +4422,11 @@ async function subagentCatalog(ctx: NativeContext, parentSessionId: string): Pro
 
 async function readNativeGoalState(ctx: NativeContext, sessionId: string): Promise<ReturnType<typeof GoalChangedPayloadSchema.parse>> {
   if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness goal state is unavailable')
-  const raw = recordOf(await invokeNative(ctx, { namespace: 'goals', method: 'get',
-    args: { agentId: sessionId }, signal: AbortSignal.timeout(15_000) }))
+  const result = await invokeNative(ctx, { namespace: 'goals', method: 'get',
+    args: { agentId: sessionId }, signal: AbortSignal.timeout(15_000) })
+  const raw = recordOf(result)
   if (raw.ok === false) throw new RetryableHttpError(503, remoteFailureOf(raw) ?? 'Harness could not read the current goal')
-  const value = raw.ok === true ? raw.value : raw
+  const value = raw.ok === true ? raw.value : result
   if (value === undefined || value === null) return { sessionId, goal: null, roundsStarted: 0 }
   const goal = recordOf(value)
   const parsed = GoalChangedPayloadSchema.safeParse({ sessionId,

@@ -3,7 +3,7 @@ import { z } from "zod";
 /** The wire format is intentionally pinned. Bump this only with a migration plan. */
 export const PROTOCOL_VERSION = 1 as const;
 /** Matched capability floor for the Harness parity release. */
-export const SCHEMA_REVISION = 11;
+export const SCHEMA_REVISION = 12;
 export function supportsSchemaRevision(value: unknown, minimum = SCHEMA_REVISION): boolean {
   const revision = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
   return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= minimum;
@@ -603,6 +603,8 @@ export const PlanProjectionPayloadSchema = StrictObject({
 });
 export const GoalRefSchema = StrictObject({ id: IdentifierSchema, revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
 export const GoalUpdatePayloadSchema = z.discriminatedUnion("action", [
+  StrictObject({ action: z.literal("create"), objective: z.string().min(1).max(100_000).refine((value) => value.trim().length > 0),
+    maxGoalRounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional() }),
   StrictObject({ action: z.enum(["pause", "resume", "complete", "clear"]), ref: GoalRefSchema }),
   StrictObject({ action: z.literal("edit"), ref: GoalRefSchema,
     objective: z.string().min(1).max(100_000).refine((value) => value.trim().length > 0).optional(),
@@ -610,7 +612,7 @@ export const GoalUpdatePayloadSchema = z.discriminatedUnion("action", [
   }).refine((value) => value.objective !== undefined || value.maxGoalRounds !== undefined),
 ]);
 export const GoalUpdatedPayloadSchema = StrictObject({
-  sessionId: IdentifierSchema, requestId: IdentifierSchema, action: z.enum(["edit", "pause", "resume", "complete", "clear"]),
+  sessionId: IdentifierSchema, requestId: IdentifierSchema, action: z.enum(["create", "edit", "pause", "resume", "complete", "clear"]),
   ref: GoalRefSchema,
 });
 export const TodoChangedPayloadSchema = StrictObject({

@@ -228,8 +228,8 @@ describe("Relay and bridge forwarding", () => {
     const connector = new DSHAnywhereConnector(config, { fetch: requests as typeof fetch,
       webSocketFactory: (url, headers) => {
         urls.push(url)
-        if (urls.length === 1) { expect(new URL(url).searchParams.get('schemaRevision')).toBe('11'); return relay as unknown as import("../src/connector.js").WebSocketLike }
-        if (urls.length === 2) { bridgeID = new URL(url).searchParams.get('connectorId')!; expect(headers['x-dsh-schema-revision']).toBe('11'); return bridge as unknown as import("../src/connector.js").WebSocketLike }
+        if (urls.length === 1) { expect(new URL(url).searchParams.get('schemaRevision')).toBe('12'); return relay as unknown as import("../src/connector.js").WebSocketLike }
+        if (urls.length === 2) { bridgeID = new URL(url).searchParams.get('connectorId')!; expect(headers['x-dsh-schema-revision']).toBe('12'); return bridge as unknown as import("../src/connector.js").WebSocketLike }
         return upgraded as unknown as import("../src/connector.js").WebSocketLike
       }, logger: { info() {}, warn() {} }, reconnectBaseMs: 1, heartbeatMs: 60000 })
     try {
@@ -256,7 +256,7 @@ describe("Relay and bridge forwarding", () => {
       expect(upgraded.sent.map(raw => JSON.parse(raw).body)).toContainEqual(expect.objectContaining({ type: 'question.asked', payload: expect.objectContaining({ stateVersion: { epoch: 'host', revision: 4 }, questions: [expect.objectContaining({ detail: '# 完整计划\n保留详细步骤', intent: { kind: 'plan-review', approve: 'yes' } })] }) }))
     } finally { await connector.stop() }
   })
-  it.each([undefined, 10])('rejects a Relay greeting with unsupported revision %s before forwarding', async revision => {
+  it.each([undefined, 10, 11])('rejects a Relay greeting with unsupported revision %s before forwarding', async revision => {
     const relay = new FakeSocket(), bridge = new FakeSocket(); let sockets = 0
     const connector = new DSHAnywhereConnector(config, { webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike, logger: { info() {}, warn() {} } })
     try {
@@ -291,7 +291,7 @@ describe("Relay and bridge forwarding", () => {
     });
     connector.start(); openRelay(relay); bridge.emit("open");
     relay.emit("message", JSON.stringify({
-      type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1",
+      type: "relay.ready", schemaRevision: 12, machineId: "machine-1", role: "machine", connectionId: "connection-1",
       serverTime: 1, leaseGeneration: 1, relayEpoch: "relay-1",
     }));
     relay.emit("message", JSON.stringify({
@@ -701,7 +701,7 @@ describe("Relay and bridge forwarding", () => {
       body: { type: "connection.ready", machineId: "machine-1", payload: { machineId: "machine-1" } },
     });
 
-    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 12, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
     expect(fetchMock).not.toHaveBeenCalled();
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "relay-message-1", sender: "device", body: command("prompt.send") }));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
@@ -731,7 +731,7 @@ describe("Relay and bridge forwarding", () => {
     connector.start();
     openRelay(relay);
     bridge.emit("open");
-    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 12, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
 
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "relay-message-2",
@@ -767,7 +767,7 @@ describe("Relay and bridge forwarding", () => {
     connector.start();
     openRelay(relay);
     bridge.emit("open");
-    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 12, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "relay-message-truncated",
       sender: "device", body: command("session.create"),
@@ -938,7 +938,7 @@ describe("desktop endpoint and failure handling", () => {
 
 function openRelay(socket: FakeSocket): void {
   socket.emit("open");
-  socket.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "schema-test", serverTime: 1 }));
+  socket.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 12, machineId: "machine-1", role: "machine", connectionId: "schema-test", serverTime: 1 }));
 }
 
 class FakeSocket {

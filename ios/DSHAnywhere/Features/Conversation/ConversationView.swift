@@ -467,7 +467,7 @@ struct DSHComposerQuickActionsMenu: View {
                 menuSectionHeader("快捷指令")
                 menuRow(title: "方案模式", subtitle: "/plan · 先规划再执行",
                         icon: .plan) { onCommand("plan") }
-                menuRow(title: "追求目标", subtitle: "/goal · 设置长期目标",
+                menuRow(title: "追求目标", subtitle: "设置长期目标",
                         icon: .goal) { onCommand("goal") }
                 Divider()
                     .padding(.horizontal, 12)
@@ -962,6 +962,7 @@ struct ConversationView: View {
     @State private var showJobsPanel = false
     @State private var showSubagentsPanel = false
     @State private var showWorkflowsPanel = false
+    @State private var showGoalCreation = false
     @State private var showExecutionPanel = false
     @State private var showContextPopover = false
     @State private var showRenameSession = false
@@ -1409,6 +1410,7 @@ struct ConversationView: View {
                 DSHSubagentsPanel(parentID: sessionID).environmentObject(model)
             }
             .sheet(isPresented: $showWorkflowsPanel) { DSHWorkflowsPanel(sessionID: sessionID).environmentObject(model) }
+            .sheet(isPresented: $showGoalCreation) { DSHGoalCreationView(sessionID: sessionID).environmentObject(model) }
             .sheet(isPresented: $showExecutionPanel) { DSHExecutionPanel(sessionID: sessionID).environmentObject(model) }
             .sheet(isPresented: $showHistorySearch) { DSHHistorySearchPanel(sessionID: sessionID) { locationRequest = $0; locationRevision = UUID() }.environmentObject(model) }
             .sheet(isPresented: $showSchedules) { DSHSchedulePanel(sessionID: sessionID).environmentObject(model) }
@@ -1483,6 +1485,7 @@ struct ConversationView: View {
                     Button { showExecutionPanel = true } label: { Label("执行轨迹", systemImage: "list.bullet.rectangle") }
                     Button { showHistorySearch = true } label: { Label("搜索对话", systemImage: "magnifyingglass") }
                     Button { showSchedules = true } label: { Label("定时提醒", systemImage: "clock.badge") }
+                    Button { showGoalCreation = true } label: { Label(model.goalState(for: sessionID)?.goal == nil ? "创建目标" : "目标", systemImage: "target") }
                     Button { showFilesPanel = true } label: {
                         Label("文件", systemImage: "folder")
                     }
@@ -1889,7 +1892,8 @@ struct ConversationView: View {
             if model.collapseComposerControls {
                 DSHComposerQuickActionsMenu(
                 onCommand: { command in
-                    if commandNeedsInput(command) { insertCommandAtHead(command) }
+                    if command == "goal" { showGoalCreation = true }
+                    else if commandNeedsInput(command) { insertCommandAtHead(command) }
                     else { model.executeCommand("/\(command)", for: sessionID) }
                 },
                 onPhoto: { showPhotoPicker = true },
@@ -2426,7 +2430,8 @@ struct ConversationView: View {
     }
 
     private func handleMenuCommand(_ command: String) {
-        if command == "permission" { showPermissionPicker = true }
+        if command == "goal" { showGoalCreation = true }
+        else if command == "permission" { showPermissionPicker = true }
         else if command == "model" { showModelPicker = true }
         else if commandNeedsInput(command) { insertCommandAtHead(command) }
         else { model.executeCommand("/\(command)", for: sessionID) }
@@ -3004,8 +3009,11 @@ private struct DSHGoalCard: View {
         if let state = model.goalState(for: sessionID), let goal = state.goal {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Label("目标 · \(phaseLabel(goal.phase))", systemImage: "target")
-                        .font(.subheadline.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("目标", systemImage: "target").font(.subheadline.weight(.semibold))
+                        Text(phaseLabel(goal.phase)).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
                     Spacer()
                     if busy { ProgressView() }
                     Menu {
@@ -3060,6 +3068,67 @@ private struct DSHGoalCard: View {
             defer { busy = false }
             do { try await model.updateGoal(goal, in: sessionID, action: action) }
             catch { operationError = error.localizedDescription }
+        }
+    }
+}
+
+struct DSHGoalCreationView: View {
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
+    @State private var objective = ""
+    @State private var rounds = ""
+    @State private var busy = false
+    @State private var failure: String?
+    private var draftKey: String { "dsh.goal-create.\(model.machineID).\(model.currentDeviceId ?? "unpaired").\(sessionID)" }
+    private var canCreate: Bool { model.goalState(for: sessionID)?.goal == nil || model.goalState(for: sessionID)?.goal?.phase == "complete" }
+    private var cap: Int? { Int(rounds.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    private var valid: Bool { !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && objective.utf16.count <= 100_000 &&
+        (rounds.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || cap.map { $0 > 0 && $0 <= 9_007_199_254_740_991 } == true) }
+    var body: some View {
+        NavigationStack {
+            Form {
+                if model.goalState(for: sessionID)?.goal != nil { Section { DSHGoalCard(sessionID: sessionID) } }
+                if canCreate || busy {
+                    Section("目标") { TextEditor(text: $objective).frame(minHeight: 150).disabled(busy).accessibilityLabel("目标内容") }
+                    Section("总轮次上限") {
+                        TextField("使用电脑默认值", text: $rounds).keyboardType(.numberPad).disabled(busy)
+                        Text("创建后由电脑上的 Harness 自动推进；留空使用电脑默认轮次上限。").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if model.goalState(for: sessionID) == nil {
+                    Section { ProgressView("读取电脑当前目标…"); Button("重新读取") { model.requestGoalState(for: sessionID) } }
+                } else if !canCreate && !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("此会话已有未完成目标；新目标草稿已保留。请先处理当前目标。").foregroundStyle(.secondary)
+                }
+                if let failure { Text(failure).foregroundStyle(.red).textSelection(.enabled) }
+                if busy { ProgressView("正在创建目标…") }
+            }
+            .navigationTitle(canCreate ? "创建目标" : "目标").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button(canCreate ? "取消" : "完成") { dismiss() }.disabled(busy) }
+                if canCreate || busy {
+                    ToolbarItem(placement: .confirmationAction) { Button("创建") { save() }
+                        .disabled(busy || !valid || model.connectionState != .connected || model.goalState(for: sessionID) == nil || !canCreate) }
+                }
+            }
+            .interactiveDismissDisabled(busy)
+            .task { objective = UserDefaults.standard.string(forKey: draftKey + ".objective") ?? ""; rounds = UserDefaults.standard.string(forKey: draftKey + ".rounds") ?? ""; model.requestGoalState(for: sessionID) }
+            .onChange(of: objective) { _, value in UserDefaults.standard.set(value, forKey: draftKey + ".objective") }
+            .onChange(of: rounds) { _, value in UserDefaults.standard.set(value, forKey: draftKey + ".rounds") }
+        }
+    }
+    private func save() {
+        guard !busy, valid else { return }
+        busy = true; failure = nil
+        Task { @MainActor in
+            defer { busy = false }
+            do {
+                try await model.createGoal(in: sessionID, objective: objective, maxGoalRounds: cap)
+                UserDefaults.standard.removeObject(forKey: draftKey + ".objective")
+                UserDefaults.standard.removeObject(forKey: draftKey + ".rounds")
+                dismiss()
+            } catch { failure = error.localizedDescription }
         }
     }
 }

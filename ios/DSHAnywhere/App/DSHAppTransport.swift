@@ -263,6 +263,9 @@ actor DSHRemoteTransport: DSHAppTransport {
             "subagent.catalog", "subagent.prompt", "subagent.interrupt", "queue.update", "session.search", "conversation.search", "history.read", "schedule.get", "configuration.read", "configuration.update", "configuration.discover"].contains(command.type), try await relaySchemaRevision() < 11 {
             throw DSHRelayFeatureUpgradeRequired()
         }
+        if command.type == "goal.update", command.payload.executionObject["action"] == .string("create"), try await relaySchemaRevision() < 12 {
+            throw DSHRelayFeatureUpgradeRequired()
+        }
         var outgoing = command
         if command.type == "session.open",
            case .object(var payload) = command.payload,

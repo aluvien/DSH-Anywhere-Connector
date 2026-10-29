@@ -571,7 +571,7 @@ describe('native bridge mutations', () => {
     } as unknown as Context
     apply(context, { connectorToken })
     const send = async (method: string, url: string, body?: unknown, requestId?: string,
-                  authorization = `Bearer ${connectorToken}`, schemaRevision: string | null = "11"): Promise<{ status: number; body: unknown }> => {
+                  authorization = `Bearer ${connectorToken}`, schemaRevision: string | null = "12"): Promise<{ status: number; body: unknown }> => {
       const request = Readable.from([body === undefined ? '' : JSON.stringify(body)]) as unknown as IncomingMessage
       Object.assign(request, {
         method,
@@ -600,19 +600,19 @@ describe('native bridge mutations', () => {
     let upgrade: ((req: IncomingMessage, socket: never, head: Buffer) => void) | undefined
     mount({ upgrade: handler => { upgrade = handler } })
     const socket = { write: vi.fn(), destroy: vi.fn() }
-    for (const revision of [undefined, '10']) {
+    for (const revision of [undefined, '10', '11']) {
       const request = { url: '/dsh-anywhere/v1/events', headers: { authorization: `Bearer ${connectorToken}`, ...(revision === undefined ? {} : { 'x-dsh-schema-revision': revision }) } } as IncomingMessage
       upgrade!(request, socket as never, Buffer.alloc(0))
       expect(socket.write).toHaveBeenLastCalledWith(expect.stringContaining('426 Upgrade Required'))
     }
-    expect(socket.destroy).toHaveBeenCalledTimes(2)
+    expect(socket.destroy).toHaveBeenCalledTimes(3)
   })
   it('rejects an obsolete Connector before reads, writes or idempotency reservation, while keeping health readable', async () => {
     const invoke = vi.fn(async () => ({ TEST_KEY: { configured: false, writable: true } }))
     const request = mount({ invoke })
     const body = { kind: 'credential', action: 'set', ref: 'TEST_KEY', value: 'never-forward' }
-    await expect(request('GET', '/dsh-anywhere/v1/health', undefined, undefined, `Bearer ${connectorToken}`, null)).resolves.toMatchObject({ status: 200, body: { schemaRevision: 11, minimumConnectorSchemaRevision: 11 } })
-    for (const revision of [null, '10', '11junk']) {
+    await expect(request('GET', '/dsh-anywhere/v1/health', undefined, undefined, `Bearer ${connectorToken}`, null)).resolves.toMatchObject({ status: 200, body: { schemaRevision: 12, minimumConnectorSchemaRevision: 12 } })
+    for (const revision of [null, '10', '11', '11junk']) {
       await expect(request('POST', '/dsh-anywhere/v1/configuration', body, 'same-id', `Bearer ${connectorToken}`, revision)).resolves.toMatchObject({ status: 426 })
       await expect(request('GET', '/dsh-anywhere/v1/configuration?section=credentials&refs=%5B%22TEST_KEY%22%5D', undefined, undefined, `Bearer ${connectorToken}`, revision)).resolves.toMatchObject({ status: 426 })
     }
@@ -854,6 +854,15 @@ describe('native bridge mutations', () => {
       body: { sessionId: 's', path: '项目', entries: [{ name: '图.png' }, { name: 'src' }], truncated: false } })
     expect(calls).toHaveLength(1)
   })
+  it('translates the mobile root path to Native dot and maps thrown Host capability failures', async () => {
+    const request = mount({ invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'workspaceFiles', method: 'list', args: { workspaceFileScopeId: 's', path: '.' } })
+      return { path: '', entries: [], truncated: false }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=')).resolves.toMatchObject({ status: 200, body: { path: '', entries: [] } })
+    const unavailable = mount({ invoke: async () => { throw { code: 'gateway/namespace-not-found', message: 'No Native files capability' } } })
+    await expect(unavailable('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=')).resolves.toMatchObject({ status: 501 })
+  })
   it('reads bounded original bytes and checks the native version after reading', async () => {
     const request = mount({ invoke: async (value) => {
       const call = value as { method: string }
@@ -907,6 +916,36 @@ describe('native bridge mutations', () => {
     await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', { atSeq: 42 }, 'fork-1'))
       .resolves.toMatchObject({ status: 201, body: { sessionId: 'child' } })
     expect(calls).toBe(1)
+  })
+  it('reads a Native undefined goal as an empty baseline and creates through goals.create exactly once', async () => {
+    let created = false, mutations = 0
+    const goal = { id: 'native-goal', revision: 1, objective: 'Read on mobile', phase: 'active', maxGoalRounds: 7, roundsStarted: 0, activation: 'armed' }
+    const request = mount({ invoke: async (value) => {
+      const call = value as { method: string }
+      if (call.method === 'get') return created ? goal : undefined
+      expect(value).toMatchObject({ namespace: 'goals', method: 'create', args: { agentId: 's', request: { objective: 'Read on mobile', maxGoalRounds: 7 } } })
+      expect((value as { args: Record<string, unknown> }).args).not.toHaveProperty('ref')
+      created = true; mutations += 1
+      return { ref: { id: goal.id, revision: goal.revision } }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/goal')).resolves.toMatchObject({ status: 200, body: { goal: null, roundsStarted: 0 } })
+    const body = { action: 'create', objective: goal.objective, maxGoalRounds: 7 }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-create')).resolves.toMatchObject({ status: 202, body: { action: 'create', ref: { id: goal.id, revision: 1 } } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-create')).resolves.toMatchObject({ status: 202 })
+    expect(mutations).toBe(1)
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'new-create')).resolves.toMatchObject({ status: 409 })
+    expect(mutations).toBe(1)
+  })
+  it('retains an unknown Native goal creation without creating it a second time', async () => {
+    let mutations = 0
+    const request = mount({ invoke: async (value) => {
+      if ((value as { method: string }).method === 'get') return undefined
+      mutations += 1; throw new Error('Native creation acknowledgement lost')
+    } })
+    const body = { action: 'create', objective: 'Keep original request' }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'unknown-create')).resolves.toMatchObject({ status: 503 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'unknown-create')).resolves.toMatchObject({ status: 503 })
+    expect(mutations).toBe(1)
   })
   it('edits the exact goal revision once and keeps the native edit request envelope', async () => {
     let mutations = 0

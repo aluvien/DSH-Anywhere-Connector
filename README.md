@@ -91,9 +91,11 @@ iPhone App ── HTTPS / WSS ──▶ Relay ◀── 主动建立 WSS 连接 
 
 需要自己管理 Relay 时，从 [`deploy/relay/README.md`](deploy/relay/README.md) 开始。配置自托管 Relay 需要 Linux 服务器、域名、TLS 证书、Docker Engine 和 Docker Compose。
 
+手机的“创建目标”直接使用 Harness 原生目标接口，不依赖可选的 `/goal` 命令。可设置目标和轮次上限，随后由电脑推进；已有目标可查看、编辑、暂停、恢复、完成或清除。
+
 ## 升级与版本要求
 
-本次 Harness 信息展示功能要求 Relay 的 `/health` 返回 `schemaRevision` 至少为 **11**。协议主版本仍是 1，但主版本相同不代表旧 Relay 能识别新增字段。
+本次 Harness 信息展示功能要求 Relay 的 `/health` 返回 `schemaRevision` 至少为 **12**。协议主版本仍是 1，但主版本相同不代表旧 Relay 能识别新增字段。
 
 升级顺序：
 
@@ -103,7 +105,7 @@ iPhone App ── HTTPS / WSS ──▶ Relay ◀── 主动建立 WSS 连接 
 
 新版 Connector 会在每次连接 Relay 时核对版本。确认之前不会转发聊天、配置或工具操作；版本过旧时，手机会收到升级提示，Connector 日志也会说明要求。Relay 升级后会自动重连并恢复暂存消息；缓存超出范围时，App 会重新读取电脑记录。不要通过删掉消息字段来绕过版本校验。
 
-新版 Bridge 同样要求 Connector 声明支持 schema 11，旧 Connector 的接口和 WebSocket 请求会被拒绝并返回升级要求。Relay 对未请求版本协商的旧客户端保留原握手格式；这项兼容措施不代表旧电脑组件能使用本次新增功能。
+新版 Bridge 同样要求 Connector 声明支持 schema 12，旧 Connector 的接口和 WebSocket 请求会被拒绝并返回升级要求。Relay 对未请求版本协商的旧客户端保留原握手格式；这项兼容措施不代表旧电脑组件能使用本次新增功能。
 
 ## 从源码构建 iOS App
 

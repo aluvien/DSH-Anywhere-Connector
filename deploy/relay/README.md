@@ -16,7 +16,7 @@ on the server itself; do not proxy this domain directly to one user's Mac.
 3. Add `nginx-location.conf` to the HTTPS server block for the Relay domain and
    reload Nginx.
 4. Verify `https://your-relay.example/health` returns `ok: true` and
-   `schemaRevision >= 11` before upgrading the computer components. Restarting
+   `schemaRevision >= 12` before upgrading the computer components. Restarting
    an old image without rebuilding does not update its protocol schema.
 
 Upgrade Relay first, then Connector and Bridge together, then the iOS app. New

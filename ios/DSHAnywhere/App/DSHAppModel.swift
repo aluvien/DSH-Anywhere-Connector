@@ -1761,7 +1761,7 @@ final class DSHAppModel: ObservableObject {
         queuedPromptsBySession.removeAll(keepingCapacity: false)
         restoreQueuedPrompts()
     }
-    private let profiles = DSHProfileStore()
+    private let profiles: DSHProfileStore
     private let unreadBaseline = DSHAppModel.loadOrCreateUnreadBaseline()
     static let groupingKey = "dsh-anywhere.session-list-grouping"
     static let languageKey = "dsh-anywhere.language"
@@ -1774,12 +1774,14 @@ final class DSHAppModel: ObservableObject {
     static let unreadBaselineKey = "dsh-anywhere.unread-baseline"
 
     init(transport: any DSHAppTransport = DSHRemoteTransport(),
-         initialState: DSHStoreState = .init(), isPaired: Bool? = nil, transactionDirectory: URL? = nil) {
+         initialState: DSHStoreState = .init(), isPaired: Bool? = nil, transactionDirectory: URL? = nil,
+         profileStore: DSHProfileStore = DSHProfileStore()) {
         self.transactionDirectory = transactionDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DSH Anywhere", isDirectory: true)
         self.transport = transport
+        self.profiles = profileStore
         self.state = initialState
-        let stored = DSHProfileStore()
+        let stored = profileStore
         self.machines = stored.profiles
         self.isPaired = isPaired ?? DSHRemoteTransport.isConfigured
         if let active = stored.activeProfile {
@@ -4447,6 +4449,40 @@ final class DSHAppModel: ObservableObject {
         let command = DSHCommand.getGoal(deviceId: deviceID, machineId: machineID, sessionId: sessionID)
         goalStateRequestIDs[sessionID] = command.requestId
         send(command)
+    }
+    func createGoal(in sessionID: String, objective: String, maxGoalRounds: Int?) async throws {
+        guard connectionState == .connected, (goalState(for: sessionID)?.goal == nil || goalState(for: sessionID)?.goal?.phase == "complete"),
+              !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, objective.utf16.count <= 100_000,
+              maxGoalRounds.map({ $0 > 0 && $0 <= 9_007_199_254_740_991 }) ?? true else {
+            throw DSHRemoteCommandError(message: "请连接电脑、确认当前没有未完成的目标，并输入有效的目标和轮次上限。")
+        }
+        let generation = machineStateGeneration, machine = machineID
+        var payload: [String: DSHJSONValue] = ["action": .string("create"), "objective": .string(objective)]
+        if let maxGoalRounds { payload["maxGoalRounds"] = .number(Double(maxGoalRounds)) }
+        let proposed = DSHCommand(deviceId: deviceID, machineId: machine, sessionId: sessionID,
+                                  type: "goal.update", payload: .object(payload))
+        guard let command = durableRemoteMutationCommand(proposed) else { throw DSHRemoteCommandError(message: errorMessage ?? "无法创建目标。") }
+        remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let receipt = state.goalReceipts?[command.requestId], receipt.sessionId == sessionID, receipt.action == "create" {
+                requestGoalState(for: sessionID)
+                return
+            }
+            if let message = state.protocolErrorsByRequestID[command.requestId] {
+                requestGoalState(for: sessionID)
+                throw DSHRemoteCommandError(message: message)
+            }
+            if let failure = remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure {
+                requestGoalState(for: sessionID)
+                throw DSHRemoteCommandError(message: failure)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "目标创建结果尚未确认，请保留原请求并检查电脑状态。")
     }
     func updateGoal(_ goal: DSHGoalState.Goal, in sessionID: String, action: String,
                     objective: String? = nil, maxGoalRounds: Int? = nil) async throws {

@@ -1926,3 +1926,147 @@ final class DSHHomeLayoutTests: XCTestCase {
     }
 }
 #endif
+
+#if canImport(UIKit)
+// Opt-in live integration: the fixture endpoint must belong to an isolated
+// DSH_HOME and Relay. Ordinary test runs never contact a developer's Harness.
+extension DSHModelPanelLayoutTests {
+    @MainActor
+    func testIsolatedNativeHarnessThroughRealRelayTransport() async throws {
+        guard let address = ProcessInfo.processInfo.environment["DSH_PARITY_FIXTURE_URL"],
+              let url = URL(string: address), url.host == "127.0.0.1" else {
+            throw XCTSkip("Set DSH_PARITY_FIXTURE_URL for the isolated Native integration stack")
+        }
+        struct Fixture: Decodable { let relayURL: URL; let machineId: String; let pairingSecret: String; let sessionId: String; let workspace: String }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        let fixture = try JSONDecoder().decode(Fixture.self, from: data)
+        guard fixture.relayURL.host == "127.0.0.1", fixture.relayURL.scheme == "http" else {
+            throw XCTSkip("Native integration requires an isolated loopback Relay")
+        }
+        let api = DSHAPIClient(relayBaseURL: fixture.relayURL)
+        let pairing = try await api.pair(machineId: fixture.machineId, credential: .secret(fixture.pairingSecret), deviceName: "iOS Native parity integration")
+        let suite = "dsh-live-parity-\(UUID().uuidString)", defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let profileStore = DSHProfileStore(defaults: defaults)
+        profileStore.upsert(pairing.profile)
+        let keychain = DSHKeychainTokenStore(service: suite)
+        try keychain.save(pairing.token, account: pairing.profile.deviceId)
+        let transport = DSHRemoteTransport(tokenStore: keychain, store: profileStore)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        let model = DSHAppModel(transport: transport, isPaired: true, transactionDirectory: directory, profileStore: profileStore)
+        model.machineID = fixture.machineId
+        addTeardownBlock {
+            await MainActor.run { model.disconnect() }
+            await transport.disconnect()
+            try await api.revokeSelfDevice(machineId: fixture.machineId, token: pairing.token)
+            try keychain.delete(account: pairing.profile.deviceId)
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func until(_ description: String, _ condition: () -> Bool) async throws {
+            for _ in 0..<400 {
+                if condition() { return }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            XCTFail("Native integration did not settle: \(description); state=\(model.connectionState), sessions=\(model.sessions.count), machine=\(model.machineID); \(model.errorMessage ?? "no app error")")
+            throw URLError(.timedOut)
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        model.connect()
+        try await until("connected session snapshot") { model.connectionState == .connected && model.hasLoadedSessions }
+        let title = "iOS 原生联调 \(UUID().uuidString.prefix(6))"
+        XCTAssertTrue(model.createSession(title: title, workingDirectory: fixture.workspace, permissionMode: "read-only"))
+        try await until("phone-created Native session") { model.sessions.contains { $0.title == title } }
+        let sessionID = try XCTUnwrap(model.sessions.first { $0.title == title }?.id)
+        model.openSession(sessionID)
+        try await until("dynamic Native commands") { model.commandCatalog(for: sessionID) != nil }
+        let catalog = try XCTUnwrap(model.commandCatalog(for: sessionID))
+        XCTAssertTrue(catalog.commands.contains { $0.name == "plan" })
+        let settings = try await model.readConfiguration("settings").decoded(DSHSettingsSnapshot.self)
+        XCTAssertTrue(settings.writable); XCTAssertGreaterThan(settings.namespaces.count, 10)
+        let plugins = try await model.readConfiguration("plugins").decoded(DSHPluginInventory.self)
+        XCTAssertFalse(plugins.entries.isEmpty)
+        let providers = try await model.readConfiguration("providers").decoded(DSHProviderDirectory.self)
+        XCTAssertFalse(providers.configurable.isEmpty)
+        let theme = try XCTUnwrap(settings.namespaces.first { $0.ns == "ui-theme" })
+        let change = model.configurationCommand(payload: .object(["kind": .string("settings"), "ns": .string(theme.ns),
+            "expectedRevision": .number(Double(theme.revision)), "ops": .array([.object(["op": .string("set"), "path": .array([.string("preference")]), "value": .string("dark")])])]))
+        let receipt = try await model.updateConfiguration(change)
+        XCTAssertEqual(receipt.namespace?.value.executionObject["preference"], .string("dark"))
+        let repeated = try await model.updateConfiguration(change)
+        XCTAssertEqual(repeated, receipt)
+        let latest = try XCTUnwrap(receipt.namespace)
+        let clear = model.configurationCommand(payload: .object(["kind": .string("settings"), "ns": .string(theme.ns),
+            "expectedRevision": .number(Double(latest.revision)), "ops": .array([.object(["op": .string("unset"), "path": .array([.string("preference")])])])]))
+        _ = try await model.updateConfiguration(clear)
+        let files = try await model.workspaceFiles(sessionID: sessionID, path: "")
+        XCTAssertTrue(files.entries.contains { $0.name == "手机联调说明.txt" })
+        let ref = DSHFileReference(sessionID: sessionID, path: fixture.workspace + "/手机联调说明.txt", name: "手机联调说明.txt")
+        let downloaded = try await model.downloadFile(ref)
+        XCTAssertEqual(try String(contentsOf: downloaded, encoding: .utf8), "手机与桌面使用同一份 Harness 原生数据。\n文件完整读取与中文路径验证。\n")
+        try? FileManager.default.removeItem(at: downloaded.deletingLastPathComponent())
+        model.requestSubagents(for: sessionID)
+        model.requestGoalState(for: sessionID)
+        try await until("Native child and goal baseline") { model.subagentCatalog(for: sessionID) != nil && model.goalState(for: sessionID) != nil }
+        XCTAssertNil(model.goalState(for: sessionID)?.goal)
+        model.executeCommand("/plan", for: sessionID)
+        try await until("Native plan command result") { model.commandResults(for: sessionID).contains { $0.matched && $0.kind == "success" } }
+        let page = try await model.executionPage(sessionID: sessionID)
+        XCTAssertNotNil(page.lifecycle)
+        XCTAssertTrue(model.planState(for: sessionID)?.active == true)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene), window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = UIHostingController(rootView: NavigationStack { DSHComputerConfigurationView().environmentObject(model) }.dynamicTypeSize(dark ? .accessibility2 : .large))
+            window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(1000))
+            let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            shot.name = "live-native-configuration-\(dark ? "dark-large-text" : "light")"; shot.lifetime = .keepAlways; add(shot)
+        }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = UIHostingController(rootView: DSHGoalCreationView(sessionID: sessionID).environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(500))
+            let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            shot.name = "live-native-goal-create-\(dark ? "dark-large-text" : "light")"; shot.lifetime = .keepAlways; add(shot)
+        }
+        // Native creation uses the goal endpoint independently of whether
+        // a profile registers the optional slash command, and keeps exact refs.
+        try await model.createGoal(in: sessionID, objective: "验证手机与桌面共享目标状态", maxGoalRounds: 7)
+        try await until("Native created goal") { model.goalState(for: sessionID)?.goal?.maxGoalRounds == 7 }
+        let createdGoal = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        try await model.updateGoal(createdGoal, in: sessionID, action: "pause")
+        try await until("Native paused goal") { model.goalState(for: sessionID)?.goal?.phase == "paused" }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = UIHostingController(rootView: DSHGoalCreationView(sessionID: sessionID).environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(500))
+            let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            shot.name = "live-native-goal-manage-\(dark ? "dark-large-text" : "light")"; shot.lifetime = .keepAlways; add(shot)
+        }
+        let pausedGoal = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        try await model.updateGoal(pausedGoal, in: sessionID, action: "edit", objective: "完整目标内容在手机上可阅读", maxGoalRounds: 8)
+        try await until("Native edited goal") { model.goalState(for: sessionID)?.goal?.maxGoalRounds == 8 }
+        let editedGoal = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        try await model.updateGoal(editedGoal, in: sessionID, action: "resume")
+        try await until("Native resumed goal") { model.goalState(for: sessionID)?.goal?.phase == "active" }
+        let resumedGoal = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        try await model.updateGoal(resumedGoal, in: sessionID, action: "complete")
+        try await until("Native completed goal") { model.goalState(for: sessionID)?.goal?.phase == "complete" }
+        let completedGoal = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        try await model.createGoal(in: sessionID, objective: "替换已完成目标并重置轮次", maxGoalRounds: 3)
+        try await until("Native replacement of completed goal") { model.goalState(for: sessionID)?.goal?.id != completedGoal.id }
+        let replacement = try XCTUnwrap(model.goalState(for: sessionID)?.goal)
+        XCTAssertEqual(model.goalState(for: sessionID)?.roundsStarted, 0)
+        try await model.updateGoal(replacement, in: sessionID, action: "clear")
+        try await until("Native cleared goal") { model.goalState(for: sessionID)?.goal == nil }
+        model.disconnect()
+        try await until("disconnect") { model.connectionState == .disconnected }
+        model.connect()
+        try await until("reconnect") { model.connectionState == .connected }
+        let restored = try await model.readConfiguration("settings").decoded(DSHSettingsSnapshot.self)
+        XCTAssertEqual(restored.namespaces.first { $0.ns == "ui-theme" }?.value.executionObject["preference"], theme.value.executionObject["preference"])
+        model.executeCommand("/plan off", for: sessionID)
+        try await until("Native plan exit") { model.commandResults(for: sessionID).contains { $0.text?.contains("Plan mode off") == true } }
+    }
+}
+#endif
