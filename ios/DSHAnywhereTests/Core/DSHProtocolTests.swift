@@ -1714,6 +1714,18 @@ final class DSHConversationViewportTests: XCTestCase {
             attachment.lifetime = .keepAlways
             add(attachment)
         }
+        // Lazy transcript rows can change contentSize after the first layout
+        // pass, particularly on a busy CI simulator. Wait for the coordinator
+        // to follow the resulting size change before evaluating the viewport.
+        func waitForPinnedViewport() async throws {
+            for _ in 0..<100 {
+                let bottom = max(-scroll.adjustedContentInset.top,
+                                 scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+                if abs(scroll.contentOffset.y - bottom) <= 3 { return }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        try await waitForPinnedViewport()
         assertViewport()
         capture("conversation-bottom")
         let oldHeight = scroll.bounds.inset(by: scroll.adjustedContentInset).height
@@ -1723,6 +1735,7 @@ final class DSHConversationViewportTests: XCTestCase {
         // Pinning is deliberately deferred out of layout. Drain that main
         // queue work before measuring the post-layout viewport.
         await settle()
+        try await waitForPinnedViewport()
         assertViewport()
         XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, oldHeight)
         capture("conversation-composer-expanded")
@@ -1742,6 +1755,7 @@ final class DSHConversationViewportTests: XCTestCase {
         // Pinning is deliberately deferred out of layout. Drain that main
         // queue work before measuring the post-layout viewport.
         await settle()
+        try await waitForPinnedViewport()
         assertViewport()
         XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, expandedHeight - 250)
         capture("conversation-keyboard-sized-inset")
