@@ -235,8 +235,7 @@ final class DSHEventStoreTests: XCTestCase {
         let images: [DSHJSONValue] = [.object(["type": .string("image"), "mediaType": .string("image/jpeg"), "name": .string("photo.jpg"), "data": .string(Data([0xff, 0xd8, 1]).base64EncodedString())])]
         let first = Task { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", delivery: "steer", images: images) }
         defer { first.cancel() }
-        try await Task.sleep(for: .milliseconds(80))
-        let captured = await transport.lastCommand(ofType: "subagent.prompt"), command = try XCTUnwrap(captured)
+        let captured = try await transport.waitForCommand(ofType: "subagent.prompt"), command = try XCTUnwrap(captured)
         XCTAssertEqual(command.payload.executionObject["images"], .array(images)); XCTAssertEqual(command.payload.executionObject["text"], .string(""))
         XCTAssertEqual(command.payload.executionObject["parentSessionId"], .string("parent"))
         await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 3,
@@ -244,8 +243,7 @@ final class DSHEventStoreTests: XCTestCase {
         do { try await first.value; XCTFail("Unknown image result must be retained") } catch { }
         let retry = Task { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", delivery: "steer", images: images) }
         defer { retry.cancel() }
-        try await Task.sleep(for: .milliseconds(80))
-        let retried = await transport.lastCommand(ofType: "subagent.prompt")
+        let retried = try await transport.waitForCommand(ofType: "subagent.prompt", count: 2)
         XCTAssertEqual(retried?.requestId, command.requestId); XCTAssertEqual(retried?.payload, command.payload)
         await transport.emit(event(type: "subagent.receipt", messageID: command.requestId, sequence: 4, payload: .object([
             "parentSessionId": .string("parent"), "childSessionId": .string("child"), "requestId": .string(command.requestId), "action": .string("prompt"), "messageId": .string("inbox")])))
@@ -2367,8 +2365,7 @@ final class DSHEventStoreTests: XCTestCase {
                                     "title": .string("First message"),
                                     "updatedAt": .number(1),
                                    ])))
-        try await Task.sleep(for: .milliseconds(80))
-        let firstPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let firstPromptValue = try await transport.waitForCommand(ofType: "prompt.send")
         let firstPrompt = try XCTUnwrap(firstPromptValue)
         model.disconnect()
 
@@ -2377,9 +2374,11 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(model.failedInitialMessage(for: "session-first-message")?.text,
                        "send after reconnect")
         let failure = try XCTUnwrap(model.failedInitialMessage(for: "session-first-message"))
+        // Reconnection preserves the in-flight acknowledgement window. Exercise
+        // the actual retry state after that original attempt has timed out.
+        model.timeoutPendingSend(requestId: firstPrompt.requestId)
         model.retryFailedInitialMessage(failure)
-        try await Task.sleep(for: .milliseconds(40))
-        let retriedPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let retriedPromptValue = try await transport.waitForCommand(ofType: "prompt.send", count: 2)
         let retriedPrompt = try XCTUnwrap(retriedPromptValue)
         XCTAssertEqual(retriedPrompt.requestId, firstPrompt.requestId,
                        "The first message retry must keep its prompt identity")
@@ -3216,6 +3215,16 @@ private actor CorrelationTransport: DSHAppTransport {
     func removeMachine(_ machineId: String) async throws {}
     func pairedDevices() async throws -> [DSHRelayDevice] { [] }
     func revokeDevice(_ deviceId: String) async throws {}
+
+    /// Observe the asynchronous send itself; a fixed sleep races persistence and task scheduling on CI.
+    func waitForCommand(ofType type: String, count: Int = 1) async throws -> DSHCommand? {
+        let deadline = Date().addingTimeInterval(5)
+        while commandCount(ofType: type) < count, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        guard commandCount(ofType: type) >= count else { return nil }
+        return lastCommand(ofType: type)
+    }
 
     func lastCommand(ofType type: String) -> DSHCommand? {
         commands.last(where: { $0.type == type })

@@ -324,7 +324,16 @@ final class DSHModelPanelLayoutTests: XCTestCase {
             attachment.name = "feedback-conflict-\(dark ? "dark-large-text" : "light")"; attachment.lifetime = .keepAlways; add(attachment)
             if dark {
                 func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
-                let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }.first { $0.contentSize.height > $0.bounds.height })
+                let layoutDeadline = Date().addingTimeInterval(5)
+                var scrollView: UIScrollView?
+                repeat {
+                    host.view.layoutIfNeeded()
+                    scrollView = descendants(host.view).compactMap { $0 as? UIScrollView }
+                        .first { $0.bounds.height > 0 && $0.contentSize.height > $0.bounds.height }
+                    if scrollView != nil { break }
+                    try await Task.sleep(for: .milliseconds(25))
+                } while Date() < layoutDeadline
+                let scroll = try XCTUnwrap(scrollView)
                 scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom), animated: false)
                 try await Task.sleep(for: .milliseconds(150))
                 let bottom = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
