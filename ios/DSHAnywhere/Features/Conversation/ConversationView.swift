@@ -1638,6 +1638,16 @@ struct ConversationView: View {
                 .padding(10)
                 .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
             }
+            // Live turn status rides above the input card while work happens,
+            // so a reader who scrolled away still sees that work is happening
+            // (and what it is doing) instead of a frozen screen. Gated on
+            // current-turn activity. A running tool also keeps this visible
+            // if its turn-state update arrives late; a just-finished Harness
+            // step remains descriptive while that turn is still running.
+            if showsLiveTurnStatus {
+                liveTurnStatus
+            }
+
             if let todo = model.todoState(for: sessionID), !todo.todos.isEmpty {
                 DisclosureGroup {
                     ScrollView {
@@ -1659,23 +1669,13 @@ struct ConversationView: View {
                     }
                     .frame(maxHeight: 220)
                 } label: {
-                    Text("待办 · \(todo.todos.filter { $0.status == "completed" }.count)/\(todo.todos.count) 已完成")
+                    Label("待办 · \(todo.todos.filter { $0.status == "completed" }.count)/\(todo.todos.count) 已完成", systemImage: "checklist")
                         .font(.subheadline.weight(.semibold))
                 }
                 .padding(10)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
             }
             if model.goalState(for: sessionID)?.goal != nil { DSHGoalCard(sessionID: sessionID) }
-
-            // Live turn status rides above the input card while work happens,
-            // so a reader who scrolled away still sees that work is happening
-            // (and what it is doing) instead of a frozen screen. Gated on
-            // current-turn activity. A running tool also keeps this visible
-            // if its turn-state update arrives late; a just-finished Harness
-            // step remains descriptive while that turn is still running.
-            if showsLiveTurnStatus {
-                liveTurnStatus
-            }
 
             // Queued prompts bubble: prompts this device queued behind the
             // run, newest last. One shows its text, several show the count;
@@ -3015,6 +3015,7 @@ private struct DSHGoalCard: View {
     @State private var busy = false
     @State private var operationError: String?
     @State private var showObjective = false
+    @State private var confirmingDelete = false
     @State private var isExpanded: Bool
 
     init(sessionID: String, initiallyExpanded: Bool = false) {
@@ -3027,7 +3028,11 @@ private struct DSHGoalCard: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 0) {
                     Button { isExpanded.toggle() } label: {
-                        (Text("目标：").fontWeight(.semibold) + Text(goal.objective))
+                        HStack(spacing: 6) {
+                            Image(systemName: "target").font(.subheadline)
+                            (Text("目标：").fontWeight(.semibold) + Text(goal.objective))
+                                .lineLimit(1).truncationMode(.tail)
+                        }
                             .font(.subheadline)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
@@ -3038,23 +3043,28 @@ private struct DSHGoalCard: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel(isExpanded ? "收起目标" : "展开目标")
                     .accessibilityValue(goal.objective)
-                    .accessibilityHint("轻点查看完整目标和运行状态；右侧更多按钮可编辑目标")
-                    if busy { ProgressView() }
-                    Menu {
-                        if goal.phase != "complete" {
-                            Button("编辑目标与轮次") { editingGoal = goal }
-                            if goal.phase == "active" { Button("暂停") { mutate(goal, action: "pause") } }
-                            if goal.phase != "active" || state.activation == "disarmed" {
-                                Button("继续目标") { mutate(goal, action: "resume") }
-                            }
-                            Button("标记完成") { mutate(goal, action: "complete") }
-                        }
-                        Button("清除目标", role: .destructive) { mutate(goal, action: "clear") }
-                        Button("刷新目标状态") { model.requestGoalState(for: sessionID) }
-                    } label: { Image(systemName: "ellipsis").font(.title3).frame(width: 44, height: 44) }
-                        .accessibilityLabel("目标菜单")
-                        .disabled(busy || model.connectionState != .connected)
+                    .accessibilityHint("轻点查看完整目标和运行状态；右侧按钮可暂停或继续、编辑、删除目标")
+                    let canResume = goal.phase != "active" || state.activation == "disarmed"
+                    Button { mutate(goal, action: canResume ? "resume" : "pause") } label: {
+                        Group {
+                            if busy { ProgressView() }
+                            else { Image(systemName: goal.phase == "complete" ? "checkmark" : canResume ? "play.fill" : "pause.fill") }
+                        }.frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel(goal.phase == "complete" ? "目标已完成" : canResume ? "继续目标" : "暂停目标")
+                    .disabled(busy || model.connectionState != .connected || goal.phase == "complete")
+                    Button { editingGoal = goal } label: {
+                        Image(systemName: "pencil").frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel("编辑目标")
+                    .disabled(busy || model.connectionState != .connected || goal.phase == "complete")
+                    Button(role: .destructive) { confirmingDelete = true } label: {
+                        Image(systemName: "trash").frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel("删除目标")
+                    .disabled(busy || model.connectionState != .connected)
                 }
+                .buttonStyle(.borderless)
                 if isExpanded {
                     Text(phaseLabel(goal.phase)).font(.caption).foregroundStyle(.secondary)
                     Button { showObjective = true } label: {
@@ -3066,23 +3076,15 @@ private struct DSHGoalCard: View {
                     Text("轮次 \(state.roundsStarted)/\(goal.maxGoalRounds) · \(activationLabel(state.activation))")
                         .font(.caption).foregroundStyle(.secondary)
                     if let reason = goal.blockedReason { Text(reason.message).font(.caption).foregroundStyle(.secondary) }
-                    if goal.phase != "complete" {
-                        if goal.phase != "active" || state.activation == "disarmed" {
-                            Button { mutate(goal, action: "resume") } label: {
-                                Label("继续目标", systemImage: "play.fill")
-                                    .frame(maxWidth: .infinity, minHeight: 32)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(busy || model.connectionState != .connected)
-                        } else {
-                            Button { mutate(goal, action: "pause") } label: {
-                                Label("暂停目标", systemImage: "pause.fill")
-                                    .frame(maxWidth: .infinity, minHeight: 32)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(busy || model.connectionState != .connected)
+                    HStack {
+                        if goal.phase != "complete" {
+                            Button("标记完成") { mutate(goal, action: "complete") }
                         }
+                        Spacer()
+                        Button("刷新") { model.requestGoalState(for: sessionID) }
                     }
+                    .font(.caption)
+                    .disabled(busy || model.connectionState != .connected)
                 }
             }
             .padding(.leading, 10)
@@ -3092,6 +3094,9 @@ private struct DSHGoalCard: View {
             .alert("目标操作失败", isPresented: Binding(get: { operationError != nil }, set: { if !$0 { operationError = nil } })) {
                 Button("好", role: .cancel) { operationError = nil }
             } message: { Text(operationError ?? "") }
+            .confirmationDialog("删除这个目标？", isPresented: $confirmingDelete, titleVisibility: .visible) {
+                Button("删除目标", role: .destructive) { mutate(goal, action: "clear") }
+            } message: { Text("清除目标后，对话记录仍会保留。") }
             .task(id: goal.id) { model.requestGoalState(for: sessionID) }
             .sheet(item: $editingGoal) { snapshot in DSHGoalEditor(sessionID: sessionID, goal: snapshot).environmentObject(model) }
             .sheet(isPresented: $showObjective) {

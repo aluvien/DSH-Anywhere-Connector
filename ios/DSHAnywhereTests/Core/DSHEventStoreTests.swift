@@ -843,6 +843,50 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleQuestionAnswerRefreshesAuthoritativeStateWithoutGlobalAlertOrResend() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let request = DSHQuestionRequest(id: "stale-question", sessionId: "s", questions: [DSHQuestion(id: "item", question: "Continue?")])
+        var initial = DSHStoreState(); initial.pendingQuestions = [request]
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: initial, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        for _ in 0..<100 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let draft = DSHQuestionDraft(questions: request.questions, selections: [:], custom: ["item": "keep this draft"], skipped: [])
+        model.saveQuestionDraft(draft, for: request)
+        let beforeRefresh = await transport.commandCount(ofType: "decisions.list")
+        let answer = Task { try await model.answer(request, answers: [.init(id: "item", selected: [], custom: "keep this draft")]) }
+        defer { answer.cancel() }
+        let sent = try await transport.waitForCommand(ofType: "question.answer")
+        let command = try XCTUnwrap(sent)
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-request-failed"), "retryable": .bool(false),
+                "message": .string("Local DSH bridge request failed (question.answer, HTTP 409)")])))
+        do { try await answer.value; XCTFail("The stale answer must not be reported as accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("同步最新问题状态")) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.questionDraft(for: request), draft)
+        XCTAssertEqual(model.pendingQuestions.count, 1, "Only the authoritative snapshot may retire the question")
+        let refreshed = try await transport.waitForCommand(ofType: "decisions.list", count: beforeRefresh + 1)
+        XCTAssertNotNil(refreshed)
+        await transport.emit(event(type: "decisions.snapshot", messageID: "fresh-decisions", sequence: 3,
+            payload: .object(["stateVersion": .object(["epoch": .string("host"), "revision": .number(2)]),
+                "approvals": .array([]), "questions": .array([])])))
+        for _ in 0..<100 {
+            if model.pendingQuestions.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(model.pendingQuestions.isEmpty)
+        XCTAssertNil(model.questionDraft(for: request))
+        let sends = await transport.commandCount(ofType: "question.answer")
+        XCTAssertEqual(sends, 1)
+    }
+
+    @MainActor
     func testQuestionAnswerFailurePreservesDraftAndCanRetryUntilResolution() async throws {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }

@@ -1687,6 +1687,9 @@ final class DSHConversationViewportTests: XCTestCase {
         let window = UIWindow(windowScene: scene)
         defer { window.isHidden = true }
         var state = DSHAppModel.preview(longConversation: true).state
+        state.turnStateBySession["preview-session"] = "running"
+        state.messagesBySession["preview-session", default: []].append(DSHChatMessage(id: "dock-current-turn", role: .user,
+            markdown: "继续验证底部阅读与操作布局", sequence: 999, timestamp: Int64(Date().timeIntervalSince1970 * 1_000)))
         state.goalBySession = ["preview-session": try JSONDecoder().decode(DSHGoalState.self, from: Data(#"{"sessionId":"preview-session","goal":{"id":"dock-goal","revision":1,"objective":"实现跨组选择与折叠提示，验证重复设备、重排和旧事件保护","phase":"paused","maxGoalRounds":256},"roundsStarted":34,"activation":"disarmed"}"#.utf8))]
         state.todoBySession = ["preview-session": try JSONDecoder().decode(DSHTodoState.self, from: Data(#"{"sessionId":"preview-session","todos":[{"content":"实现跨组选择与折叠提示","status":"completed"},{"content":"验证重复设备、重排和旧事件保护","status":"in_progress"},{"content":"执行完整回归并重建桌面应用","status":"pending"}]}"#.utf8))]
         func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }

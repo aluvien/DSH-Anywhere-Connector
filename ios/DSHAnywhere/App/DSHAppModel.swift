@@ -878,6 +878,7 @@ final class DSHAppModel: ObservableObject {
     /// `protocolError`s are consumed by that waiter (see `surfaceProtocolError`)
     /// and must not also pop the global alert.
     private var uploadWaitRequestIDs: Set<String> = []
+    private var decisionRequestTypes: [String: String] = [:]
     private var fileReadRequests: [String: DSHCommand] = [:]
     private var fileReadReplies: [String: DSHEventKind] = [:]
     private var fileReadFailures: [String: DSHProtocolError] = [:]
@@ -1731,6 +1732,7 @@ final class DSHAppModel: ObservableObject {
         cancelledStagedPromptIDs.removeAll(keepingCapacity: false)
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
+        decisionRequestTypes.removeAll(keepingCapacity: false)
         fileLinksBySession.removeAll(keepingCapacity: false)
         failedSendsByRequestID.removeAll(keepingCapacity: false)
         failedInitialMessages.removeAll(keepingCapacity: false)
@@ -4747,6 +4749,8 @@ final class DSHAppModel: ObservableObject {
         guard connectionState == .connected else { throw DSHRemoteCommandError(message: "连接已断开，内容已保留，请连接后重试。") }
         let generation = machineStateGeneration
         let machine = machineID
+        decisionRequestTypes[command.requestId] = command.type
+        defer { decisionRequestTypes.removeValue(forKey: command.requestId) }
         try await transport.send(command)
         for _ in 0..<300 {
             try Task.checkCancellation()
@@ -4791,19 +4795,8 @@ final class DSHAppModel: ObservableObject {
     }
 
     func cancelQuestion(_ request: DSHQuestionRequest) async throws {
-        let generation = machineStateGeneration
-        let machine = machineID
-        let command = DSHCommand.cancelQuestion(deviceId: deviceID, machineId: machine,
-            sessionId: request.sessionId, questionId: request.id)
-        try await transport.send(command)
-        for _ in 0..<300 {
-            try Task.checkCancellation()
-            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
-            if !state.pendingQuestions.contains(where: { $0.id == request.id }) { return }
-            if let message = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: message) }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw DSHRemoteCommandError(message: "取消结果尚未确认，请检查电脑上的状态。")
+        try await submitRemoteDecision(DSHCommand.cancelQuestion(deviceId: deviceID, machineId: machineID,
+            sessionId: request.sessionId, questionId: request.id), questionID: request.id, approvalID: nil)
     }
 
     private func isDurableRemoteMutation(_ command: DSHCommand) -> Bool {
@@ -5460,6 +5453,19 @@ final class DSHAppModel: ObservableObject {
     /// error next to the composer, and double-reporting would just overwrite it.
     private func surfaceProtocolError(_ event: DSHEvent) {
         guard case .protocolError(let error) = event.kind else { return }
+        if let decisionType = decisionRequestTypes[event.envelope.messageId] {
+            // Older Connectors only included status in this fixed diagnostic.
+            // Match the exact decision command, never unrelated HTTP conflicts.
+            let stale = error.httpStatus == 409 || error.message == "Local DSH bridge request failed (\(decisionType), HTTP 409)"
+            if stale {
+                state.protocolErrorsByRequestID[event.envelope.messageId] = decisionType == "approval.decide"
+                    ? "审批提交未被电脑接受，正在同步最新状态；你的选择已保留。"
+                    : "回答未被电脑接受，正在同步最新问题状态；你的回答草稿已保留。"
+            }
+            // The question/approval card owns its submission error and draft.
+            // Do not present a second, global alert for the same operation.
+            return
+        }
         guard !uploadWaitRequestIDs.contains(event.envelope.messageId) else { return }
         guard fileReadRequests[event.envelope.messageId] == nil else { return }
         // Catalog discovery is a passive read performed while opening a chat.
