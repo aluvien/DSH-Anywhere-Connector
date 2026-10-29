@@ -1682,6 +1682,65 @@ final class DSHConversationViewportTests: XCTestCase {
         XCTAssertEqual(dshNearestReasoningEffortIndex(full, to: "ultra"), 5)
     }
 
+    func testFrostedConversationDockAndSingleLineGoalPreview() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        var state = DSHAppModel.preview(longConversation: true).state
+        state.goalBySession = ["preview-session": try JSONDecoder().decode(DSHGoalState.self, from: Data(#"{"sessionId":"preview-session","goal":{"id":"dock-goal","revision":1,"objective":"实现跨组选择与折叠提示，验证重复设备、重排和旧事件保护","phase":"paused","maxGoalRounds":256},"roundsStarted":34,"activation":"disarmed"}"#.utf8))]
+        state.todoBySession = ["preview-session": try JSONDecoder().decode(DSHTodoState.self, from: Data(#"{"sessionId":"preview-session","todos":[{"content":"实现跨组选择与折叠提示","status":"completed"},{"content":"验证重复设备、重排和旧事件保护","status":"in_progress"},{"content":"执行完整回归并重建桌面应用","status":"pending"}]}"#.utf8))]
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        for dark in [false, true] {
+            let suite = "dock-preview-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let profiles = DSHProfileStore(defaults: defaults)
+            profiles.upsert(DSHRemoteProfile(relayBaseURL: URL(string: "https://preview.invalid")!,
+                deviceId: "preview-device", machineId: "preview-machine", machineName: "Mac mini"))
+            let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true,
+                transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(suite), profileStore: profiles)
+            model.machineID = "preview-machine"
+            model.connect()
+            defer { model.disconnect(); UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+            for _ in 0..<100 {
+                if model.connectionState == .connected { break }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertEqual(model.connectionState, .connected)
+            model.collapseComposerControls = true
+            model.machineName = "Mac mini"
+            let host = UIHostingController(rootView: NavigationStack {
+                ConversationView(sessionID: "preview-session").environmentObject(model)
+            })
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            try await Task.sleep(for: .milliseconds(800))
+            await settle()
+            let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }
+                .max { $0.bounds.height < $1.bounds.height })
+            let probe = try XCTUnwrap(descendants(host.view).compactMap { $0 as? DSHScrollProbeView }.first)
+            try XCTUnwrap(probe.coordinator).pauseFollowing()
+            scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height / 2), animated: false)
+            try await Task.sleep(for: .milliseconds(400))
+            let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "frosted-dock-single-line-goal-\(dark ? "dark" : "light")"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            let goalHost = UIHostingController(rootView: DSHGoalCreationView(sessionID: "preview-session").environmentObject(model))
+            window.rootViewController = goalHost
+            try await Task.sleep(for: .milliseconds(600))
+            let detail = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            detail.name = "paused-goal-continue-\(dark ? "dark" : "light")"
+            detail.lifetime = .keepAlways
+            add(detail)
+        }
+    }
+
     func testLongConversationViewportStaysBetweenHeaderAndComposer() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)

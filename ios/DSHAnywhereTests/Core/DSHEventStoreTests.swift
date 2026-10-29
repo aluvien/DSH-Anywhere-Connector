@@ -707,6 +707,19 @@ final class DSHEventStoreTests: XCTestCase {
         do { try await model.updateGoal(goal, in: "s", action: "edit", objective: "Old edit"); XCTFail("Old revision must not be sent") } catch { }
         let count = await transport.commandCount(ofType: "goal.update")
         XCTAssertEqual(count, 1)
+        let pausedGoal = try XCTUnwrap(model.goalState(for: "s")?.goal)
+        let resume = Task { @MainActor in try await model.updateGoal(pausedGoal, in: "s", action: "resume") }
+        defer { resume.cancel() }
+        let resumeValue = try await transport.waitForCommand(ofType: "goal.update", count: 2)
+        let resumeCommand = try XCTUnwrap(resumeValue)
+        XCTAssertEqual(resumeCommand.payload, .object(["action": .string("resume"), "ref": .object(["id": .string("g"), "revision": .number(3)])]))
+        let resumed = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":4,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":3,"activation":"armed"}"#.utf8))
+        await transport.emit(event(type: "goal.changed", messageID: "goal-4", sequence: 5, payload: resumed))
+        await transport.emit(event(type: "goal.updated", messageID: resumeCommand.requestId, sequence: 6,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(resumeCommand.requestId), "action": .string("resume"),
+                "ref": .object(["id": .string("g"), "revision": .number(4)])])))
+        try await resume.value
+        XCTAssertEqual(model.goalState(for: "s")?.goal?.phase, "active")
     }
 
     @MainActor
