@@ -4,8 +4,8 @@
 
 ## 当前进度（2026-10-30）
 
-- 开发分支 `codex/harness-ios-parity`，草稿 PR #1；此前提交已推送到 `91278df`，本轮目标创建及真实联调修复尚待最终回归后提交。
-- 生产 Relay、已加载的桌面 Bridge 与已安装 Connector 均为 schema 11；Harness 已按用户确认重启，4 个原有会话保留。本轮开发修订号升为 12，协议主版本仍为 1；用户已明确授权验证后按 Relay → 电脑组件 → App 顺序更新，不可将本地构建视为线上已更新。
+- 开发分支 `codex/harness-ios-parity`，草稿 PR #1；目标创建及真实联调修复已推送；schema 12 生产组件已按顺序升级。
+- 生产 Relay、已加载的桌面 Bridge 与已安装 Connector 已按用户确认顺序升级为 schema 12，协议主版本仍为 1。Build 125 已本地签名和导出，尚未上传 TestFlight。
 - 原生目标创建使用 `goals.create({agentId, request})`，提供目标和可选总轮次上限；不需要伪造 GoalRef，也不依赖 `/goal` 是否注册。当前存在未完成目标时禁止覆盖；已完成目标可按 Native 语义直接替换，新目标轮次从 0 开始。创建回执、未知结果和重试使用同一持久请求；已存在目标沿用原生 CAS 控制。静态 profile 的 disabled 值不能代表最终运行目录，不据此推断命令实际缺失。
 - 真实联调发现并修复：Native 无目标直接返回 undefined 时需保留空基线；手机根目录空路径需转换为 Native `.`；Native 文件异常可能直接抛出，需映射到明确能力/访问错误。独立 AppModel 注入配对存储，使测试不使用或改变开发者的手机配对。
 - TypeScript 构建、类型检查和 293 项回归通过（协议 37、Relay 23、Bridge 177、Connector 56），覆盖旧 schema 11 拒绝与新的创建请求。完整 iOS 回归及当前修订的真实 Native 流程最终结果待下方记录。
@@ -144,7 +144,7 @@
 
 版本组合批次：协议主版本固定为 1，共享 schemaRevision 11。新版 Connector 每次 Relay 连接等待显式协商，未确认前保留完整事件并拒绝分派手机操作；缺失/旧版本和握手超时返回旧版可识别的升级诊断并关闭连接，按退避重连。升级后保持原生位置、计划 Markdown、审阅意图及决策版本，不能删字段迁就旧 Relay。新版 Bridge 在 HTTP 幂等预留之前和 WebSocket 重放之前拒绝未声明 schema 11 的旧 Connector（HTTP 426）；健康信息提供最低版本。Relay 只有对明确请求协商的连接才附加 schemaRevision，原有客户端的握手格式保持一致。`pnpm build`、`pnpm check` 通过，共 288 项 TypeScript 测试（协议 36、Relay 23、Bridge 174、Connector 55）；桌面安装器独立测试通过。
 
-真实 Harness 初步验证：使用本机已安装 `@deepseek-ai/dsh 0.1.5-rc.1` 在 `/tmp/dsh-parity-native-20261029` 独立 DSH_HOME 启动，端口 18931；没有加载现有配置、会话与凭据。新 Bridge 的健康检查、Native settings.describe（14 个命名空间）、llm 提供方目录、pluginInventory 清单均真实返回 200。尚未将此只读结果等同配置写入、冲突、双端或 iPhone 实机验收。线上 Relay 初次只读检查为 schema 10；随后已通过 Termius 的 ALI-BJ 完成升级，详见下方实际部署记录。
+真实 Harness 初步验证：使用本机已安装 `@deepseek-ai/dsh 0.1.5-rc.1` 在 `/tmp/dsh-parity-native-20261029` 独立 DSH_HOME 启动，端口 18931；没有加载现有配置、会话与凭据。新 Bridge 的健康检查、Native settings.describe（14 个命名空间）、llm 提供方目录、pluginInventory 清单均真实返回 200。尚未将此只读结果等同配置写入、冲突、双端或 iPhone 实机验收。线上 Relay 初次只读检查为 schema 10；随后已完成生产服务升级，详见下方实际部署记录。
 
 ## 后续执行顺序
 
@@ -157,9 +157,9 @@
 ## 2026-10-29 实际部署与 Native 配置验收
 
 - GitHub 分支 `codex/harness-ios-parity` 已推送，草稿 PR：[Harness mobile parity #1](https://github.com/aluvien/DSH-Anywhere-Connector/pull/1)。主分支尚未合并，本轮尚未上传新 TestFlight。
-- ALI-BJ 的生产 Relay 已由固定提交 `4246f429eaaeb2a5482aefeb7bbb0c6ea1303fdf` 构建、预检并部署。公网与容器内 `/health` 均返回 schemaRevision 11、build 2026-10-29，生产容器 `relay-relay-1` 为 healthy。没有修改现有 `.env` 或数据卷。
-- 升级前备份位于服务器 `/opt/dsh-backup-parity-20261029-aSprxK`，旧镜像保留为 `dsh-relay:before-parity-4246f42`；新镜像 `dsh-relay:parity-4246f42`。升级前后比对确认 1 台现有机器和 1 台未过期设备的身份、令牌哈希和配对信息保持不变。备份包含敏感配置，仅保留于服务器受限目录。
-- 独立预检容器只绑定 loopback，验证真实打包镜像的旧手机握手保持原格式、新 Connector schema 11 协商、完整计划问题 Markdown/意图/决策版本不丢失，以及新目标命令携带认证设备身份。结果为 `/opt/dsh-parity-4246f42/preflight-result.json`；生产升级结果为同目录 `deployment-result.json`。预检容器已停止，生产配置校验和仍一致。
+- 生产 Relay 已由固定提交 `4246f429eaaeb2a5482aefeb7bbb0c6ea1303fdf` 构建、预检并部署。公网与容器内 `/health` 均返回 schemaRevision 11、build 2026-10-29，生产容器为 healthy。没有修改现有 `.env` 或数据卷。
+- 升级前备份与回滚镜像保留在受限运维存储中。升级前后比对确认 1 台现有机器和 1 台未过期设备的身份、令牌哈希和配对信息保持不变；公开文档不包含备份位置或运维身份。
+- 独立预检容器只绑定 loopback，验证真实打包镜像的旧手机握手保持原格式、新 Connector schema 11 协商、完整计划问题 Markdown/意图/决策版本不丢失，以及新目标命令携带认证设备身份。预检与生产升级证据保留在受限记录中；预检容器已停止，生产配置校验和仍一致。
 - 独立 Native Harness 0.1.5-rc.1 的真实配置写入验收通过：原生 settings.mutate、相同请求幂等回执、旧 revision 409、外部 settings.yaml 更新后失效通知、测试凭据写入/读取状态/0600 权限/脱敏日志、凭据删除、用户覆盖清除后恢复基础值。共读取 14 个命名空间、接收 13 条仅含标识的失效通知；未读取或改变用户现有凭据。结果：`artifacts/ios/harness-parity/native-configuration-20261029.json`。
 - Native 模型发现经真正的 llm-pi-ai 适配器请求独立 loopback 模型目录，验证 API 地址与临时测试凭据、模型 ID/上下文/输出限制映射；畸形目录错误不回显凭据。官方 llm-deepseek 当前没有发现适配器，修正为 501 和手动添加提示；请求参数不完整为 400。结果：`artifacts/ios/harness-parity/native-discovery-20261029.json`。
 - 上述发现能力回退修复后，`pnpm build`、`pnpm check` 全部通过：288 项 TypeScript。iOS 最新完整回归为 239 项通过；提供方标签改为“可配置，尚未添加”后，布局定向测试通过，结果位于 `/tmp/DSHAnywhere-parity-build/Logs/Test/Test-DSHAnywhere-2026.10.29_23-11-22-+0800.xcresult`。
@@ -175,3 +175,13 @@
 - TypeScript 最终 293 项、桌面安装器独立测试通过。真实 iOS Native 验收不访问用户原有会话；测试实例关闭 goal-round-driver，避免产生真实模型调用，因此不把 CRUD 验收等同自动推进/流式模型/子任务实测。
 
 最终视觉定向通过：`/tmp/dsh-native-ios-goal-layout-final.xcresult`，1 项真实 Native 链路测试通过。最终 6 张截图保存在 `artifacts/ios/harness-parity/live-native-*.png`；深色辅助大字目标阶段“已暂停”完整可见，正文与轮次可换行，目标管理不显示无效创建按钮。
+
+
+## schema 12 发布进度（2026-10-30）
+
+- 生产 Relay、电脑 Bridge 与 Connector 已升级并验证 schema 12。公网与本地健康检查通过；升级前后的机器和手机配对信息保持不变。
+- 生产 `.env` 仅更新一键安装的固定源码版本，其余配置逐行比对不变。公开安装入口已验证会取得匹配组件；完整备份和回滚细节仅保留在受限运维记录中。
+- 打包镜像的独立 WebSocket 预检通过：旧手机握手格式、新版本协商、完整计划 Markdown 与审阅意图、新目标创建的认证身份路由。预检实例已停止。
+- GitHub Swift 6.3.3 的隔离函数转换编译器崩溃，通过对数字字段和 5 个设置开关使用等价显式 Binding 闭包修复；CI 使用模拟器 ad hoc 签名验证真实 Keychain。编译已通过。
+- CI 随后发现固定 20 ms 握手等待，以及布局后立即测量的测试竞争。改为等待命令实际就绪、测量前排空布局后的主队列，保留全部严格协议与位置断言。没有更改产品滚动算法。22 项布局/网络定向测试本机通过，最终 CI 结果待记录。
+- 独立本机模拟模型经 Native pi-ai 流式通道验证：思考单独保存并关联同一条回答，用量与轮次耗时保留。证据为 `artifacts/ios/harness-parity/native-model-stream-20261030.json`；不使用用户原有 API 配置或外部模型服务。

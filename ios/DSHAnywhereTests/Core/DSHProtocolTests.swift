@@ -1681,6 +1681,9 @@ final class DSHConversationViewportTests: XCTestCase {
         defer { window.isHidden = true }
         try await Task.sleep(for: .milliseconds(800))
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         func descendants(_ view: UIView) -> [UIView] {
             [view] + view.subviews.flatMap(descendants)
         }
@@ -1717,6 +1720,9 @@ final class DSHConversationViewportTests: XCTestCase {
         XCTAssertTrue(editor.becomeFirstResponder())
         try await Task.sleep(for: .milliseconds(800))
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         assertViewport()
         XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, oldHeight)
         capture("conversation-composer-expanded")
@@ -1726,10 +1732,16 @@ final class DSHConversationViewportTests: XCTestCase {
         editor.resignFirstResponder()
         try await Task.sleep(for: .milliseconds(800))
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         let expandedHeight = scroll.bounds.inset(by: scroll.adjustedContentInset).height
         host.additionalSafeAreaInsets.bottom = 320
         try await Task.sleep(for: .milliseconds(500))
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         assertViewport()
         XCTAssertLessThan(scroll.bounds.inset(by: scroll.adjustedContentInset).height, expandedHeight - 250)
         capture("conversation-keyboard-sized-inset")
@@ -1738,9 +1750,15 @@ final class DSHConversationViewportTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(500))
         scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         capture("conversation-top")
         scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height / 2), animated: false)
         window.layoutIfNeeded()
+        // Pinning is deliberately deferred out of layout. Drain that main
+        // queue work before measuring the post-layout viewport.
+        await settle()
         capture("conversation-glass-scrolled")
     }
 }

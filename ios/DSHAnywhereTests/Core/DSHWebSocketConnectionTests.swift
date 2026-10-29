@@ -110,10 +110,16 @@ final class DSHWebSocketConnectionTests: XCTestCase {
             return fake
         })
         _ = await connection.connect()
-        try await Task.sleep(nanoseconds: 20_000_000)
+        // Handshake tasks run asynchronously; slow CI hosts may need more
+        // than one fixed 20 ms scheduling slice. Keep all wire assertions.
+        for _ in 0..<500 {
+            if fake.sentCommands.count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(fake.resumeCount, 1)
         let commands = fake.sentCommands
         XCTAssertEqual(commands.count, 2)
+        guard commands.count >= 2 else { await connection.disconnect(); return }
         XCTAssertEqual(commands[0].type, "connection.resume")
         XCTAssertEqual(commands[0].deviceId, "device")
         XCTAssertEqual(commands[0].machineId, "machine")
