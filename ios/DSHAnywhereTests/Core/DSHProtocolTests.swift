@@ -2092,6 +2092,32 @@ extension DSHModelPanelLayoutTests {
         let downloaded = try await model.downloadFile(ref)
         XCTAssertEqual(try String(contentsOf: downloaded, encoding: .utf8), "手机与桌面使用同一份 Harness 原生数据。\n文件完整读取与中文路径验证。\n")
         try? FileManager.default.removeItem(at: downloaded.deletingLastPathComponent())
+        if let mockAddress = ProcessInfo.processInfo.environment["DSH_PARITY_MOCK_MODEL_URL"],
+           let mockURL = URL(string: mockAddress), mockURL.host == "127.0.0.1", mockURL.scheme == "http" {
+            var mockRequest = URLRequest(url: mockURL.appendingPathComponent("control"))
+            mockRequest.httpMethod = "POST"
+            mockRequest.httpBody = Data(#"{"scenario":"plain"}"#.utf8)
+            let (_, response) = try await URLSession.shared.data(for: mockRequest)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            let contents = Data("真实手机附件联调\n保留完整内容。\n".utf8)
+            let attachment = DSHStagedAttachment(name: "手机附件.txt", data: contents, isImage: false)
+            let sent = try await model.sendStagedPromptPersisted("请读取这份测试附件", attachments: [attachment],
+                to: sessionID, requestId: "native-attachment-\(UUID().uuidString)")
+            XCTAssertTrue(sent)
+            try await until("Native attachment persisted") {
+                model.messages(for: sessionID).contains { $0.role == .user && $0.nativeSequence != nil && $0.attachments.contains { $0.name == attachment.name && $0.hostPath != nil } }
+            }
+            let message = try XCTUnwrap(model.messages(for: sessionID).first { $0.role == .user && $0.nativeSequence != nil && $0.attachments.contains { $0.name == attachment.name } })
+            let history = try await model.historyPage(sessionID: sessionID, atSeq: message.nativeSequence)
+            let row = try XCTUnwrap(history.rows.first { $0.type == "user.message.accepted" && $0.nativeSequence == message.nativeSequence })
+            let payload = try XCTUnwrap(row.payload["attachments"])
+            let replayed = try JSONDecoder().decode([DSHMessageAttachment].self, from: JSONEncoder().encode(payload))
+            let persisted = try XCTUnwrap(replayed.first { $0.name == attachment.name && $0.hostPath != nil })
+            let storedRef = try XCTUnwrap(persisted.fileReference(sessionID: sessionID))
+            let stored = try await model.downloadFile(storedRef)
+            XCTAssertEqual(try Data(contentsOf: stored), contents)
+            try? FileManager.default.removeItem(at: stored.deletingLastPathComponent())
+        }
         model.requestSubagents(for: sessionID)
         model.requestGoalState(for: sessionID)
         try await until("Native child and goal baseline") { model.subagentCatalog(for: sessionID) != nil && model.goalState(for: sessionID) != nil }
