@@ -66,6 +66,12 @@ private struct DSHRelayPairingUpgradeRequired: LocalizedError {
     var errorDescription: String? { "当前 Relay 不支持安全配对，请先升级 Relay 服务后再试。" }
 }
 
+protocol DSHCommandNotSentError: Error {}
+
+struct DSHRelayFeatureUpgradeRequired: LocalizedError, DSHCommandNotSentError {
+    var errorDescription: String? { "当前服务尚不支持此功能，请先更新 Relay 与电脑端 Connector/Bridge。" }
+}
+
 private enum DSHProvisionalPairingState: String, Codable, Sendable {
     case provisional
     case localCommitted
@@ -252,6 +258,10 @@ actor DSHRemoteTransport: DSHAppTransport {
         }
         if ["workspace.catalog", "workspace.create", "mode.catalog", "directory.list", "session.rename"].contains(command.type) {
             try await verifyCatalogRelay()
+        }
+        if ["workspace.files", "workspace.bytes", "execution.list", "feedback.list", "feedback.update", "reference.list",
+            "subagent.catalog", "subagent.prompt", "subagent.interrupt", "queue.update", "session.search", "conversation.search", "history.read", "schedule.get", "configuration.read", "configuration.update", "configuration.discover"].contains(command.type), try await relaySchemaRevision() < 11 {
+            throw DSHRelayFeatureUpgradeRequired()
         }
         var outgoing = command
         if command.type == "session.open",

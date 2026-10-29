@@ -24,6 +24,83 @@ private final class DSHModelPanelFixture: ObservableObject {
         ])], failures: [])
 }
 
+private func dshConfigurationLayoutNamespace() throws -> DSHJSONValue {
+    try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"ns":"llm-layout","revision":4,"applies":"live","value":{"baseURL":"https://api.example.test/compatible/v1","apiKeyEnv":"DEEPSEEK_API_KEY","maxTokens":8192,"enabled":true,"models":[{"id":"reasoner","name":"思考模型","contextWindow":131072,"futureField":true}],"reasoningEffort":"high"},"base":{"baseURL":"https://api.example.test/v1"},"user":{"baseURL":"https://api.example.test/compatible/v1"},"secrets":[{"path":["apiKey"],"set":true}],"schema":{"uid":1,"refs":{"1":{"type":"object","dict":{"baseURL":2,"apiKeyEnv":3,"maxTokens":4,"models":5,"enabled":7,"reasoningEffort":8,"apiKey":11}},"2":{"type":"string","meta":{"description":"服务地址由电脑端校验，未修改的字段会保留。"}},"3":{"type":"string","meta":{"role":"credential-ref"}},"4":{"type":"number","meta":{"min":1,"step":1}},"5":{"type":"array","inner":6},"6":{"type":"object","dict":{"id":2,"name":2,"contextWindow":4}},"7":{"type":"boolean"},"8":{"type":"union","list":[9,10]},"9":{"type":"const","value":"high"},"10":{"type":"const","value":"max"},"11":{"type":"string","meta":{"role":"secret"}}}}}"#.utf8))
+}
+private actor DSHFileLayoutTransport: DSHAppTransport {
+    private var fileData: Data?
+    func setFileData(_ data: Data) { fileData = data }
+    func seedMediaQueue(_ queue: DSHServerQueue) throws {
+        emit(type: "queue.changed", id: "media-queue", payload: try JSONDecoder().decode(DSHJSONValue.self, from: JSONEncoder().encode(queue)))
+    }
+    private var continuation: AsyncThrowingStream<DSHEvent, Error>.Continuation?
+    private var sequence: Int64 = 0
+    func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential, deviceName: String) async throws -> DSHRemoteProfile { throw DSHWebSocketError.notConnected }
+    func connect() async -> AsyncThrowingStream<DSHEvent, Error> {
+        let stream = AsyncThrowingStream<DSHEvent, Error>.makeStream(); continuation = stream.continuation
+        emit(type: "connection.ready", id: "ready", payload: .object([:])); return stream.stream
+    }
+    func setIncludeArchived(_ value: Bool) async { }
+    func send(_ command: DSHCommand) async throws {
+        if command.type == "configuration.read" {
+            let section = command.payload.executionObject["section"]?.executionString ?? "settings"
+            let value: DSHJSONValue
+            switch section {
+            case "settings": value = .object(["writable": .bool(true), "hasDocument": .bool(true), "namespaces": .array([try dshConfigurationLayoutNamespace()])])
+            case "providers": value = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"registered":[{"id":"deepseek","name":"DeepSeek"}],"configurable":[{"provider":"deepseek","displayName":"DeepSeek 思考模型","settingsNs":"llm-layout","settingsPath":[]},{"provider":"custom","displayName":"自定义服务","settingsNs":"llm-layout","settingsPath":[],"declared":true,"error":"等待检查服务地址与凭据来源"}]}"#.utf8))
+            case "plugins": value = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"entries":[{"entryId":"a","moduleName":"@deepseek-ai/dsh-schedule","enabled":true,"fiberPhase":"active"},{"entryId":"b","moduleName":"本机可选插件与较长名称的加载状态示例","enabled":false,"fiberPhase":"failed"}],"agentPresets":[{"id":"standard","name":"标准模式","trust":"system","isDefault":true,"rows":[{"entryId":null,"moduleName":"按工作区启用的插件","enabled":"conditional","condition":"workspace is available","fiberPhase":null}]}]}"#.utf8))
+            default:
+                let refs = command.payload.executionObject["refs"]?.executionArray.compactMap(\.executionString) ?? []
+                value = .object(Dictionary(uniqueKeysWithValues: refs.map { ($0, .object(["configured": .bool(true), "writable": .bool(true), "source": .string("本机凭据存储")])) }))
+            }
+            emit(type: "configuration.result", id: command.requestId, payload: .object(["section": .string(section), "value": value]))
+        } else if command.type == "schedule.get" {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","epoch":"schedule-preview","seq":100,"available":true,"supported":true,"items":[{"id":"once","kind":"at","prompt":"检查手机端长对话的搜索定位和历史加载，记录实际发现的问题。","scheduledAt":"2026-10-28T08:00:00.000Z"},{"id":"recurring","kind":"every","prompt":"检查桌面端的构建结果，并在原会话继续处理失败原因。","everySeconds":1800,"scheduledAt":"2026-10-30T01:00:00.000Z"}]}"#.utf8))
+            emit(type: "schedule.projection", id: command.requestId, payload: payload, sessionID: command.sessionId)
+        } else if command.type == "session.search" || command.type == "conversation.search" {
+            var payload: [String: DSHJSONValue] = ["query": command.payload.executionObject["query"] ?? .string(""), "hasMore": .bool(true), "nextCursor": .string("next-native-page"), "items": .array([
+                .object(["sessionId": .string("s"), "nativeSequence": .number(42), "type": .string("assistant/message"), "time": .number(1793274000000), "surface": .string("current"),
+                    "snippet": .string("手机需要保留桌面端的计划、目标、思考过程和工具结果。点击搜索结果后，按原生消息位置读取完整记录。"),
+                    "session": .object(["id": .string("s"), "title": .string("DeepSeek Harness 信息展示与手机阅读适配"), "updatedAt": .number(1793274000000)])]),
+                .object(["sessionId": .string("other"), "nativeSequence": .number(0), "type": .string("user/message"), "time": .number(1793187600000), "surface": .string("shadowed"),
+                    "snippet": .string("检查长对话的历史分页，避免把未加载的中间记录显示为完整历史。"),
+                    "session": .object(["id": .string("other"), "title": .string("历史加载和准确定位"), "updatedAt": .number(1793187600000)])])])]
+            if let session = command.sessionId { payload["scopeSessionId"] = .string(session) }
+            emit(type: "search.results", id: command.requestId, payload: .object(payload), sessionID: command.sessionId)
+        } else if command.type == "workspace.files" {
+            emit(type: command.type, id: command.requestId, payload: .object(["sessionId": .string("s"), "path": .string(""), "truncated": .bool(true), "entries": .array([
+                .object(["name": .string("设计资源"), "type": .string("directory")]),
+                .object(["name": .string("交付说明与跨端验证记录-2026-10-29.md"), "type": .string("file"), "size": .number(16384)]),
+                .object(["name": .string("演示视频.mp4"), "type": .string("file"), "size": .number(12 * 1024 * 1024)]),
+                .object(["name": .string("界面截图.png"), "type": .string("file"), "size": .number(25731)])])]))
+        } else if command.type == "reference.list" {
+            let kind = command.payload.executionObject["kind"]?.executionString ?? "file", query = command.payload.executionObject["query"]?.executionString ?? ""
+            let items: [DSHJSONValue] = kind == "file" ? [
+                .object(["id": .string("dir"), "kind": .string("directory"), "label": .string("手机阅读与跨端验证资源目录"), "path": .string("手机阅读与跨端验证资源目录"), "insertion": .string("@手机阅读与跨端验证资源目录/")]),
+                .object(["id": .string("file"), "kind": .string("file"), "label": .string("文档/完整功能对齐与验收步骤.md"), "path": .string("文档/完整功能对齐与验收步骤.md"), "insertion": .string("@文档/完整功能对齐与验收步骤.md")])
+            ] : [.object(["id": .string("session"), "kind": .string("session"), "label": .string("检查 DeepSeek Harness 信息展示与手机操作"), "detail": .string("/Users/me/Projects/DSH-ANYWHERE"), "sourceSessionId": .string("a/b"), "insertion": .string("@[参考会话](dsh-session:ImEvYiI)"), "sameWorkspace": .bool(true)])]
+            emit(type: "reference.candidates", id: command.requestId, payload: .object(["sessionId": .string("s"), "kind": .string(kind), "query": .string(query), "items": .array(items)]))
+        } else if command.type == "feedback.list" {
+            emit(type: "feedback.state", id: command.requestId, payload: .object(["sessionId": .string("s"), "nativeSequence": .number(100), "items": .array([
+                .object(["messageId": .string("a"), "rating": .string("positive"), "version": .string("v2"), "note": .string("电脑端新增的评价备注"), "createdAt": .number(1), "updatedAt": .number(2)])])]))
+        } else if command.type == "workspace.bytes" {
+            let data = fileData ?? Data("文件已完整下载。\n\n可通过右上角的分享按钮保存到“文件”或在其他 App 中打开。\n".utf8)
+            emit(type: command.type, id: command.requestId, payload: .object(["sessionId": .string("s"), "absolutePath": .string("/workspace/交付说明.txt"), "version": .string("v1"),
+                "bytes": .number(Double(data.count)), "offset": .number(0), "data": .string(data.base64EncodedString()), "eof": .bool(true)]))
+        }
+    }
+    func disconnect() async { continuation?.finish(); continuation = nil }
+    func forgetPairing() async throws { await disconnect() }
+    func setActiveMachine(_ machineId: String) async { }
+    func removeMachine(_ machineId: String) async throws { }
+    func pairedDevices() async throws -> [DSHRelayDevice] { [] }
+    func revokeDevice(_ deviceId: String) async throws { }
+    private func emit(type: String, id: String, payload: DSHJSONValue, sessionID: String? = nil) {
+        sequence += 1
+        continuation?.yield(DSHEvent(envelope: DSHEnvelope(messageId: id, deviceId: "device", machineId: "machine", sessionId: sessionID, sequence: sequence, type: type, payload: payload)))
+    }
+}
+
 private struct DSHModelPanelFixtureView: View {
     @ObservedObject var fixture: DSHModelPanelFixture
     var body: some View {
@@ -46,6 +123,453 @@ private struct DSHModelPanelFixtureView: View {
 
 @MainActor
 final class DSHModelPanelLayoutTests: XCTestCase {
+    func testComputerConfigurationAndConflictFormsInLightDarkAndLargeText() async throws {
+        let defaults = UserDefaults.standard
+        let oldProfiles = defaults.object(forKey: DSHProfileStore.profilesKey), oldActive = defaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!, deviceId: "device", machineId: "machine", machineName: "Fixture Mac")
+        defaults.set(try JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey); defaults.set("machine", forKey: DSHProfileStore.activeMachineKey)
+        defer { for (key, value) in [(DSHProfileStore.profilesKey, oldProfiles), (DSHProfileStore.activeMachineKey, oldActive)] { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        let model = DSHAppModel(transport: DSHFileLayoutTransport(), isPaired: true, transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        model.connect(); defer { model.disconnect() }
+        for _ in 0..<40 { if model.connectionState == .connected { break }; try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(model.connectionState, .connected)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene), window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        let namespace = try JSONDecoder().decode(DSHSettingsNamespace.self, from: JSONEncoder().encode(dshConfigurationLayoutNamespace()))
+        let storage = DSHSecureConfigurationStorage(tokens: DSHKeychainTokenStore(service: "configuration-layout-\(UUID().uuidString)"))
+        let key = storage.key(machine: "machine", device: "device", scope: "settings:llm-layout:\(DSHJSONValue.array([]).executionPrettyJSON)")
+        let credentialKey = storage.key(machine: "machine", device: "device", scope: "credential:TEST_KEY")
+        defer { try? storage.delete(key: key); try? storage.delete(key: credentialKey) }
+        func capture(_ name: String) { let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) }); shot.name = name; shot.lifetime = .keepAlways; add(shot) }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            let home = UIHostingController(rootView: NavigationStack { DSHComputerConfigurationView() }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.rootViewController = home; window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(650))
+            capture(dark ? "configuration-home-dark-large-text" : "configuration-home-light")
+            let raw = try JSONEncoder().encode(namespace), json = try JSONDecoder().decode(DSHJSONValue.self, from: raw)
+            var old = json.executionObject; old["revision"] = .number(3)
+            let previous = try JSONDecoder().decode(DSHSettingsNamespace.self, from: JSONEncoder().encode(DSHJSONValue.object(old)))
+            var draft = DSHConfigurationDraft(base: previous); draft.edit(path: ["maxTokens"], value: .number(16384))
+            try storage.save(draft, key: key)
+            let editor = UIHostingController(rootView: NavigationStack { DSHSettingsEditor(namespace: namespace, writable: true, title: "模型配置", storage: storage) }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.rootViewController = editor; window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(500))
+            capture(dark ? "configuration-conflict-dark-large-text" : "configuration-conflict-light")
+            func scrollViews(_ view: UIView) -> [UIScrollView] { (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews) }
+            if let scroll = scrollViews(editor.view).first(where: { $0.contentSize.height > $0.bounds.height }) {
+                scroll.setContentOffset(.init(x: 0, y: max(-scroll.adjustedContentInset.top, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)), animated: false)
+                try await Task.sleep(for: .milliseconds(250)); capture(dark ? "configuration-fields-dark-large-text-bottom" : "configuration-fields-light-bottom")
+            }
+            try storage.save(DSHJSONValue.object(["ref": .string("TEST_KEY"), "value": .string("fake-layout-secret")]), key: credentialKey)
+            let credential = UIHostingController(rootView: NavigationStack { DSHCredentialEditor(initialRef: "TEST_KEY", storage: storage) }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.rootViewController = credential; window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(500))
+            capture(dark ? "credential-form-dark-large-text" : "credential-form-light")
+            let discovered = try JSONDecoder().decode(DSHDiscoveredModels.self, from: Data(#"{"settingsNs":"llm-layout","models":[{"id":"reasoner","name":"已配置的推理模型","contextWindow":131072},{"id":"new-model-with-a-long-provider-identifier","name":"适合长文本与工具调用的新模型","contextWindow":262144,"maxTokens":32768}]}"#.utf8))
+            let discovery = UIHostingController(rootView: NavigationStack { DSHModelDiscoveryView(settingsNs: "llm-layout", request: ["baseURL": .string("https://api.example.test/v1"), "api": .string("openai")], existing: [.object(["id": .string("reasoner")])], initialModels: discovered) { _, _ in } }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.rootViewController = discovery; window.makeKeyAndVisible(); try await Task.sleep(for: .milliseconds(450))
+            capture(dark ? "model-discovery-dark-large-text" : "model-discovery-light")
+            if let scroll = scrollViews(discovery.view).first(where: { $0.contentSize.height > $0.bounds.height }) {
+                for _ in 0..<4 {
+                    scroll.setContentOffset(.init(x: 0, y: max(-scroll.adjustedContentInset.top, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)), animated: false)
+                    try await Task.sleep(for: .milliseconds(150))
+                }
+                capture(dark ? "model-discovery-dark-large-text-bottom" : "model-discovery-light-bottom")
+            }
+
+        }
+    }
+    func testNativeHistorySearchAndScheduleInLightDarkAndLargeText() async throws {
+        let defaults = UserDefaults.standard
+        let oldProfiles = defaults.object(forKey: DSHProfileStore.profilesKey), oldActive = defaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!, deviceId: "device", machineId: "machine", machineName: "Fixture Mac")
+        defaults.set(try JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey); defaults.set("machine", forKey: DSHProfileStore.activeMachineKey)
+        defer {
+            for (key, value) in [(DSHProfileStore.profilesKey, oldProfiles), (DSHProfileStore.activeMachineKey, oldActive)] {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        let model = DSHAppModel(transport: DSHFileLayoutTransport(), isPaired: true, transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        model.connect(); defer { model.disconnect() }
+        for _ in 0..<40 { if model.connectionState == .connected { break }; try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(model.connectionState, .connected)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            let host = UIHostingController(rootView: NavigationStack {
+                ScrollView { DSHHistorySearchResults(query: "手机").frame(width: 320).padding(.vertical, 12) }.navigationTitle("搜索对话").navigationBarTitleDisplayMode(.inline)
+            }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large))
+            window.rootViewController = host; window.makeKeyAndVisible()
+            try await Task.sleep(for: .milliseconds(750))
+            let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            shot.name = dark ? "history-search-dark-large-text" : "history-search-light"; shot.lifetime = .keepAlways; add(shot)
+            let scheduleHost = UIHostingController(rootView: DSHSchedulePanel(sessionID: "s").environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            window.rootViewController = scheduleHost; window.makeKeyAndVisible()
+            try await Task.sleep(for: .milliseconds(500))
+            let schedule = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            schedule.name = dark ? "schedule-dark-large-text" : "schedule-light"; schedule.lifetime = .keepAlways; add(schedule)
+            if dark {
+                func scrollViews(_ view: UIView) -> [UIScrollView] { (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews) }
+                if let scroll = scrollViews(scheduleHost.view).first(where: { $0.contentSize.height > $0.bounds.height }) {
+                    scroll.setContentOffset(.init(x: 0, y: max(-scroll.adjustedContentInset.top, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)), animated: false)
+                    try await Task.sleep(for: .milliseconds(250))
+                    let bottom = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                    bottom.name = "schedule-dark-large-text-bottom"; bottom.lifetime = .keepAlways; add(bottom)
+                }
+            }
+        }
+    }
+    func testChildImageComposerAndQueuedAttachmentsInLightDarkAndLargeText() async throws {
+        let profileDefaults = UserDefaults.standard
+        let previousProfiles = profileDefaults.object(forKey: DSHProfileStore.profilesKey), previousActive = profileDefaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!, deviceId: "device", machineId: "machine", machineName: "Fixture Mac")
+        profileDefaults.set(try JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey); profileDefaults.set("machine", forKey: DSHProfileStore.activeMachineKey)
+        defer {
+            for (key, previous) in [(DSHProfileStore.profilesKey, previousProfiles), (DSHProfileStore.activeMachineKey, previousActive)] {
+                if let previous { profileDefaults.set(previous, forKey: key) } else { profileDefaults.removeObject(forKey: key) }
+            }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "child-media-layout-\(UUID().uuidString)", defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let jpeg = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 200, height: 140)).image { context in
+            UIColor.systemTeal.setFill(); context.fill(CGRect(x: 0, y: 0, width: 200, height: 140))
+            ("子任务参考图" as NSString).draw(at: CGPoint(x: 20, y: 55), withAttributes: [.font: UIFont.systemFont(ofSize: 22), .foregroundColor: UIColor.white])
+        }.jpegData(compressionQuality: 0.85))
+        let catalog = try JSONDecoder().decode(DSHSubagentCatalog.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":true,"entries":[{"kind":"child","id":"child","mode":"continuable","activity":"running","hasChildren":false,"label":"分析图片中的界面"}]}"#.utf8))
+        var state = DSHStoreState()
+        state.subagentCatalogs = ["parent": catalog]
+        state.messagesBySession["child"] = [DSHChatMessage(id: "a", role: .assistant, markdown: "可以继续发送图片。图片会由 Harness 校验并保存，发送失败时会保留草稿。")]
+        let attachment = DSHMessageAttachment(id: "img", name: "参考图.jpg", mediaType: "image/jpeg", thumbnail: "data:image/jpeg;base64," + jpeg.base64EncodedString(), hostPath: "/host/参考图.jpg")
+        let file = DSHMessageAttachment(id: "file", name: "完整功能实现与跨端验收说明.pdf", hostPath: "/host/说明.pdf")
+        let item = DSHServerQueue.Item(id: "queue", placement: "queued", message: .init(id: "queue", content: [
+            .object(["type": .string("text"), "text": .string("请按图片和说明继续处理。")]), .object(["type": .string("image")])]), attachments: [attachment, file])
+        state.serverQueues = ["s": .init(sessionId: "s", available: true, items: [item])]
+        let transport = DSHFileLayoutTransport()
+        let model = DSHAppModel(transport: transport, initialState: state, isPaired: true, transactionDirectory: directory.appendingPathComponent("transactions"))
+        model.connect()
+        for _ in 0..<40 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.connectionState, .connected)
+        try await transport.seedMediaQueue(try XCTUnwrap(state.serverQueues?["s"]))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(model.serverQueue(for: "s")?.available == true)
+        let drafts = DSHSubagentComposerDrafts(storage: DSHSubagentMediaStorage(directory: directory.appendingPathComponent("images")), defaults: defaults)
+        let address = DSHSubagentDraftAddress(machineID: model.machineID, parentID: "parent", childID: "child")
+        try await drafts.load(address); drafts.setText("请看这张参考图，继续检查顶部的显示效果。", for: address)
+        try await drafts.setImages([.init(name: "photo.jpg", data: jpeg, isImage: true)], for: address)
+        let child = try XCTUnwrap(catalog.entries.first), scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true; model.disconnect() }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            for queue in [false, true] {
+                let view: AnyView = queue ? AnyView(QueuedPromptsSheet(sessionID: "s").environmentObject(model)) :
+                    AnyView(NavigationStack { DSHSubagentRecord(parentID: "parent", child: child, composerDrafts: drafts) }.environmentObject(model))
+                window.rootViewController = UIHostingController(rootView: view.dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+                window.makeKeyAndVisible()
+                try await Task.sleep(for: .milliseconds(400))
+                let screenshot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                screenshot.name = "\(queue ? "queue-attachments" : "child-image-composer")-\(dark ? "dark-large-text" : "light")"; screenshot.lifetime = .keepAlways; add(screenshot)
+            }
+        }
+        model.disconnect()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertNotEqual(model.connectionState, .connected)
+        let offline = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+        offline.name = "queue-attachments-dark-large-text-offline"; offline.lifetime = .keepAlways; add(offline)
+    }
+    func testFeedbackDraftAndCrossDeviceConflictInLightDarkAndLargeText() async throws {
+        let defaults = UserDefaults.standard
+        let previousProfiles = defaults.object(forKey: DSHProfileStore.profilesKey), previousActive = defaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!, deviceId: "device", machineId: "machine", machineName: "Test Mac")
+        defaults.set(try JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey); defaults.set("machine", forKey: DSHProfileStore.activeMachineKey)
+        let draftKey = "dsh.feedback.draft." + Data(["machine", "s", "a"].joined(separator: "\u{0}").utf8).base64EncodedString()
+        let previousDraft = defaults.object(forKey: draftKey)
+        defer {
+            for (key, previous) in [(DSHProfileStore.profilesKey, previousProfiles), (DSHProfileStore.activeMachineKey, previousActive), (draftKey, previousDraft)] {
+                if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        let draft = Data(#"{"base":{"messageId":"a","rating":"negative","version":"v1","createdAt":1,"updatedAt":1},"rating":"negative","category":"instruction-following","note":"手机端已经写好的备注：希望回答保留原生数据，并适合小屏阅读。其他端更新后，这段文字应继续保留。"}"#.utf8)
+        let model = DSHAppModel(transport: DSHFileLayoutTransport(), isPaired: true,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        model.connect()
+        for _ in 0..<40 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(model.connectionState, .connected)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene), host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host; window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        for dark in [false, true] {
+            defaults.set(draft, forKey: draftKey)
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(DSHFeedbackEditor(sessionID: "s", messageID: "a", initialRating: "negative")
+                .environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320).id(UUID()))
+            try await Task.sleep(for: .milliseconds(450))
+            XCTAssertEqual(model.feedback(for: "a", in: "s")?.version, "v2")
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            attachment.name = "feedback-conflict-\(dark ? "dark-large-text" : "light")"; attachment.lifetime = .keepAlways; add(attachment)
+            if dark {
+                func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+                let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }.first { $0.contentSize.height > $0.bounds.height })
+                scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom), animated: false)
+                try await Task.sleep(for: .milliseconds(150))
+                let bottom = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                bottom.name = "feedback-conflict-dark-large-text-scrolled"; bottom.lifetime = .keepAlways; add(bottom)
+            }
+        }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            for kind in ["file", "session"] {
+                let pickerHost = UIHostingController(rootView: DSHReferencePicker(sessionID: "s", initialKind: kind, onInsert: { _ in })
+                    .environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+                window.rootViewController = pickerHost
+                window.makeKeyAndVisible()
+                try await Task.sleep(for: .milliseconds(500))
+                let screenshot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                screenshot.name = "references-\(kind)-\(dark ? "dark-large-text" : "light")"; screenshot.lifetime = .keepAlways; add(screenshot)
+            }
+        }
+    }
+    func testStructuredToolResultsInCompactWidthLightDarkAndLargeText() async throws {
+        let model = DSHAppModel(transport: DSHPreviewTransport(), isPaired: false,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene), host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host; window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        let fixtures: [(String, DSHToolResult)] = [
+            ("diff-search", .diff([DSHToolDiff(path: "Sources/对话界面/ConversationView.swift", oldText: "let title = name\nlet opaque = true\nrender(title)", newText: "let title = name\nlet opaque = false\nrender(title)")])),
+            ("search", .search(DSHToolSearch(shape: "matches", files: [.init(path: "Sources/原生桥接/normalize.ts", matches: [.init(lineNumber: 137, line: "保留原生结果和真实子调用身份，手机端按文件分组展示。")])], paths: nil, truncated: true, total: 146))),
+            ("web-terminal", .webSearch(DSHToolWebSearch(sources: [.init(url: "https://example.com/harness/reference", title: "Harness 工具展示参考", snippet: "原生元数据保留来源、摘要与日期；手机阅读时可以打开完整来源。", publishedAt: "2026-10-29")], answer: "**查询摘要**：保留来源与截断信息。", truncated: true)))
+        ]
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            for (name, result) in fixtures {
+                host.rootView = AnyView(NavigationStack {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            DSHToolResultContent(result: result, detail: nil, sessionID: "s", initiallyExpanded: true)
+                            if name == "web-terminal" {
+                                DSHToolResultContent(result: .terminal(output: "检查结果：发现 2 项需要处理。\n保持完整输出，可选择并复制。", exitCode: 2, signal: nil), detail: nil, sessionID: "s")
+                            }
+                        }.frame(width: 288).padding(16)
+                    }.navigationTitle("工具结果").navigationBarTitleDisplayMode(.inline)
+                }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large))
+                try await Task.sleep(for: .milliseconds(250))
+                let screenshot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                screenshot.name = "tools-\(name)-\(dark ? "dark-large-text" : "light")"; screenshot.lifetime = .keepAlways; add(screenshot)
+                let fitting = host.sizeThatFits(in: CGSize(width: window.bounds.width, height: window.bounds.height))
+                XCTAssertLessThanOrEqual(fitting.width, window.bounds.width + 1)
+            }
+        }
+    }
+    func testExecutionNoticesAndAttemptDetailsInCompactWidthAndLargeText() async throws {
+        let records = try JSONDecoder().decode([DSHExecutionRecord].self, from: Data(#"[{"nativeSequence":0,"type":"turn/start","time":1000,"data":{"turn":1}},{"nativeSequence":1,"type":"step/start","time":1100,"data":{"turn":1,"step":1}},{"nativeSequence":2,"type":"assistant/attempt","time":1900,"data":{"turn":1,"step":1,"stream":[{"type":"reasoning-chunks","index":0,"time0":1200,"texts":["未展开不能出现的思考内容"],"dt":[]},{"type":"text-chunks","index":1,"time0":1300,"texts":["尚未提交的回答片段"],"dt":[]},{"type":"chunk","time":1800,"chunk":{"type":"finish","reason":{"kind":"error","failure":{"message":"服务商限流","code":"RATE_LIMIT","status":429}}}}]}},{"nativeSequence":3,"type":"llm/retry","time":2000,"data":{"turn":1,"step":1,"retryId":"r","retry":1,"maxRetries":3,"delayMs":4000,"provider":"DeepSeek","failure":{"message":"服务商限流，将按原计划重试。","code":"RATE_LIMIT","status":429}}},{"nativeSequence":4,"type":"step/end","time":2500,"data":{"turn":1,"step":1}},{"nativeSequence":5,"type":"turn/end","time":2600,"data":{"turn":1,"reason":{"kind":"aborted","reason":"user"}}},{"nativeSequence":6,"type":"compaction/start","time":3000,"data":{"compactionId":"c","turn":null}},{"nativeSequence":7,"type":"compaction/summary","time":4000,"data":{"compactionId":"c","summary":[{"type":"text","text":"保留目标、已完成的验证和接下来需要处理的工作。"}],"shadowedSeqs":[12,4],"shadowedTokenCount":1200,"provider":"DeepSeek","model":"reasoner"}},{"nativeSequence":8,"type":"compaction/checkpoint","time":4100,"data":{"compactionId":"c"}},{"nativeSequence":9,"type":"compaction/end","time":4200,"data":{"compactionId":"c","turn":null}}]"#.utf8))
+        var state = DSHStoreState(); state.executionBySession = ["s": records]
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: false,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene), host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host; window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(NavigationStack {
+                ScrollView { VStack(spacing: 12) {
+                    ForEach(DSHExecutionNotice.build(records)) { notice in DSHExecutionNoticeCard(sessionID: "s", notice: notice, initiallyExpanded: true) }
+                }.frame(width: 320).padding(.vertical) }
+                    .navigationTitle("执行过程").navigationBarTitleDisplayMode(.inline)
+            }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large))
+            try await Task.sleep(for: .milliseconds(400))
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            attachment.name = dark ? "execution-notices-dark-large-text" : "execution-notices-light"
+            attachment.lifetime = .keepAlways; add(attachment)
+            if dark {
+                func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+                let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }.first { $0.contentSize.height > $0.bounds.height })
+                scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom), animated: false)
+                try await Task.sleep(for: .milliseconds(150))
+                let bottom = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                bottom.name = "execution-notices-dark-large-text-scrolled"; bottom.lifetime = .keepAlways; add(bottom)
+            }
+        }
+        let lifecycle = try JSONDecoder().decode(DSHExecutionLifecycle.self, from: Data(#"{"createdAt":1793280000000,"inheritedEventCount":360,"throughSeq":382,"ownEventCount":23,"turnsStarted":3,"turnsEnded":2,"measuredTurns":2,"endedTurnMilliseconds":81750,"timingIncomplete":true,"assistantMessages":4,"toolCalls":8,"lastActivityAt":1793280300000,"lastEndKind":"aborted","openTurn":{"turn":4,"startedAt":1793280300000}}"#.utf8))
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(NavigationStack { List { DSHExecutionLifecycleSection(lifecycle: lifecycle) }.navigationTitle("子任务执行轨迹").navigationBarTitleDisplayMode(.inline) }.dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320))
+            try await Task.sleep(for: .milliseconds(400))
+            func capture(_ suffix: String) {
+                let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+                shot.name = "execution-lifecycle-\(dark ? "dark-large-text" : "light")\(suffix)"; shot.lifetime = .keepAlways; add(shot)
+            }
+            capture("")
+            if dark {
+                func scrollViews(_ view: UIView) -> [UIScrollView] { (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews) }
+                if let scroll = scrollViews(host.view).first(where: { $0.contentSize.height > $0.bounds.height }) {
+                    for _ in 0..<3 { scroll.setContentOffset(.init(x: 0, y: max(-scroll.adjustedContentInset.top, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)), animated: false); try await Task.sleep(for: .milliseconds(150)) }
+                    capture("-bottom")
+                }
+            }
+        }
+        let attempt = try XCTUnwrap(records.first { $0.type == "assistant/attempt" })
+        host.rootView = AnyView(NavigationStack { DSHExecutionDetail(sessionID: "s", record: attempt) }.environmentObject(model))
+        try await Task.sleep(for: .milliseconds(400))
+        let detail = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+        detail.name = "execution-attempt-detail-thinking-collapsed"; detail.lifetime = .keepAlways; add(detail)
+    }
+
+    func testWorkspaceBrowserAndFilePreviewInLightDarkAndLargeText() async throws {
+        let defaults = UserDefaults.standard
+        let previousProfiles = defaults.object(forKey: DSHProfileStore.profilesKey)
+        let previousActive = defaults.object(forKey: DSHProfileStore.activeMachineKey)
+        let profile = DSHRemoteProfile(relayBaseURL: URL(string: "https://example.test")!, deviceId: "device", machineId: "machine", machineName: "Test Mac")
+        defaults.set(try JSONEncoder().encode([profile]), forKey: DSHProfileStore.profilesKey)
+        defaults.set("machine", forKey: DSHProfileStore.activeMachineKey)
+        defer {
+            if let previousProfiles { defaults.set(previousProfiles, forKey: DSHProfileStore.profilesKey) }
+            else { defaults.removeObject(forKey: DSHProfileStore.profilesKey) }
+            if let previousActive { defaults.set(previousActive, forKey: DSHProfileStore.activeMachineKey) }
+            else { defaults.removeObject(forKey: DSHProfileStore.activeMachineKey) }
+        }
+        let transport = DSHFileLayoutTransport()
+        let model = DSHAppModel(transport: transport, isPaired: true,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        model.connect()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host; window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        try await Task.sleep(for: .milliseconds(200))
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(DSHRemoteFilesPanel(sessionID: "s").environmentObject(model)
+                .dynamicTypeSize(dark ? .accessibility2 : .large))
+            try await Task.sleep(for: .milliseconds(1100))
+            window.layoutIfNeeded()
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+            attachment.name = dark ? "workspace-files-dark-large-text" : "workspace-files-light"
+            attachment.lifetime = .keepAlways; add(attachment)
+        }
+        host.rootView = AnyView(DSHRemoteFilePreview(reference: .init(sessionID: "s", path: "交付说明.txt")).environmentObject(model))
+        try await Task.sleep(for: .milliseconds(900))
+        let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+        attachment.name = "workspace-file-text-preview"; attachment.lifetime = .keepAlways; add(attachment)
+        let illustration = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 240)).image { context in
+            UIColor.systemTeal.setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 240))
+            ("完整附件预览" as NSString).draw(at: CGPoint(x: 32, y: 98), withAttributes: [.font: UIFont.systemFont(ofSize: 30, weight: .semibold), .foregroundColor: UIColor.white])
+        }
+        await transport.setFileData(try XCTUnwrap(illustration.pngData()))
+        host.rootView = AnyView(DSHRemoteFilePreview(reference: .init(sessionID: "s", path: "/host/objects/hash", name: "界面图片.png"))
+            .id("image-preview").environmentObject(model))
+        try await Task.sleep(for: .milliseconds(900))
+        let imageAttachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
+        imageAttachment.name = "workspace-file-image-preview"; imageAttachment.lifetime = .keepAlways; add(imageAttachment)
+    }
+
+    func testWorkflowReadabilityInCompactWidthAndLargeText() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let run = try JSONDecoder().decode(DSHWorkflowRun.self, from: Data(#"{"id":"r","name":"并行检查与交付","status":"interrupted","startedAt":1000,"finishedAt":12000,"members":[{"seq":1,"phase":"检查","label":"审阅历史回放与实时状态的合并","childId":"a","status":"completed"},{"seq":2,"phase":"检查","label":"核对父子会话身份与模式","childId":"b","status":"failed"},{"seq":3,"phase":"","label":"补充兼容验证","childId":"c","status":"cancelled"},{"seq":4,"label":"汇总交付结果","childId":"d","status":"interrupted"}]}"#.utf8))
+        let model = DSHAppModel(transport: DSHPreviewTransport(), isPaired: false,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(NavigationStack {
+                ScrollView {
+                    DSHWorkflowRunCard(sessionID: "s", run: run, initiallyExpanded: true,
+                        initiallyExpandedPhases: Set(run.phases.map(\.id)))
+                        .frame(width: 320).padding(.vertical)
+                }
+                .navigationTitle("工作流记录").navigationBarTitleDisplayMode(.inline)
+            }.environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large))
+            try await Task.sleep(for: .milliseconds(400))
+            window.layoutIfNeeded()
+            XCTAssertGreaterThan(host.view.bounds.width, 320)
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = dark ? "workflow-compact-dark-large-text" : "workflow-compact-light"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            if dark {
+                func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+                let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }
+                    .first(where: { $0.contentSize.height > $0.bounds.height + 1 }))
+                scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom), animated: false)
+                try await Task.sleep(for: .milliseconds(200))
+                let bottom = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                    window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                })
+                bottom.name = "workflow-compact-dark-large-text-scrolled"
+                bottom.lifetime = .keepAlways
+                add(bottom)
+            }
+        }
+    }
+    func testGoalEditorShowsConflictInLightDarkAndLargeText() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        let goalState = try JSONDecoder().decode(DSHGoalState.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"让 iOS 尽量还原桌面 Harness 信息，并适合手机阅读和操作。","phase":"active","maxGoalRounds":12},"roundsStarted":3}"#.utf8))
+        let newer = try JSONDecoder().decode(DSHGoalState.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":3,"objective":"电脑上新增：保留原生任务状态和审批交互，并验证掉线后恢复。","phase":"active","maxGoalRounds":18},"roundsStarted":4}"#.utf8))
+        var state = DSHStoreState()
+        state.goalBySession = ["s": newer]
+        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: false,
+            transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let goal = try XCTUnwrap(goalState.goal)
+        let host = UIHostingController(rootView: AnyView(EmptyView()))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; model.disconnect() }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        for dark in [false, true] {
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            host.rootView = AnyView(DSHGoalEditor(sessionID: "s", goal: goal).environmentObject(model)
+                .dynamicTypeSize(dark ? .accessibility2 : .large))
+            try await Task.sleep(for: .milliseconds(400))
+            window.layoutIfNeeded()
+            let textViews = descendants(host.view).compactMap { $0 as? UITextView }
+            let fields = descendants(host.view).compactMap { $0 as? UITextField }
+            XCTAssertEqual(textViews.count, 1)
+            XCTAssertEqual(fields.count, 1)
+            for view in textViews.map({ $0 as UIView }) + fields.map({ $0 as UIView }) {
+                let rect = view.convert(view.bounds, to: host.view)
+                XCTAssertGreaterThan(rect.width, 150)
+                XCTAssertGreaterThanOrEqual(rect.minX, 0)
+                XCTAssertLessThanOrEqual(rect.maxX, host.view.bounds.width + 1)
+            }
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = dark ? "goal-conflict-dark-accessibility" : "goal-conflict-light"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            if dark {
+                let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }
+                    .first(where: { $0 is UICollectionView || $0 is UITableView }))
+                scroll.setContentOffset(CGPoint(x: 0, y: max(0, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)), animated: false)
+                try await Task.sleep(for: .milliseconds(200))
+                let scrolled = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                    window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                })
+                scrolled.name = "goal-conflict-dark-accessibility-scrolled"
+                scrolled.lifetime = .keepAlways
+                add(scrolled)
+            }
+        }
+    }
     func testNewAndExistingConversationsShareEditorGeometry() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)
@@ -142,6 +666,284 @@ final class DSHModelPanelLayoutTests: XCTestCase {
 #endif
 
 final class DSHProtocolTests: XCTestCase {
+    func testConfigurationEditsKeepUnknownFieldsAndWriteArraysAsOneNativeValue() throws {
+        let namespace = try JSONDecoder().decode(DSHSettingsNamespace.self, from: Data(#"{"ns":"llm-test","revision":4,"schema":{"type":"object"},"value":{"models":[{"id":"m","future":{"keep":true},"maxTokens":100}],"other":"untouched"},"applies":"live","secrets":[]}"#.utf8))
+        var draft = DSHConfigurationDraft(base: namespace)
+        draft.edit(path: ["models", "0", "maxTokens"], value: .number(200), arrayRoot: ["models"])
+        XCTAssertEqual(draft.edits.count, 1)
+        XCTAssertEqual(draft.edits[0].path, ["models"])
+        XCTAssertEqual(draft.edits[0].value?.configurationValue(at: ["0", "future", "keep"]), .bool(true))
+        XCTAssertEqual(draft.value.configurationValue(at: ["other"]), .string("untouched"))
+        draft.edit(path: ["providers", "new"], value: .object([:]))
+        draft.edit(path: ["providers", "new", "baseURL"], value: .string("https://test.invalid"))
+        XCTAssertEqual(draft.edits.filter { $0.path == ["providers", "new"] }.count, 1)
+        XCTAssertEqual(draft.edits.last?.value?.configurationValue(at: ["baseURL"]), .string("https://test.invalid"))
+        let fieldKey = DSHJSONValue.array(["models", "0", "maxTokens"].map(DSHJSONValue.string)).executionPrettyJSON
+        draft.rawNumbers[fieldKey] = "stale input"
+        draft.invalidNumbers.insert(fieldKey)
+        draft.edit(path: ["models", "0"], value: nil, arrayRoot: ["models"])
+        XCTAssertTrue(draft.rawNumbers.isEmpty)
+        XCTAssertTrue(draft.invalidNumbers.isEmpty)
+    }
+    func testExecutionLifecycleDecodesIndependentOfPageAndDoesNotPretendAnOpenTurnFinished() throws {
+        let page = try JSONDecoder().decode(DSHExecutionPage.self, from: Data(#"{"sessionId":"child","records":[],"hasMore":false,"lifecycle":{"createdAt":1000,"inheritedEventCount":20,"throughSeq":24,"ownEventCount":5,"turnsStarted":2,"turnsEnded":1,"measuredTurns":1,"endedTurnMilliseconds":2000,"timingIncomplete":false,"assistantMessages":1,"toolCalls":1,"lastEndKind":"aborted","openTurn":{"turn":3,"startedAt":8000}}}"#.utf8))
+        XCTAssertEqual(page.lifecycle?.inheritedEventCount, 20)
+        XCTAssertEqual(page.lifecycle?.endedTurnMilliseconds, 2000)
+        XCTAssertEqual(page.lifecycle?.endDescription, "已取消")
+        XCTAssertEqual(page.lifecycle?.openTurn?.turn, 3)
+        XCTAssertNil(try JSONDecoder().decode(DSHExecutionPage.self, from: Data(#"{"sessionId":"old-host","records":[],"hasMore":false}"#.utf8)).lifecycle)
+    }
+    func testDiscoveredModelImportAppendsUniqueIDsAndPreservesConfiguredUnknownFields() throws {
+        let found = try JSONDecoder().decode(DSHDiscoveredModels.self, from: Data(#"{"settingsNs":"llm-test","models":[{"id":"old","name":"Changed by server"},{"id":"new","name":"New","contextWindow":131072,"maxTokens":8192},{"id":"new","name":"Duplicate"}]}"#.utf8))
+        let original: DSHJSONValue = .object(["id": .string("old"), "name": .string("My name"), "future": .bool(true)])
+        let imported = found.appending(to: [original], selected: ["old", "new"])
+        XCTAssertEqual(imported.count, 2); XCTAssertEqual(imported.first, original)
+        XCTAssertEqual(imported.last?.executionObject["contextWindow"], .number(131072))
+        XCTAssertEqual(imported.last?.executionObject["maxTokens"], .number(8192))
+        XCTAssertEqual(found.appending(to: [original], selected: []), [original])
+    }
+    func testConfigurationSchemaResolvesNativeReferenceEnvelopeAndEnumWithoutGuessingUIDs() throws {
+        let json = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"uid":1,"refs":{"1":{"type":"object","dict":{"thinking":2}},"2":{"type":"union","list":[3,4]},"3":{"type":"const","value":"enabled"},"4":{"type":"const","value":"disabled"}}}"#.utf8))
+        let schema = DSHConfigurationSchema(document: json)
+        XCTAssertEqual(schema.at(["thinking"])["type"], .string("union"))
+        XCTAssertEqual(schema.choices(schema.at(["thinking"])), [.string("enabled"), .string("disabled")])
+        XCTAssertTrue(schema.node(.number(1e100)).isEmpty)
+        let models = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"type":"object","dict":{"providers":{"type":"array","inner":{"type":"object","dict":{"models":{"type":"array","inner":{"type":"string"}}}}}}}"#.utf8))
+        XCTAssertEqual(DSHConfigurationSchema(document: models).arrayRoot(in: ["providers", "0", "models", "0"]), ["providers"])
+    }
+    @MainActor
+    func testSecureConfigurationDraftRejectsLateReceiptOverwritingAnotherEditorsNewInput() throws {
+        let tokens = DSHKeychainTokenStore(service: "configuration-tests-\(UUID().uuidString)"), storage = DSHSecureConfigurationStorage(tokens: tokens)
+        let key = storage.key(machine: "mac", device: "phone", scope: "credential:TEST_KEY")
+        defer { try? storage.delete(key: key) }
+        let first = try storage.save(["value": "first-test-secret", "pending": "original-request"], key: key, expecting: nil)
+        let editorB = try storage.loadRecord([String: String].self, key: key)
+        let newer = try storage.save(["value": "newer-test-secret"], key: key, expecting: editorB.token)
+        XCTAssertThrowsError(try storage.save(["value": ""], key: key, expecting: first))
+        XCTAssertEqual(try tokens.read(account: key), newer)
+        XCTAssertEqual(try storage.load([String: String].self, key: key)?["value"], "newer-test-secret")
+        XCTAssertNotEqual(key, storage.key(machine: "other-mac", device: "phone", scope: "credential:TEST_KEY"))
+        XCTAssertNil(try tokens.read(account: storage.key(machine: "mac", device: "other-phone", scope: "credential:TEST_KEY")))
+    }
+    func testScheduleRulesKeepOriginalTimezoneInstantAndNativeFrequency() throws {
+        let items = try JSONDecoder().decode([DSHScheduleRecord].self, from: Data(#"[{"id":"r","kind":"every","prompt":"Inspect","everySeconds":300,"scheduledAt":"2026-10-30T00:00:00.000Z"},{"id":"once","kind":"after","prompt":"Review","afterSeconds":3600,"scheduledAt":"2026-10-30T00:00:00Z"}]"#.utf8))
+        XCTAssertEqual(items[0].date, items[1].date)
+        XCTAssertEqual(items[0].frequencyLabel, "每 5 分钟")
+        XCTAssertEqual(items[1].frequencyLabel, "延时 1 小时 · 一次")
+        XCTAssertNotNil(items[0].date)
+    }
+    func testHistoryCoverageMergesOverlapAndExposesUnloadedIntervals() {
+        var coverage = DSHHistoryCoverage()
+        coverage.include(.init(sessionId: "s", throughSeq: 100, fromSeq: 90, toSeq: 100, hasMore: true))
+        coverage.include(.init(sessionId: "s", throughSeq: 100, fromSeq: 10, toSeq: 20, hasMore: true))
+        XCTAssertEqual(coverage.gaps, [.init(lower: 21, upper: 89)])
+        XCTAssertEqual(coverage.nextBefore, 90)
+        coverage.include(.init(sessionId: "s", throughSeq: 100, fromSeq: 20, toSeq: 89, hasMore: true))
+        XCTAssertEqual(coverage.ranges, [.init(lower: 10, upper: 100)])
+        coverage.include(.init(sessionId: "s", throughSeq: 100, fromSeq: 0, toSeq: 9, hasMore: false))
+        XCTAssertTrue(coverage.gaps.isEmpty)
+        XCTAssertNil(coverage.nextBefore)
+        coverage.include(.init(sessionId: "s", throughSeq: 200, fromSeq: 300, toSeq: 200, hasMore: true))
+        XCTAssertEqual(coverage.throughSeq, 100, "Invalid coverage cannot mark an unknown interval loaded")
+    }
+
+    func testHistoryGapBreaksReasoningAndTaskTimelineGrouping() {
+        let messages: [DSHChatMessage] = [.init(id: "old", role: .assistant, markdown: "", reasoning: "Old reasoning", nativeSequence: 10),
+            .init(id: "new", role: .assistant, markdown: "New answer", nativeSequence: 100)]
+        let sections = messages.transcriptEntries(with: [], historyGaps: [.init(lower: 11, upper: 99)]).groupedTurns().withTaskTimelines()
+        XCTAssertEqual(sections.count, 3)
+        guard case .row(.historyGap) = sections[1], case .turn(let old, _) = sections[0], case .turn(let new, _) = sections[2] else { return XCTFail("A missing interval must remain a distinct row") }
+        XCTAssertEqual(old.messages.map(\.id), ["old"])
+        XCTAssertEqual(new.messages.map(\.id), ["new"])
+        XCTAssertEqual(new.taskTimeline?.messages.map(\.id), ["new"])
+    }
+
+    func testMessageDecodeRetainsNativeIdentityAndInterruptedStateAcrossPersistence() throws {
+        let message = try JSONDecoder().decode(DSHChatMessage.self, from: Data(#"{"id":"a","role":"assistant","markdown":"Partial","nativeSequence":0,"replacesMessageId":"delta","interrupted":true}"#.utf8))
+        XCTAssertEqual(message.nativeSequence, 0)
+        XCTAssertEqual(message.replacesMessageId, "delta")
+        XCTAssertEqual(message.interrupted, true)
+        XCTAssertEqual(try JSONDecoder().decode(DSHChatMessage.self, from: JSONEncoder().encode(message)), message)
+    }
+    func testNativeSessionReferenceURIUsesExactOpaqueIdentityAndReferenceInsertionKeepsDraft() throws {
+        XCTAssertEqual(DSHSessionReference.sessionID(from: try XCTUnwrap(URL(string: "dsh-session:ImEvYiI"))), "a/b")
+        XCTAssertNil(DSHSessionReference.sessionID(from: try XCTUnwrap(URL(string: "dsh-session:e30"))))
+        XCTAssertNil(DSHSessionReference.sessionID(from: try XCTUnwrap(URL(string: "dsh-session:ImEvYiI="))))
+        XCTAssertNil(DSHSessionReference.sessionID(from: try XCTUnwrap(URL(string: "https://example.com/ImEvYiI"))))
+        XCTAssertEqual(dshAppendReference("@\"目录/a b.md\"", to: "阅读"), "阅读 @\"目录/a b.md\" ")
+        XCTAssertEqual(dshAppendReference("@[Title](dsh-session:ImEvYiI)", to: "已有草稿\n"), "已有草稿\n@[Title](dsh-session:ImEvYiI) ")
+    }
+    func testToolResultDecodingPreservesNativeSearchReadAndWebFactsAndFallsBackOnInvalidMetadata() throws {
+        func result(_ name: String, _ json: String, status: String = "succeeded") throws -> DSHToolResult? {
+            var tool = DSHToolActivity(id: "t", name: name, status: status)
+            tool.resultMeta = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            return DSHToolResult.parse(tool)
+        }
+        guard case .search(let search) = try result("grep", #"{"shape":"matches","files":[{"path":"文档.md","matches":[{"lineNumber":31,"line":"检查输出"}]}],"total":12,"truncated":true}"#) else { return XCTFail("Missing search projection") }
+        XCTAssertEqual(search.files?.first?.matches.first?.lineNumber, 31)
+        XCTAssertEqual(search.total, 12); XCTAssertTrue(search.truncated)
+        XCTAssertNil(try result("grep", #"{"shape":"matches","files":[{"path":"a","matches":[{"lineNumber":0,"line":"bad"}]}],"total":1,"truncated":false}"#))
+        guard case .search(let empty) = try result("glob", #"{"shape":"paths","paths":[],"total":0,"truncated":false}"#) else { return XCTFail("Zero matches are valid") }
+        XCTAssertEqual(empty.paths, [])
+        guard case .read(let read) = try result("read", #"{"path":"a.ts","offset":9,"lines":[{"number":9,"text":"a"},{"number":12,"text":"b"}],"totalLines":12}"#) else { return XCTFail("Missing numbered read") }
+        XCTAssertEqual(read.lines.map(\.number), [9, 12])
+        XCTAssertNil(try result("read", #"{"path":"a","offset":9,"lines":[{"number":8,"text":"bad"}],"totalLines":12}"#))
+        XCTAssertNil(try result("read", #"{"path":"a","offset":1,"lines":[{"number":2,"text":"a"},{"number":2,"text":"b"}],"totalLines":12}"#))
+        guard case .webSearch(let web) = try result("web_search", #"{"sources":[{"url":"https://example.com/a","title":"标题","snippet":"摘要","publishedAt":"2026-10-29"}],"answer":"结论","truncated":true}"#) else { return XCTFail("Missing sources") }
+        XCTAssertEqual(web.sources.first?.publishedAt, "2026-10-29"); XCTAssertTrue(web.truncated)
+        XCTAssertNil(try result("web_search", #"{"sources":[],"truncated":false}"#, status: "failed"))
+        XCTAssertNil(try result("other_plugin", #"{"diffs":[{"path":"a","oldText":null,"newText":"b"}]}"#))
+        XCTAssertNil(DSHToolResult.webURL("javascript:alert(1)")); XCTAssertNil(DSHToolResult.webURL("file:///private/a"))
+        XCTAssertNotNil(DSHToolResult.webURL("https://example.com/a"))
+    }
+
+    func testTerminalExitMarkersMatchNativeContractWithoutInventingStatusOnInfrastructureFailures() {
+        func result(_ text: String, status: String = "succeeded") -> DSHToolResult? {
+            DSHToolResult.parse(DSHToolActivity(id: "t", name: "bash", status: status, detail: text))
+        }
+        XCTAssertEqual(result("output\n[exit code: 2]"), .terminal(output: "output", exitCode: 2, signal: nil))
+        XCTAssertEqual(result("output\n[killed by signal: SIGTERM]"), .terminal(output: "output", exitCode: nil, signal: "SIGTERM"))
+        XCTAssertEqual(result("output"), .terminal(output: "output", exitCode: 0, signal: nil))
+        XCTAssertEqual(result("[exit code: 2]"), .terminal(output: "[exit code: 2]", exitCode: 0, signal: nil))
+        XCTAssertNil(result("spawn failed", status: "failed"))
+    }
+
+    func testDiffKeepsContextAndDistinguishesNullBeforeImageAndLargeWrites() {
+        let lines = DSHToolDiffLine.lines(DSHToolDiff(path: "a", oldText: "context\nbefore\ntail", newText: "context\nafter\ntail"))
+        XCTAssertEqual(lines.map(\.kind), [" ", "−", "+", " "])
+        XCTAssertEqual(lines.map(\.text), ["context", "before", "after", "tail"])
+        XCTAssertEqual(DSHToolDiffLine.lines(DSHToolDiff(path: "a", oldText: nil, newText: "new")).map(\.kind), ["+"])
+        XCTAssertEqual(DSHToolDiffLine.lines(DSHToolDiff(path: "a", oldText: "", newText: "new")).map(\.kind), ["+"])
+        let large = DSHToolDiffLine.lines(DSHToolDiff(path: "a", oldText: nil, newText: Array(repeating: "line", count: 2_001).joined(separator: "\n")))
+        XCTAssertEqual(large.count, 2_001); XCTAssertTrue(large.allSatisfy { $0.kind == "+" })
+    }
+
+    func testSubcallsUseNativeParentIdentityAndOrphansAndCyclesRemainReadable() {
+        let root = DSHToolActivity(id: "root", name: "run_code")
+        var child = DSHToolActivity(id: "child", name: "read", status: "failed")
+        child.rootCallId = root.id; child.parentCallId = root.id
+        var nested = DSHToolActivity(id: "nested", name: "glob")
+        nested.rootCallId = root.id; nested.parentCallId = child.id
+        let tree = DSHToolActivity.nested([root, child, nested])
+        XCTAssertEqual(tree.map(\.id), ["root"])
+        XCTAssertEqual(tree.first?.children?.first?.status, "failed")
+        XCTAssertEqual(tree.first?.children?.first?.children?.first?.id, "nested")
+        XCTAssertEqual(DSHToolActivity.nested([child, nested]).count, 2)
+        child.parentCallId = nested.id; child.rootCallId = nested.id
+        XCTAssertEqual(DSHToolActivity.nested([child, nested]).count, 2)
+    }
+    func testRetryCountdownRequiresConfirmedCurrentOwnerAndAnUnclosedNativeWait() throws {
+        let retry = DSHExecutionRecord(nativeSequence: 3, type: "llm/retry", time: 1_000,
+            data: ["retryId": .string("r"), "turn": .number(1), "step": .number(1), "delayMs": .number(5000)])
+        let notice = try XCTUnwrap(DSHExecutionNotice.build([retry]).first)
+        XCTAssertTrue(notice.canCountDown(connected: true, sessionRunning: true, latestTurn: 1))
+        XCTAssertFalse(notice.canCountDown(connected: false, sessionRunning: true, latestTurn: 1))
+        XCTAssertFalse(notice.canCountDown(connected: true, sessionRunning: false, latestTurn: 1))
+        XCTAssertFalse(notice.canCountDown(connected: true, sessionRunning: true, latestTurn: 2))
+        XCTAssertFalse(notice.canCountDown(connected: true, sessionRunning: true, latestTurn: nil))
+        let end = DSHExecutionRecord(nativeSequence: 4, type: "turn/end", time: 2000,
+            data: ["turn": .number(1), "reason": .object(["kind": .string("aborted")])])
+        let closed = try XCTUnwrap(DSHExecutionNotice.build([retry, end]).first)
+        XCTAssertFalse(closed.canCountDown(connected: true, sessionRunning: true, latestTurn: 1))
+    }
+    func testNativeExecutionNoticesStayBetweenCachedMessagesAfterRelayReplayRenumbersEvents() throws {
+        let messages = [DSHChatMessage(id: "u", role: .user, markdown: "Task", sequence: 100, nativeSequence: 0),
+            DSHChatMessage(id: "a", role: .assistant, markdown: "Before", sequence: 101, nativeSequence: 3),
+            DSHChatMessage(id: "b", role: .assistant, markdown: "After", sequence: 102, nativeSequence: 7)]
+        let retry = DSHExecutionRecord(nativeSequence: 5, type: "llm/retry", time: nil, data: ["retryId": .string("r"), "turn": .number(1), "step": .number(1)], sequence: 1000)
+        let notices = DSHExecutionNotice.build([retry])
+        XCTAssertEqual(messages.transcriptEntries(with: [], execution: notices).map(\.id), ["turn-u", "turn-a", "execution-retry:r", "turn-b"])
+        let legacyTool = DSHToolActivity(id: "legacy", name: "read", sequence: 101)
+        let first = messages.transcriptEntries(with: [legacyTool], execution: notices).map(\.id)
+        XCTAssertEqual(first, messages.transcriptEntries(with: [legacyTool], execution: notices).map(\.id))
+    }
+    func testExecutionStreamAssemblyKeepsSettledBlocksAndFirstTokenLatency() throws {
+        let record = try JSONDecoder().decode(DSHExecutionRecord.self, from: Data(#"{"nativeSequence":9,"type":"assistant/attempt","time":2000,"data":{"turn":1,"step":2,"stream":[{"type":"reasoning-chunks","index":0,"time0":1100,"dt":[40],"texts":["","Thought"]},{"type":"text-chunks","index":1,"time0":1200,"dt":[20],"texts":["Hel","lo"]},{"type":"chunk","time":1300,"chunk":{"type":"block-end","index":1,"block":{"type":"text","text":"Hello"}}},{"type":"chunk","time":1400,"chunk":{"type":"finish","reason":{"kind":"error","failure":{"message":"Limited","code":"RATE_LIMIT"}}}}]}}"#.utf8))
+        XCTAssertEqual(record.firstTokenTime, 1140)
+        XCTAssertEqual(record.output.text, "Hello", "A block-end replaces deltas rather than duplicating them")
+        XCTAssertEqual(record.output.reasoning, "Thought")
+        XCTAssertEqual(record.finish?.executionObject["kind"], .string("error"))
+    }
+    func testRetryChainUsesExplicitStartsAndOnlyCancelsPendingWaitAtOwningBoundary() throws {
+        func record(_ seq: Int64, _ type: String, _ data: [String: DSHJSONValue]) -> DSHExecutionRecord {
+            DSHExecutionRecord(nativeSequence: seq, type: type, time: seq * 1000, data: data)
+        }
+        let one = record(1, "llm/retry", ["retryId": .string("r"), "turn": .number(1), "step": .number(2), "retry": .number(1)])
+        let started = record(2, "llm/retry-started", ["retryId": .string("r"), "turn": .number(1), "step": .number(2), "retry": .number(1)])
+        let two = record(3, "llm/retry", ["retryId": .string("r"), "turn": .number(1), "step": .number(2), "retry": .number(2)])
+        let wrong = record(4, "step/end", ["turn": .number(1), "step": .number(3)])
+        let close = record(5, "step/end", ["turn": .number(1), "step": .number(2)])
+        XCTAssertEqual(DSHExecutionNotice.build([one, started, wrong]).first?.retryState, "started")
+        XCTAssertEqual(DSHExecutionNotice.build([one, started, two, wrong]).first?.retryState, "scheduled")
+        let notice = try XCTUnwrap(DSHExecutionNotice.build([one, started, two, wrong, close]).first)
+        XCTAssertEqual(notice.retryState, "cancelled")
+        XCTAssertEqual(notice.records.map(\.nativeSequence), [1, 2, 3])
+    }
+    func testExecutionGroupsKeepHeaderInsideItsNativeTurnAndStandaloneCompactionSeparate() {
+        let records = [DSHExecutionRecord(nativeSequence: 0, type: "turn/start", time: nil, data: ["turn": .number(1)]),
+            DSHExecutionRecord(nativeSequence: 1, type: "request/header", time: nil, data: [:]),
+            DSHExecutionRecord(nativeSequence: 2, type: "turn/end", time: nil, data: ["turn": .number(1), "reason": .object(["kind": .string("completed")])]),
+            DSHExecutionRecord(nativeSequence: 3, type: "compaction/start", time: nil, data: ["turn": .null, "compactionId": .string("c")]),
+            DSHExecutionRecord(nativeSequence: 4, type: "compaction/summary", time: nil, data: ["compactionId": .string("c")])]
+        let groups = DSHExecutionGroup.build(records)
+        XCTAssertEqual(groups.map(\.id), ["turn:1", "compaction:c"])
+        XCTAssertEqual(groups[0].records.map(\.nativeSequence), [0, 1, 2])
+        XCTAssertEqual(groups[0].title, "轮次 1 · 完成")
+        let invalid = DSHExecutionRecord(nativeSequence: 10, type: "step/start", time: nil, data: ["turn": .number(1e100)])
+        XCTAssertNil(invalid.turn, "Malformed extension data must not trap in Int conversion")
+    }
+    func testNativeFileAddressesKeepSessionAndAbsolutePathGrammar() throws {
+        func reference(_ address: String) throws -> DSHFileReference { try XCTUnwrap(DSHFileReference(url: try XCTUnwrap(URL(string: address)), sessionID: "current")) }
+        XCTAssertEqual(try reference("dsh-resource://file/session/other%2Fa/%2Ftmp/%E5%9B%BE.png?x=1#preview"), .init(sessionID: "other/a", path: "/tmp/图.png"))
+        XCTAssertEqual(try reference("dsh-resource://file/absolute/tmp/a.pdf").path, "/tmp/a.pdf")
+        XCTAssertEqual(try reference("dsh-resource://file/absolute/C%3A/Users/a.txt").path, "C:/Users/a.txt")
+        XCTAssertEqual(try reference("dsh-resource://file/absolute//server/share/a.txt").path, "//server/share/a.txt")
+        XCTAssertEqual(try reference("file:///tmp/a%20b.txt").path, "/tmp/a b.txt")
+        XCTAssertNil(DSHFileReference(url: URL(string: "https://example.com/a.pdf")!, sessionID: "s"))
+        XCTAssertNil(DSHFileReference(url: URL(string: "file://other-host/a.pdf")!, sessionID: "s"))
+        let links = DSHFileReference.links(in: "[文件](dsh-resource://file/session/s/output.pdf) [重复](dsh-resource://file/session/s/output.pdf) [网页](https://example.com)\n\n```\n[代码示例](/not-a-real-link)\n```", sessionID: "current")
+        XCTAssertEqual(links, [.init(sessionID: "s", path: "output.pdf")])
+        let image = DSHMessageAttachment(id: "image", name: "Image", mediaType: "image/png", hostPath: "/host/objects/hash")
+        XCTAssertEqual(image.fileReference(sessionID: "s"), .init(sessionID: "s", path: "/host/objects/hash", name: "Image.png"))
+        let legacy = try JSONDecoder().decode(DSHMessageAttachment.self, from: Data(#"{"id":"old","name":"Old file"}"#.utf8))
+        XCTAssertNil(legacy.hostPath)
+        XCTAssertNil(legacy.fileReference(sessionID: "s"))
+    }
+    func testWorkflowPhasesKeepAbsentEmptyAndUnicodeIdentitiesDistinct() throws {
+        let run = try JSONDecoder().decode(DSHWorkflowRun.self, from: Data(#"{"id":"r","name":"Review","status":"running","members":[{"seq":1,"label":"A","childId":"a","status":"completed"},{"seq":2,"label":"B","phase":"","childId":"b","status":"running"},{"seq":3,"label":"C","phase":"missing","childId":"c","status":"failed"},{"seq":4,"label":"D","phase":"😀","childId":"d","status":"cancelled"}]}"#.utf8))
+        XCTAssertEqual(run.phases.count, 4)
+        XCTAssertEqual(run.phases.map(\.id), ["missing", "value:0:", "value:7:missing", "value:2:😀"])
+        XCTAssertEqual(run.phases[1].members.first?.childId, "b")
+        XCTAssertNil(run.sequence)
+    }
+    func testSubagentHistoryAddressPreservesParentAndLifecycleMode() throws {
+        let command = DSHCommand.openSession(deviceId: "phone", machineId: "mac", sessionId: "child",
+                                             parentSessionId: "parent", subagentMode: "one-shot")
+        XCTAssertEqual(command.payload, .object(["sessionId": .string("child"),
+            "parentSessionId": .string("parent"), "subagentMode": .string("one-shot")]))
+        let catalog = try JSONDecoder().decode(DSHSubagentCatalog.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":false,"entries":[{"kind":"child","id":"child","mode":"one-shot","activity":"inactive","hasChildren":true},{"kind":"diagnostic","id":"bad","reason":"corrupt"}]}"#.utf8))
+        XCTAssertEqual(catalog.entries[0].mode, "one-shot")
+        XCTAssertEqual(catalog.entries[1].reason, "corrupt")
+    }
+    func testQueueItemsKeepAttachmentsAndQueueCommandsUseOccurrenceIdentity() throws {
+        let queue = try JSONDecoder().decode(DSHServerQueue.self, from: Data(#"{"sessionId":"s","available":true,"items":[{"id":"item","placement":"queued","rpcId":"rpc","message":{"id":"item","content":[{"type":"text","text":"Task"},{"type":"file","receiptId":"receipt"}]}}]}"#.utf8))
+        XCTAssertEqual(queue.items[0].text, "Task")
+        XCTAssertFalse(queue.items[0].isTextOnly)
+        XCTAssertEqual(queue.items[0].rpcId, "rpc")
+        let command = DSHCommand.updateQueue(deviceId: "phone", machineId: "mac", sessionId: "s", itemId: "item", action: "remove")
+        XCTAssertEqual(command.type, "queue.update")
+        XCTAssertEqual(command.payload, .object(["itemId": .string("item"), "action": .string("remove")]))
+    }
+    func testNativeForkUsesHostSequenceAndNeverCopiesPromptText() throws {
+        let command = DSHCommand.forkSession(deviceId: "phone", machineId: "mac", sessionId: "parent", atSeq: 42, requestId: "fork-1")
+        XCTAssertEqual(command.type, "session.fork")
+        XCTAssertEqual(command.payload, .object(["atSeq": .number(42)]))
+        let message = try JSONDecoder().decode(DSHChatMessage.self, from: Data(#"{"id":"a","role":"assistant","markdown":"Done","nativeSequence":42}"#.utf8))
+        XCTAssertEqual(message.nativeSequence, 42)
+        XCTAssertNil(message.sequence, "Relay ordering must remain independent of Host fork boundaries")
+        let legacy = try JSONDecoder().decode(DSHChatMessage.self, from: Data(#"{"id":"old","role":"assistant","markdown":"Done"}"#.utf8))
+        XCTAssertNil(legacy.nativeSequence)
+    }
     func testMacCatalogWireFixturesKeepEmptyWorkspacesAndCustomModes() throws {
         func event(_ type: String, _ payload: String) throws -> DSHEvent {
             let json = """
@@ -696,6 +1498,33 @@ import SwiftUI
 
 @MainActor
 final class DSHConversationViewportTests: XCTestCase {
+    func testSkillSuggestionsUsePromptPathAndHostCommandsWinNameCollisions() throws {
+        let catalog = try JSONDecoder().decode(DSHCommandCatalog.self, from: Data(#"{"sessionId":"s","commands":[{"name":"review","description":"Host"}],"skills":[{"name":"review","description":"Skill duplicate","modelInvocable":true},{"name":"write-docs","description":"Docs","modelInvocable":false}]}"#.utf8))
+        let choices = dshComposerCommands(catalog)
+        XCTAssertEqual(choices.map(\.id), ["review", "write-docs"])
+        XCTAssertEqual(choices[0].gloss, "Host")
+        XCTAssertNil(dshNativeComposerCommand("/write-docs", knownCommands: Set(catalog.commands.map(\.name))))
+    }
+    func testComposerRoutesOnlyExactPlanAndGoalCommands() {
+        XCTAssertEqual(dshNativeComposerCommand("  /plan 修复问题  "), "/plan 修复问题")
+        XCTAssertEqual(dshNativeComposerCommand("/plan"), "/plan")
+        XCTAssertEqual(dshNativeComposerCommand("/goal\n长期目标"), "/goal\n长期目标")
+        XCTAssertNil(dshNativeComposerCommand("/planet"))
+        XCTAssertNil(dshNativeComposerCommand("解释 /plan"))
+        XCTAssertNil(dshNativeComposerCommand("/other test"))
+        XCTAssertEqual(dshNativeComposerCommand("/custom task", knownCommands: ["custom"]), "/custom task")
+        XCTAssertNil(dshNativeComposerCommand("/plan task", knownCommands: []))
+        XCTAssertNil(dshNativeComposerCommand("/customized", knownCommands: ["custom"]))
+    }
+
+    func testPlanReviewIntentSurvivesQuestionDecoding() throws {
+        let data = Data(##"{"id":"review","question":"Approve?","detail":"# Plan","options":[{"label":"Yes"},{"label":"No"}],"intent":{"kind":"plan-review","approve":"Yes"}}"##.utf8)
+        let question = try JSONDecoder().decode(DSHQuestion.self, from: data)
+        XCTAssertEqual(question.intent?.approve, "Yes")
+        XCTAssertEqual(question.detail, "# Plan")
+        let legacy = try JSONDecoder().decode(DSHQuestion.self, from: Data(#"{"id":"q","question":"Why?"}"#.utf8))
+        XCTAssertNil(legacy.intent)
+    }
     func testHeaderTranslucentTextAppearance() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)
@@ -1028,13 +1857,21 @@ final class DSHHomeLayoutTests: XCTestCase {
         XCTAssertEqual(search.returnKeyType, .search)
         XCTAssertTrue(search.isFirstResponder)
         XCTAssertGreaterThan(search.bounds.width, window.bounds.width * 0.6)
-        XCTAssertEqual(searchRect.midY, conversationCenter, accuracy: 3)
+        XCTAssertLessThanOrEqual(searchRect.midY, conversationCenter + 3)
         capture("home-search-expanded")
+        // Compare like-for-like keyboard states. The search field focuses on
+        // entry, while the conversation field above was unfocused. UIKit also
+        // takes max(keyboard, additional safe-area) rather than adding them.
+        search.resignFirstResponder()
+        try await Task.sleep(for: .milliseconds(800))
+        window.layoutIfNeeded()
+        let unfocusedRect = search.convert(search.bounds, to: window)
+        XCTAssertEqual(unfocusedRect.midY, conversationCenter, accuracy: 3)
         host.additionalSafeAreaInsets.bottom = 320
         try await Task.sleep(for: .milliseconds(350))
         window.layoutIfNeeded()
         let raisedRect = search.convert(search.bounds, to: window)
-        XCTAssertEqual(searchRect.midY - raisedRect.midY, 320, accuracy: 2)
+        XCTAssertEqual(unfocusedRect.midY - raisedRect.midY, 320, accuracy: 2)
         capture("home-search-keyboard-inset")
         fixture.searching = false
         host.additionalSafeAreaInsets.bottom = 0

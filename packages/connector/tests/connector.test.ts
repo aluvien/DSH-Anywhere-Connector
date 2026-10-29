@@ -32,6 +32,110 @@ function command(type: "session.list" | "session.open" | "session.create" | "pro
 }
 
 describe("bridge command mapping", () => {
+  it("keeps configuration path operations and credential references behind the native controller", () => {
+    const base = { version: 1 as const, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1 };
+    const read = bridgeRequestFor({ ...base, type: "configuration.read", payload: { section: "credentials", refs: ["A_KEY", "B_KEY"] } });
+    const url = new URL(read.path, "http://bridge");
+    expect(url.pathname).toBe("/configuration"); expect(JSON.parse(url.searchParams.get("refs")!)).toEqual(["A_KEY", "B_KEY"]);
+    const payload = { kind: "settings" as const, ns: "llm-test", expectedRevision: 4, ops: [{ op: "set" as const, path: ["providers", "a/b", "models"], value: [{ id: "m", unknown: true }] }] };
+    expect(bridgeRequestFor({ ...base, type: "configuration.discover", payload: { settingsNs: "llm-test", request: { apiKey: "temporary-test-key" } } })).toEqual({ method: "POST", path: "/configuration/discover", body: { settingsNs: "llm-test", request: { apiKey: "temporary-test-key" } } });
+    expect(bridgeRequestFor({ ...base, type: "configuration.update", payload })).toEqual({ method: "POST", path: "/configuration", headers: { "x-dsh-origin-device-id": "d" }, body: payload });
+  });
+  it("routes native search and history without rewriting opaque cursors or child identities", () => {
+    const base = { version: 1 as const, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1 };
+    const global = bridgeRequestFor({ ...base, type: "session.search", payload: { query: "你好 & /", cursor: "a+b/=x" } });
+    const url = new URL(global.path, "http://bridge");
+    expect(url.pathname).toBe("/search"); expect(url.searchParams.get("query")).toBe("你好 & /"); expect(url.searchParams.get("cursor")).toBe("a+b/=x");
+    const scoped = bridgeRequestFor({ ...base, sessionId: "child/a", type: "history.read", payload: { atSeq: 0, parentSessionId: "p/b", subagentMode: "one-shot" } });
+    const location = new URL(scoped.path, "http://bridge");
+    expect(location.pathname).toBe("/sessions/child%2Fa/history"); expect(location.searchParams.get("atSeq")).toBe("0"); expect(location.searchParams.get("parentSessionId")).toBe("p/b");
+    const schedule = bridgeRequestFor({ ...base, sessionId: "child/a", type: "schedule.get", payload: { parentSessionId: "p/b", subagentMode: "one-shot" } });
+    expect(new URL(schedule.path, "http://bridge").pathname).toBe("/sessions/child%2Fa/schedules");
+  });
+  it("encodes native reference queries without changing spaces or source-session IDs", () => {
+    const command: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "refs", machineId: "machine-1", deviceId: "phone-1",
+      timestamp: 1, sessionId: "s/a", type: "reference.list", payload: { kind: "file", query: "目录/a & b" } };
+    const request = bridgeRequestFor(command), url = new URL(request.path, "http://localhost");
+    expect(request.method).toBe("GET"); expect(url.pathname).toBe("/sessions/s%2Fa/references");
+    expect(Object.fromEntries(url.searchParams)).toEqual(command.payload);
+  });
+  it("keeps message feedback CAS tokens and native target identity", () => {
+    const command: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "feedback", machineId: "machine-1", deviceId: "phone-1",
+      timestamp: 1, sessionId: "a/b", type: "feedback.update", payload: { action: "put", messageId: "answer", rating: "negative", note: "检查", ifVersion: "v1" } };
+    expect(bridgeRequestFor(command)).toEqual({ method: "POST", path: "/sessions/a%2Fb/feedback", headers: { "x-dsh-origin-device-id": "phone-1" }, body: command.payload });
+    expect(bridgeRequestFor({ ...command, type: "feedback.list", payload: {} })).toEqual({ method: "GET", path: "/sessions/a%2Fb/feedback" });
+  });
+  it("keeps exclusive execution cursors and child parent addresses", () => {
+    const read: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "execution", machineId: "machine-1", deviceId: "phone-1",
+      timestamp: 1, sessionId: "child/a", type: "execution.list", payload: { beforeSeq: 0, limit: 100, parentSessionId: "parent/b", subagentMode: "one-shot" } };
+    const request = bridgeRequestFor(read), url = new URL(request.path, "http://localhost");
+    expect(request.method).toBe("GET");
+    expect(url.pathname).toBe("/sessions/child%2Fa/execution");
+    expect(Object.fromEntries(url.searchParams)).toEqual({ beforeSeq: "0", limit: "100", parentSessionId: "parent/b", subagentMode: "one-shot" });
+  });
+  it("encodes file paths as query data and preserves the file version across chunks", () => {
+    const read: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "file", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "a/b", type: "workspace.bytes",
+      payload: { path: "/项目/a & b.pdf", offset: 196608, length: 196608, version: "v?2#x" } };
+    const request = bridgeRequestFor(read);
+    expect(request.method).toBe("GET");
+    const url = new URL(request.path, "http://localhost");
+    expect(url.pathname).toBe("/sessions/a%2Fb/workspace/bytes");
+    expect(Object.fromEntries(url.searchParams)).toEqual({ path: "/项目/a & b.pdf", offset: "196608", length: "196608", version: "v?2#x" });
+    expect(bridgeRequestFor({ ...read, type: "workspace.files", payload: { path: "" } })).toEqual({ method: "GET", path: "/sessions/a%2Fb/workspace/files?path=" });
+  });
+  it("keeps the goal identity and expected revision at the native boundary", () => {
+    const update: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "goal-update", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "s", type: "goal.update", payload: { action: "pause", ref: { id: "g", revision: 2 } } };
+    expect(bridgeRequestFor(update)).toEqual({ method: "POST", path: "/sessions/s/goal", headers: { "x-dsh-origin-device-id": "phone-1" }, body: update.payload });
+    expect(bridgeRequestFor({ ...update, type: "goal.get", payload: {} })).toEqual({ method: "GET", path: "/sessions/s/goal" });
+  });
+  it("reads current pending decisions from the authenticated Bridge", () => {
+    const list: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "decisions", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, type: "decisions.list", payload: {} };
+    expect(bridgeRequestFor(list)).toEqual({ method: "GET", path: "/decisions" });
+  });
+  it("keeps continuable child delivery and interrupt in their parent scope", () => {
+    const base = { version: PROTOCOL_VERSION, requestId: "child-control", machineId: "machine-1", deviceId: "phone-1", timestamp: 1, sessionId: "child/a" };
+    const prompt: CommandEnvelope = { ...base, type: "subagent.prompt",
+      payload: { parentSessionId: "parent/b", mode: "continuable", delivery: "steer", text: "continue" } };
+    expect(bridgeRequestFor(prompt)).toEqual({ method: "POST", path: "/sessions/parent%2Fb/subagents/child%2Fa/prompt",
+      headers: { "x-dsh-origin-device-id": "phone-1" }, body: prompt.payload });
+    const interrupt: CommandEnvelope = { ...base, type: "subagent.interrupt", payload: { parentSessionId: "parent/b", mode: "continuable" } };
+    expect(bridgeRequestFor(interrupt)).toEqual({ method: "POST", path: "/sessions/parent%2Fb/subagents/child%2Fa/interrupt",
+      headers: { "x-dsh-origin-device-id": "phone-1" }, body: interrupt.payload });
+    expect(bridgeTimeoutFor(prompt)).toBeGreaterThan(15_000);
+  });
+  it("keeps parent and mode when opening a subagent history", () => {
+    const open: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "child-open", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "child", type: "session.open",
+      payload: { sessionId: "child", parentSessionId: "parent", subagentMode: "one-shot", streaming: true } };
+    expect(bridgeRequestFor(open)).toEqual({ method: "POST", path: "/sessions/child/open",
+      body: { deviceId: "phone-1", parentSessionId: "parent", subagentMode: "one-shot" } });
+  });
+  it("updates queue items through their exact server identity", () => {
+    const update: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "queue-1", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "s", type: "queue.update", payload: { itemId: "item-1", action: "remove" } };
+    expect(bridgeRequestFor(update)).toEqual({ method: "POST", path: "/sessions/s/queue",
+      headers: { "x-dsh-origin-device-id": "phone-1" }, body: { itemId: "item-1", action: "remove" } });
+  });
+  it("routes question cancellation without inventing an answer", () => {
+    const cancel: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "cancel-1", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "s", type: "question.cancel", payload: { questionId: "q/1" } };
+    expect(bridgeRequestFor(cancel)).toEqual({ method: "POST", path: "/questions/q%2F1/cancel", body: {} });
+  });
+  it("reads command catalogs from the selected session", () => {
+    const catalog: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "catalog-1", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "a/b", type: "command.catalog", payload: {} };
+    expect(bridgeRequestFor(catalog)).toEqual({ method: "GET", path: "/sessions/a%2Fb/commands" });
+  });
+  it("keeps native fork boundaries and origin device identities", () => {
+    const fork: CommandEnvelope = { version: PROTOCOL_VERSION, requestId: "fork-1", machineId: "machine-1",
+      deviceId: "phone-1", timestamp: 1, sessionId: "parent", type: "session.fork", payload: { atSeq: 42 } };
+    expect(bridgeRequestFor(fork)).toEqual({ method: "POST", path: "/sessions/parent/fork",
+      headers: { "x-dsh-origin-device-id": "phone-1" }, body: { atSeq: 42 } });
+    expect(bridgeTimeoutFor(fork)).toBeGreaterThan(120_000);
+  });
   it("preserves prompt requestId and maps every supported endpoint", () => {
     expect(bridgeRequestFor(command("session.list"))).toEqual({ method: "GET", path: "/sessions?deviceId=phone-1" });
     expect(bridgeRequestFor({
@@ -108,7 +212,7 @@ describe("bridge command mapping", () => {
       logger: { info: () => undefined, warn: () => undefined }, reconnectBaseMs: 1, heartbeatMs: 60_000,
     });
     connector.start();
-    relay.emit("open");
+    openRelay(relay);
     bridge.emit("open");
     relay.emit("close", 4001);
     await vi.waitFor(() => expect(connector.status).toBe("stopped"));
@@ -118,6 +222,58 @@ describe("bridge command mapping", () => {
 });
 
 describe("Relay and bridge forwarding", () => {
+  it('quarantines full parity messages and phone operations until a matching Relay is verified, then resumes without stripping fields', async () => {
+    const relay = new FakeSocket(), bridge = new FakeSocket(), upgraded = new FakeSocket(), requests = vi.fn(async () => Response.json({ accepted: true }))
+    const urls: string[] = []; let bridgeID = ''
+    const connector = new DSHAnywhereConnector(config, { fetch: requests as typeof fetch,
+      webSocketFactory: (url, headers) => {
+        urls.push(url)
+        if (urls.length === 1) { expect(new URL(url).searchParams.get('schemaRevision')).toBe('11'); return relay as unknown as import("../src/connector.js").WebSocketLike }
+        if (urls.length === 2) { bridgeID = new URL(url).searchParams.get('connectorId')!; expect(headers['x-dsh-schema-revision']).toBe('11'); return bridge as unknown as import("../src/connector.js").WebSocketLike }
+        return upgraded as unknown as import("../src/connector.js").WebSocketLike
+      }, logger: { info() {}, warn() {} }, reconnectBaseMs: 1, heartbeatMs: 60000 })
+    try {
+      connector.start(); relay.emit('open'); bridge.emit('open')
+      bridge.emit('message', JSON.stringify({ version: 1, messageId: 'greeting', machineId: 'local', deviceId: 'broadcast', sequence: 1, timestamp: 1,
+        type: 'connection.ready', payload: { machineId: 'local', deviceId: 'connector', serverTime: 1, capabilities: [], bridgeConnectionId: bridgeID } }))
+      bridge.emit('message', JSON.stringify({ version: 1, messageId: 'answer', machineId: 'local', deviceId: 'broadcast', sessionId: 'session-1', sequence: 2, timestamp: 2,
+        type: 'assistant.message.completed', payload: { id: 'answer', role: 'assistant', markdown: '完整回答', nativeSequence: 42 } }))
+      bridge.emit('message', JSON.stringify({ version: 1, messageId: 'plan-review', machineId: 'local', deviceId: 'broadcast', sessionId: 'session-1', sequence: 3, timestamp: 3,
+        type: 'question.asked', payload: { id: 'review', sessionId: 'session-1', stateVersion: { epoch: 'host', revision: 4 }, questions: [{ id: 'q', question: '执行此计划？', detail: '# 完整计划\n保留详细步骤', intent: { kind: 'plan-review', approve: 'yes' }, options: [{ label: 'yes', description: '实施计划' }] }] } }))
+      relay.emit('message', JSON.stringify({ type: 'relay.payload', machineId: 'machine-1', messageId: 'unsafe-early-command', sender: 'device', body: command('prompt.send') }))
+      await new Promise(done => setTimeout(done, 10))
+      expect(requests).not.toHaveBeenCalled(); expect(relay.sent).toHaveLength(0); expect(connector.status).not.toBe('connected')
+      relay.emit('message', JSON.stringify({ type: 'relay.ready', machineId: 'machine-1', role: 'machine', connectionId: 'old', serverTime: 1, schemaRevision: 10 }))
+      expect(relay.readyState).toBe(3)
+      expect(relay.sent.map(raw => JSON.parse(raw).body)).toEqual([expect.objectContaining({ type: 'protocol.error', payload: expect.objectContaining({ code: 'relay-upgrade-required' }) })])
+      relay.emit('close', 4406)
+      await vi.waitFor(() => expect(urls).toHaveLength(3))
+      upgraded.emit('open')
+      expect(upgraded.sent).toHaveLength(0)
+      upgraded.emit('message', JSON.stringify({ type: 'relay.ready', machineId: 'machine-1', role: 'machine', connectionId: 'new', serverTime: 2, schemaRevision: 12, leaseGeneration: 2, relayEpoch: 'new' }))
+      expect(connector.status).toBe('connected')
+      expect(upgraded.sent.map(raw => JSON.parse(raw).body)).toContainEqual(expect.objectContaining({ type: 'assistant.message.completed', payload: expect.objectContaining({ markdown: '完整回答', nativeSequence: 42 }) }))
+      expect(upgraded.sent.map(raw => JSON.parse(raw).body)).toContainEqual(expect.objectContaining({ type: 'question.asked', payload: expect.objectContaining({ stateVersion: { epoch: 'host', revision: 4 }, questions: [expect.objectContaining({ detail: '# 完整计划\n保留详细步骤', intent: { kind: 'plan-review', approve: 'yes' } })] }) }))
+    } finally { await connector.stop() }
+  })
+  it.each([undefined, 10])('rejects a Relay greeting with unsupported revision %s before forwarding', async revision => {
+    const relay = new FakeSocket(), bridge = new FakeSocket(); let sockets = 0
+    const connector = new DSHAnywhereConnector(config, { webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike, logger: { info() {}, warn() {} } })
+    try {
+      connector.start(); relay.emit('open')
+      relay.emit('message', JSON.stringify({ type: 'relay.ready', machineId: 'machine-1', role: 'machine', connectionId: 'old', serverTime: 1, ...(revision === undefined ? {} : { schemaRevision: revision }) }))
+      expect(relay.readyState).toBe(3); expect(connector.status).not.toBe('connected')
+      expect(JSON.parse(relay.sent[0]!).body.payload.code).toBe('relay-upgrade-required')
+    } finally { await connector.stop() }
+  })
+  it('closes a socket which never proves its Relay schema', async () => {
+    vi.useFakeTimers()
+    const relay = new FakeSocket(); let sockets = 0
+    const connector = new DSHAnywhereConnector(config, { webSocketFactory: () => (++sockets === 1 ? relay : new FakeSocket()) as unknown as import("../src/connector.js").WebSocketLike, logger: { info() {}, warn() {} } })
+    try { connector.start(); relay.emit('open'); await vi.advanceTimersByTimeAsync(10001); expect(relay.readyState).toBe(3); expect(connector.status).not.toBe('connected') }
+    finally { await connector.stop(); vi.useRealTimers() }
+  })
+
   it("reports real Relay device presence to the local approval bridge", async () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();
@@ -133,9 +289,9 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     relay.emit("message", JSON.stringify({
-      type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1",
+      type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1",
       serverTime: 1, leaseGeneration: 1, relayEpoch: "relay-1",
     }));
     relay.emit("message", JSON.stringify({
@@ -163,7 +319,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const duplicate = JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "relay-copy", sender: "device",
       body: command("session.create"),
@@ -210,7 +366,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const duplicate = JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "retry-copy", sender: "device",
       body: { ...command("session.create"), payload: { workingDirectory: "/tmp" } },
@@ -233,6 +389,36 @@ describe("Relay and bridge forwarding", () => {
     await connector.stop();
   });
 
+  it("targets file bytes to their requester and rereads without retaining them for chat replay", async () => {
+    const relay = new FakeSocket(), bridge = new FakeSocket();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/workspace/bytes")
+      ? Response.json({ sessionId: "s", absolutePath: "/a.txt", version: "v1", bytes: 1, offset: 0, data: "YQ==", eof: true })
+      : Response.json({ items: [] }));
+    let sockets = 0;
+    const connector = new DSHAnywhereConnector(config, {
+      fetch: fetchMock as typeof fetch,
+      webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
+      logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
+    });
+    connector.start(); openRelay(relay); bridge.emit("open");
+    const read = { version: PROTOCOL_VERSION, requestId: "file", machineId: "machine-1", deviceId: "phone-1", timestamp: 1,
+      sessionId: "s", type: "workspace.bytes", payload: { path: "a.txt", offset: 0, length: 3 } };
+    const deliver = (body: unknown) => relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "copy", sender: "device", body }));
+    const bytes = () => relay.sent.map((raw) => JSON.parse(raw)).filter((message) => message.body?.type === "workspace.bytes");
+    try {
+      deliver(read);
+      await vi.waitFor(() => expect(bytes()).toHaveLength(1));
+      expect(bytes()[0]).toMatchObject({ targetDeviceId: "phone-1", body: { deviceId: "phone-1", messageId: "file", payload: { data: "YQ==" } } });
+      deliver(read);
+      await vi.waitFor(() => expect(bytes()).toHaveLength(2));
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/workspace/bytes"))).toHaveLength(2);
+      deliver({ version: PROTOCOL_VERSION, requestId: "resume", machineId: "machine-1", deviceId: "phone-1", timestamp: 2,
+        type: "connection.resume", payload: { lastSequence: 0 } });
+      await vi.waitFor(() => expect(relay.sent.map((raw) => JSON.parse(raw)).some((message) => message.body?.type === "session.snapshot")).toBe(true));
+      expect(bytes()).toHaveLength(2);
+    } finally { await connector.stop(); }
+  });
+
   it("emits and replays a targeted prompt acceptance receipt", async () => {
     const relay = new FakeSocket();
     const bridge = new FakeSocket();
@@ -245,7 +431,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++sockets === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const duplicate = JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "prompt-copy", sender: "device",
       body: command("prompt.send"),
@@ -279,7 +465,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "bridge-snapshot", machineId: "mac", deviceId: "dsh-anywhere-connector", sequence: 1, timestamp: 1,
       type: "session.snapshot", payload: [{ id: "stale", title: "Stale", updatedAt: 1 }],
@@ -300,7 +486,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "list-relay", sender: "device", body: command("session.list") }));
     await vi.waitFor(() => expect(relay.sent).toHaveLength(1));
     expect(JSON.parse(relay.sent[0]!).body).toMatchObject({
@@ -327,7 +513,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     relay.emit("message", JSON.stringify({
       type: "relay.presence", machineId: "machine-1", role: "device", deviceId: "phone-1", online: true, serverTime: 1,
     }));
@@ -363,7 +549,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const archiveList = { ...command("session.list"), requestId: "archives", payload: { includeArchived: true } };
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "archives-relay", sender: "device", body: archiveList }));
     await vi.waitFor(() => expect(urls).toContain("http://127.0.0.1:3080/dsh-anywhere/v1/sessions?includeArchived=true&deviceId=phone-1"));
@@ -394,7 +580,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const explicit = { ...command("session.list"), requestId: "explicit-list" };
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "list", sender: "device", body: explicit }));
     await vi.waitFor(() => expect(pendingLists).toHaveLength(1));
@@ -432,7 +618,7 @@ describe("Relay and bridge forwarding", () => {
       webSocketFactory: () => (++calls === 1 ? relay : bridge) as unknown as import("../src/connector.js").WebSocketLike,
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     const listing = { ...command("directory.list"), deviceId: "phone-folder", requestId: "folder-list" };
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "folder-relay", sender: "device", body: listing }));
     await vi.waitFor(() => expect(relay.sent).toHaveLength(1));
@@ -457,7 +643,7 @@ describe("Relay and bridge forwarding", () => {
       heartbeatMs: 60_000,
     });
     connector.start();
-    relay.emit("open");
+    openRelay(relay);
     bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "event-1", machineId: "local-hostname-machine", deviceId: "broadcast", sequence: 1, timestamp: 1,
@@ -501,7 +687,7 @@ describe("Relay and bridge forwarding", () => {
       heartbeatMs: 60_000,
     });
     connector.start();
-    relay.emit("open");
+    openRelay(relay);
     bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "event-1", machineId: "local-hostname-machine", deviceId: "broadcast", sequence: 1, timestamp: 1,
@@ -515,7 +701,7 @@ describe("Relay and bridge forwarding", () => {
       body: { type: "connection.ready", machineId: "machine-1", payload: { machineId: "machine-1" } },
     });
 
-    relay.emit("message", JSON.stringify({ type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
     expect(fetchMock).not.toHaveBeenCalled();
     relay.emit("message", JSON.stringify({ type: "relay.payload", machineId: "machine-1", messageId: "relay-message-1", sender: "device", body: command("prompt.send") }));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
@@ -543,9 +729,9 @@ describe("Relay and bridge forwarding", () => {
       heartbeatMs: 60_000,
     });
     connector.start();
-    relay.emit("open");
+    openRelay(relay);
     bridge.emit("open");
-    relay.emit("message", JSON.stringify({ type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
 
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "relay-message-2",
@@ -579,9 +765,9 @@ describe("Relay and bridge forwarding", () => {
       heartbeatMs: 60_000,
     });
     connector.start();
-    relay.emit("open");
+    openRelay(relay);
     bridge.emit("open");
-    relay.emit("message", JSON.stringify({ type: "relay.ready", machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
+    relay.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "connection-1", serverTime: 1 }));
     relay.emit("message", JSON.stringify({
       type: "relay.payload", machineId: "machine-1", messageId: "relay-message-truncated",
       sender: "device", body: command("session.create"),
@@ -613,7 +799,7 @@ describe("Relay and bridge forwarding", () => {
       },
       logger: { info: () => undefined, warn: () => undefined }, heartbeatMs: 60_000,
     });
-    connector.start(); relay.emit("open"); bridge.emit("open");
+    connector.start(); openRelay(relay); bridge.emit("open");
     bridge.emit("message", JSON.stringify({
       version: PROTOCOL_VERSION, messageId: "ready", machineId: "mac", deviceId: "broadcast", sequence: 1, timestamp: 1,
       type: "connection.ready", payload: { machineId: "mac", deviceId: "bridge-device", serverTime: 1,
@@ -696,7 +882,7 @@ describe("desktop endpoint and failure handling", () => {
       reconnectBaseMs: 1, heartbeatMs: 60_000, logger: { info() {}, warn() {} },
     });
     try {
-      connector.start(); relay.emit("open");
+      connector.start(); openRelay(relay);
       await vi.waitFor(() => expect(bridges.length).toBe(1));
       expect(urls[1]).toContain(':59656/');
       port = 59657;
@@ -737,7 +923,7 @@ describe("desktop endpoint and failure handling", () => {
       logger: { info() {}, warn() {} }, heartbeatMs: 60_000,
     });
     try {
-      connector.start(); relay.emit('open');
+      connector.start(); openRelay(relay);
       relay.emit('message', JSON.stringify({ type: 'relay.payload', machineId: 'machine-1',
         messageId: 'modes', sender: 'device', body: command('mode.catalog') }));
       const error = () => relay.sent.map(raw => JSON.parse(raw).body).find(body => body?.type === 'protocol.error');
@@ -749,6 +935,11 @@ describe("desktop endpoint and failure handling", () => {
     } finally { await connector.stop(); }
   });
 });
+
+function openRelay(socket: FakeSocket): void {
+  socket.emit("open");
+  socket.emit("message", JSON.stringify({ type: "relay.ready", schemaRevision: 11, machineId: "machine-1", role: "machine", connectionId: "schema-test", serverTime: 1 }));
+}
 
 class FakeSocket {
   readyState = 1;

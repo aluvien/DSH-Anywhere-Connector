@@ -1298,6 +1298,9 @@ struct DSHRemoteHomeView: View {
         NavigationStack(path: $navigationPath) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        DSHHistorySearchResults(query: searchText).padding(.horizontal, 12)
+                    }
                     if isLoadingTasks {
                         remoteLoadingState
                     } else if model.groupsSessionsByWorkspace {

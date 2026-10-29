@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PROTOCOL_VERSION,
+  supportsSchemaRevision,
   CommandEnvelopeSchema,
   EventEnvelopeSchema,
   PairingRequestSchema,
@@ -21,6 +22,96 @@ const envelopeFields = {
   sequence: 1,
   timestamp: 1_735_000_000_000,
 };
+
+describe("collaboration controls", () => {
+  it("requires an explicit safe schema revision, keeping the main wire version pinned", () => {
+    expect(PROTOCOL_VERSION).toBe(1);
+    for (const revision of [undefined, null, true, "", "11garbage", "11.5", "1e2", 10, 11.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) expect(supportsSchemaRevision(revision)).toBe(false);
+    for (const revision of [11, "11", 12, "12"]) expect(supportsSchemaRevision(revision)).toBe(true);
+  });
+  it("keeps discovery overrides private to requests and invalidations limited to identifiers", () => {
+    const base = { version: 1, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1, type: "configuration.discover" };
+    expect(CommandEnvelopeSchema.safeParse({ ...base, payload: { settingsNs: "llm-test", request: { apiKey: "temporary" } } }).success).toBe(true);
+    expect(EventEnvelopeSchema.safeParse({ ...envelopeFields, type: "configuration.invalidated", payload: { section: "settings", ns: "llm-test", value: { apiKey: "secret" } } }).success).toBe(false);
+    expect(EventEnvelopeSchema.safeParse({ ...envelopeFields, type: "configuration.models", payload: { settingsNs: "llm-test", models: [{ id: "m", apiKey: "secret" }] } }).success).toBe(false);
+  });
+  it("requires settings CAS, explicit operations and bounded one-way credential values", () => {
+    const base = { version: 1, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1, type: "configuration.update" };
+    const settings = { kind: "settings", ns: "llm-test", expectedRevision: 0, ops: [{ op: "set", path: ["models"], value: [{ id: "m", futureField: true }] }] };
+    expect(CommandEnvelopeSchema.safeParse({ ...base, payload: settings }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({ ...base, payload: { ...settings, expectedRevision: undefined } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...base, payload: { ...settings, ops: [{ op: "set", path: ["x"] }] } }).success).toBe(false);
+    for (const payload of [{ kind: "credential", action: "set", ref: "TEST_KEY" }, { kind: "credential", action: "unset", ref: "TEST_KEY", value: "extra" }, { kind: "credential", action: "set", ref: "bad-ref", value: "x" }]) expect(CommandEnvelopeSchema.safeParse({ ...base, payload }).success).toBe(false);
+  });
+  it("validates native history/search inputs and keeps zero as a real location", () => {
+    const base = { version: 1, requestId: "r", machineId: "m", deviceId: "d", timestamp: 1 };
+    expect(CommandEnvelopeSchema.safeParse({ ...base, type: "session.search", payload: { query: "完整对话" } }).success).toBe(true);
+    for (const query of ["  ", "x\0y", "x".repeat(501)]) expect(CommandEnvelopeSchema.safeParse({ ...base, type: "session.search", payload: { query } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...base, sessionId: "child", type: "history.read", payload: { atSeq: 0, throughSeq: 0, parentSessionId: "p", subagentMode: "one-shot" } }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({ ...base, sessionId: "child", type: "history.read", payload: { atSeq: -1 } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...base, sessionId: "child", type: "conversation.search", payload: { query: "x", parentSessionId: "p" } }).success).toBe(false);
+  });
+  it("admits image-only continuable prompts but rejects fabricated attachments and aggregate image overflow", () => {
+    const command = { version: 1, requestId: "images", machineId: "mac", deviceId: "phone", sessionId: "child", timestamp: 1, type: "subagent.prompt" };
+    const payload = { parentSessionId: "parent", mode: "continuable", delivery: "queue", text: "", images: [{ type: "image", mediaType: "image/jpeg", data: "YQ==", name: "photo.jpg" }] };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { ...payload, images: [] } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { ...payload, mode: "one-shot" } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { ...payload, images: [{ type: "image", attachment: { attachmentId: "fabricated" } }] } }).success).toBe(false);
+    const image = { type: "image", mediaType: "image/jpeg", data: "A".repeat(4 * 1024 * 1024 + 1) };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { ...payload, images: [image, image] } }).success).toBe(false);
+  });
+  it("requires an explicit feedback revision and validates categories", () => {
+    const command = { version: 1, requestId: "feedback", machineId: "mac", deviceId: "phone", sessionId: "s", timestamp: 1, type: "feedback.update" };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "put", messageId: "a", rating: "positive", ifVersion: null } }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "put", messageId: "a", rating: "positive" } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "put", messageId: "a", rating: "negative", category: "invented", ifVersion: null } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "delete", messageId: "a", ifVersion: null } }).success).toBe(false);
+  });
+  it("keeps exact execution sequence zero and requires complete child addresses", () => {
+    const command = { version: PROTOCOL_VERSION, requestId: "trace", machineId: "mac", deviceId: "phone", sessionId: "s", timestamp: 1, type: "execution.list" };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { beforeSeq: 0 } }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { parentSessionId: "p" } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { parentSessionId: "p", subagentMode: "one-shot" } }).success).toBe(true);
+    expect(EventEnvelopeSchema.parse({ ...envelopeFields, type: "execution.recorded", payload: { sessionId: "s", inTranscript: false,
+      record: { type: "compaction/start", nativeSequence: 0, data: { compactionId: "c", turn: null } } } }).payload)
+      .toMatchObject({ record: { nativeSequence: 0, data: { turn: null } } });
+  });
+  it("bounds file chunks and keeps empty workspace root distinct from a file path", () => {
+    const base = { version: PROTOCOL_VERSION, requestId: "file", machineId: "mac", deviceId: "phone", timestamp: 1, sessionId: "s" };
+    expect(CommandEnvelopeSchema.safeParse({ ...base, type: "workspace.files", payload: { path: "" } }).success).toBe(true);
+    const read = { ...base, type: "workspace.bytes", payload: { path: "图.png", offset: 0, length: 196608 } };
+    expect(CommandEnvelopeSchema.safeParse(read).success).toBe(true);
+    for (const payload of [{ ...read.payload, path: "" }, { ...read.payload, path: "a\0b" }, { ...read.payload, length: 196609 }, { ...read.payload, offset: -1 }]) {
+      expect(CommandEnvelopeSchema.safeParse({ ...read, payload }).success).toBe(false);
+    }
+    expect(EventEnvelopeSchema.safeParse({ ...envelopeFields, type: "workspace.files", payload: { sessionId: "s", path: "", truncated: false,
+      entries: [{ name: "../bad", type: "file" }] } }).success).toBe(false);
+  });
+  it("retains workflow member phase identity and a catalog-only update", () => {
+    const parsed = EventEnvelopeSchema.parse({ ...envelopeFields, type: "workflow.changed", payload: {
+      sessionId: "s", inTranscript: false, run: { id: "r", name: "Review", status: "completed", nativeSequence: 2, updatedNativeSequence: 10,
+        members: [{ seq: 1, label: "A", childId: "a", status: "completed" }, { seq: 2, label: "B", childId: "b", phase: "", status: "failed" }] } } });
+    expect(parsed.payload).toMatchObject({ inTranscript: false, run: { members: [{ childId: "a" }, { childId: "b", phase: "" }] } });
+  });
+  it("requires an exact valid goal revision and a nonempty edit", () => {
+    const command = { version: PROTOCOL_VERSION, requestId: "goal", machineId: "mac-1", deviceId: "phone-1",
+      timestamp: 1, sessionId: "s", type: "goal.update" };
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "edit", ref: { id: "g", revision: 2 } } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "pause", ref: { id: "g", revision: 0 } } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({ ...command, payload: { action: "edit", ref: { id: "g", revision: 2 }, maxGoalRounds: 0 } }).success).toBe(false);
+    expect(CommandEnvelopeSchema.parse({ ...command, payload: { action: "edit", ref: { id: "g", revision: 2 }, objective: "Ship", maxGoalRounds: 18 } }).type).toBe("goal.update");
+  });
+  it("keeps native pending state and a goal's separate activation", () => {
+    const plan = EventEnvelopeSchema.parse({ ...envelopeFields, type: "plan.projection", payload: {
+      sessionId: "s", active: false, pending: true, available: true, supported: true, epoch: "control-1", seq: 10 } });
+    expect(plan.payload).toMatchObject({ active: false, pending: true, seq: 10 });
+    const goal = EventEnvelopeSchema.parse({ ...envelopeFields, type: "goal.state", payload: {
+      sessionId: "s", goal: { id: "g", revision: 2, objective: "Ship", phase: "active", maxGoalRounds: 12 },
+      roundsStarted: 3, activation: "disarmed" } });
+    expect(goal.payload).toMatchObject({ activation: "disarmed" });
+  });
+});
 
 describe("DSH Anywhere wire protocol", () => {
   it("parses a valid streaming chat event", () => {

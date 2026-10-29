@@ -246,7 +246,7 @@ private enum DSHStoredSendFailure: Codable, Equatable, Sendable {
     case server(String)
 }
 
-/// Durable prompt sends have an explicit phase so a restart can distinguish
+/// Durable prompt and attachment-command sends have an explicit phase so a restart can distinguish
 /// an upload that has not produced a prompt yet from a prompt that was
 /// actually sent and is waiting for its targeted acknowledgement.
 enum DSHPromptTransactionPhase: String, Codable, Equatable, Sendable {
@@ -664,6 +664,8 @@ enum DSHSessionDot: Sendable, Equatable {
 
 @MainActor
 final class DSHAppModel: ObservableObject {
+    @Published private(set) var configurationChangeRevision = 0
+    private(set) var configurationInvalidation: DSHConfigurationInvalidation?
     @Published private(set) var state: DSHStoreState
     @Published private(set) var isPaired: Bool
     @Published private(set) var isPairing = false
@@ -866,6 +868,7 @@ final class DSHAppModel: ObservableObject {
     /// child-folder listing.
     private var pendingDirectoryRequestID: String?
     private var requestedCatalogsForConnection = false
+    private var requestedDecisionsForConnection = false
     /// Attachments selected in the shared new-session composer stay local until
     /// the session exists. They are uploaded and sent as one initial prompt
     /// immediately after the matching `session.created` event arrives.
@@ -875,12 +878,23 @@ final class DSHAppModel: ObservableObject {
     /// `protocolError`s are consumed by that waiter (see `surfaceProtocolError`)
     /// and must not also pop the global alert.
     private var uploadWaitRequestIDs: Set<String> = []
+    private var fileReadRequests: [String: DSHCommand] = [:]
+    private var fileReadReplies: [String: DSHEventKind] = [:]
+    private var fileReadFailures: [String: DSHProtocolError] = [:]
+    private var configurationWrites: [String: (command: DSHCommand, task: Task<DSHConfigurationReceipt, Error>)] = [:]
+    private var fileLinksBySession: [String: [String: (markdown: String, references: [DSHFileReference])]] = [:]
     /// Last `openSession` per session, to collapse duplicate replays.
     private var lastOpenSessionAt: [String: Date] = [:]
     /// The visible screen, unlike `lastOpenSessionAt`, is cleared when the
     /// user returns home. Replay recovery must not reopen a stale transcript
     /// behind the session list.
     private var visibleConversationSessionID: String?
+    private var commandCatalogRequestIDs: [String: String] = [:]
+    private var subagentCatalogRequestIDs: [String: String] = [:]
+    private var subagentCatalogReceivedIDs: [String: String] = [:]
+    private var goalStateRequestIDs: [String: String] = [:]
+    private var subagentCatalogWatchers: [String: Set<UUID>] = [:]
+    private var subagentRefreshTasks: [String: Task<Void, Never>] = [:]
     /// A Connector can explicitly say that its replay window no longer covers
     /// this phone's cursor. That is a recoverable cache miss, rather than a
     /// failed user command: once the current socket and Mac are ready again,
@@ -921,19 +935,15 @@ final class DSHAppModel: ObservableObject {
     private var notifiedQuestionIDs: Set<String> = []
     private var notifiedFailedSessions: Set<String> = []
 
-    private var pendingTransactionStoreURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("DSH Anywhere/pending-transactions.json")
-    }
+    private let transactionDirectory: URL
+    private var pendingTransactionStoreURL: URL { transactionDirectory.appendingPathComponent("pending-transactions.json") }
 
     private var pendingAttachmentDirectoryURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("DSH Anywhere/pending-attachments", isDirectory: true)
+        transactionDirectory.appendingPathComponent("pending-attachments", isDirectory: true)
     }
 
     private var removedMachineIDsURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("DSH Anywhere/removed-machines.json")
+        transactionDirectory.appendingPathComponent("removed-machines.json")
     }
 
     private lazy var pendingTransactionFileStore = DSHPendingTransactionFileStore(
@@ -1685,6 +1695,13 @@ final class DSHAppModel: ObservableObject {
     /// state reset already drops any carried-over rows).
     private func resetTransientRequestState() {
         machineStateGeneration += 1
+        requestedDecisionsForConnection = false
+        for task in subagentRefreshTasks.values { task.cancel() }
+        subagentRefreshTasks.removeAll()
+        subagentCatalogWatchers.removeAll()
+        subagentCatalogRequestIDs.removeAll()
+        subagentCatalogReceivedIDs.removeAll()
+        goalStateRequestIDs.removeAll()
         replayResynchronizationTask?.cancel()
         replayResynchronizationTask = nil
         pendingReplayResynchronizationGeneration = nil
@@ -1714,6 +1731,7 @@ final class DSHAppModel: ObservableObject {
         cancelledStagedPromptIDs.removeAll(keepingCapacity: false)
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
+        fileLinksBySession.removeAll(keepingCapacity: false)
         failedSendsByRequestID.removeAll(keepingCapacity: false)
         failedInitialMessages.removeAll(keepingCapacity: false)
         failedSessionCreations.removeAll(keepingCapacity: false)
@@ -1756,7 +1774,9 @@ final class DSHAppModel: ObservableObject {
     static let unreadBaselineKey = "dsh-anywhere.unread-baseline"
 
     init(transport: any DSHAppTransport = DSHRemoteTransport(),
-         initialState: DSHStoreState = .init(), isPaired: Bool? = nil) {
+         initialState: DSHStoreState = .init(), isPaired: Bool? = nil, transactionDirectory: URL? = nil) {
+        self.transactionDirectory = transactionDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DSH Anywhere", isDirectory: true)
         self.transport = transport
         self.state = initialState
         let stored = DSHProfileStore()
@@ -1858,7 +1878,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     func tools(for sessionID: String) -> [DSHToolActivity] {
-        state.toolsBySession[sessionID, default: []]
+        DSHToolActivity.nested(state.toolsBySession[sessionID, default: []])
     }
 
     /// The transcript in the order things actually happened: messages and tool
@@ -1870,7 +1890,10 @@ final class DSHAppModel: ObservableObject {
             .transcriptEntries(
             with: tools(for: sessionID),
             commandResults: commandResults(for: sessionID),
-            modelChanges: modelChanges(for: sessionID)
+            modelChanges: modelChanges(for: sessionID),
+            workflows: workflows(for: sessionID),
+            execution: DSHExecutionNotice.build(executionRecords(for: sessionID)),
+            historyGaps: historyCoverage(for: sessionID)?.gaps ?? []
         )
         transcriptEntriesCache[sessionID] = entries
         return entries
@@ -1910,6 +1933,12 @@ final class DSHAppModel: ObservableObject {
             switch event.kind {
             case .historyStarted(let batch), .historyCompleted(let batch):
                 sessionIDs.insert(batch.sessionId)
+            case .workflowChanged(let update):
+                sessionIDs.insert(update.sessionId)
+            case .executionRecorded(let update):
+                sessionIDs.insert(update.sessionId)
+            case .executionPage(let page):
+                sessionIDs.insert(page.sessionId)
             default:
                 break
             }
@@ -1946,6 +1975,25 @@ final class DSHAppModel: ObservableObject {
 
     func attachments(for sessionID: String) -> [DSHUploadedAttachment] {
         state.attachmentsBySession[sessionID, default: []]
+    }
+
+    func fileReferences(for sessionID: String) -> [DSHFileReference] {
+        let messages = messages(for: sessionID)
+        let ids = Set(messages.map(\.id))
+        var cache = (fileLinksBySession[sessionID] ?? [:]).filter { ids.contains($0.key) }
+        var seen: Set<String> = []
+        var references: [DSHFileReference] = []
+        for message in messages {
+            if cache[message.id]?.markdown != message.markdown {
+                cache[message.id] = (message.markdown, message.role == .assistant ? DSHFileReference.links(in: message.markdown, sessionID: sessionID) : [])
+            }
+            for reference in cache[message.id]?.references ?? [] where seen.insert(reference.id).inserted { references.append(reference) }
+            for attachment in message.attachments {
+                if let reference = attachment.fileReference(sessionID: sessionID), seen.insert(reference.id).inserted { references.append(reference) }
+            }
+        }
+        fileLinksBySession[sessionID] = cache
+        return references
     }
 
     /// Keeps the already-downsampled image available for the current run and
@@ -2797,6 +2845,8 @@ final class DSHAppModel: ObservableObject {
         lastOpenSessionAt[sessionID] = now
         send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
                                     sessionId: sessionID, streaming: true))
+        requestCommands(for: sessionID)
+        Task { [weak self] in try? await self?.loadFeedback(for: sessionID) }
     }
 
     func setConversationVisible(_ sessionID: String, visible: Bool) {
@@ -3042,12 +3092,13 @@ final class DSHAppModel: ObservableObject {
         // A reconnect can invoke this method to resume an already-preparing
         // request; the stored staged array is authoritative in that case.
         for attachment in current.stagedAttachments {
+            let key = attachment.id.uuidString
             guard generation == machineStateGeneration, machineID == expectedID,
                   !cancelledStagedPromptIDs.contains(requestID),
-                  pendingSendsByRequestID[requestID]?.phase == .preparing else {
+                  pendingSendsByRequestID[requestID]?.phase == .preparing
+                    || (pendingSendsByRequestID[requestID]?.phase == .readyToSend && current.uploadedAttachments[key] != nil) else {
                 return false
             }
-            let key = attachment.id.uuidString
             if current.uploadedAttachments[key] == nil {
                 let uploadRequestID = "\(requestID)/attachment/\(key)"
                 let receipt = try await uploadAttachmentAndWait(
@@ -3075,7 +3126,7 @@ final class DSHAppModel: ObservableObject {
         }
         guard !cancelledStagedPromptIDs.contains(requestID),
               pendingSendsByRequestID[requestID] != nil else { return false }
-        current.stagedAttachments = []
+        if current.mode != "command" { current.stagedAttachments = [] }
         current.phase = .readyToSend
         current.sentAt = .now
         pendingSendsByRequestID[requestID] = current
@@ -3089,6 +3140,19 @@ final class DSHAppModel: ObservableObject {
         }
         pendingSendsByRequestID[requestID] = current
         guard await persistCurrentTransactions(for: machineID) else { return false }
+        if current.mode == "command" {
+            do {
+                try await sendPreparedCommand(current, machineGeneration: generation, machineID: expectedID)
+                return true
+            } catch {
+                if generation == machineStateGeneration, var retry = pendingSendsByRequestID[requestID] {
+                    retry.phase = .readyToSend
+                    pendingSendsByRequestID[requestID] = retry
+                    _ = await persistCurrentTransactions(for: expectedID)
+                }
+                throw error
+            }
+        }
         armSendAckTimeout(requestId: requestID, attempt: current.attempt)
         let parts = current.receipts.map {
             DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)])
@@ -3193,6 +3257,18 @@ final class DSHAppModel: ObservableObject {
         }
         guard machineStateGeneration == prepared.machineGeneration,
               machineID == prepared.machineID else { return false }
+        if pending.mode == "command" {
+            do {
+                try await sendPreparedCommand(pending, machineGeneration: prepared.machineGeneration, machineID: prepared.machineID)
+                return true
+            } catch {
+                if machineStateGeneration == prepared.machineGeneration {
+                    timeoutPendingSend(requestId: prepared.requestID, attempt: prepared.attempt)
+                    errorMessage = error.localizedDescription
+                }
+                return false
+            }
+        }
         armSendAckTimeout(requestId: prepared.requestID, attempt: prepared.attempt)
         let parts = prepared.receipts.map {
             DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)])
@@ -3207,6 +3283,8 @@ final class DSHAppModel: ObservableObject {
     /// An outbound prompt awaiting its accepted user message. If nothing
     /// comes back, the send failed somewhere between this phone and the Mac.
     struct DSHPendingSend: Sendable, Equatable, Identifiable, Codable {
+        // mode == "command" is a journal-only discriminator. Such records
+        // dispatch through command.execute and must never become prompt.send.
         let id: String
         let text: String
         var receipts: [String]
@@ -3446,11 +3524,11 @@ final class DSHAppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         if let key = pendingSendsByRequestID.values.first(
-            where: { $0.sessionID == sessionID && $0.text == trimmed })?.id {
+            where: { $0.sessionID == sessionID && $0.mode != "command" && $0.text == trimmed })?.id {
             pendingSendsByRequestID.removeValue(forKey: key)
         }
         if let failure = failedSendsByRequestID.values.first(where: {
-            $0.sessionID == sessionID && $0.text == trimmed
+            $0.sessionID == sessionID && $0.mode != "command" && $0.text == trimmed
         }) { failedSendsByRequestID.removeValue(forKey: failure.id) }
         persistCurrentTransactionsLater(for: machineID)
     }
@@ -3932,6 +4010,544 @@ final class DSHAppModel: ObservableObject {
         send(command)
     }
 
+    func planState(for sessionID: String) -> DSHPlanState? {
+        if let plan = state.planProjections?[sessionID] {
+            if !plan.available, var durable = state.planBySession?[sessionID] {
+                durable.available = false
+                return durable
+            }
+            guard plan.supported else { return nil }
+            return DSHPlanState(sessionId: sessionID, active: plan.active, pending: plan.pending, available: plan.available)
+        }
+        return state.planBySession?[sessionID]
+    }
+    func commandCatalog(for sessionID: String) -> DSHCommandCatalog? {
+        guard let catalog = state.commandCatalogs?[sessionID], catalog.supported != false else { return nil }
+        return catalog
+    }
+    func requestCommands(for sessionID: String) {
+        let command = DSHCommand.commandCatalog(deviceId: deviceID, machineId: machineID, sessionId: sessionID)
+        commandCatalogRequestIDs[sessionID] = command.requestId
+        send(command)
+    }
+    func forkSession(_ sessionID: String, atSeq: Int64? = nil) async throws -> String {
+        let generation = machineStateGeneration
+        let expectedMachineID = machineID
+        guard await preparePromptPersistence(expectedMachineGeneration: generation,
+                                              expectedMachineID: expectedMachineID) else {
+            throw DSHRemoteCommandError(message: "无法保存分支请求，请稍后重试。")
+        }
+        let proposed = DSHCommand.forkSession(deviceId: deviceID, machineId: machineID,
+                                               sessionId: sessionID, atSeq: atSeq)
+        guard let command = durableRemoteMutationCommand(proposed) else {
+            throw DSHRemoteCommandError(message: errorMessage ?? "无法创建分支。")
+        }
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<3_000 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == expectedMachineID else { throw CancellationError() }
+            if let fork = state.forksByRequestID?[command.requestId], fork.parentSessionId == sessionID {
+                refreshSessions(includeArchived: true)
+                return fork.sessionId
+            }
+            if let error = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: error) }
+            if let failure = remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.failure {
+                throw DSHRemoteCommandError(message: failure)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "分支结果尚未确认，请检查电脑上的状态。")
+    }
+    func todoState(for sessionID: String) -> DSHTodoState? { state.todoBySession?[sessionID] }
+    func executionRecords(for sessionID: String) -> [DSHExecutionRecord] { state.executionBySession?[sessionID] ?? [] }
+    func feedback(for messageID: String, in sessionID: String) -> DSHFeedbackItem? {
+        state.feedbackBySession?[sessionID]?.items.first { $0.messageId == messageID }
+    }
+    func referenceCandidates(in sessionID: String, kind: String, query: String) async throws -> DSHReferenceCandidates {
+        guard ["file", "session"].contains(kind), query.utf16.count <= 8_192 else {
+            throw DSHRemoteCommandError(message: "引用搜索词过长或类型无效，请缩短后重试。")
+        }
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, sessionId: sessionID,
+            type: "reference.list", payload: .object(["kind": .string(kind), "query": .string(query)])))
+        guard case .referenceCandidates(let result) = reply, result.sessionId == sessionID, result.kind == kind, result.query == query else {
+            throw DSHRemoteCommandError(message: "引用查询回复不匹配，请重试。")
+        }
+        return result
+    }
+    func searchHistory(query: String, sessionID: String? = nil, cursor: String? = nil, parentID: String? = nil, mode: String? = nil) async throws -> DSHSearchResults {
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, query.utf16.count <= 500, !query.contains("\0") else { throw DSHRemoteCommandError(message: "请输入 1–500 字符的搜索词。") }
+        var payload: [String: DSHJSONValue] = ["query": .string(query)]
+        if let cursor { payload["cursor"] = .string(cursor) }
+        if let parentID { payload["parentSessionId"] = .string(parentID) }
+        if let mode { payload["subagentMode"] = .string(mode) }
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, sessionId: sessionID,
+            type: sessionID == nil ? "session.search" : "conversation.search", payload: .object(payload)))
+        guard case .searchResults(let result) = reply, result.query == query, result.scopeSessionId == sessionID else { throw DSHRemoteCommandError(message: "搜索回复不匹配，请重新搜索。") }
+        return result
+    }
+    func historyCoverage(for sessionID: String) -> DSHHistoryCoverage? { state.historyCoverage?[sessionID] }
+    func readConfiguration(_ section: String, refs: [String] = []) async throws -> DSHConfigurationResult {
+        var payload: [String: DSHJSONValue] = ["section": .string(section)]
+        if section == "credentials" { payload["refs"] = .array(refs.map(DSHJSONValue.string)) }
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, type: "configuration.read", payload: .object(payload)))
+        guard case .configurationResult(let result) = reply, result.section == section else { throw DSHRemoteCommandError(message: "配置回复不匹配，请重新读取。") }
+        return result
+    }
+    func discoverModels(settingsNs: String, request: [String: DSHJSONValue]) async throws -> DSHDiscoveredModels {
+        let command = DSHCommand(deviceId: deviceID, machineId: machineID, type: "configuration.discover", payload: .object(["settingsNs": .string(settingsNs), "request": .object(request)]))
+        let reply = try await readWorkspace(command)
+        guard case .configurationModels(let result) = reply, result.settingsNs == settingsNs else { throw DSHRemoteCommandError(message: "模型发现回复不匹配，请重新读取。") }
+        return result
+    }
+    func configurationCommand(payload: DSHJSONValue) -> DSHCommand { DSHCommand(deviceId: deviceID, machineId: machineID, type: "configuration.update", payload: payload) }
+    func updateConfiguration(_ command: DSHCommand) async throws -> DSHConfigurationReceipt {
+        guard command.type == "configuration.update", command.machineId == machineID, command.deviceId == deviceID else { throw DSHRemoteCommandError(message: "电脑或设备身份已变化，请重新打开配置。") }
+        let key = "\(command.machineId)\0\(command.requestId)"
+        if let active = configurationWrites[key] {
+            guard active.command.payload == command.payload, active.command.deviceId == command.deviceId else { throw DSHRemoteCommandError(message: "此保存请求已对应其他修改，请重新打开配置。") }
+            return try await active.task.value
+        }
+        let task = Task { () throws -> DSHConfigurationReceipt in
+            let reply = try await self.readWorkspace(command)
+            guard case .configurationUpdated(let receipt) = reply, receipt.requestId == command.requestId else { throw DSHRemoteCommandError(message: "保存回复不匹配，请检查电脑状态。") }
+            return receipt
+        }
+        configurationWrites[key] = (command, task)
+        defer { configurationWrites.removeValue(forKey: key) }
+        return try await task.value
+    }
+    func scheduleState(for sessionID: String) -> DSHScheduleProjection? { state.schedulesBySession?[sessionID] }
+    func loadSchedules(sessionID: String, parentID: String? = nil, mode: String? = nil) async throws {
+        var payload: [String: DSHJSONValue] = [:]
+        if let parentID { payload["parentSessionId"] = .string(parentID) }
+        if let mode { payload["subagentMode"] = .string(mode) }
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, sessionId: sessionID, type: "schedule.get", payload: .object(payload)))
+        guard case .scheduleProjection(let value) = reply, value.sessionId == sessionID else { throw DSHRemoteCommandError(message: "提醒回复不匹配，请重新读取。") }
+    }
+    func historyPage(sessionID: String, beforeSeq: Int64? = nil, atSeq: Int64? = nil, parentID: String? = nil, mode: String? = nil) async throws -> DSHHistoryPage {
+        var payload: [String: DSHJSONValue] = [:]
+        if atSeq == nil, let through = historyCoverage(for: sessionID)?.throughSeq { payload["throughSeq"] = .number(Double(through)) }
+        if let beforeSeq { payload["beforeSeq"] = .number(Double(beforeSeq)) }
+        if let atSeq { payload["atSeq"] = .number(Double(atSeq)) }
+        if let parentID { payload["parentSessionId"] = .string(parentID) }
+        if let mode { payload["subagentMode"] = .string(mode) }
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, sessionId: sessionID, type: "history.read", payload: .object(payload)))
+        guard case .historyPage(let page) = reply, page.sessionId == sessionID, page.window.isValid,
+              atSeq == nil || page.focus?.nativeSequence == atSeq else { throw DSHRemoteCommandError(message: "历史回复不匹配，请重新读取。") }
+        return page
+    }
+    func loadFeedback(for sessionID: String) async throws {
+        let reply = try await readWorkspace(DSHCommand(deviceId: deviceID, machineId: machineID, sessionId: sessionID, type: "feedback.list", payload: .object([:])))
+        guard case .feedbackState(let snapshot) = reply, snapshot.sessionId == sessionID else { throw DSHRemoteCommandError(message: "评价回复不匹配，请重新读取。") }
+    }
+    func updateFeedback(messageID: String, in sessionID: String, action: String, rating: String,
+                        note: String, category: String?, ifVersion: String?) async throws {
+        guard connectionState == .connected, ["put", "delete"].contains(action), action != "delete" || ifVersion != nil else {
+            throw DSHRemoteCommandError(message: "请先连接电脑并读取当前评价。")
+        }
+        guard feedback(for: messageID, in: sessionID)?.version == ifVersion else {
+            throw DSHRemoteCommandError(message: "评价已在其他端更新，请合并最新版本；备注已保留。")
+        }
+        var payload: [String: DSHJSONValue] = ["action": .string(action), "messageId": .string(messageID), "ifVersion": ifVersion.map(DSHJSONValue.string) ?? .null]
+        if action == "put" {
+            payload["rating"] = .string(rating)
+            if !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { payload["note"] = .string(note) }
+            if let category { payload["category"] = .string(category) }
+        }
+        let generation = machineStateGeneration, machine = machineID
+        guard let command = durableRemoteMutationCommand(DSHCommand(deviceId: deviceID, machineId: machine, sessionId: sessionID,
+            type: "feedback.update", payload: .object(payload))) else { throw DSHRemoteCommandError(message: errorMessage ?? "无法保存评价请求。") }
+        remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let receipt = state.feedbackReceipts?[command.requestId], receipt.sessionId == sessionID, receipt.messageId == messageID {
+                Task { [weak self] in
+                    guard let self, self.machineStateGeneration == generation, self.machineID == machine else { return }
+                    try? await self.loadFeedback(for: sessionID)
+                }
+                return
+            }
+            let failure = state.protocolErrorsByRequestID[command.requestId] ?? remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure
+            if let failure {
+                Task { [weak self] in
+                    guard let self, self.machineStateGeneration == generation, self.machineID == machine else { return }
+                    try? await self.loadFeedback(for: sessionID)
+                }
+                throw DSHRemoteCommandError(message: failure)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "评价提交结果尚未确认，备注已保留。请检查最新状态后重试。")
+    }
+    func executionPage(sessionID: String, beforeSeq: Int64? = nil, parentID: String? = nil, mode: String? = nil) async throws -> DSHExecutionPage {
+        let reply = try await readWorkspace(.executionList(deviceId: deviceID, machineId: machineID, sessionId: sessionID, beforeSeq: beforeSeq,
+            parentSessionId: parentID, subagentMode: mode))
+        guard case .executionPage(let page) = reply, page.sessionId == sessionID else { throw DSHRemoteCommandError(message: "执行记录回复不匹配，请重新加载。") }
+        return page
+    }
+    func interruptedMessage(_ message: DSHChatMessage, in sessionID: String) -> Bool {
+        message.interrupted == true || executionRecords(for: sessionID).contains { record in
+            record.type == "assistant/message" && record.data["interrupted"] == .bool(true) &&
+                (record.nativeSequence == message.nativeSequence || record.data["message"]?.executionObject["id"] == .string(message.id))
+        }
+    }
+    private func readWorkspace(_ command: DSHCommand) async throws -> DSHEventKind {
+        let generation = machineStateGeneration
+        let resource = command.type.hasPrefix("configuration.") ? "电脑配置" : command.type == "execution.list" ? "执行记录" : command.type == "schedule.get" ? "提醒" : command.type == "history.read" ? "历史" : command.type.hasSuffix(".search") ? "搜索结果" : command.type == "feedback.list" ? "评价" : command.type == "reference.list" ? "引用" : "文件"
+        guard connectionState == .connected else { throw DSHRemoteCommandError(message: "请先连接电脑，再读取\(resource)。") }
+        fileReadRequests[command.requestId] = command
+        defer {
+            fileReadRequests.removeValue(forKey: command.requestId)
+            fileReadReplies.removeValue(forKey: command.requestId)
+            fileReadFailures.removeValue(forKey: command.requestId)
+            state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        }
+        try await transport.send(command)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation else { throw CancellationError() }
+            if let reply = fileReadReplies.removeValue(forKey: command.requestId) { return reply }
+            if command.type.hasPrefix("configuration."), let failure = fileReadFailures[command.requestId] { throw DSHConfigurationRequestError(failure: failure) }
+            if let message = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: message) }
+            guard connectionState == .connected else { throw DSHRemoteCommandError(message: "连接已断开，请重新读取\(resource)。") }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "读取\(resource)超时，请重试。")
+    }
+
+    func workspaceFiles(sessionID: String, path: String) async throws -> DSHWorkspaceFiles {
+        let reply = try await readWorkspace(.workspaceFiles(deviceId: deviceID, machineId: machineID, sessionId: sessionID, path: path))
+        guard case .workspaceFiles(let listing) = reply, listing.sessionId == sessionID else {
+            throw DSHRemoteCommandError(message: "电脑返回的目录不匹配，请重新读取。")
+        }
+        return listing
+    }
+
+    /// Assemble into an unshared temporary file; only a fully validated file
+    /// becomes available to Quick Look and the system share sheet.
+    func downloadFile(_ reference: DSHFileReference,
+                      progress: @escaping (Int, Int?) -> Void = { _, _ in }) async throws -> URL {
+        let generation = machineStateGeneration
+        let maximum = 64 * 1_024 * 1_024
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("DSH-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let leaf = (reference.name as NSString).lastPathComponent
+        let name = leaf.isEmpty || [".", ".."].contains(leaf) ? "download" : leaf
+        let target = directory.appendingPathComponent(name, isDirectory: false)
+        guard FileManager.default.createFile(atPath: target.path, contents: nil) else {
+            try? FileManager.default.removeItem(at: directory)
+            throw DSHRemoteCommandError(message: "无法创建本地文件，请检查手机存储空间。")
+        }
+        var completed = false
+        var handle: FileHandle?
+        defer {
+            try? handle?.close()
+            if !completed { try? FileManager.default.removeItem(at: directory) }
+        }
+        handle = try FileHandle(forWritingTo: target)
+        var offset = 0
+        var version: String?
+        var absolutePath: String?
+        var totalBytes: Int?
+        while true {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation else { throw CancellationError() }
+            let reply = try await readWorkspace(.workspaceBytes(deviceId: deviceID, machineId: machineID,
+                sessionId: reference.sessionID, path: reference.path, offset: offset, version: version))
+            try Task.checkCancellation()
+            guard case .workspaceBytes(let chunk) = reply, chunk.sessionId == reference.sessionID,
+                  chunk.offset == offset, version == nil || chunk.version == version,
+                  absolutePath == nil || absolutePath == chunk.absolutePath,
+                  let data = Data(base64Encoded: chunk.data), data.count <= 192 * 1_024,
+                  !data.isEmpty || chunk.eof,
+                  totalBytes == nil || chunk.bytes == nil || totalBytes == chunk.bytes else {
+                throw DSHRemoteCommandError(message: "文件内容或版本不一致，请重新下载。")
+            }
+            if (chunk.bytes ?? 0) > maximum || offset + data.count > maximum {
+                throw DSHRemoteCommandError(message: "手机单次预览和分享支持最大 64 MB 的文件。")
+            }
+            totalBytes = totalBytes ?? chunk.bytes
+            version = chunk.version
+            absolutePath = chunk.absolutePath
+            try handle?.write(contentsOf: data)
+            offset += data.count
+            guard totalBytes == nil || offset <= totalBytes! else { throw DSHRemoteCommandError(message: "文件大小已改变，请重新下载。") }
+            progress(offset, totalBytes)
+            if chunk.eof {
+                guard totalBytes == nil || offset == totalBytes else { throw DSHRemoteCommandError(message: "文件下载不完整，请重试。") }
+                break
+            }
+        }
+        try handle?.close()
+        handle = nil
+        try Task.checkCancellation()
+        completed = true
+        return target
+    }
+    func jobsState(for sessionID: String) -> DSHJobsState? { state.jobsBySession?[sessionID] }
+    func serverQueue(for sessionID: String) -> DSHServerQueue? { state.serverQueues?[sessionID] }
+    func workflows(for sessionID: String) -> [DSHWorkflowRun] {
+        (state.workflowsBySession?[sessionID] ?? []).enumerated().sorted { left, right in
+            let a = left.element.nativeSequence ?? left.element.sequence ?? 0
+            let b = right.element.nativeSequence ?? right.element.sequence ?? 0
+            return a == b ? left.offset < right.offset : a < b
+        }.map(\.element)
+    }
+    func subagentCatalog(for parentID: String) -> DSHSubagentCatalog? { state.subagentCatalogs?[parentID] }
+    func subagentCatalogError(for parentID: String) -> String? {
+        guard let requestID = subagentCatalogRequestIDs[parentID] else { return nil }
+        return state.protocolErrorsByRequestID[requestID]
+    }
+    func requestSubagents(for parentID: String) {
+        let command = DSHCommand.subagentCatalog(deviceId: deviceID, machineId: machineID, sessionId: parentID)
+        subagentCatalogRequestIDs[parentID] = command.requestId
+        send(command)
+    }
+    func watchSubagents(for parentID: String, token: UUID) {
+        let alreadyWatching = subagentCatalogWatchers[parentID]?.isEmpty == false
+        subagentCatalogWatchers[parentID, default: []].insert(token)
+        if !alreadyWatching, connectionState == .connected { requestSubagents(for: parentID) }
+    }
+    func unwatchSubagents(for parentID: String, token: UUID) {
+        subagentCatalogWatchers[parentID]?.remove(token)
+        if subagentCatalogWatchers[parentID]?.isEmpty == true {
+            subagentCatalogWatchers.removeValue(forKey: parentID)
+            subagentRefreshTasks.removeValue(forKey: parentID)?.cancel()
+        }
+    }
+    private func refreshWatchedSubagents(for parentID: String) {
+        guard subagentCatalogWatchers[parentID]?.isEmpty == false, subagentRefreshTasks[parentID] == nil else { return }
+        let generation = machineStateGeneration
+        subagentRefreshTasks[parentID] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled else { return }
+            self.subagentRefreshTasks.removeValue(forKey: parentID)
+            guard self.machineStateGeneration == generation, self.subagentCatalogWatchers[parentID]?.isEmpty == false else { return }
+            self.requestSubagents(for: parentID)
+        }
+    }
+    func openSubagent(_ child: DSHSubagentCatalog.Entry, parentID: String) {
+        guard connectionState == .connected, child.kind == "child", let mode = child.mode else { return }
+        send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID, sessionId: child.id, streaming: true,
+                                    parentSessionId: parentID, subagentMode: mode))
+    }
+
+    func workflowChild(_ childID: String, parentID: String) async throws -> DSHSubagentCatalog.Entry {
+        if let child = subagentCatalog(for: parentID)?.entries.first(where: { $0.id == childID && $0.kind == "child" }) { return child }
+        guard connectionState == .connected else { throw DSHRemoteCommandError(message: "当前离线，尚未缓存这个子任务的身份记录。") }
+        let generation = machineStateGeneration
+        requestSubagents(for: parentID)
+        for _ in 0..<340 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation else { throw CancellationError() }
+            if let catalog = subagentCatalog(for: parentID) {
+                if let child = catalog.entries.first(where: { $0.id == childID && $0.kind == "child" }) { return child }
+                if catalog.supported == false { throw DSHRemoteCommandError(message: "这台电脑暂不支持读取关联子任务。") }
+                if subagentCatalogReceivedIDs[parentID] == subagentCatalogRequestIDs[parentID] { break }
+            }
+            if let message = subagentCatalogError(for: parentID) { throw DSHRemoteCommandError(message: message) }
+            guard connectionState == .connected else { throw DSHRemoteCommandError(message: "连接已断开，工作流记录已保留。") }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "关联子任务尚未出现在目录，请刷新后重试。")
+    }
+
+    func controlSubagent(childID: String, parentID: String, text: String? = nil,
+                         delivery: String = "queue", images: [DSHJSONValue] = []) async throws {
+        guard connectionState == .connected,
+              let catalog = subagentCatalog(for: parentID),
+              catalog.entries.contains(where: { $0.kind == "child" && $0.id == childID && $0.mode == "continuable" }) else {
+            throw DSHRemoteCommandError(message: "子任务状态尚未同步，请刷新后重试。")
+        }
+        guard text != nil || images.isEmpty else { throw DSHRemoteCommandError(message: "停止子任务不能附带图片。") }
+        if let text {
+            let encodedBytes = images.reduce(0) { $0 + ($1.executionObject["data"]?.executionString?.utf8.count ?? 0) }
+            guard catalog.parentAvailable, (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty),
+                  images.count <= 16, encodedBytes <= 8 * 1_024 * 1_024,
+                  images.allSatisfy({ value in
+                      let image = value.executionObject
+                      guard image["type"] == .string("image"), ["image/png", "image/jpeg", "image/webp", "image/gif"].contains(image["mediaType"]?.executionString),
+                            let data = image["data"]?.executionString, !data.isEmpty, Data(base64Encoded: data) != nil else { return false }
+                      return Set(image.keys).isSubset(of: ["type", "mediaType", "data", "name"]) &&
+                          (image["name"].map { $0.executionString.map { !$0.isEmpty && $0.utf16.count <= 512 } ?? false } ?? true)
+                  }),
+                  text.utf16.count <= 100_000, ["queue", "steer"].contains(delivery) else {
+                throw DSHRemoteCommandError(message: "父会话当前无法接收子任务消息，或消息内容无效。")
+            }
+        }
+        let generation = machineStateGeneration
+        let machine = machineID
+        let proposed = DSHCommand.controlSubagent(deviceId: deviceID, machineId: machine, childID: childID,
+                                                  parentID: parentID, text: text, delivery: delivery, images: images)
+        guard let command = durableRemoteMutationCommand(proposed) else {
+            throw DSHRemoteCommandError(message: errorMessage ?? "无法操作子任务。")
+        }
+        remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let receipt = state.subagentReceipts?[command.requestId], receipt.childSessionId == childID,
+               receipt.parentSessionId == parentID, receipt.action == (text == nil ? "interrupt" : "prompt") {
+                requestSubagents(for: parentID)
+                return
+            }
+            if let error = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: error) }
+            if let failure = remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure { throw DSHRemoteCommandError(message: failure) }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "子任务操作结果尚未确认，草稿已保留，请检查状态后重试。")
+    }
+
+    func updateServerQueue(_ item: DSHServerQueue.Item, in sessionID: String,
+                           action: String, text: String? = nil) async throws {
+        guard state.serverQueues?[sessionID]?.available == true, connectionState == .connected else {
+            throw DSHRemoteCommandError(message: "队列状态尚未同步，请等待重新连接。")
+        }
+        guard item.placement != "context", ["edit", "remove", "steer"].contains(action) else {
+            throw DSHRemoteCommandError(message: "这条队列内容不能进行此操作。")
+        }
+        if action == "edit" {
+            guard item.isTextOnly, let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  text.utf16.count <= 100_000 else {
+                throw DSHRemoteCommandError(message: "仅可编辑非空的纯文字排队消息。")
+            }
+        }
+        let generation = machineStateGeneration
+        let machine = machineID
+        let proposed = DSHCommand.updateQueue(deviceId: deviceID, machineId: machine, sessionId: sessionID,
+                                              itemId: item.id, action: action, text: text)
+        guard let command = durableRemoteMutationCommand(proposed) else {
+            throw DSHRemoteCommandError(message: errorMessage ?? "无法更新队列。")
+        }
+        remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<300 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let receipt = state.queueReceipts?[command.requestId], receipt.itemId == item.id, receipt.sessionId == sessionID { return }
+            if let error = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: error) }
+            if let failure = remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure { throw DSHRemoteCommandError(message: failure) }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "队列更新结果尚未确认，请检查最新队列后重试。")
+    }
+    func goalState(for sessionID: String) -> DSHGoalState? {
+        guard var goal = state.goalBySession?[sessionID] else { return nil }
+        if connectionState != .connected || state.liveGoalSessions?.contains(sessionID) != true { goal.activation = nil }
+        return goal
+    }
+    func requestGoalState(for sessionID: String) {
+        let command = DSHCommand.getGoal(deviceId: deviceID, machineId: machineID, sessionId: sessionID)
+        goalStateRequestIDs[sessionID] = command.requestId
+        send(command)
+    }
+    func updateGoal(_ goal: DSHGoalState.Goal, in sessionID: String, action: String,
+                    objective: String? = nil, maxGoalRounds: Int? = nil) async throws {
+        guard connectionState == .connected, ["edit", "pause", "resume", "complete", "clear"].contains(action) else {
+            throw DSHRemoteCommandError(message: "连接尚未恢复，请稍后再操作目标。")
+        }
+        if action == "edit" {
+            guard objective != nil || maxGoalRounds != nil,
+                  objective.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf16.count <= 100_000 }) ?? true,
+                  maxGoalRounds.map({ $0 > 0 && $0 <= 9_007_199_254_740_991 }) ?? true else {
+                throw DSHRemoteCommandError(message: "请输入非空目标和有效的轮次上限。")
+            }
+        }
+        guard state.goalBySession?[sessionID]?.goal?.id == goal.id,
+              state.goalBySession?[sessionID]?.goal?.revision == goal.revision else {
+            throw DSHRemoteCommandError(message: "目标已在其他端更新，请先重新载入；编辑内容已保留。")
+        }
+        let generation = machineStateGeneration
+        let machine = machineID
+        let proposed = DSHCommand.updateGoal(deviceId: deviceID, machineId: machine, sessionId: sessionID,
+                                             goal: goal, action: action, objective: objective, maxGoalRounds: maxGoalRounds)
+        guard let command = durableRemoteMutationCommand(proposed) else { throw DSHRemoteCommandError(message: errorMessage ?? "无法修改目标。") }
+        remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let receipt = state.goalReceipts?[command.requestId], receipt.sessionId == sessionID,
+               receipt.action == action, receipt.ref.id == goal.id {
+                requestGoalState(for: sessionID)
+                return
+            }
+            if let message = state.protocolErrorsByRequestID[command.requestId] {
+                requestGoalState(for: sessionID)
+                throw DSHRemoteCommandError(message: message)
+            }
+            if let failure = remoteMutationTransactionsByMachine[machine]?[command.requestId]?.failure {
+                requestGoalState(for: sessionID)
+                throw DSHRemoteCommandError(message: failure)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        requestGoalState(for: sessionID)
+        throw DSHRemoteCommandError(message: "目标修改结果尚未确认，请检查最新状态后再重试。")
+    }
+
+    /// Keep the composer's draft until the correlated native result arrives.
+    /// The mutation journal retains the request identity after an uncertain
+    /// outcome, so a retry cannot silently execute the same command twice.
+    private func sendPreparedCommand(_ pending: DSHPendingSend, machineGeneration: Int, machineID: String) async throws {
+        let parts = pending.receipts.map { DSHJSONValue.object(["type": .string("file"), "receiptId": .string($0)]) }
+        try await executeComposerCommand(pending.text, for: pending.sessionID,
+                                         machineGeneration: machineGeneration, expectedMachineID: machineID,
+                                         attachments: parts, requestID: pending.id)
+    }
+
+    func executeComposerCommand(_ line: String, for sessionID: String,
+                                machineGeneration: Int, expectedMachineID: String,
+                                attachments: [DSHJSONValue] = [], requestID: String = UUID().uuidString) async throws {
+        guard machineStateGeneration == machineGeneration, machineID == expectedMachineID,
+              !removedMachineFenceUnavailable, !pendingTransactionPersistenceUnavailable,
+              !machineID.isEmpty, !removedMachineIDs.contains(machineID) else {
+            throw CancellationError()
+        }
+        guard line.count <= 20_000 else {
+            throw DSHRemoteCommandError(message: "命令过长，请缩短后重试。")
+        }
+        if let deadline = pendingSendsByRequestID[requestID]?.dedupeExpiresAt, Date() >= deadline {
+            throw DSHRemoteCommandError(message: "原命令已超过安全重试窗口，请先检查电脑上的结果。")
+        }
+        let proposed = DSHCommand.executeCommand(deviceId: deviceID, machineId: machineID,
+                                                  sessionId: sessionID, line: line, attachments: attachments, requestId: requestID)
+        guard let command = durableRemoteMutationCommand(proposed) else {
+            throw DSHRemoteCommandError(message: errorMessage ?? "无法发送命令。")
+        }
+        remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.failure = nil
+        state.protocolErrorsByRequestID.removeValue(forKey: command.requestId)
+        send(command)
+        for _ in 0..<3_000 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == machineGeneration, machineID == expectedMachineID else {
+                throw CancellationError()
+            }
+            if let message = state.protocolErrorsByRequestID[command.requestId] {
+                throw DSHRemoteCommandError(message: message)
+            }
+            if let result = state.commandResultsBySession[sessionID]?.first(where: { $0.requestId == command.requestId }) {
+                guard result.matched, result.kind != "error" else {
+                    throw DSHRemoteCommandError(message: result.text ?? "这台电脑没有接受该命令。")
+                }
+                return
+            }
+            if let failure = remoteMutationTransactionsByMachine[expectedMachineID]?[command.requestId]?.failure {
+                throw DSHRemoteCommandError(message: failure)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "命令结果尚未确认，请检查电脑上的状态后再重试。")
+    }
+
     func uploadAttachment(name: String, data: Data, for sessionID: String) {
         send(DSHCommand.uploadAttachment(deviceId: deviceID, machineId: machineID,
                                          sessionId: sessionID, name: name, data: data))
@@ -4067,20 +4683,97 @@ final class DSHAppModel: ObservableObject {
         send(DSHCommand.cancelTurn(deviceId: deviceID, machineId: machineID, sessionId: sessionID))
     }
 
-    func decide(_ approval: DSHApprovalRequest, allow: Bool) {
-        send(DSHCommand.decideApproval(deviceId: deviceID, machineId: machineID,
-                                       sessionId: approval.sessionId, approvalId: approval.id, allow: allow))
+    func decide(_ approval: DSHApprovalRequest, allow: Bool) async throws {
+        guard state.pendingApprovals.contains(where: { $0.id == approval.id }),
+              approval.expiresAt.map({ $0 > Int64(Date().timeIntervalSince1970 * 1_000) }) ?? true else {
+            throw DSHRemoteCommandError(message: "这条审批已结束或过期，请以电脑上的最新状态为准。")
+        }
+        UserDefaults.standard.set(allow, forKey: approvalDraftKey(approval.id))
+        try await submitRemoteDecision(DSHCommand.decideApproval(deviceId: deviceID, machineId: machineID,
+                                       sessionId: approval.sessionId, approvalId: approval.id, allow: allow),
+                                       questionID: nil, approvalID: approval.id)
     }
 
-    func answer(_ request: DSHQuestionRequest, answers: [DSHQuestionAnswer]) {
-        guard !answers.isEmpty else { return }
-        send(DSHCommand.answerQuestion(deviceId: deviceID, machineId: machineID,
+    func answer(_ request: DSHQuestionRequest, answers: [DSHQuestionAnswer]) async throws {
+        guard state.pendingQuestions.contains(where: { $0.id == request.id }),
+              request.expiresAt.map({ $0 > Int64(Date().timeIntervalSince1970 * 1_000) }) ?? true else {
+            throw DSHRemoteCommandError(message: "这个问题已结束或过期，请以电脑上的最新状态为准。")
+        }
+        guard answers.count == request.questions.count, Set(answers.map(\.id)) == Set(request.questions.map(\.id)) else {
+            throw DSHRemoteCommandError(message: "请完成所有问题后再提交。")
+        }
+        try await submitRemoteDecision(DSHCommand.answerQuestion(deviceId: deviceID, machineId: machineID,
                                        sessionId: request.sessionId, questionId: request.id,
-                                       answers: answers))
+                                       answers: answers), questionID: request.id, approvalID: nil)
+    }
+
+    private func submitRemoteDecision(_ command: DSHCommand, questionID: String?, approvalID: String?) async throws {
+        guard connectionState == .connected else { throw DSHRemoteCommandError(message: "连接已断开，内容已保留，请连接后重试。") }
+        let generation = machineStateGeneration
+        let machine = machineID
+        try await transport.send(command)
+        for _ in 0..<300 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if let questionID, !state.pendingQuestions.contains(where: { $0.id == questionID }) { return }
+            if let approvalID, !state.pendingApprovals.contains(where: { $0.id == approvalID }) { return }
+            if let message = state.protocolErrorsByRequestID[command.requestId] {
+                refreshPendingDecisions()
+                throw DSHRemoteCommandError(message: message)
+            }
+            guard connectionState == .connected else { throw DSHRemoteCommandError(message: "连接已断开，结果待确认；内容已保留，请重新连接后检查。") }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        refreshPendingDecisions()
+        throw DSHRemoteCommandError(message: "提交结果尚未确认，内容已保留。请检查电脑状态或重新连接后重试。")
+    }
+
+    private func refreshPendingDecisions() {
+        guard connectionState == .connected else { return }
+        send(DSHCommand(deviceId: deviceID, machineId: machineID, type: "decisions.list", payload: .object([:])))
+    }
+
+    private func questionDraftKey(_ id: String, machine: String? = nil) -> String {
+        "dsh.question.draft." + Data([machine ?? machineID, id].joined(separator: "\u{0}").utf8).base64EncodedString()
+    }
+    private func approvalDraftKey(_ id: String) -> String {
+        "dsh.approval.draft." + Data([machineID, id].joined(separator: "\u{0}").utf8).base64EncodedString()
+    }
+    func approvalDecisionDraft(for request: DSHApprovalRequest) -> Bool? {
+        UserDefaults.standard.object(forKey: approvalDraftKey(request.id)) as? Bool
+    }
+    func questionDraft(for request: DSHQuestionRequest) -> DSHQuestionDraft? {
+        guard let data = UserDefaults.standard.data(forKey: questionDraftKey(request.id)),
+              let draft = try? JSONDecoder().decode(DSHQuestionDraft.self, from: data),
+              draft.questions == request.questions else { return nil }
+        return draft
+    }
+    func saveQuestionDraft(_ draft: DSHQuestionDraft, for request: DSHQuestionRequest) {
+        guard state.pendingQuestions.contains(where: { $0.id == request.id }),
+              let data = try? JSONEncoder().encode(draft) else { return }
+        UserDefaults.standard.set(data, forKey: questionDraftKey(request.id))
+    }
+
+    func cancelQuestion(_ request: DSHQuestionRequest) async throws {
+        let generation = machineStateGeneration
+        let machine = machineID
+        let command = DSHCommand.cancelQuestion(deviceId: deviceID, machineId: machine,
+            sessionId: request.sessionId, questionId: request.id)
+        try await transport.send(command)
+        for _ in 0..<300 {
+            try Task.checkCancellation()
+            guard machineStateGeneration == generation, machineID == machine else { throw CancellationError() }
+            if !state.pendingQuestions.contains(where: { $0.id == request.id }) { return }
+            if let message = state.protocolErrorsByRequestID[command.requestId] { throw DSHRemoteCommandError(message: message) }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DSHRemoteCommandError(message: "取消结果尚未确认，请检查电脑上的状态。")
     }
 
     private func isDurableRemoteMutation(_ command: DSHCommand) -> Bool {
-        command.type == "command.execute" || command.type == "workspace.create"
+        command.type == "command.execute" || command.type == "workspace.create" || command.type == "session.fork" || command.type == "queue.update"
+            || command.type == "subagent.prompt" || command.type == "subagent.interrupt"
+            || command.type == "goal.update" || command.type == "feedback.update"
     }
 
     /// Returns an existing command when the same native mutation is retried.
@@ -4170,6 +4863,7 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func remoteMutationDefinitelyNotSent(_ error: Error) -> Bool {
+        if error is any DSHCommandNotSentError { return true }
         guard let websocketError = error as? DSHWebSocketError else { return false }
         switch websocketError {
         case .dedupeWindowExpired, .invalidMessage, .unsupportedProtocolVersion,
@@ -4223,9 +4917,7 @@ final class DSHAppModel: ObservableObject {
             return
         }
         let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
-        let promptDeadline = command.type == "prompt.send"
-            ? pendingSendsByRequestID[command.requestId]?.dedupeExpiresAt
-            : nil
+        let promptDeadline = pendingSendsByRequestID[command.requestId]?.dedupeExpiresAt
         let machineGeneration = self.machineStateGeneration
         let expectedMachineID = self.machineID
         let readOnlyReadinessAtAttempt = self.readOnlyRecoveryReadinessRevision
@@ -4384,6 +5076,7 @@ final class DSHAppModel: ObservableObject {
         }
         let mutationMachineID = targetMachineID ?? machineID
         if remoteMutationTransactionsByMachine[mutationMachineID]?[requestID] != nil {
+            if mutationMachineID == machineID { state.protocolErrorsByRequestID[requestID] = detail }
             markRemoteMutationFailed(requestID, detail: detail, error: error,
                                       hadPriorMayHaveBeenSent: hadPriorMayHaveBeenSent,
                                       machineID: mutationMachineID)
@@ -4402,6 +5095,59 @@ final class DSHAppModel: ObservableObject {
     /// Ignore an old or another device's reply before it reaches the reducer;
     /// otherwise a late response can visibly jump the folder browser back.
     private func shouldReduce(_ event: DSHEvent) -> Bool {
+        if case .configurationModels(let result) = event.kind {
+            guard let request = fileReadRequests[event.id], request.type == "configuration.discover", request.payload.executionObject["settingsNs"] == .string(result.settingsNs) else { return false }
+        }
+        if case .configurationResult(let result) = event.kind {
+            guard let request = fileReadRequests[event.id], request.type == "configuration.read", request.payload.executionObject["section"] == .string(result.section) else { return false }
+            if result.section == "credentials" {
+                let refs = request.payload.executionObject["refs"]?.executionArray.compactMap(\.executionString) ?? []
+                guard Set(result.value.executionObject.keys) == Set(refs) else { return false }
+            }
+        }
+        if case .configurationUpdated(let receipt) = event.kind {
+            guard let request = fileReadRequests[event.id], request.type == "configuration.update", request.requestId == receipt.requestId,
+                  request.payload.executionObject["kind"] == .string(receipt.kind) else { return false }
+            if receipt.kind == "settings", request.payload.executionObject["ns"] != receipt.namespace.map({ .string($0.ns) }) { return false }
+            if receipt.kind == "credential", request.payload.executionObject["ref"] != receipt.ref.map(DSHJSONValue.string) { return false }
+        }
+        if case .scheduleProjection(let snapshot) = event.kind, let request = fileReadRequests[event.envelope.messageId] {
+            guard request.type == "schedule.get", request.sessionId == snapshot.sessionId, event.envelope.sessionId == snapshot.sessionId else { return false }
+        }
+        if case .searchResults(let result) = event.kind {
+            guard let request = fileReadRequests[event.envelope.messageId], ["session.search", "conversation.search"].contains(request.type),
+                  request.sessionId == result.scopeSessionId, request.payload.executionObject["query"] == .string(result.query),
+                  event.envelope.sessionId == request.sessionId else { return false }
+        }
+        if case .historyPage(let page) = event.kind {
+            guard let request = fileReadRequests[event.envelope.messageId], request.type == "history.read", request.sessionId == page.sessionId,
+                  page.events(in: event.envelope) != nil else { return false }
+            let payload = request.payload.executionObject
+            if let atSeq = payload["atSeq"], page.focus.map({ DSHJSONValue.number(Double($0.nativeSequence)) }) != atSeq { return false }
+            if let throughSeq = payload["throughSeq"], throughSeq != .number(Double(page.throughSeq)) { return false }
+            if let beforeSeq = payload["beforeSeq"], beforeSeq != .number(Double(page.toSeq + 1)) { return false }
+        }
+        if case .referenceCandidates(let result) = event.kind {
+            guard let request = fileReadRequests[event.envelope.messageId], request.type == "reference.list", request.sessionId == result.sessionId,
+                  request.payload.executionObject["kind"] == .string(result.kind), request.payload.executionObject["query"] == .string(result.query) else { return false }
+        }
+        if case .feedbackState(let snapshot) = event.kind {
+            guard let request = fileReadRequests[event.envelope.messageId], request.type == "feedback.list", request.sessionId == snapshot.sessionId else { return false }
+        }
+        if case .feedbackUpdated(let receipt) = event.kind {
+            guard let request = remoteMutationTransactionsByMachine[event.envelope.machineId]?[receipt.requestId]?.command,
+                  request.type == "feedback.update", request.sessionId == receipt.sessionId,
+                  request.payload.executionObject["messageId"] == .string(receipt.messageId),
+                  event.envelope.messageId == receipt.requestId else { return false }
+        }
+        if case .executionPage(let page) = event.kind {
+            guard let request = fileReadRequests[event.envelope.messageId], request.type == "execution.list", request.sessionId == page.sessionId else { return false }
+        }
+        if case .goalState(let goal) = event.kind, goalStateRequestIDs[goal.sessionId] != event.envelope.messageId { return false }
+        if case .subagentCatalog(let catalog) = event.kind,
+           let latest = subagentCatalogRequestIDs[catalog.parentSessionId], latest != event.envelope.messageId { return false }
+        if case .commandCatalog(let catalog) = event.kind,
+           let latest = commandCatalogRequestIDs[catalog.sessionId], latest != event.envelope.messageId { return false }
         guard case .directoryListing = event.kind else { return true }
         return event.envelope.messageId == pendingDirectoryRequestID
     }
@@ -4428,10 +5174,33 @@ final class DSHAppModel: ObservableObject {
         var next = state
         for event in events where shouldReduce(event) {
             if reducer.reduce(event, into: &next) {
+                if case .commandCatalogInvalidated(let update) = event.kind {
+                    if let sessionID = update.sessionId { commandCatalogRequestIDs[sessionID] = UUID().uuidString }
+                    else { for sessionID in Array(commandCatalogRequestIDs.keys) { commandCatalogRequestIDs[sessionID] = UUID().uuidString } }
+                }
+                if case .subagentCatalogInvalidated(let update) = event.kind {
+                    subagentCatalogRequestIDs[update.parentSessionId] = UUID().uuidString
+                }
+                if case .goalChanged(let goal) = event.kind, event.envelope.historyBatchId == nil {
+                    goalStateRequestIDs[goal.sessionId] = UUID().uuidString
+                }
+                if case .goalActivation(let activation) = event.kind,
+                   next.goalBySession?[activation.sessionId]?.goal?.id == activation.id,
+                   next.goalBySession?[activation.sessionId]?.goal?.revision == activation.revision {
+                    goalStateRequestIDs[activation.sessionId] = UUID().uuidString
+                }
                 acceptedEvents.append(event)
             }
         }
         attachPendingMessageThumbnails(to: &next, events: acceptedEvents)
+        let remainingQuestions = Set(next.pendingQuestions.map(\.id))
+        for request in state.pendingQuestions where !remainingQuestions.contains(request.id) {
+            UserDefaults.standard.removeObject(forKey: questionDraftKey(request.id))
+        }
+        let remainingApprovals = Set(next.pendingApprovals.map(\.id))
+        for request in state.pendingApprovals where !remainingApprovals.contains(request.id) {
+            UserDefaults.standard.removeObject(forKey: approvalDraftKey(request.id))
+        }
         invalidateTranscriptCaches(for: transcriptSessionIDs(affectedBy: acceptedEvents))
         // Do not compare the entire transcript here: that equality check would
         // walk every message/tool on every frame and cost more than the
@@ -4450,9 +5219,11 @@ final class DSHAppModel: ObservableObject {
                 // Re-arm per-connection catalogs here so a resumed Connector
                 // cannot leave Home using only an old workspace/mode cache.
                 requestedCatalogsForConnection = false
+                requestedDecisionsForConnection = false
                 markPendingSessionCreationsUnknown(
                     detail: "连接已断开，创建结果待确认。")
             case .machinePresence(false):
+                requestedDecisionsForConnection = false
                 markPendingSessionCreationsUnknown(
                     detail: "Mac 已离线，创建结果待确认。")
             default:
@@ -4654,6 +5425,7 @@ final class DSHAppModel: ObservableObject {
     private func surfaceProtocolError(_ event: DSHEvent) {
         guard case .protocolError(let error) = event.kind else { return }
         guard !uploadWaitRequestIDs.contains(event.envelope.messageId) else { return }
+        guard fileReadRequests[event.envelope.messageId] == nil else { return }
         if isReplayResynchronizationNotice(error) {
             scheduleReplayResynchronization(for: event)
             return
@@ -4853,6 +5625,35 @@ final class DSHAppModel: ObservableObject {
     private func handleRemoteRequestCompletion(_ event: DSHEvent) {
         let requestID = event.envelope.messageId
         switch event.kind {
+        case .configurationInvalidated(let invalidation):
+            configurationInvalidation = invalidation
+            configurationChangeRevision += 1
+        case .configurationResult, .configurationUpdated, .configurationModels:
+            fileReadReplies[requestID] = event.kind
+        case .protocolError(let failure) where fileReadRequests[requestID] != nil:
+            fileReadFailures[requestID] = failure
+        case .referenceCandidates:
+            fileReadReplies[requestID] = event.kind
+        case .searchResults, .historyPage:
+            fileReadReplies[requestID] = event.kind
+        case .scheduleProjection(let snapshot):
+            if let request = fileReadRequests[requestID], request.type == "schedule.get", request.sessionId == snapshot.sessionId { fileReadReplies[requestID] = event.kind }
+        case .feedbackState(let snapshot):
+            if let request = fileReadRequests[requestID], request.type == "feedback.list", request.sessionId == snapshot.sessionId { fileReadReplies[requestID] = event.kind }
+        case .feedbackUpdated(let receipt):
+            completeRemoteMutation(receipt.requestId, for: event.envelope.machineId)
+        case .executionPage(let page):
+            if let request = fileReadRequests[requestID], request.type == "execution.list", request.sessionId == page.sessionId {
+                fileReadReplies[requestID] = event.kind
+            }
+        case .workspaceFiles(let listing):
+            if let request = fileReadRequests[requestID], request.type == "workspace.files", request.sessionId == listing.sessionId {
+                fileReadReplies[requestID] = event.kind
+            }
+        case .workspaceBytes(let bytes):
+            if let request = fileReadRequests[requestID], request.type == "workspace.bytes", request.sessionId == bytes.sessionId {
+                fileReadReplies[requestID] = event.kind
+            }
         case .workspaceCreated(let workspace):
             completeRemoteMutation(requestID, for: event.envelope.machineId)
             guard requestID == pendingWorkspaceCreationRequestID else { break }
@@ -4865,6 +5666,46 @@ final class DSHAppModel: ObservableObject {
             // instead of assuming every future Connector event keeps the
             // envelope message id equal to the original command id.
             completeRemoteMutation(result.requestId, for: event.envelope.machineId)
+            if result.matched, result.kind != "error",
+               pendingSendsByRequestID[result.requestId]?.mode == "command"
+                || failedSendsByRequestID[result.requestId]?.mode == "command" {
+                confirmPendingSend(text: "", sessionID: result.sessionId, requestID: result.requestId)
+            }
+        case .sessionForked(let fork):
+            completeRemoteMutation(fork.requestId, for: event.envelope.machineId)
+        case .queueUpdated(let receipt):
+            completeRemoteMutation(receipt.requestId, for: event.envelope.machineId)
+        case .goalUpdated(let receipt):
+            completeRemoteMutation(receipt.requestId, for: event.envelope.machineId)
+        case .subagentReceipt(let receipt):
+            completeRemoteMutation(receipt.requestId, for: event.envelope.machineId)
+        case .subagentCatalog(let catalog):
+            subagentCatalogReceivedIDs[catalog.parentSessionId] = event.envelope.messageId
+        case .questionResolved(let resolution):
+            UserDefaults.standard.removeObject(forKey: questionDraftKey(resolution.id, machine: event.envelope.machineId))
+        case .subagentCatalogInvalidated(let update):
+            refreshWatchedSubagents(for: update.parentSessionId)
+        case .turnStateChanged(let turn):
+            for parentID in subagentCatalogWatchers.keys {
+                if parentID == turn.sessionId || state.subagentCatalogs?[parentID]?.entries.contains(where: { $0.id == turn.sessionId }) == true {
+                    refreshWatchedSubagents(for: parentID)
+                }
+            }
+        case .connectionReady:
+            for parentID in subagentCatalogWatchers.keys { refreshWatchedSubagents(for: parentID) }
+        case .queueChanged(let queue):
+            guard queue.available else { break }
+            let admitted = Set(queue.items.compactMap(\.rpcId))
+            for requestID in admitted { confirmPendingSend(text: "", sessionID: queue.sessionId, requestID: requestID) }
+            if var local = queuedPromptsBySession[queue.sessionId] {
+                local.removeAll { $0.requestId.map(admitted.contains) ?? false }
+                queuedPromptsBySession[queue.sessionId] = local
+                persistQueuedPrompts()
+            }
+        case .commandCatalogInvalidated(let update):
+            if let visible = visibleConversationSessionID, update.sessionId == nil || update.sessionId == visible {
+                requestCommands(for: visible)
+            }
         case .directoryListing where requestID == pendingDirectoryRequestID:
             pendingDirectoryRequestID = nil
             isLoadingDirectory = false
@@ -5028,8 +5869,12 @@ final class DSHAppModel: ObservableObject {
     /// boundary as well, so empty projects do not depend on a SwiftUI timing
     /// race. The transport's schema gate keeps this harmless on older Relays.
     private func requestRemoteCatalogsWhenConnected() {
-        guard state.transportState == .connected, state.machineOnline,
-              !requestedCatalogsForConnection else { return }
+        guard state.transportState == .connected, state.machineOnline else { return }
+        if !requestedDecisionsForConnection {
+            requestedDecisionsForConnection = true
+            refreshPendingDecisions()
+        }
+        guard !requestedCatalogsForConnection else { return }
         requestedCatalogsForConnection = true
         requestWorkspaces()
         requestModes()

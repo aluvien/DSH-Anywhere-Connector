@@ -424,6 +424,24 @@ func dshCompleteSlashCommand(_ command: String, in text: String) -> String {
     return String(text[..<slashIndex]) + "/\(command) "
 }
 
+/// Only route commands whose semantics are known until a host command catalog
+/// is available. Ordinary messages and unknown slash text stay as prompts.
+func dshNativeComposerCommand(_ text: String, knownCommands: Set<String>? = nil) -> String? {
+    let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard line.first == "/" else { return nil }
+    let name = line.dropFirst().prefix { !$0.isWhitespace }
+    return (knownCommands ?? ["plan", "goal"]).contains(String(name)) ? line : nil
+}
+
+func dshComposerCommands(_ catalog: DSHCommandCatalog?) -> [(id: String, gloss: String, icon: String)] {
+    guard let catalog else { return DSHSlashCommands }
+    let hostNames = Set(catalog.commands.map(\.name))
+    return catalog.commands.map { (id: $0.name, gloss: $0.description, icon: "terminal") }
+        + (catalog.skills ?? []).filter { !hostNames.contains($0.name) }.map {
+            (id: $0.name, gloss: $0.description, icon: "sparkles")
+        }
+}
+
 /// A native anchored menu, deliberately not a sheet/card. These are the only
 /// three controls hidden by the compact-editor preference. The two command
 /// entries are real slash-command shortcuts; choosing one sends it through
@@ -433,6 +451,7 @@ struct DSHComposerQuickActionsMenu: View {
     let onPhoto: () -> Void
     let onFile: () -> Void
     var onCamera: (() -> Void)? = nil
+    var onReference: (() -> Void)? = nil
     @State private var isPresented = false
     @State private var pendingPicker: (() -> Void)?
 
@@ -462,6 +481,9 @@ struct DSHComposerQuickActionsMenu: View {
                 }
                 menuRow(title: "照片", subtitle: "从相簿选取",
                         icon: .photos, afterDismissal: true, action: onPhoto)
+                if let onReference {
+                    menuRow(title: "引用", subtitle: "电脑上的文件、目录或会话", icon: .file, afterDismissal: true, action: onReference)
+                }
             }
             .padding(.vertical, 8)
             .frame(width: 280)
@@ -635,6 +657,8 @@ final class DSHScrollCoordinator: NSObject {
         }
     }
 
+    func pauseFollowing() { setFollowing(false) }
+
     func resumeFollowing(animated: Bool = false) {
         setFollowing(true)
         guard animated, !UIAccessibility.isReduceMotionEnabled, let scrollView else {
@@ -686,6 +710,10 @@ private final class DSHScrollProbeView: UIView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         resolveScrollView()
+        // The same scroll view may have been found before it entered a
+        // window. attach() correctly coalesces that identity, so request the
+        // initial pin again at the mounted lifecycle boundary.
+        if window != nil { coordinator?.schedulePin() }
     }
 
     private func resolveScrollView() {
@@ -753,12 +781,14 @@ private struct ConversationModals: ViewModifier {
         content
             .sheet(isPresented: $showCommandMenu) {
                 CommandMenuSheet(
+                    commands: dshComposerCommands(model.commandCatalog(for: sessionID)),
                     onCommand: { command in
                         showCommandMenu = false
                         handleMenuCommand(command)
                     },
                     onDismiss: { showCommandMenu = false }
                 )
+                .onAppear { model.requestCommands(for: sessionID) }
                 .presentationDetents([.medium])
             }
             .sheet(isPresented: $showModelPicker) {
@@ -772,7 +802,7 @@ private struct ConversationModals: ViewModifier {
                     .presentationDetents([.medium])
             }
             .sheet(isPresented: $showFilesPanel) {
-                RemoteFilesPanel(sessionID: sessionID)
+                DSHRemoteFilesPanel(sessionID: sessionID)
                     .environmentObject(model)
                     .presentationDetents([.large])
                     .presentationDragIndicator(.hidden)
@@ -904,8 +934,18 @@ struct ConversationView: View {
     @EnvironmentObject private var model: DSHAppModel
     @Environment(\.dismiss) private var dismiss
     let sessionID: String
+    var initialLocation: DSHSearchHit? = nil
+    @State private var showHistorySearch = false
+    @State private var showSchedules = false
+    @State private var locationRequest: DSHSearchHit?
+    @State private var locationRevision = UUID()
+    @State private var historyLoading = false
+    @State private var historyError: String?
+    @State private var focusedHistory: DSHHistoryFocus?
+    @State private var highlightedSection: String?
 
     @State private var showFileImporter = false
+    @State private var showReferencePicker = false
     @State private var showPhotoPicker = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showCamera = false
@@ -919,6 +959,10 @@ struct ConversationView: View {
     @State private var showQueuedList = false
     @State private var showFilesPanel = false
     @State private var showUsagePanel = false
+    @State private var showJobsPanel = false
+    @State private var showSubagentsPanel = false
+    @State private var showWorkflowsPanel = false
+    @State private var showExecutionPanel = false
     @State private var showContextPopover = false
     @State private var showRenameSession = false
     @State private var renameSessionText = ""
@@ -933,6 +977,8 @@ struct ConversationView: View {
     /// whole prompt, so cancelling/removing a chip never leaves a remote file.
     @State private var draftAttachments: [DSHStagedAttachment] = []
     @State private var isSending = false
+    @State private var isForking = false
+    @State private var forkedSessionID: String?
     @State private var didRefresh = false
     /// Tracks the composer field so the keyboard can be dismissed explicitly.
     @FocusState private var isDraftFocused: Bool
@@ -1049,7 +1095,7 @@ struct ConversationView: View {
     /// switch type-checks in its own budget unit instead of inside the view
     /// body's single expression.
     @ViewBuilder
-    private func transcriptSectionView(_ section: DSHTranscriptSection) -> some View {
+    private func transcriptSectionView(_ section: DSHTranscriptSection, proxy: ScrollViewProxy) -> some View {
         switch section {
         case .turn(let block, _):
             if block.isUserTurn {
@@ -1061,10 +1107,21 @@ struct ConversationView: View {
                                   streamingMessage: activeStreamingMessage,
                                   streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
                                     ? streamingHeadroom.reservedReplyHeight : nil,
-                                  onBranch: createBranchSession).id(section.id)
+                                  onBranch: { createBranchSession(at: block.messages.last?.nativeSequence) }).id(section.id)
             }
         case .row(let entry):
             switch entry {
+            case .historyGap(let range):
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("此处还有未加载的历史记录").font(.caption).foregroundStyle(.secondary)
+                    Button("从此处继续加载") {
+                        let sections = visibleTranscriptSections
+                        let index = sections.firstIndex(where: { $0.id == section.id })
+                        let anchor = index.flatMap { $0 + 1 < sections.count ? sections[$0 + 1].id : nil }
+                        Task { await loadRemoteHistory(beforeSeq: range.upper + 1, proxy: proxy, anchorID: anchor) }
+                    }
+                        .disabled(historyLoading || model.connectionState != .connected)
+                }.frame(maxWidth: .infinity).padding(.vertical, 12).id(section.id)
             case .turn(let block):
                 if block.isUserTurn {
                     MessageBubble(sessionID: sessionID, message: block.messages[0]).id(section.id)
@@ -1075,16 +1132,20 @@ struct ConversationView: View {
                                       streamingMessage: activeStreamingMessage,
                                       streamingMinimumHeight: streamingHeadroom.streamID == activeStreamingMessage?.streamID
                                         ? streamingHeadroom.reservedReplyHeight : nil,
-                                      onBranch: createBranchSession).id(section.id)
+                                      onBranch: { createBranchSession(at: block.messages.last?.nativeSequence) }).id(section.id)
                 }
             case .tool(let tool):
                 // A tool with no preceding assistant turn
                 // (history edge): keep it visible standalone.
-                ToolActivityCard(tool: tool).id(section.id)
+                ToolActivityCard(tool: tool, sessionID: sessionID).id(section.id)
             case .command(let result):
                 CommandResultCard(result: result).id(section.id)
             case .modelChange(let notice):
                 ModelChangeCard(notice: notice).id(section.id)
+            case .workflow(let run):
+                DSHWorkflowRunCard(sessionID: sessionID, run: run).id(section.id)
+            case .execution(let notice):
+                DSHExecutionNoticeCard(sessionID: sessionID, notice: notice).id(section.id)
             }
         }
     }
@@ -1093,7 +1154,11 @@ struct ConversationView: View {
     /// pinned under the header so the viewport does not jump. Called by the
     /// tap button and by the top sentinel (scroll-to-top auto-loads).
     private func loadEarlierSections(proxy: ScrollViewProxy) {
-        guard hiddenSectionCount > 0 else { return }
+        guard hiddenSectionCount > 0 else {
+            guard !historyLoading else { return }
+            Task { await loadRemoteHistory(beforeSeq: model.historyCoverage(for: sessionID)?.nextBefore, proxy: proxy) }
+            return
+        }
         let anchorID = windowedTranscriptSections.first?.id
         visibleSectionLimit += Self.transcriptPageSize
         if let anchorID {
@@ -1108,12 +1173,12 @@ struct ConversationView: View {
     /// budget. Empty when everything is already shown.
     @ViewBuilder
     private func loadEarlierBanner(proxy: ScrollViewProxy) -> some View {
-        if hiddenSectionCount > 0 {
+        if hiddenSectionCount > 0 || model.historyCoverage(for: sessionID)?.nextBefore != nil || model.historyCoverage(for: sessionID) == nil {
             // Scrolling to the very top pages automatically; appearing
             // without a disappear cycle does not refire, so this cannot loop.
             Color.clear
                 .frame(height: 1)
-                .onAppear { loadEarlierSections(proxy: proxy) }
+                .onAppear { if hiddenSectionCount > 0 { loadEarlierSections(proxy: proxy) } }
             HStack {
                 Spacer(minLength: 0)
                 Button {
@@ -1122,16 +1187,56 @@ struct ConversationView: View {
                     loadEarlierLabel
                 }
                 .accessibilityLabel("加载更早的对话内容")
+                .disabled(historyLoading || (hiddenSectionCount == 0 && model.connectionState != .connected))
                 Spacer(minLength: 0)
             }
         }
+        if historyLoading { ProgressView("读取电脑历史…") }
+        if let historyError { Text(historyError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
     }
 
     private var loadEarlierLabel: some View {
-        Text("↑ 加载更早 \(hiddenSectionCount) 段")
+        Text(hiddenSectionCount > 0 ? "↑ 加载更早 \(hiddenSectionCount) 段" : model.historyCoverage(for: sessionID) == nil ? "读取电脑上的完整历史" : "↑ 从电脑加载更早记录")
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(Color.accentColor)
             .padding(.vertical, 8)
+    }
+
+    private func loadRemoteHistory(beforeSeq: Int64?, proxy: ScrollViewProxy?, anchorID: String? = nil) async {
+        guard !historyLoading else { return }
+        historyLoading = true; historyError = nil
+        scrollCoordinator.pauseFollowing(); isFollowingLatest = false
+        let anchor = anchorID ?? windowedTranscriptSections.first?.id
+        let oldCount = visibleTranscriptSections.count
+        defer { historyLoading = false }
+        do {
+            _ = try await model.historyPage(sessionID: sessionID, beforeSeq: beforeSeq)
+            try Task.checkCancellation()
+            visibleSectionLimit += max(Self.transcriptPageSize, visibleTranscriptSections.count - oldCount)
+            if let anchor, let proxy { DispatchQueue.main.async { proxy.scrollTo(anchor, anchor: .top) } }
+        } catch is CancellationError { }
+        catch { historyError = error.localizedDescription }
+    }
+
+    private func locateHistory(_ hit: DSHSearchHit, proxy: ScrollViewProxy) async {
+        guard let seq = hit.nativeSequence else { return }
+        historyError = nil; historyLoading = true
+        scrollCoordinator.pauseFollowing(); isFollowingLatest = false
+        defer { historyLoading = false }
+        do {
+            let page = try await model.historyPage(sessionID: sessionID, atSeq: seq)
+            try Task.checkCancellation()
+            if let index = visibleTranscriptSections.firstIndex(where: { $0.contains(nativeSequence: seq) }) {
+                let id = visibleTranscriptSections[index].id
+                visibleSectionLimit = max(visibleSectionLimit, visibleTranscriptSections.count - index + 2)
+                highlightedSection = id
+                DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) }
+                // Tools and non-message hits can live inside a collapsed
+                // chain. The explicit search selection opens their exact data.
+                if hit.type != "user/message" && hit.type != "assistant/message" { focusedHistory = page.focus }
+            } else { focusedHistory = page.focus }
+        } catch is CancellationError { }
+        catch { historyError = error.localizedDescription }
     }
 
     /// Pending approval/question cards inline in the transcript. Extracted
@@ -1139,13 +1244,17 @@ struct ConversationView: View {
     @ViewBuilder
     private func inlineDecisionCards() -> some View {
         ForEach(model.pendingApprovals.filter { $0.sessionId == sessionID }) { approval in
-            ApprovalCard(approval: approval) { allow in
-                model.decide(approval, allow: allow)
+            ApprovalCard(approval: approval, savedDecision: model.approvalDecisionDraft(for: approval)) { allow in
+                try await model.decide(approval, allow: allow)
             }
         }
         ForEach(model.pendingQuestions.filter { $0.sessionId == sessionID }) { question in
-            QuestionCard(request: question) { answers in
-                model.answer(question, answers: answers)
+            QuestionCard(request: question, savedDraft: model.questionDraft(for: question),
+                         onDraftChange: { model.saveQuestionDraft($0, for: question) }, onCancel: {
+                try await model.cancelQuestion(question)
+                isDraftFocused = true
+            }) { answers in
+                try await model.answer(question, answers: answers)
             }
         }
     }
@@ -1167,7 +1276,8 @@ struct ConversationView: View {
                 // trip); thinking still expands in place on tap.
                 loadEarlierBanner(proxy: proxy)
                 ForEach(windowedTranscriptSections) { section in
-                    transcriptSectionView(section)
+                    transcriptSectionView(section, proxy: proxy)
+                        .overlay { if highlightedSection == section.id { RoundedRectangle(cornerRadius: 12).stroke(Color.accentColor.opacity(0.6), lineWidth: 1).allowsHitTesting(false) } }
                 }
                 inlineDecisionCards()
                 if !hasRenderedContent {
@@ -1227,7 +1337,8 @@ struct ConversationView: View {
                 scrollCoordinator.followingChanged = { following in
                     withAnimation(.easeInOut(duration: 0.25)) { isFollowingLatest = following }
                 }
-                scrollCoordinator.schedulePin()
+                if initialLocation == nil { scrollCoordinator.schedulePin() }
+                else { scrollCoordinator.pauseFollowing(); isFollowingLatest = false; locationRequest = initialLocation; locationRevision = UUID() }
             }
             .onDisappear {
                 model.setConversationVisible(sessionID, visible: false)
@@ -1243,8 +1354,14 @@ struct ConversationView: View {
                 model.sendModelCatalog()
                 model.openSession(sessionID)
             }
+            .task(id: locationRevision) {
+                if let hit = locationRequest { await locateHistory(hit, proxy: proxy) }
+            }
             // Auto-follow only while the reader is already at the newest output.
             // Scrolling back disarms it, so incoming work never yanks the view.
+            .navigationDestination(isPresented: Binding(get: { forkedSessionID != nil }, set: { if !$0 { forkedSessionID = nil } })) {
+                if let id = forkedSessionID { ConversationView(sessionID: id) }
+            }
             .modifier(ConversationObservers(messageCount: model.messages(for: sessionID).count,
                                             sessionUpdatedAt: session?.updatedAt,
                                             entriesCount: transcriptEntries.count,
@@ -1282,6 +1399,20 @@ struct ConversationView: View {
             .fileImporter(isPresented: $showFileImporter,
                           allowedContentTypes: [.data], allowsMultipleSelection: true,
                           onCompletion: handleFileImporterResult)
+            .sheet(isPresented: $showJobsPanel) {
+                DSHJobsPanel(sessionID: sessionID).environmentObject(model)
+            }
+            .sheet(isPresented: $showReferencePicker) {
+                DSHReferencePicker(sessionID: sessionID) { model.draft = dshAppendReference($0, to: model.draft) }
+            }
+            .sheet(isPresented: $showSubagentsPanel) {
+                DSHSubagentsPanel(parentID: sessionID).environmentObject(model)
+            }
+            .sheet(isPresented: $showWorkflowsPanel) { DSHWorkflowsPanel(sessionID: sessionID).environmentObject(model) }
+            .sheet(isPresented: $showExecutionPanel) { DSHExecutionPanel(sessionID: sessionID).environmentObject(model) }
+            .sheet(isPresented: $showHistorySearch) { DSHHistorySearchPanel(sessionID: sessionID) { locationRequest = $0; locationRevision = UUID() }.environmentObject(model) }
+            .sheet(isPresented: $showSchedules) { DSHSchedulePanel(sessionID: sessionID).environmentObject(model) }
+            .sheet(item: $focusedHistory) { DSHHistoryFocusView(sessionID: sessionID, focus: $0).environmentObject(model) }
             .alert("重命名会话", isPresented: $showRenameSession) {
                 TextField("会话名称", text: $renameSessionText)
                 Button("取消", role: .cancel) { }
@@ -1349,8 +1480,22 @@ struct ConversationView: View {
                     Button { beginRenameSession() } label: {
                         Label("重命名", systemImage: "pencil")
                     }
+                    Button { showExecutionPanel = true } label: { Label("执行轨迹", systemImage: "list.bullet.rectangle") }
+                    Button { showHistorySearch = true } label: { Label("搜索对话", systemImage: "magnifyingglass") }
+                    Button { showSchedules = true } label: { Label("定时提醒", systemImage: "clock.badge") }
                     Button { showFilesPanel = true } label: {
                         Label("文件", systemImage: "folder")
+                    }
+                    Button { showSubagentsPanel = true } label: {
+                        Label("子任务", systemImage: "person.2")
+                    }
+                    if !model.workflows(for: sessionID).isEmpty {
+                        Button { showWorkflowsPanel = true } label: { Label("工作流记录", systemImage: "point.3.connected.trianglepath.dotted") }
+                    }
+                    if let jobs = model.jobsState(for: sessionID), !jobs.jobs.isEmpty {
+                        Button { showJobsPanel = true } label: {
+                            Label("后台任务 · \(jobs.jobs.filter { $0.status == "running" || $0.status == "stopping" }.count) 运行中", systemImage: "gearshape.2")
+                        }
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -1471,6 +1616,54 @@ struct ConversationView: View {
                 draftAttachmentStrip
             }
 
+            if let plan = model.planState(for: sessionID), plan.active || plan.pending == true {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(plan.active ? "计划模式" : "正在切换计划模式", systemImage: "list.clipboard")
+                        if plan.available == false { Text("状态待同步").font(.caption).foregroundStyle(.secondary) }
+                        else if plan.pending == true {
+                            Text(plan.active ? "等待下一步退出计划模式" : "等待下一步进入计划模式")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("退出") { model.executeCommand("/plan off", for: sessionID) }
+                        .frame(minWidth: 44, minHeight: 44)
+                        .disabled(model.connectionState != .connected || plan.available == false)
+                }
+                .font(.subheadline)
+                .padding(10)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            }
+            if let todo = model.todoState(for: sessionID), !todo.todos.isEmpty {
+                DisclosureGroup {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(todo.todos, id: \.content) { item in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: item.status == "completed" ? "checkmark.circle.fill" : item.status == "in_progress" ? "circle.dotted" : "circle")
+                                        .foregroundStyle(item.status == "completed" ? Color.green : Color.accentColor)
+                                    Text(item.content)
+                                        .foregroundStyle(item.status == "completed" ? .secondary : .primary)
+                                        .textSelection(.enabled)
+                                }
+                                .font(.subheadline)
+                                .accessibilityLabel("\(item.content)，\(item.status == "completed" ? "已完成" : item.status == "in_progress" ? "进行中" : "待处理")")
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 8)
+                    }
+                    .frame(maxHeight: 220)
+                } label: {
+                    Text("待办 · \(todo.todos.filter { $0.status == "completed" }.count)/\(todo.todos.count) 已完成")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .padding(10)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            }
+            if model.goalState(for: sessionID)?.goal != nil { DSHGoalCard(sessionID: sessionID) }
+
             // Live turn status rides above the input card while work happens,
             // so a reader who scrolled away still sees that work is happening
             // (and what it is doing) instead of a frozen screen. Gated on
@@ -1484,7 +1677,7 @@ struct ConversationView: View {
             // Queued prompts bubble: prompts this device queued behind the
             // run, newest last. One shows its text, several show the count;
             // tapping opens the detail list. Entries retire when accepted.
-            if !model.queuedPrompts(for: sessionID).isEmpty {
+            if !model.queuedPrompts(for: sessionID).isEmpty || model.serverQueue(for: sessionID)?.items.isEmpty == false {
                 queuedPromptBubble
             }
 
@@ -1689,19 +1882,19 @@ struct ConversationView: View {
                           autofocus: previewComposerFocused,
                           showsMicrophone: false,
                           onSubmit: { send() },
-                          slashCommands: DSHSlashCommands,
+                          slashCommands: dshComposerCommands(model.commandCatalog(for: sessionID)),
                           onSlashCommand: { command in
                               model.draft = dshCompleteSlashCommand(command, in: model.draft)
                           }) {
             if model.collapseComposerControls {
                 DSHComposerQuickActionsMenu(
                 onCommand: { command in
-                    if Self.commandNeedsArguments(command) { insertCommandAtHead(command) }
+                    if commandNeedsInput(command) { insertCommandAtHead(command) }
                     else { model.executeCommand("/\(command)", for: sessionID) }
                 },
                 onPhoto: { showPhotoPicker = true },
                 onFile: { showFileImporter = true },
-                    onCamera: { showCamera = true }
+                    onCamera: { showCamera = true }, onReference: { showReferencePicker = true }
                 )
             } else {
                 HStack(spacing: 0) {
@@ -1713,10 +1906,13 @@ struct ConversationView: View {
                         Image(systemName: "photo").frame(width: 34, height: 34)
                     }
                     .accessibilityLabel("Attach photos")
-                    Button { showFileImporter = true } label: {
+                    Menu {
+                        Button("从手机添加文件") { showFileImporter = true }
+                        Button("引用电脑文件或会话") { showReferencePicker = true }
+                    } label: {
                         Image(systemName: "paperclip").frame(width: 34, height: 34)
                     }
-                    .accessibilityLabel("Attach file")
+                    .accessibilityLabel("文件与引用")
                 }
                 .font(.system(size: DSHComposerGlyphHeight))
                 .buttonStyle(.plain)
@@ -1746,10 +1942,8 @@ struct ConversationView: View {
         return "在 \(name) 上工作"
     }
 
-    /// Commands that are meaningless bare: sending "/plan" or "/goal" with no
-    /// task text fires an empty command. They insert at the draft head for
-    /// the user to complete instead. compact/export/feedback are valid bare
-    /// and keep executing immediately; permission/model open their pickers.
+    /// These shortcuts prepare a draft so the user can add a task or choose
+    /// a subcommand. Bare /plan and /goal remain valid when submitted.
     private static func commandNeedsArguments(_ command: String) -> Bool {
         command == "plan" || command == "goal"
     }
@@ -1837,20 +2031,22 @@ struct ConversationView: View {
     @ViewBuilder
     private var queuedPromptBubble: some View {
         let queued = model.queuedPrompts(for: sessionID)
-        if !queued.isEmpty {
+        let serverItems = model.serverQueue(for: sessionID)?.items ?? []
+        let count = queued.count + serverItems.count
+        if count > 0 {
             HStack {
                 Spacer(minLength: 0)
                 Button { showQueuedList = true } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "hourglass")
                             .font(.system(size: 12, weight: .medium))
-                        if queued.count == 1, let first = queued.first {
-                            Text(first.text)
+                        if count == 1 {
+                            Text(queued.first?.text ?? serverItems.first?.text ?? "排队消息")
                                 .font(.system(size: 13))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         } else {
-                            Text("\(queued.count)条排队")
+                            Text("\(count)条排队")
                                 .font(.system(size: 13, weight: .medium))
                         }
                     }
@@ -1861,7 +2057,7 @@ struct ConversationView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(
-                    queued.count == 1 ? "排队中的消息" : "\(queued.count)条排队消息，查看详情")
+                    count == 1 ? "排队中的消息" : "\(count)条排队消息，查看详情")
             }
         }
     }
@@ -2054,6 +2250,44 @@ struct ConversationView: View {
             model.errorMessage = "附件必须不超过 10 MiB，请移除过大的文件后重试。"
             return
         }
+        if let line = dshNativeComposerCommand(text, knownCommands: model.commandCatalog(for: sessionID).map { Set($0.commands.map(\.name)) }) {
+            let commandName = String(line.dropFirst().prefix { !$0.isWhitespace })
+            guard staged.isEmpty || model.commandCatalog(for: sessionID)?.commands.first(where: { $0.name == commandName })?.input?.attachments == true else {
+                model.errorMessage = "这条命令未声明支持附件，请移除附件后重试。"
+                return
+            }
+            isSending = true
+            let generation = model.currentMachineGeneration
+            let expectedMachineID = model.machineID
+            Task { @MainActor in
+                defer { isSending = false }
+                do {
+                    if staged.isEmpty {
+                        try await model.executeComposerCommand(line, for: sessionID,
+                                                           machineGeneration: generation,
+                                                           expectedMachineID: expectedMachineID)
+                    } else {
+                        guard await model.preparePromptPersistence(expectedMachineGeneration: generation,
+                                                                    expectedMachineID: expectedMachineID) else { return }
+                        let requestID = model.stagedPromptRequestID(text: line, attachments: staged, sessionID: sessionID)
+                            ?? UUID().uuidString
+                        guard try await model.sendStagedPromptPersisted(line, attachments: staged, to: sessionID,
+                            mode: "command", requestId: requestID, expectedMachineGeneration: generation,
+                            expectedMachineID: expectedMachineID) else { return }
+                    }
+                    if model.currentMachineGeneration == generation,
+                       model.machineID == expectedMachineID, model.draft == text, draftAttachments == staged {
+                        model.draft = ""
+                        draftAttachments = []
+                    }
+                } catch {
+                    if model.currentMachineGeneration == generation, model.machineID == expectedMachineID {
+                        model.errorMessage = error.localizedDescription
+                    }
+                }
+            }
+            return
+        }
         let wasRunning = isRunning
         // Text-only queue while busy stays on the device (editable,
         // cancellable, auto-fired when the turn settles). Anything with
@@ -2194,8 +2428,16 @@ struct ConversationView: View {
     private func handleMenuCommand(_ command: String) {
         if command == "permission" { showPermissionPicker = true }
         else if command == "model" { showModelPicker = true }
-        else if Self.commandNeedsArguments(command) { insertCommandAtHead(command) }
+        else if commandNeedsInput(command) { insertCommandAtHead(command) }
         else { model.executeCommand("/\(command)", for: sessionID) }
+    }
+
+    private func commandNeedsInput(_ command: String) -> Bool {
+        if let entry = model.commandCatalog(for: sessionID)?.commands.first(where: { $0.name == command }) {
+            return entry.input != nil
+        }
+        if model.commandCatalog(for: sessionID)?.skills?.contains(where: { $0.name == command }) == true { return true }
+        return Self.commandNeedsArguments(command)
     }
 
     /// Stages picked photos without uploading. Extracted from `body` so the
@@ -2238,38 +2480,24 @@ struct ConversationView: View {
         }
     }
 
-    /// Starts a sibling task with the same machine/workspace/branch/model
-    /// context. The Harness exposes no fork API, so the prior dialogue
-    /// travels as the new session's first prompt (best effort, text only);
-    /// the parent transcript remains untouched.
-    private func createBranchSession() {
-        guard let session else { return }
-        let workspace: DSHWorkspaceOption?
-        if let workspaceID = session.workspaceId {
-            workspace = DSHWorkspaceOption(
-                id: workspaceID,
-                name: model.workspaceDisplayName(for: workspaceID,
-                                                  fallback: session.workspaceName ?? ""))
-        } else {
-            workspace = nil
+    /// The Host selects a completed-turn boundary and inherits its log.
+    private func createBranchSession(at nativeSequence: Int64?) {
+        guard !isForking else { return }
+        guard let nativeSequence else {
+            model.errorMessage = "这条回答缺少原始历史位置，请刷新会话后再创建分支。"
+            return
         }
-        let selectedModel: DSHModelSelection?
-        if let modelID = session.model, !modelID.isEmpty {
-            selectedModel = DSHModelSelection(provider: session.provider ?? "deepseek",
-                                               model: modelID,
-                                               reasoningEffort: session.reasoningEffort)
-        } else {
-            selectedModel = nil
+        isForking = true
+        let generation = model.currentMachineGeneration
+        Task { @MainActor in
+            defer { isForking = false }
+            do {
+                let id = try await model.forkSession(sessionID, atSeq: nativeSequence)
+                if model.currentMachineGeneration == generation { forkedSessionID = id }
+            } catch {
+                if model.currentMachineGeneration == generation { model.errorMessage = error.localizedDescription }
+            }
         }
-        let parentTitle = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        model.createSession(in: workspace,
-                            title: parentTitle.isEmpty ? "新会话" : "\(parentTitle) 分支",
-                            workingDirectory: session.cwd,
-                            branch: session.branch,
-                            mode: session.mode ?? session.agentPreset ?? "standard",
-                            model: selectedModel,
-                            permissionMode: session.permissionMode ?? "workspace-write",
-                            initialPrompt: branchTranscriptText())
     }
 
     private func archiveSession() {
@@ -2288,26 +2516,6 @@ struct ConversationView: View {
         model.renameSession(session, to: title)
     }
 
-    /// Prior dialogue carried into a branch as plain text (newest 40
-    /// messages, hard-capped). Reasoning and tool detail stay behind;
-    /// the new session continues from the readable Q&A.
-    private func branchTranscriptText() -> String? {
-        let messages = transcriptEntries.flatMap { entry -> [DSHChatMessage] in
-            guard case .turn(let block) = entry else { return [] }
-            return block.messages
-        }
-        .filter { !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        .suffix(40)
-        guard !messages.isEmpty else { return nil }
-        var text = "以下是之前会话中的对话记录，请基于这些上下文继续协助我：\n\n" + messages.map { message in
-            let body = message.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-            return message.role == .user ? "用户：\(body)" : "助手：\(body)"
-        }.joined(separator: "\n\n")
-        if text.count > 12_000 {
-            text = "…（更早记录已省略）\n\n" + String(text.suffix(12_000))
-        }
-        return text
-    }
 }
 
 /// Restores the native UINavigationController interactive-pop gesture after a
@@ -2603,86 +2811,6 @@ private struct UsageFooter: View {
     }
 }
 
-private struct RemoteFilesPanel: View {
-    @EnvironmentObject private var model: DSHAppModel
-    @Environment(\.dismiss) private var dismiss
-    let sessionID: String
-
-    private var attachments: [DSHUploadedAttachment] {
-        model.attachments(for: sessionID)
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("会话文件")
-                        .font(.system(size: 17, weight: .semibold))
-                    Text(attachments.isEmpty ? "还没有上传文件" : "共 \(attachments.count) 个")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 18, weight: .medium))
-                        .frame(width: 44, height: 44)
-                        .background(.thinMaterial, in: Circle())
-                        .overlay { Circle().stroke(Color.primary.opacity(0.10), lineWidth: 0.75) }
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭")
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-
-            Divider()
-
-            ScrollView {
-                if attachments.isEmpty {
-                    ContentUnavailableView("暂无文件", systemImage: "doc.on.doc",
-                                           description: Text("用输入框的加号上传文件后，会显示在这里。"))
-                        .padding(.top, 80)
-                } else {
-                    LazyVStack(spacing: 10) {
-                        ForEach(attachments) { file in
-                            HStack(spacing: 12) {
-                                Image(systemName: file.mediaType?.hasPrefix("image/") == true ? "photo" : "doc")
-                                    .font(.system(size: 18, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 36, height: 36)
-                                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(file.name)
-                                        .font(.system(size: 15, weight: .medium))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Text(fileSubtitle(file))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer(minLength: 8)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                    .padding(16)
-                }
-            }
-        }
-        .background(Color(.systemBackground))
-    }
-
-    private func fileSubtitle(_ file: DSHUploadedAttachment) -> String {
-        var parts: [String] = []
-        if let mediaType = file.mediaType, !mediaType.isEmpty { parts.append(mediaType) }
-        if let size = file.size, size > 0 { parts.append(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) }
-        return parts.isEmpty ? "已上传" : parts.joined(separator: " · ")
-    }
-}
-
 /// Full session usage is kept behind the compact footer so the composer never
 /// loses width. Tapping the footer opens the same native sheet treatment as
 /// the Files pill and makes it clear these numbers cover the whole
@@ -2757,6 +2885,7 @@ let DSHSlashCommands: [(id: String, gloss: String, icon: String)] = [
 ]
 
 struct CommandMenuSheet: View {
+    var commands: [(id: String, gloss: String, icon: String)] = DSHSlashCommands
     let onCommand: (String) -> Void
     let onDismiss: () -> Void
 
@@ -2764,7 +2893,7 @@ struct CommandMenuSheet: View {
         NavigationStack {
             List {
                 Section("Commands") {
-                    ForEach(DSHSlashCommands, id: \.id) { item in
+                    ForEach(commands, id: \.id) { item in
                         Button { onCommand(item.id) } label: {
                             Label {
                                 // Show the literal command the row runs, so the sheet
@@ -2863,20 +2992,532 @@ private struct ModelPickerSheet: View {
     }
 }
 
-private struct QueuedPromptsSheet: View {
+private struct DSHGoalCard: View {
+    let sessionID: String
+    @EnvironmentObject private var model: DSHAppModel
+    @State private var editingGoal: DSHGoalState.Goal?
+    @State private var busy = false
+    @State private var operationError: String?
+    @State private var showObjective = false
+
+    var body: some View {
+        if let state = model.goalState(for: sessionID), let goal = state.goal {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("目标 · \(phaseLabel(goal.phase))", systemImage: "target")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if busy { ProgressView() }
+                    Menu {
+                        if goal.phase != "complete" {
+                            Button("编辑目标与轮次") { editingGoal = goal }
+                            if goal.phase == "active" { Button("暂停") { mutate(goal, action: "pause") } }
+                            if goal.phase != "active" || state.activation == "disarmed" {
+                                Button("恢复") { mutate(goal, action: "resume") }
+                            }
+                            Button("标记完成") { mutate(goal, action: "complete") }
+                        }
+                        Button("清除目标", role: .destructive) { mutate(goal, action: "clear") }
+                        Button("刷新目标状态") { model.requestGoalState(for: sessionID) }
+                    } label: { Image(systemName: "ellipsis.circle").frame(width: 44, height: 44) }
+                        .disabled(busy || model.connectionState != .connected)
+                }
+                Button { showObjective = true } label: {
+                    Text(goal.objective).font(.subheadline).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("查看完整目标")
+                Text("轮次 \(state.roundsStarted)/\(goal.maxGoalRounds) · \(activationLabel(state.activation))")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let reason = goal.blockedReason { Text(reason.message).font(.caption).foregroundStyle(.secondary) }
+                if let operationError { Text(operationError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+            }
+            .padding(10)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .task(id: goal.id) { model.requestGoalState(for: sessionID) }
+            .sheet(item: $editingGoal) { snapshot in DSHGoalEditor(sessionID: sessionID, goal: snapshot).environmentObject(model) }
+            .sheet(isPresented: $showObjective) {
+                NavigationStack {
+                    ScrollView { MarkdownBlockText(text: goal.objective).textSelection(.enabled).padding().frame(maxWidth: .infinity, alignment: .leading) }
+                        .navigationTitle("完整目标").navigationBarTitleDisplayMode(.inline)
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showObjective = false } } }
+                }
+            }
+        }
+    }
+    private func phaseLabel(_ phase: String) -> String {
+        switch phase { case "active": "已启用"; case "paused": "已暂停"; case "blocked": "受阻"; case "complete": "已完成"; default: phase }
+    }
+    private func activationLabel(_ activation: String?) -> String {
+        switch activation { case "armed": "自动推进已启用"; case "disarmed": "自动推进未启用"; default: "自动推进状态待同步" }
+    }
+    private func mutate(_ goal: DSHGoalState.Goal, action: String) {
+        guard !busy else { return }
+        busy = true
+        operationError = nil
+        Task { @MainActor in
+            defer { busy = false }
+            do { try await model.updateGoal(goal, in: sessionID, action: action) }
+            catch { operationError = error.localizedDescription }
+        }
+    }
+}
+
+struct DSHGoalEditor: View {
+    let sessionID: String
+    @State private var base: DSHGoalState.Goal
+    @State private var objective: String
+    @State private var rounds: String
+    @State private var busy = false
+    @State private var operationError: String?
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+
+    init(sessionID: String, goal: DSHGoalState.Goal) {
+        self.sessionID = sessionID
+        _base = State(initialValue: goal)
+        _objective = State(initialValue: goal.objective)
+        _rounds = State(initialValue: String(goal.maxGoalRounds))
+    }
+    private var latest: DSHGoalState.Goal? { model.goalState(for: sessionID)?.goal }
+    private var conflicted: Bool { latest?.id != base.id || latest?.revision != base.revision }
+    private var valid: Bool {
+        !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && objective.utf16.count <= 100_000
+            && Int(rounds).map { $0 > 0 && $0 <= 9_007_199_254_740_991 } == true
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("目标") { TextEditor(text: $objective).frame(minHeight: 150).disabled(busy) }
+                Section("自动推进的总轮次上限") {
+                    TextField("轮次", text: $rounds).keyboardType(.numberPad).disabled(busy)
+                    Text("已经开始的轮次也计入总上限。修改目标不会重置轮次。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if conflicted {
+                    Section("目标已在其他端更新") {
+                        if let latest {
+                            Text(latest.objective).textSelection(.enabled)
+                            Text("版本 \(latest.revision) · 上限 \(latest.maxGoalRounds) 轮").font(.caption).foregroundStyle(.secondary)
+                            if latest.id == base.id, latest.phase != "complete" {
+                                Button("保留我的编辑，使用最新版本") { base = latest; operationError = nil }
+                                    .disabled(busy)
+                            } else { Text("原目标已结束或被替换，请关闭此编辑器查看最新目标。") }
+                        } else { Text("原目标已清除，请关闭此编辑器查看最新状态。") }
+                    }
+                }
+                if let operationError { Text(operationError).foregroundStyle(.red).textSelection(.enabled) }
+                if busy { ProgressView("正在保存目标") }
+            }
+            .navigationTitle("编辑目标")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(busy) }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { save() }.disabled(!valid || conflicted || busy || model.connectionState != .connected)
+                }
+            }
+        }
+        .interactiveDismissDisabled(busy)
+    }
+    private func save() {
+        guard valid, !busy, !conflicted, let cap = Int(rounds) else { return }
+        busy = true
+        operationError = nil
+        Task { @MainActor in
+            defer { busy = false }
+            do { try await model.updateGoal(base, in: sessionID, action: "edit", objective: objective, maxGoalRounds: cap); dismiss() }
+            catch { operationError = error.localizedDescription }
+        }
+    }
+}
+
+private struct DSHSubagentsPanel: View {
+    let parentID: String
+    @EnvironmentObject private var model: DSHAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var watcherToken = UUID()
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let catalog = model.subagentCatalog(for: parentID) {
+                    if catalog.supported == false {
+                        Text("这台电脑暂不支持子任务目录。")
+                    } else if catalog.entries.isEmpty {
+                        Text("暂无子任务").foregroundStyle(.secondary)
+                    }
+                    if !catalog.parentAvailable, !catalog.entries.isEmpty {
+                        Text("父会话当前不在线，仍可查看保存的执行记录。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(catalog.entries) { child in
+                        if child.kind == "child" {
+                            NavigationLink {
+                                DSHSubagentRecord(parentID: parentID, child: child)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(child.label ?? child.id).font(.headline)
+                                    Text("\(child.mode == "continuable" ? "可继续会话" : "单次任务") · \(child.activity == "running" ? "运行中" : "未运行")")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        } else {
+                            VStack(alignment: .leading) {
+                                Text(child.id).font(.caption.monospaced())
+                                Text("执行记录暂不可用 · \(child.reason ?? "unknown")")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } else if let error = model.subagentCatalogError(for: parentID) {
+                    Text(error).foregroundStyle(.secondary)
+                    Button("重试") { model.requestSubagents(for: parentID) }
+                } else if model.connectionState != .connected {
+                    Text("连接恢复后可读取子任务目录。").foregroundStyle(.secondary)
+                } else { ProgressView("正在读取子任务") }
+            }
+            .navigationTitle("子任务")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task { model.watchSubagents(for: parentID, token: watcherToken) }
+            .onDisappear { model.unwatchSubagents(for: parentID, token: watcherToken) }
+            .refreshable { model.requestSubagents(for: parentID) }
+        }
+    }
+}
+
+struct DSHSubagentRecord: View {
+    let parentID: String
+    let child: DSHSubagentCatalog.Entry
+    @EnvironmentObject private var model: DSHAppModel
+    @State private var showChildren = false
+    @State private var showWorkflows = false
+    @State private var showExecution = false
+    @State private var showReferences = false
+    @State private var showHistorySearch = false
+    @State private var showSchedules = false
+    @State private var focusedHistory: DSHHistoryFocus?
+    @State private var historyLoading = false
+    @State private var watcherToken = UUID()
+    @ObservedObject private var composerDrafts: DSHSubagentComposerDrafts
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var stagingTask: Task<Void, Never>?
+    @State private var stagingID = UUID()
+    @State private var isStaging = false
+    @State private var busy = false
+    @State private var operationError: String?
+    @State private var operationNotice: String?
+    init(parentID: String, child: DSHSubagentCatalog.Entry, composerDrafts: DSHSubagentComposerDrafts = .shared) {
+        self.parentID = parentID; self.child = child
+        _composerDrafts = ObservedObject(wrappedValue: composerDrafts)
+    }
+    private var draftAddress: DSHSubagentDraftAddress { .init(machineID: model.machineID, parentID: parentID, childID: child.id) }
+    private var draft: String {
+        get { composerDrafts.text(for: draftAddress) }
+        nonmutating set { composerDrafts.setText(newValue, for: draftAddress) }
+    }
+    private var delivery: String {
+        get { composerDrafts.delivery(for: draftAddress) }
+        nonmutating set { composerDrafts.setDelivery(newValue, for: draftAddress) }
+    }
+    private var images: [DSHStagedAttachment] { composerDrafts.images(for: draftAddress) }
+
+    private func loadChildHistory(beforeSeq: Int64? = nil, atSeq: Int64? = nil) async {
+        guard !historyLoading else { return }
+        historyLoading = true; operationError = nil
+        defer { historyLoading = false }
+        do {
+            let page = try await model.historyPage(sessionID: child.id, beforeSeq: beforeSeq, atSeq: atSeq, parentID: parentID, mode: currentChild.mode)
+            try Task.checkCancellation()
+            if atSeq != nil { focusedHistory = page.focus }
+        } catch is CancellationError { }
+        catch { operationError = error.localizedDescription }
+    }
+
+    private var currentChild: DSHSubagentCatalog.Entry {
+        model.subagentCatalog(for: parentID)?.entries.first(where: { $0.id == child.id && $0.kind == "child" }) ?? child
+    }
+    private var canSend: Bool {
+        currentChild.mode == "continuable" && model.subagentCatalog(for: parentID)?.parentAvailable == true
+            && model.connectionState == .connected && !busy && !isStaging && composerDrafts.isLoaded(draftAddress)
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                Text(currentChild.mode == "continuable" ? "可继续会话 · \(currentChild.activity == "running" ? "运行中" : "未运行")" : "单次任务 · 执行记录只读")
+                    .font(.caption).foregroundStyle(.secondary)
+                if model.historyCoverage(for: child.id)?.nextBefore != nil || model.historyCoverage(for: child.id) == nil {
+                    Button("加载更早的电脑记录") { Task { await loadChildHistory(beforeSeq: model.historyCoverage(for: child.id)?.nextBefore) } }
+                        .disabled(historyLoading || model.connectionState != .connected)
+                }
+                if historyLoading { ProgressView() }
+                ForEach(model.transcriptEntries(for: child.id)) { entry in
+                    switch entry {
+                    case .historyGap(let range):
+                        Text("此处还有未加载的历史记录").font(.caption).foregroundStyle(.secondary)
+                        Button("加载此处历史") { Task { await loadChildHistory(beforeSeq: range.upper + 1) } }.disabled(historyLoading || model.connectionState != .connected)
+                    case .turn(let block):
+                        if let duration = block.taskTimeline?.duration() {
+                            Text("\(duration.estimated ? "约 " : "")用时 \(duration.seconds) 秒")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(block.messages) { message in
+                            if let reasoning = message.reasoning, !reasoning.isEmpty {
+                                DisclosureGroup("思考过程") { Text(reasoning).textSelection(.enabled) }
+                                    .font(.subheadline)
+                            }
+                            MessageBubble(sessionID: child.id, message: message)
+                        }
+                    case .tool(let tool): ToolActivityCard(tool: tool, sessionID: child.id)
+                    case .command(let result): CommandResultCard(result: result)
+                    case .modelChange(let notice): ModelChangeCard(notice: notice)
+                    case .workflow(let run): DSHWorkflowRunCard(sessionID: child.id, run: run)
+                    case .execution(let notice): DSHExecutionNoticeCard(sessionID: child.id, notice: notice)
+                    }
+                }
+                ForEach(model.pendingApprovals.filter { $0.sessionId == child.id }) { approval in
+                    ApprovalCard(approval: approval, savedDecision: model.approvalDecisionDraft(for: approval)) {
+                        try await model.decide(approval, allow: $0)
+                    }
+                }
+                ForEach(model.pendingQuestions.filter { $0.sessionId == child.id }) { request in
+                    QuestionCard(request: request, savedDraft: model.questionDraft(for: request),
+                        onDraftChange: { model.saveQuestionDraft($0, for: request) },
+                        onCancel: { try await model.cancelQuestion(request) }) {
+                            try await model.answer(request, answers: $0)
+                        }
+                }
+                if model.usage(for: child.id) != nil { UsageFooter(usage: model.usage(for: child.id)) }
+            }
+            .padding()
+        }
+        .navigationTitle(child.label ?? child.id)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            Group {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button("执行轨迹") { showExecution = true }
+                        Button("搜索对话") { showHistorySearch = true }
+                        Button("定时提醒") { showSchedules = true }
+                        if currentChild.hasChildren == true { Button("下级任务") { showChildren = true } }
+                        if !model.workflows(for: child.id).isEmpty { Button("工作流记录") { showWorkflows = true } }
+                    } label: { Image(systemName: "ellipsis.circle").frame(width: 44, height: 44) }
+                }
+            }
+            if currentChild.mode == "continuable", currentChild.activity == "running" {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("停止", role: .destructive) { performControl(interrupt: true) }
+                        .disabled(busy || model.connectionState != .connected)
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if currentChild.mode == "continuable" {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let operationError { Text(operationError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+                    if let operationNotice { Text(operationNotice).font(.caption).foregroundStyle(.secondary) }
+                    if model.subagentCatalog(for: parentID)?.parentAvailable == false {
+                        Text("父会话离线，恢复后可继续发送。运行中的子任务仍可停止。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if !composerDrafts.isLoaded(draftAddress) {
+                        HStack {
+                            Button("重新读取图片草稿") { loadMediaDraft() }
+                            Button("移除图片草稿", role: .destructive) {
+                                Task { do { try await composerDrafts.setImages([], for: draftAddress) } catch { operationError = error.localizedDescription } }
+                            }
+                        }.font(.caption).disabled(busy)
+                    }
+                    if isStaging { ProgressView("正在准备图片…").font(.caption) }
+                    if !images.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(images) { image in
+                                    VStack(spacing: 4) {
+                                        MessageImageThumbnail(data: image.data, name: image.name)
+                                        Button("移除") {
+                                            let address = draftAddress
+                                            Task { do { try await composerDrafts.removeImage(image.id, for: address) } catch { operationError = error.localizedDescription } }
+                                        }.font(.caption).frame(minHeight: 32).disabled(busy || isStaging)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TextField("继续子任务", text: Binding(get: { draft }, set: { draft = $0 }), axis: .vertical).lineLimit(1...6)
+                        .frame(maxWidth: .infinity, alignment: .leading).disabled(busy)
+                    HStack(spacing: 8) {
+                        Button { showReferences = true } label: { Image(systemName: "at").font(.system(size: 20)).frame(width: 44, height: 44) }
+                            .disabled(busy).accessibilityLabel("插入文件或会话引用")
+                        PhotosPicker(selection: $selectedPhotos, maxSelectionCount: max(1, 4 - images.count), matching: .images) {
+                            Image(systemName: "photo").font(.system(size: 20)).frame(width: 44, height: 44)
+                        }.disabled(busy || isStaging || images.count >= 4 || !composerDrafts.isLoaded(draftAddress)).accessibilityLabel("给子任务添加图片")
+                        Spacer(minLength: 8)
+                        Menu {
+                            Picker("发送方式", selection: Binding(get: { delivery }, set: { delivery = $0 })) {
+                                Text("排队").tag("queue")
+                                Text("插话").tag("steer")
+                            }
+                        } label: { Image(systemName: delivery == "steer" ? "bolt" : "clock").font(.system(size: 20)).frame(width: 44, height: 44) }
+                            .disabled(busy)
+                        Button { performControl(interrupt: false) } label: {
+                            if busy { ProgressView() } else { Image(systemName: "arrow.up.circle.fill").font(.system(size: 26)).frame(width: 44, height: 44) }
+                        }
+                        .disabled(!canSend || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && images.isEmpty))
+                        .accessibilityLabel(delivery == "steer" ? "发送插话" : "发送排队消息")
+                    }
+                }
+                .padding().background(.regularMaterial)
+            }
+        }
+        .sheet(isPresented: $showChildren) { DSHSubagentsPanel(parentID: child.id).environmentObject(model) }
+        .sheet(isPresented: $showReferences) { DSHReferencePicker(sessionID: child.id) { draft = dshAppendReference($0, to: draft) } }
+        .sheet(isPresented: $showExecution) { DSHExecutionPanel(sessionID: child.id, parentID: parentID, mode: currentChild.mode).environmentObject(model) }
+        .sheet(isPresented: $showHistorySearch) {
+            DSHHistorySearchPanel(sessionID: child.id, parentID: parentID, mode: currentChild.mode) { hit in
+                guard let seq = hit.nativeSequence else { return }
+                Task { await loadChildHistory(atSeq: seq) }
+            }.environmentObject(model)
+        }
+        .sheet(item: $focusedHistory) { DSHHistoryFocusView(sessionID: child.id, focus: $0).environmentObject(model) }
+        .sheet(isPresented: $showSchedules) { DSHSchedulePanel(sessionID: child.id, parentID: parentID, mode: currentChild.mode).environmentObject(model) }
+        .sheet(isPresented: $showWorkflows) {
+            DSHWorkflowsPanel(sessionID: child.id, parentID: parentID, child: currentChild).environmentObject(model)
+        }
+        .task {
+            loadMediaDraft()
+            model.watchSubagents(for: parentID, token: watcherToken)
+            model.openSubagent(child, parentID: parentID)
+        }
+        .onChange(of: selectedPhotos) { _, value in stagePhotos(value) }
+        .onDisappear { stagingTask?.cancel(); model.unwatchSubagents(for: parentID, token: watcherToken) }
+        .onChange(of: model.connectionState) { _, value in
+            if value == .connected { model.openSubagent(child, parentID: parentID) }
+        }
+        .refreshable { model.openSubagent(child, parentID: parentID) }
+    }
+
+    private func performControl(interrupt: Bool) {
+        guard !busy else { return }
+        busy = true
+        operationError = nil
+        operationNotice = nil
+        let submitted = draft, submittedImages = images, submittedDelivery = delivery, address = draftAddress
+        let generation = model.currentMachineGeneration
+        Task { @MainActor in
+            defer { busy = false }
+            do {
+                if !interrupt { try await composerDrafts.persist(address) }
+                guard model.machineID == address.machineID, model.currentMachineGeneration == generation else { throw CancellationError() }
+                try await model.controlSubagent(childID: child.id, parentID: parentID,
+                                                text: interrupt ? nil : submitted, delivery: submittedDelivery,
+                                                images: interrupt ? [] : submittedImages.map(\.subagentImagePart))
+                operationNotice = interrupt ? "停止信号已接收，等待任务状态更新。" : "Harness 已接收消息。"
+                if !interrupt {
+                    do { try await composerDrafts.consume(text: submitted, delivery: submittedDelivery, images: submittedImages, address: address) }
+                    catch { operationError = "Harness 已接收；本机图片草稿清理失败：\(error.localizedDescription)" }
+                }
+            } catch { operationError = error.localizedDescription }
+        }
+    }
+
+    private func loadMediaDraft() {
+        let address = draftAddress
+        Task { do { try await composerDrafts.load(address) } catch { operationError = error.localizedDescription } }
+    }
+    private func stagePhotos(_ selected: [PhotosPickerItem]) {
+        guard !selected.isEmpty else { return }
+        stagingTask?.cancel()
+        let address = draftAddress, identity = UUID()
+        stagingID = identity
+        isStaging = true; operationError = nil
+        stagingTask = Task { @MainActor in
+            defer { if stagingID == identity { isStaging = false; selectedPhotos = [] } }
+            do {
+                var staged = [DSHStagedAttachment]()
+                guard selected.count <= max(0, 4 - images.count) else { throw DSHSubagentDraftError(message: "子任务最多附带 4 张图片，请减少选择数量或先移除已有图片。") }
+                for item in selected {
+                    guard let data = try await item.loadTransferable(type: Data.self), data.count <= 32 * 1_024 * 1_024 else {
+                        throw DSHSubagentDraftError(message: "图片无法读取或原图超过 32 MiB，请选择较小的图片。")
+                    }
+                    let optimized = await optimizedPhotoDataOffMain(data)
+                    try Task.checkCancellation()
+                    guard optimized.starts(with: [0xff, 0xd8]) else { throw DSHSubagentDraftError(message: "此图片无法转换为可发送的格式，请换一张图片。") }
+                    staged.append(.init(name: "photo.jpg", data: optimized, isImage: true))
+                }
+                try Task.checkCancellation()
+                guard address == draftAddress else { throw CancellationError() }
+                guard !staged.isEmpty else { throw DSHSubagentDraftError(message: "子任务最多附带 4 张图片，请先移除已有图片。") }
+                try await composerDrafts.setImages(composerDrafts.images(for: address) + staged, for: address)
+            } catch is CancellationError { }
+            catch { operationError = error.localizedDescription }
+        }
+    }
+}
+
+struct QueuedPromptsSheet: View {
     @EnvironmentObject private var model: DSHAppModel
     @Environment(\.dismiss) private var dismiss
     let sessionID: String
     @State private var editingItem: DSHAppModel.DSHQueuedPrompt?
     @State private var editingText = ""
+    @State private var serverEditingItem: DSHServerQueue.Item?
+    @State private var busyItemID: String?
+    @State private var mutationError: String?
 
     var body: some View {
         NavigationStack {
             List {
                 let queued = model.queuedPrompts(for: sessionID)
+                let server = model.serverQueue(for: sessionID)
+                if let mutationError { Text(mutationError).foregroundStyle(.red).font(.caption) }
+                if let server, !server.items.isEmpty {
+                    Section("Harness 已接收") {
+                        if !server.available || model.connectionState != .connected {
+                            Text("队列状态暂未同步，连接恢复前不能修改。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(server.items) { item in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(item.placement == "steering" ? "插话" : item.placement == "context" ? "上下文" : "排队")
+                                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                if !item.text.isEmpty { Text(item.text).textSelection(.enabled) }
+                                if let attachments = item.attachments, !attachments.isEmpty {
+                                    MessageAttachmentsView(sessionID: sessionID, attachments: attachments)
+                                }
+                                if !item.isTextOnly {
+                                    Text("包含附件或结构化内容").font(.caption).foregroundStyle(.secondary)
+                                    DisclosureGroup("查看原始内容") {
+                                        Text(rawQueueContent(item)).font(.caption.monospaced()).textSelection(.enabled)
+                                    }
+                                }
+                                if busyItemID == item.id { ProgressView() }
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if item.placement != "context" {
+                                    if item.placement == "queued" {
+                                        Button("转为插话") { mutateServer(item, action: "steer") }.tint(.accentColor)
+                                            .disabled(!server.available || model.connectionState != .connected || busyItemID != nil)
+                                    }
+                                    if item.isTextOnly {
+                                        Button("编辑") { serverEditingItem = item; editingText = item.text }
+                                            .disabled(!server.available || model.connectionState != .connected || busyItemID != nil)
+                                    }
+                                    Button("删除", role: .destructive) { mutateServer(item, action: "remove") }
+                                        .disabled(!server.available || model.connectionState != .connected || busyItemID != nil)
+                                }
+                            }
+                        }
+                    }
+                }
                 if queued.isEmpty {
-                    Text("暂无排队消息")
+                    if server?.items.isEmpty != false { Text("暂无排队消息")
                         .foregroundStyle(.secondary)
+                    }
                 } else {
                     ForEach(queued) { item in
                         VStack(alignment: .leading, spacing: 4) {
@@ -2915,7 +3556,7 @@ private struct QueuedPromptsSheet: View {
                         }
                     }
                     Section {
-                        Text("本机暂存的排队上轮结束自动发出，可编辑/取消/立即发送；已发送的由服务端执行，不可改删，接收后自动消失。")
+                        Text("本机暂存的消息尚未发送，可编辑、取消或立即发送；Harness 已接收的消息使用上方真实队列，可按项目编辑、删除或转为插话。")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
@@ -2942,11 +3583,40 @@ private struct QueuedPromptsSheet: View {
                     editingItem = nil
                 }
             }
+            .alert("编辑 Harness 队列", isPresented: Binding(
+                get: { serverEditingItem != nil }, set: { if !$0 { serverEditingItem = nil } }
+            )) {
+                TextField("消息内容", text: $editingText, axis: .vertical)
+                Button("取消", role: .cancel) { serverEditingItem = nil }
+                Button("保存") {
+                    if let item = serverEditingItem { mutateServer(item, action: "edit", text: editingText) }
+                    serverEditingItem = nil
+                }
+            }
         }
     }
 
     private func sendNow(_ item: DSHAppModel.DSHQueuedPrompt) {
         model.sendQueuedPrompt(id: item.id, sessionID: sessionID)
+    }
+    private func mutateServer(_ item: DSHServerQueue.Item, action: String, text: String? = nil) {
+        guard busyItemID == nil else { return }
+        busyItemID = item.id
+        mutationError = nil
+        Task { @MainActor in
+            defer { busyItemID = nil }
+            do { try await model.updateServerQueue(item, in: sessionID, action: action, text: text) }
+            catch {
+                mutationError = error.localizedDescription
+                if action == "edit" { serverEditingItem = item }
+            }
+        }
+    }
+    private func rawQueueContent(_ item: DSHServerQueue.Item) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(item.message.content) else { return "" }
+        return String(decoding: data, as: UTF8.self)
     }
 }
 
@@ -3139,7 +3809,11 @@ private struct MessageBubble: View {
     /// remains the intrinsic Markdown layout rather than the reserved shell.
     let streamingMeasurementID: String?
     let streamingMinimumHeight: CGFloat?
+    @State private var selectedFile: DSHFileReference?
     @State private var showActions = false
+    @State private var showFeedback = false
+    @State private var feedbackRating = "positive"
+    @State private var referencedSessionID: String?
     @State private var didCopy = false
 
     init(sessionID: String, message: DSHChatMessage, onBranch: (() -> Void)? = nil,
@@ -3153,12 +3827,16 @@ private struct MessageBubble: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
+            if model.interruptedMessage(message, in: sessionID) {
+                Label("以下为中断前已保存的回答", systemImage: "pause.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             // Media lives outside the tinted bubble so photos are never
             // squeezed into (or masked by) its rounded shape.
             if !message.attachments.isEmpty {
                 HStack {
                     if message.role == .user { Spacer(minLength: 36) }
-                    MessageAttachmentsView(attachments: message.attachments,
+                    MessageAttachmentsView(sessionID: sessionID, attachments: message.attachments,
                                            alignTrailing: message.role == .user)
                     if message.role != .user { Spacer(minLength: 0) }
                 }
@@ -3215,6 +3893,18 @@ private struct MessageBubble: View {
                     }
                     .accessibilityLabel(didCopy ? "Copied" : "Copy")
 
+                    if message.role == .assistant && streamingMeasurementID == nil {
+                        ForEach(["positive", "negative"], id: \.self) { rating in
+                            Button {
+                                feedbackRating = rating; showFeedback = true
+                            } label: {
+                                let selected = model.feedback(for: message.id, in: sessionID)?.rating == rating
+                                Image(systemName: (rating == "positive" ? "hand.thumbsup" : "hand.thumbsdown") + (selected ? ".fill" : ""))
+                                    .font(.system(size: 17)).frame(width: 28, height: 28)
+                            }.accessibilityLabel(rating == "positive" ? "评价有帮助" : "评价需要改进")
+                        }
+                    }
+
                     if let onBranch {
                         // One size down from copy, same centered box: quieter
                         // secondary action, still easy to hit.
@@ -3252,6 +3942,22 @@ private struct MessageBubble: View {
             }
         }
         .frame(minHeight: streamingMinimumHeight ?? 0, alignment: .top)
+        .environment(\.openURL, OpenURLAction { url in
+            if let id = DSHSessionReference.sessionID(from: url) {
+                referencedSessionID = id
+                return .handled
+            }
+            if let reference = DSHFileReference(url: url, sessionID: sessionID) {
+                selectedFile = reference
+                return .handled
+            }
+            return .systemAction
+        })
+        .sheet(item: $selectedFile) { DSHRemoteFilePreview(reference: $0) }
+        .sheet(isPresented: $showFeedback) { DSHFeedbackEditor(sessionID: sessionID, messageID: message.id, initialRating: feedbackRating) }
+        .navigationDestination(isPresented: Binding(get: { referencedSessionID != nil }, set: { if !$0 { referencedSessionID = nil } })) {
+            if let referencedSessionID { ConversationView(sessionID: referencedSessionID) }
+        }
     }
 
     /// Reply timestamp ("Tuesday 17:56" / "星期二 17:56"), stamped from the
@@ -3283,7 +3989,8 @@ private struct MessageBubble: View {
 }
 
 /// Square thumbnails in one row so any number of quoted images stays tidy.
-private struct MessageAttachmentsView: View {
+struct MessageAttachmentsView: View {
+    let sessionID: String
     let attachments: [DSHMessageAttachment]
     /// User uploads sit on the right with the user's bubble; Mac-side
     /// attachments stay left with the assistant.
@@ -3298,7 +4005,7 @@ private struct MessageAttachmentsView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(images) { attachment in
-                            MessageAttachmentPreview(attachment: attachment)
+                            MessageAttachmentPreview(sessionID: sessionID, attachment: attachment)
                         }
                     }
                     // Short rows hug the leading edge of a horizontal
@@ -3308,7 +4015,7 @@ private struct MessageAttachmentsView: View {
                 }
             }
             ForEach(files) { attachment in
-                MessageAttachmentPreview(attachment: attachment)
+                MessageAttachmentPreview(sessionID: sessionID, attachment: attachment)
             }
         }
         .frame(maxWidth: 300, alignment: alignTrailing ? .trailing : .leading)
@@ -3317,43 +4024,53 @@ private struct MessageAttachmentsView: View {
 
 private struct MessageAttachmentPreview: View {
     @EnvironmentObject private var model: DSHAppModel
+    let sessionID: String
     let attachment: DSHMessageAttachment
     @State private var data: Data?
+    @State private var selectedFile: DSHFileReference?
 
     var body: some View {
         Group {
-            if let data, attachment.isImage, UIImage(data: data) != nil {
-                MessageImageThumbnail(data: data, name: attachment.name)
-            } else if !attachment.isImage {
-                HStack(spacing: 8) {
-                    Image(systemName: "paperclip")
-                        .font(.caption.weight(.semibold))
-                    Text(attachment.name)
-                        .font(.caption)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
+            if model.connectionState != .connected, let data, attachment.isImage, UIImage(data: data) != nil {
+                MessageImageThumbnail(data: data, name: attachment.name + "（缓存预览）")
+            } else if let reference = attachment.fileReference(sessionID: sessionID) {
+                Button { selectedFile = reference } label: {
+                    if let data, attachment.isImage, let image = UIImage(data: data) {
+                        Image(uiImage: image).resizable().scaledToFill().frame(width: 96, height: 96)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else { attachmentLabel }
                 }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 7)
-                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            } else {
-                // Image bytes not in cache yet: keep the square slot so the
-                // row does not jump when the thumbnail lands.
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(width: 96, height: 96)
-                    .overlay {
-                        Image(systemName: "photo")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                    .accessibilityLabel(attachment.name)
-            }
+                .buttonStyle(.plain)
+                .accessibilityLabel("打开 \(attachment.name)")
+            } else if let data, attachment.isImage, UIImage(data: data) != nil {
+                MessageImageThumbnail(data: data, name: attachment.name)
+            } else { attachmentLabel }
         }
-        .task(id: attachment.id) {
-            // Receipt cache first (phone uploads); embedded thumbnail second
-            // (web uploads, Mac-side and model-returned images).
+        .task(id: attachment) {
             data = model.attachmentData(for: attachment) ?? attachment.thumbnailData
+        }
+        .sheet(item: $selectedFile) { DSHRemoteFilePreview(reference: $0) }
+    }
+
+    private var attachmentLabel: some View {
+        Group {
+            if attachment.isImage {
+                RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.08))
+                    .frame(width: 96, height: 96)
+                    .overlay { Image(systemName: "photo").font(.title3).foregroundStyle(Color.secondary) }
+                    .accessibilityLabel(attachment.name)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperclip").font(.caption.weight(.semibold))
+                    Text(attachment.name).font(.caption).lineLimit(2).truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    if attachment.hostPath != nil { Image(systemName: "chevron.right").font(.caption).foregroundStyle(Color.secondary) }
+                }
+                .foregroundStyle(Color.primary)
+                .padding(.horizontal, 9).padding(.vertical, 7)
+                .frame(minHeight: 44)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
         }
     }
 }
@@ -3475,7 +4192,7 @@ final class DSHMarkdownBlockRenderer: ObservableObject {
 /// `#`, ``` ``` ``` and `|` included. Block structure is recognised first
 /// (`DSHMarkdown`), then each block is styled; inline markup inside a block is
 /// still left to `AttributedString`.
-private struct MarkdownBlockText: View {
+struct MarkdownBlockText: View {
     let text: String
     @StateObject private var renderer: DSHMarkdownBlockRenderer
 
@@ -3739,7 +4456,7 @@ private struct AssistantTurnView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 ForEach(tools) { tool in
-                    ToolActivityCard(tool: tool)
+                    ToolActivityCard(tool: tool, sessionID: sessionID, isLive: isTaskRunning)
                 }
             }
             .padding(.bottom, 4)

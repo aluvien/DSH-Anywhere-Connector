@@ -12,6 +12,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("电脑端") { NavigationLink { DSHComputerConfigurationView().environmentObject(model) } label: { Label("模型、凭据与插件配置", systemImage: "server.rack") } }
                 Section("Sessions") {
                     Toggle(isOn: Binding(
                         get: { model.groupsSessionsByWorkspace },

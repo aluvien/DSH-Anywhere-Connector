@@ -108,3 +108,9 @@ android/                  Paused Android source
 ```
 
 The product page is in [`site/`](site/). Automatic GitHub Pages deployment is configured. In the repository, go to **Settings → Pages → Build and deployment → Source**, choose **GitHub Actions**, then push to `main` to publish it.
+
+## Upgrade compatibility
+
+The Harness parity release requires Relay `schemaRevision >= 11` (check `/health`). Upgrade Relay first, then reinstall Connector and Bridge together, then update the iOS app. Existing machine identity and phone pairings are retained.
+
+Connector verifies the Relay schema on every connection before forwarding messages or phone operations. An older Relay produces an explicit upgrade diagnostic; messages remain buffered within the documented transport limits and reconnect after the Relay is upgraded. Bridge rejects obsolete Connectors with HTTP 426. Legacy clients that do not opt into Relay schema negotiation retain the original greeting format; this does not enable new features on old computer components.

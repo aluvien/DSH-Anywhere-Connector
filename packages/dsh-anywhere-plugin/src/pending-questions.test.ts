@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PendingQuestions, firstAnswered } from './pending-questions.js'
+import { PendingQuestions, firstAnswered, QuestionCancelledError } from './pending-questions.js'
 
 /** A promise with its settle functions exposed, for deterministic ordering. */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
@@ -12,6 +12,27 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 describe('user question answering', () => {
+  it('lets explicit phone cancellation win even while the desktop is waiting', async () => {
+    const questions = new PendingQuestions()
+    const pending = questions.create(60_000)
+    const browser = deferred<readonly unknown[]>()
+    const winner = firstAnswered(pending.result, browser.promise)
+    const assertion = expect(winner).rejects.toMatchObject({ name: 'UserQuestionError', code: 'ASK_CANCELLED' })
+    expect(questions.cancel(pending.id)).toBe(true)
+    await assertion
+    expect(questions.answer(pending.id, [{ id: 'q', selected: ['Approve'] }])).toBe(false)
+    expect(questions.cancel(pending.id)).toBe(false)
+  })
+
+  it('lets explicit desktop cancellation terminate the phone wait', async () => {
+    const phone = deferred<string | undefined>()
+    const browser = deferred<string>()
+    const winner = firstAnswered(phone.promise, browser.promise)
+    const assertion = expect(winner).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    browser.reject(new QuestionCancelledError())
+    await assertion
+    phone.resolve('late phone answer')
+  })
   it('records and answers a question exactly once', () => {
     const questions = new PendingQuestions()
     const pending = questions.create(60_000)

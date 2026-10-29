@@ -1,5 +1,78 @@
 import Foundation
 
+public struct DSHWorkspaceFiles: Codable, Equatable, Sendable {
+    public struct Entry: Codable, Equatable, Identifiable, Sendable {
+        public let name: String
+        public let type: String
+        public let size: Int?
+        public var id: String { name }
+    }
+    public let sessionId: String
+    public let path: String
+    public let truncated: Bool
+    public let entries: [Entry]
+}
+
+public struct DSHWorkspaceBytes: Codable, Equatable, Sendable {
+    public let sessionId: String
+    public let absolutePath: String
+    public let version: String
+    public let bytes: Int?
+    public let offset: Int
+    public let data: String
+    public let eof: Bool
+}
+
+/// Keep the native Session scope; web links are a separate operation.
+public struct DSHFileReference: Identifiable, Equatable, Sendable {
+    public let sessionID: String
+    public let path: String
+    public let displayName: String?
+    public var id: String { "\(sessionID.utf8.count):\(sessionID)\(path)" }
+    public var name: String { displayName ?? (path as NSString).lastPathComponent }
+
+    public init(sessionID: String, path: String, name: String? = nil) { self.sessionID = sessionID; self.path = path; self.displayName = name }
+
+    public init?(url: URL, sessionID: String) {
+        self.displayName = nil
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        let scheme = parts.scheme?.lowercased()
+        if scheme == "dsh-resource", parts.host == "file" {
+            let encoded = parts.percentEncodedPath.dropFirst().split(separator: "/", omittingEmptySubsequences: false)
+            guard encoded.count >= 2 else { return nil }
+            if encoded[0] == "session", encoded.count >= 3, let scope = String(encoded[1]).removingPercentEncoding, !scope.isEmpty {
+                self.sessionID = scope
+                let segments = encoded.dropFirst(2).map { String($0).removingPercentEncoding }
+                guard segments.allSatisfy({ $0 != nil }) else { return nil }
+                self.path = segments.compactMap { $0 }.joined(separator: "/")
+            } else if encoded[0] == "absolute" {
+                self.sessionID = sessionID
+                let unc = encoded.count > 2 && encoded[1].isEmpty
+                let segments = encoded.dropFirst(unc ? 2 : 1).map { String($0).removingPercentEncoding }
+                guard segments.allSatisfy({ $0 != nil }), let first = segments.first ?? nil, !first.isEmpty else { return nil }
+                let decoded = segments.compactMap { $0 }.joined(separator: "/")
+                let drive = first.range(of: "^[A-Za-z]:$", options: .regularExpression) != nil
+                self.path = unc ? "//" + decoded : drive ? decoded : "/" + decoded
+            } else { return nil }
+        } else if scheme == "file", parts.host == nil || parts.host == "" || parts.host == "localhost" {
+            self.sessionID = sessionID; self.path = parts.path
+        } else if scheme == nil, parts.host == nil, !parts.path.isEmpty {
+            self.sessionID = sessionID; self.path = parts.path
+        } else { return nil }
+        guard !path.isEmpty, !path.contains("\0") else { return nil }
+    }
+
+    public static func links(in markdown: String, sessionID: String) -> [DSHFileReference] {
+        guard let attributed = try? AttributedString(markdown: markdown) else { return [] }
+        var seen: Set<String> = []
+        return attributed.runs.compactMap { run in
+            guard let url = run.link, let reference = DSHFileReference(url: url, sessionID: sessionID),
+                  seen.insert(reference.id).inserted else { return nil }
+            return reference
+        }
+    }
+}
+
 /// A small JSON value type keeps the wire protocol forward compatible.  In
 /// particular, payloads for event types that this client does not know yet are
 /// retained instead of being discarded.
@@ -191,9 +264,12 @@ public struct DSHCommand: Codable, Sendable, Equatable {
     /// history as ordinary transcript events over the existing socket.
     public static func openSession(deviceId: String, machineId: String,
                                    sessionId: String, streaming: Bool = false,
+                                   parentSessionId: String? = nil, subagentMode: String? = nil,
                                    requestId: String = UUID().uuidString) -> DSHCommand {
         var payload: [String: DSHJSONValue] = ["sessionId": .string(sessionId)]
         if streaming { payload["streaming"] = .bool(true) }
+        if let parentSessionId { payload["parentSessionId"] = .string(parentSessionId) }
+        if let subagentMode { payload["subagentMode"] = .string(subagentMode) }
         return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
                    sessionId: sessionId, type: "session.open",
                    payload: .object(payload))
@@ -283,6 +359,71 @@ public struct DSHCommand: Codable, Sendable, Equatable {
                           sessionId: sessionId, type: "command.execute", payload: .object(payload))
     }
 
+    public static func forkSession(deviceId: String, machineId: String, sessionId: String,
+                                   atSeq: Int64? = nil, requestId: String = UUID().uuidString) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = [:]
+        if let atSeq { payload["atSeq"] = .number(Double(atSeq)) }
+        return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
+                          sessionId: sessionId, type: "session.fork", payload: .object(payload))
+    }
+    public static func commandCatalog(deviceId: String, machineId: String, sessionId: String) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                   type: "command.catalog", payload: .object([:]))
+    }
+    public static func subagentCatalog(deviceId: String, machineId: String, sessionId: String) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                   type: "subagent.catalog", payload: .object([:]))
+    }
+    public static func workspaceFiles(deviceId: String, machineId: String, sessionId: String, path: String) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                   type: "workspace.files", payload: .object(["path": .string(path)]))
+    }
+    public static func executionList(deviceId: String, machineId: String, sessionId: String, beforeSeq: Int64? = nil,
+                                      parentSessionId: String? = nil, subagentMode: String? = nil) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["limit": .number(100)]
+        if let beforeSeq { payload["beforeSeq"] = .number(Double(beforeSeq)) }
+        if let parentSessionId { payload["parentSessionId"] = .string(parentSessionId) }
+        if let subagentMode { payload["subagentMode"] = .string(subagentMode) }
+        return DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId, type: "execution.list", payload: .object(payload))
+    }
+    public static func workspaceBytes(deviceId: String, machineId: String, sessionId: String, path: String,
+                                      offset: Int, version: String? = nil) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["path": .string(path), "offset": .number(Double(offset)), "length": .number(192 * 1_024)]
+        if let version { payload["version"] = .string(version) }
+        return DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                          type: "workspace.bytes", payload: .object(payload))
+    }
+    public static func controlSubagent(deviceId: String, machineId: String, childID: String, parentID: String,
+                                        text: String? = nil, delivery: String = "queue", images: [DSHJSONValue] = []) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["parentSessionId": .string(parentID), "mode": .string("continuable")]
+        if let text {
+            payload["text"] = .string(text)
+            payload["delivery"] = .string(delivery)
+            payload["clientTimeZone"] = .string(TimeZone.current.identifier)
+            if !images.isEmpty { payload["images"] = .array(images) }
+        }
+        return DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: childID,
+                          type: text == nil ? "subagent.interrupt" : "subagent.prompt", payload: .object(payload))
+    }
+    public static func updateQueue(deviceId: String, machineId: String, sessionId: String,
+                                   itemId: String, action: String, text: String? = nil) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["itemId": .string(itemId), "action": .string(action)]
+        if let text { payload["text"] = .string(text) }
+        return DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                          type: "queue.update", payload: .object(payload))
+    }
+    public static func getGoal(deviceId: String, machineId: String, sessionId: String) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId, type: "goal.get", payload: .object([:]))
+    }
+    public static func updateGoal(deviceId: String, machineId: String, sessionId: String, goal: DSHGoalState.Goal,
+                                  action: String, objective: String? = nil, maxGoalRounds: Int? = nil) -> DSHCommand {
+        var payload: [String: DSHJSONValue] = ["action": .string(action),
+            "ref": .object(["id": .string(goal.id), "revision": .number(Double(goal.revision))])]
+        if let objective { payload["objective"] = .string(objective) }
+        if let maxGoalRounds { payload["maxGoalRounds"] = .number(Double(maxGoalRounds)) }
+        return DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId, type: "goal.update", payload: .object(payload))
+    }
+
     public static func setPermission(deviceId: String, machineId: String, sessionId: String,
                                      mode: String, requestId: String = UUID().uuidString) -> DSHCommand {
         DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
@@ -314,6 +455,12 @@ public struct DSHCommand: Codable, Sendable, Equatable {
 
     /// One answered question. `selected` carries option labels verbatim, which
     /// is what the Harness echoes back into the model's tool result.
+    public static func cancelQuestion(deviceId: String, machineId: String, sessionId: String,
+                                     questionId: String) -> DSHCommand {
+        DSHCommand(deviceId: deviceId, machineId: machineId, sessionId: sessionId,
+                   type: "question.cancel", payload: .object(["questionId": .string(questionId)]))
+    }
+
     public static func answerQuestion(deviceId: String, machineId: String, sessionId: String,
                                       questionId: String, answers: [DSHQuestionAnswer],
                                       requestId: String = UUID().uuidString) -> DSHCommand {
@@ -415,17 +562,35 @@ public struct DSHPairingLink: Equatable, Sendable {
 /// What arrived in a transcript, before any grouping. Declared at file scope
 /// because Swift cannot nest a type inside a generic function.
 private enum DSHTranscriptArrival {
+    case historyGap(DSHHistoryRange)
     case message(DSHChatMessage)
     case tool(DSHToolActivity)
     case command(DSHCommandResult)
     case modelChange(DSHModelChangeNotice)
+    case workflow(DSHWorkflowRun)
+    case execution(DSHExecutionNotice)
 
     var sequence: Int64 {
         switch self {
+        case .historyGap: return 0
         case .message(let message): return message.sequence ?? 0
         case .tool(let tool): return tool.sequence ?? 0
         case .command(let result): return result.sequence ?? 0
         case .modelChange(let notice): return notice.sequence
+        case .workflow(let run): return run.sequence ?? 0
+        case .execution(let notice): return notice.sequence ?? 0
+        }
+    }
+
+    var nativeSequence: Int64? {
+        switch self {
+        case .historyGap(let range): return range.upper
+        case .message(let message): return message.nativeSequence
+        case .tool(let tool): return tool.nativeSequence
+        case .command(let command): return command.nativeSequence
+        case .modelChange(let change): return change.nativeSequence
+        case .workflow(let run): return run.nativeSequence
+        case .execution(let notice): return notice.nativeSequence
         }
     }
 
@@ -488,26 +653,35 @@ public enum DSHLocalization {
 
 /// One row of the transcript, in the order the events actually arrived.
 public enum DSHTranscriptEntry: Identifiable, Sendable, Equatable {
+    case historyGap(DSHHistoryRange)
     case turn(DSHTranscriptBlock)
     case tool(DSHToolActivity)
     case command(DSHCommandResult)
     case modelChange(DSHModelChangeNotice)
+    case workflow(DSHWorkflowRun)
+    case execution(DSHExecutionNotice)
 
     public var id: String {
         switch self {
+        case .historyGap(let range): return "history-gap-\(range.id)"
         case .turn(let block): return "turn-\(block.id)"
         case .tool(let tool): return "tool-\(tool.id)"
         case .command(let result): return "command-\(result.id)"
         case .modelChange(let notice): return "model-change-\(notice.id)"
+        case .workflow(let run): return "workflow-\(run.id)"
+        case .execution(let notice): return "execution-\(notice.id)"
         }
     }
 
     var sequence: Int64 {
         switch self {
+        case .historyGap: return 0
         case .turn(let block): return block.sequence
         case .tool(let tool): return tool.sequence ?? 0
         case .command(let result): return result.sequence ?? 0
         case .modelChange(let notice): return notice.sequence
+        case .workflow(let run): return run.sequence ?? 0
+        case .execution(let notice): return notice.sequence ?? 0
         }
     }
 }
@@ -520,21 +694,51 @@ public extension Array where Element == DSHChatMessage {
     /// model writes, calls a tool, writes again, and so on.
     func transcriptEntries(with tools: [DSHToolActivity],
                            commandResults: [DSHCommandResult] = [],
-                           modelChanges: [DSHModelChangeNotice] = []) -> [DSHTranscriptEntry] {
+                           modelChanges: [DSHModelChangeNotice] = [],
+                           workflows: [DSHWorkflowRun] = [],
+                           execution: [DSHExecutionNotice] = [], historyGaps: [DSHHistoryRange] = []) -> [DSHTranscriptEntry] {
         // Stable by construction: a tie keeps arrival order. Sorting on the
         // sequence alone is not enough, because state persisted before
         // sequences existed carries none, and any arbitrary tie-break (id
         // order, say) would scramble the whole transcript on upgrade.
         var ordered: [(order: Int, arrival: DSHTranscriptArrival)] = []
+        for gap in historyGaps { ordered.append((ordered.count, .historyGap(gap))) }
         for message in self { ordered.append((ordered.count, .message(message))) }
         for tool in tools { ordered.append((ordered.count, .tool(tool))) }
         for result in commandResults { ordered.append((ordered.count, .command(result))) }
         for notice in modelChanges { ordered.append((ordered.count, .modelChange(notice))) }
+        for run in workflows where run.sequence != nil { ordered.append((ordered.count, .workflow(run))) }
+        for notice in execution where notice.sequence != nil { ordered.append((ordered.count, .execution(notice))) }
         ordered.sort { left, right in
             left.arrival.sequence == right.arrival.sequence
                 ? left.order < right.order
                 : left.arrival.sequence < right.arrival.sequence
         }
+        // A replay can add native records beside cached rows whose first
+        // Relay positions belong to an earlier Connector process. Use native
+        // positions where available; retain legacy/transient rows between
+        // their neighbouring known anchors without a non-transitive mixed
+        // Native-vs-Relay comparator.
+        var positions = ordered.map { $0.arrival.nativeSequence.map(Double.init) }
+        var index = 0
+        while index < positions.count {
+            if positions[index] != nil { index += 1; continue }
+            let start = index
+            while index < positions.count && positions[index] == nil { index += 1 }
+            let left = start > 0 ? positions[start - 1] : nil
+            let right = index < positions.count ? positions[index] : nil
+            for offset in start..<index {
+                let fraction = Double(offset - start + 1) / Double(index - start + 1)
+                if let left, let right, right >= left { positions[offset] = left + (right - left) * fraction }
+                else if let left { positions[offset] = left + fraction }
+                else if let right { positions[offset] = right - 1 + fraction }
+                else { positions[offset] = Double(ordered[offset].arrival.sequence) }
+            }
+        }
+        ordered = ordered.enumerated().sorted { left, right in
+            let a = positions[left.offset] ?? 0, b = positions[right.offset] ?? 0
+            return a == b ? left.offset < right.offset : a < b
+        }.map(\.element)
         let arrivals = ordered.map(\.arrival)
 
         var entries: [DSHTranscriptEntry] = []
@@ -547,6 +751,9 @@ public extension Array where Element == DSHChatMessage {
 
         for arrival in arrivals {
             switch arrival {
+            case .historyGap(let range):
+                flushRun()
+                entries.append(.historyGap(range))
             case .message(let message):
                 if message.role == .assistant {
                     run.append(message)
@@ -571,6 +778,12 @@ public extension Array where Element == DSHChatMessage {
             case .modelChange(let notice):
                 flushRun()
                 entries.append(.modelChange(notice))
+            case .workflow(let workflow):
+                flushRun()
+                entries.append(.workflow(workflow))
+            case .execution(let notice):
+                flushRun()
+                entries.append(.execution(notice))
             }
         }
         flushRun()
@@ -930,14 +1143,26 @@ public struct DSHMessageAttachment: Codable, Sendable, Equatable, Identifiable {
     /// uploaded itself (web uploads, Mac-side files, model-returned images).
     /// Phone uploads keep resolving through the receipt cache instead.
     public let thumbnail: String?
+    public let hostPath: String?
 
     public init(id: String, name: String, mediaType: String? = nil, receiptId: String? = nil,
-                thumbnail: String? = nil) {
+                thumbnail: String? = nil, hostPath: String? = nil) {
         self.id = id
         self.name = name
         self.mediaType = mediaType
         self.receiptId = receiptId
         self.thumbnail = thumbnail
+        self.hostPath = hostPath
+    }
+
+    public func fileReference(sessionID: String) -> DSHFileReference? {
+        guard let hostPath, !hostPath.isEmpty else { return nil }
+        var filename = name
+        if (filename as NSString).pathExtension.isEmpty {
+            let suffix = ["image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"][mediaType ?? ""]
+            if let suffix { filename += "." + suffix }
+        }
+        return DSHFileReference(sessionID: sessionID, path: hostPath, name: filename)
     }
 
     public var isImage: Bool {
@@ -966,6 +1191,7 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let role: DSHMessageRole
     public var replacesMessageId: String?
+    public var interrupted: Bool?
     public var markdown: String
     public var attachments: [DSHMessageAttachment]
     public var usage: DSHSessionUsage?
@@ -979,6 +1205,7 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
     /// Sequence of the event that produced this message. Client-side only.
     public var sequence: Int64?
     /// Wall-clock time the message arrived, in milliseconds since the epoch.
+    public var nativeSequence: Int64?
     /// Stamped from the envelope (first sighting wins, like `sequence`) so
     /// the reply timestamp survives replays. Client-side only.
     public var timestamp: Int64?
@@ -992,23 +1219,26 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
                 usage: DSHSessionUsage? = nil, provider: String? = nil, model: String? = nil,
                 reasoningEffort: String? = nil, contextWindow: Double? = nil,
                 reasoning: String? = nil, sequence: Int64? = nil, timestamp: Int64? = nil,
-                replacesMessageId: String? = nil) {
+                replacesMessageId: String? = nil, nativeSequence: Int64? = nil, interrupted: Bool? = nil) {
         self.id = id; self.role = role; self.markdown = markdown; self.attachments = attachments
         self.usage = usage; self.provider = provider; self.model = model
         self.reasoningEffort = reasoningEffort; self.contextWindow = contextWindow
         self.reasoning = reasoning; self.sequence = sequence; self.timestamp = timestamp
         self.replacesMessageId = replacesMessageId
+        self.nativeSequence = nativeSequence
+        self.interrupted = interrupted
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, role, markdown, attachments, usage, provider, model, replacesMessageId,
-             reasoningEffort, contextWindow, reasoning, sequence, timestamp, completedAt, taskCompletedAt
+             reasoningEffort, contextWindow, reasoning, sequence, timestamp, completedAt, taskCompletedAt, nativeSequence, interrupted
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         replacesMessageId = try container.decodeIfPresent(String.self, forKey: .replacesMessageId)
+        nativeSequence = try container.decodeIfPresent(Int64.self, forKey: .nativeSequence)
         role = try container.decode(DSHMessageRole.self, forKey: .role)
         markdown = try container.decode(String.self, forKey: .markdown)
         // Older Relay/Connector builds did not include this field.
@@ -1024,6 +1254,9 @@ public struct DSHChatMessage: Codable, Sendable, Equatable, Identifiable {
         timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
         completedAt = try container.decodeIfPresent(Int64.self, forKey: .completedAt)
         taskCompletedAt = try container.decodeIfPresent(Int64.self, forKey: .taskCompletedAt)
+        nativeSequence = try container.decodeIfPresent(Int64.self, forKey: .nativeSequence)
+        replacesMessageId = try container.decodeIfPresent(String.self, forKey: .replacesMessageId)
+        interrupted = try container.decodeIfPresent(Bool.self, forKey: .interrupted)
     }
 }
 
@@ -1132,6 +1365,9 @@ public extension Array where Element == DSHTranscriptSection {
         }
         for index in result.indices {
             switch result[index] {
+            case .row(.historyGap):
+                flush()
+                prompt = nil
             case .row(.turn(let block)) where block.isUserTurn:
                 flush()
                 prompt = block.messages.first
@@ -1187,6 +1423,7 @@ public struct DSHModelChangeNotice: Codable, Sendable, Equatable, Identifiable {
     public let current: DSHModelSelection
     public var sequence: Int64
     public var timestamp: Int64
+    public var nativeSequence: Int64?
 
     public var id: String {
         "\(sessionId)-\(sequence)-\(current.provider)-\(current.model)"
@@ -1202,7 +1439,7 @@ public struct DSHModelChangeNotice: Codable, Sendable, Equatable, Identifiable {
         self.timestamp = timestamp
     }
 
-    private enum CodingKeys: String, CodingKey { case sessionId, previous, current, sequence, timestamp }
+    private enum CodingKeys: String, CodingKey { case sessionId, previous, current, sequence, timestamp, nativeSequence }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -1210,6 +1447,7 @@ public struct DSHModelChangeNotice: Codable, Sendable, Equatable, Identifiable {
         previous = try container.decodeIfPresent(DSHModelSelection.self, forKey: .previous)
         current = try container.decode(DSHModelSelection.self, forKey: .current)
         sequence = try container.decodeIfPresent(Int64.self, forKey: .sequence) ?? 0
+        nativeSequence = try container.decodeIfPresent(Int64.self, forKey: .nativeSequence)
         timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
             ?? Int64(Date().timeIntervalSince1970 * 1_000)
     }
@@ -1227,6 +1465,7 @@ public struct DSHCommandResult: Codable, Sendable, Equatable, Identifiable {
     /// wire while still allowing command acknowledgements to be interleaved
     /// with messages and tool calls in the transcript.
     public var sequence: Int64?
+    public var nativeSequence: Int64?
     public var id: String { requestId }
     public init(sessionId: String, requestId: String, matched: Bool,
                 commandId: String? = nil, kind: String? = nil, text: String? = nil,
@@ -1287,12 +1526,84 @@ public struct DSHToolActivity: Codable, Sendable, Equatable, Identifiable {
     /// Sequence of the event that produced this call. Client-side only, and
     /// optional so decoding a payload that omits it still works.
     public var sequence: Int64?
+    public var nativeSequence: Int64?
+    public var rootCallId: String?
+    public var parentCallId: String?
+    public var startedAt: Double?
+    public var finishedAt: Double?
+    public var resultMeta: DSHJSONValue?
+    public var resultContent: [DSHJSONValue]?
+    public var error: DSHJSONValue?
+    public var attachments: [DSHMessageAttachment]?
+    /// Derived locally from native parent identities; never inferred from names.
+    public var children: [DSHToolActivity]?
 
     public init(id: String, name: String, status: String = "running", detail: String? = nil,
                 arguments: String? = nil, sequence: Int64? = nil) {
         self.id = id; self.name = name; self.status = status; self.detail = detail
         self.arguments = arguments
         self.sequence = sequence
+    }
+}
+
+public struct DSHFeedbackItem: Codable, Sendable, Equatable, Identifiable {
+    public let messageId: String
+    public let rating: String
+    public let note: String?
+    public let category: String?
+    public let version: String
+    public let createdAt: Double
+    public let updatedAt: Double
+    public var id: String { messageId }
+}
+public struct DSHFeedbackState: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public var items: [DSHFeedbackItem]
+    public var nativeSequence: Int64
+}
+public struct DSHFeedbackChange: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let messageId: String
+    public let item: DSHFeedbackItem?
+    public let nativeSequence: Int64
+}
+public struct DSHFeedbackReceipt: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let messageId: String
+    public let requestId: String
+    public let item: DSHFeedbackItem?
+}
+public struct DSHReferenceCandidates: Codable, Sendable, Equatable {
+    public struct Item: Codable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let label: String
+        public let kind: String
+        public let insertion: String
+        public let path: String?
+        public let sourceSessionId: String?
+        public let detail: String?
+        public let sameWorkspace: Bool?
+    }
+    public let sessionId: String
+    public let kind: String
+    public let query: String
+    public let items: [Item]
+}
+
+public enum DSHSessionReference {
+    /// Native URI is base64url(JSON.stringify(opaque sessionId)), not a path.
+    public static func sessionID(from url: URL) -> String? {
+        let text = url.absoluteString, prefix = "dsh-session:"
+        guard text.hasPrefix(prefix) else { return nil }
+        let payload = String(text.dropFirst(prefix.count))
+        guard !payload.isEmpty, payload.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else { return nil }
+        let base64 = payload.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        guard let data = Data(base64Encoded: base64 + String(repeating: "=", count: (4 - base64.count % 4) % 4)),
+              let id = try? JSONDecoder().decode(String.self, from: data), !id.isEmpty else { return nil }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard let canonical = try? encoder.encode(id),
+              canonical.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") == payload else { return nil }
+        return id
     }
 }
 
@@ -1406,6 +1717,15 @@ public enum DSHToolPresentation {
     }
 }
 
+public struct DSHDecisionVersion: Codable, Sendable, Equatable {
+    public let epoch: String
+    public let revision: Int64
+}
+public struct DSHDecisionsSnapshot: Codable, Sendable, Equatable {
+    public let stateVersion: DSHDecisionVersion
+    public let approvals: [DSHApprovalRequest]
+    public let questions: [DSHQuestionRequest]
+}
 public struct DSHApprovalRequest: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let sessionId: String
@@ -1414,17 +1734,22 @@ public struct DSHApprovalRequest: Codable, Sendable, Equatable, Identifiable {
     public let expiresAt: Int64?
 
     public init(id: String, sessionId: String, toolName: String, reason: String,
-                expiresAt: Int64? = nil) {
+                expiresAt: Int64? = nil, stateVersion: DSHDecisionVersion? = nil) {
         self.id = id; self.sessionId = sessionId; self.toolName = toolName
         self.reason = reason; self.expiresAt = expiresAt
+        self.stateVersion = stateVersion
     }
+    public let stateVersion: DSHDecisionVersion?
 }
 
 public struct DSHApprovalResolution: Codable, Sendable, Equatable {
     public let id: String
     public let allowed: Bool
 
-    public init(id: String, allowed: Bool) { self.id = id; self.allowed = allowed }
+    public let stateVersion: DSHDecisionVersion?
+    public init(id: String, allowed: Bool, stateVersion: DSHDecisionVersion? = nil) {
+        self.id = id; self.allowed = allowed; self.stateVersion = stateVersion
+    }
 }
 
 /// One selectable answer for a question raised by `ask_user_question`.
@@ -1439,6 +1764,233 @@ public struct DSHQuestionOption: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct DSHWorkflowRun: Codable, Sendable, Equatable, Identifiable {
+    public struct Member: Codable, Sendable, Equatable, Identifiable {
+        public let seq: Int
+        public let label: String
+        public let phase: String?
+        public let childId: String
+        public let status: String
+        public var id: Int { seq }
+    }
+    public struct Phase: Sendable, Equatable, Identifiable {
+        public let name: String?
+        public var members: [Member]
+        public var id: String { name.map { "value:\($0.utf16.count):\($0)" } ?? "missing" }
+    }
+    public let id: String
+    public let name: String
+    public let status: String
+    public let nativeSequence: Int64?
+    public let updatedNativeSequence: Int64?
+    public let startedAt: Int64?
+    public let finishedAt: Int64?
+    public let members: [Member]
+    public var sequence: Int64?
+    public var phases: [Phase] {
+        var result: [Phase] = []
+        for member in members {
+            if let index = result.firstIndex(where: { $0.name == member.phase }) { result[index].members.append(member) }
+            else { result.append(Phase(name: member.phase, members: [member])) }
+        }
+        return result
+    }
+}
+public struct DSHWorkflowChanged: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let run: DSHWorkflowRun
+    public let inTranscript: Bool?
+}
+
+public struct DSHPlanState: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let active: Bool
+    public var pending: Bool? = nil
+    public var available: Bool? = nil
+}
+
+public struct DSHPlanProjection: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let active: Bool
+    public let pending: Bool
+    public var available: Bool
+    public let supported: Bool
+    public let epoch: String
+    public let seq: Int64
+}
+
+public struct DSHCommandCatalog: Codable, Sendable, Equatable {
+    public struct Skill: Codable, Sendable, Equatable {
+        public let name: String
+        public let description: String
+        public let whenToUse: String?
+        public let modelInvocable: Bool
+    }
+    public struct Entry: Codable, Sendable, Equatable {
+        public struct Input: Codable, Sendable, Equatable {
+            public let hint: String
+            public let attachments: Bool?
+        }
+        public let name: String
+        public let description: String
+        public let input: Input?
+    }
+    public let sessionId: String
+    public let supported: Bool?
+    public let commands: [Entry]
+    public let skills: [Skill]?
+}
+
+public struct DSHCommandCatalogInvalidated: Codable, Sendable, Equatable {
+    public let sessionId: String?
+}
+
+public struct DSHSessionForked: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let parentSessionId: String
+    public let requestId: String
+}
+
+public struct DSHTodoState: Codable, Sendable, Equatable {
+    public struct Item: Codable, Sendable, Equatable {
+        public let content: String
+        public let status: String
+    }
+    public let sessionId: String
+    public let todos: [Item]
+}
+
+public struct DSHJobsState: Codable, Sendable, Equatable {
+    public struct Job: Codable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let kind: String
+        public let label: String
+        public let status: String
+        public let detail: String?
+        public let startedAt: Int64
+        public let finishedAt: Int64?
+    }
+    public let sessionId: String
+    public let available: Bool
+    public let jobs: [Job]
+}
+
+public struct DSHServerQueue: Codable, Sendable, Equatable {
+    public struct Item: Codable, Sendable, Equatable, Identifiable {
+        public struct Message: Codable, Sendable, Equatable {
+            public let id: String
+            public let content: [DSHJSONValue]
+        }
+        public let id: String
+        public let placement: String
+        public let rpcId: String?
+        public let message: Message
+        public let attachments: [DSHMessageAttachment]?
+        public init(id: String, placement: String, rpcId: String? = nil, message: Message, attachments: [DSHMessageAttachment]? = nil) {
+            self.id = id; self.placement = placement; self.rpcId = rpcId; self.message = message; self.attachments = attachments
+        }
+        public var text: String {
+            message.content.compactMap { block -> String? in
+                guard case .object(let fields) = block, fields["type"] == .string("text"),
+                      case .string(let text) = fields["text"] else { return nil }
+                return text
+            }.joined(separator: "\n")
+        }
+        public var isTextOnly: Bool {
+            !message.content.isEmpty && message.content.allSatisfy { block in
+                if case .object(let fields) = block { return fields["type"] == .string("text") }
+                return false
+            }
+        }
+    }
+    public let sessionId: String
+    public let available: Bool
+    public let items: [Item]
+}
+
+public struct DSHQueueUpdated: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let itemId: String
+    public let requestId: String
+}
+
+public struct DSHSubagentCatalog: Codable, Sendable, Equatable {
+    public struct Entry: Codable, Sendable, Equatable, Identifiable {
+        public let kind: String
+        public let id: String
+        public let activity: String?
+        public let hasChildren: Bool?
+        public let mode: String?
+        public let label: String?
+        public let reason: String?
+    }
+    public let parentSessionId: String
+    public let parentAvailable: Bool
+    public let supported: Bool?
+    public let entries: [Entry]
+}
+
+public struct DSHSubagentCatalogInvalidated: Codable, Sendable, Equatable {
+    public let parentSessionId: String
+}
+
+public struct DSHSubagentReceipt: Codable, Sendable, Equatable {
+    public let parentSessionId: String
+    public let childSessionId: String
+    public let requestId: String
+    public let action: String
+    public let messageId: String?
+}
+
+public struct DSHGoalState: Codable, Sendable, Equatable {
+    public struct Goal: Codable, Sendable, Equatable, Identifiable {
+        public struct BlockReason: Codable, Sendable, Equatable {
+            public let code: String
+            public let message: String
+        }
+        public let id: String
+        public let revision: Int
+        public let objective: String
+        public let phase: String
+        public let maxGoalRounds: Int
+        public let blockedReason: BlockReason?
+    }
+    public let sessionId: String
+    public let goal: Goal?
+    public var roundsStarted: Int
+    public var activation: String?
+}
+
+public struct DSHGoalUpdated: Codable, Sendable, Equatable {
+    public struct Ref: Codable, Sendable, Equatable {
+        public let id: String
+        public let revision: Int
+    }
+    public let sessionId: String
+    public let requestId: String
+    public let action: String
+    public let ref: Ref
+}
+
+public struct DSHGoalActivation: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let id: String
+    public let revision: Int
+    public let activation: String
+}
+
+public struct DSHGoalRound: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let id: String
+    public let round: Int
+}
+
+public struct DSHQuestionIntent: Codable, Sendable, Equatable {
+    public let kind: String
+    public let approve: String
+    public init(kind: String, approve: String) { self.kind = kind; self.approve = approve }
+}
+
 public struct DSHQuestion: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let question: String
@@ -1447,11 +1999,14 @@ public struct DSHQuestion: Codable, Sendable, Equatable, Identifiable {
     public let detail: String?
     public let options: [DSHQuestionOption]?
     public let multiSelect: Bool?
+    public let intent: DSHQuestionIntent?
 
     public init(id: String, question: String, header: String? = nil, detail: String? = nil,
-                options: [DSHQuestionOption]? = nil, multiSelect: Bool? = nil) {
+                options: [DSHQuestionOption]? = nil, multiSelect: Bool? = nil,
+                intent: DSHQuestionIntent? = nil) {
         self.id = id; self.question = question; self.header = header; self.detail = detail
         self.options = options; self.multiSelect = multiSelect
+        self.intent = intent
     }
 }
 
@@ -1461,9 +2016,12 @@ public struct DSHQuestionRequest: Codable, Sendable, Equatable, Identifiable {
     public let questions: [DSHQuestion]
     public let expiresAt: Int64?
 
-    public init(id: String, sessionId: String, questions: [DSHQuestion], expiresAt: Int64? = nil) {
+    public let stateVersion: DSHDecisionVersion?
+    public init(id: String, sessionId: String, questions: [DSHQuestion], expiresAt: Int64? = nil,
+                stateVersion: DSHDecisionVersion? = nil) {
         self.id = id; self.sessionId = sessionId
         self.questions = questions; self.expiresAt = expiresAt
+        self.stateVersion = stateVersion
     }
 }
 
@@ -1471,7 +2029,10 @@ public struct DSHQuestionResolution: Codable, Sendable, Equatable {
     public let id: String
     public let sessionId: String
 
-    public init(id: String, sessionId: String) { self.id = id; self.sessionId = sessionId }
+    public let stateVersion: DSHDecisionVersion?
+    public init(id: String, sessionId: String, stateVersion: DSHDecisionVersion? = nil) {
+        self.id = id; self.sessionId = sessionId; self.stateVersion = stateVersion
+    }
 }
 
 public struct DSHReasoning: Codable, Sendable, Equatable {
@@ -1488,11 +2049,13 @@ public struct DSHProtocolError: Codable, Sendable, Equatable {
     public let code: String
     public let message: String
     public let retryable: Bool
+    public let httpStatus: Int?
 
-    public init(code: String, message: String, retryable: Bool = false) {
+    public init(code: String, message: String, retryable: Bool = false, httpStatus: Int? = nil) {
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.httpStatus = httpStatus
     }
 }
 
@@ -1542,6 +2105,8 @@ public enum DSHEventKind: Sendable, Equatable {
     case workspaceCreated(DSHWorkspaceOption)
     case modeCatalog(DSHModeCatalog)
     case directoryListing(DSHDirectoryListing)
+    case workspaceFiles(DSHWorkspaceFiles)
+    case workspaceBytes(DSHWorkspaceBytes)
     case usageUpdated(DSHUsageUpdate)
     case permissionUpdated(DSHPermissionUpdate)
     case sessionMetadataUpdated(DSHSessionMetadataUpdate)
@@ -1552,6 +2117,39 @@ public enum DSHEventKind: Sendable, Equatable {
     case assistantReasoning(DSHReasoning)
     case questionAsked(DSHQuestionRequest)
     case questionResolved(DSHQuestionResolution)
+    case planChanged(DSHPlanState)
+    case todoChanged(DSHTodoState)
+    case jobsChanged(DSHJobsState)
+    case queueChanged(DSHServerQueue)
+    case queueUpdated(DSHQueueUpdated)
+    case subagentCatalog(DSHSubagentCatalog)
+    case subagentCatalogInvalidated(DSHSubagentCatalogInvalidated)
+    case subagentReceipt(DSHSubagentReceipt)
+    case decisionsSnapshot(DSHDecisionsSnapshot)
+    case sessionForked(DSHSessionForked)
+    case commandCatalog(DSHCommandCatalog)
+    case commandCatalogInvalidated(DSHCommandCatalogInvalidated)
+    case goalChanged(DSHGoalState)
+    case goalState(DSHGoalState)
+    case goalUpdated(DSHGoalUpdated)
+    case feedbackState(DSHFeedbackState)
+    case feedbackChanged(DSHFeedbackChange)
+    case feedbackUpdated(DSHFeedbackReceipt)
+    case referenceCandidates(DSHReferenceCandidates)
+    case searchResults(DSHSearchResults)
+    case historyWindow(DSHHistoryWindow)
+    case historyPage(DSHHistoryPage)
+    case scheduleProjection(DSHScheduleProjection)
+    case configurationInvalidated(DSHConfigurationInvalidation)
+    case configurationModels(DSHDiscoveredModels)
+    case configurationResult(DSHConfigurationResult)
+    case configurationUpdated(DSHConfigurationReceipt)
+    case planProjection(DSHPlanProjection)
+    case workflowChanged(DSHWorkflowChanged)
+    case executionRecorded(DSHExecutionRecorded)
+    case executionPage(DSHExecutionPage)
+    case goalActivation(DSHGoalActivation)
+    case goalRound(DSHGoalRound)
     case protocolError(DSHProtocolError)
     case historyStarted(DSHHistoryBatch)
     case historyCompleted(DSHHistoryBatch)
@@ -1614,6 +2212,41 @@ public struct DSHEvent: Codable, Sendable, Equatable, Identifiable {
         case "prompt.accepted": return decode(DSHPromptAccepted.self, payload).map(DSHEventKind.promptAccepted) ?? .unknown
         case "assistant.reasoning": return decode(DSHReasoning.self, payload).map(DSHEventKind.assistantReasoning) ?? .unknown
         case "question.asked": return decode(DSHQuestionRequest.self, payload).map(DSHEventKind.questionAsked) ?? .unknown
+        case "plan.changed": return decode(DSHPlanState.self, payload).map(DSHEventKind.planChanged) ?? .unknown
+        case "todo.changed": return decode(DSHTodoState.self, payload).map(DSHEventKind.todoChanged) ?? .unknown
+        case "jobs.changed": return decode(DSHJobsState.self, payload).map(DSHEventKind.jobsChanged) ?? .unknown
+        case "queue.changed": return decode(DSHServerQueue.self, payload).map(DSHEventKind.queueChanged) ?? .unknown
+        case "queue.updated": return decode(DSHQueueUpdated.self, payload).map(DSHEventKind.queueUpdated) ?? .unknown
+        case "subagent.catalog": return decode(DSHSubagentCatalog.self, payload).map(DSHEventKind.subagentCatalog) ?? .unknown
+        case "workspace.files": return decode(DSHWorkspaceFiles.self, payload).map(DSHEventKind.workspaceFiles) ?? .unknown
+        case "workspace.bytes": return decode(DSHWorkspaceBytes.self, payload).map(DSHEventKind.workspaceBytes) ?? .unknown
+        case "subagent.catalog.invalidated": return decode(DSHSubagentCatalogInvalidated.self, payload).map(DSHEventKind.subagentCatalogInvalidated) ?? .unknown
+        case "subagent.receipt": return decode(DSHSubagentReceipt.self, payload).map(DSHEventKind.subagentReceipt) ?? .unknown
+        case "decisions.snapshot": return decode(DSHDecisionsSnapshot.self, payload).map(DSHEventKind.decisionsSnapshot) ?? .unknown
+        case "session.forked": return decode(DSHSessionForked.self, payload).map(DSHEventKind.sessionForked) ?? .unknown
+        case "command.catalog": return decode(DSHCommandCatalog.self, payload).map(DSHEventKind.commandCatalog) ?? .unknown
+        case "command.catalog.invalidated": return decode(DSHCommandCatalogInvalidated.self, payload).map(DSHEventKind.commandCatalogInvalidated) ?? .unknown
+        case "goal.changed": return decode(DSHGoalState.self, payload).map(DSHEventKind.goalChanged) ?? .unknown
+        case "goal.state": return decode(DSHGoalState.self, payload).map(DSHEventKind.goalState) ?? .unknown
+        case "goal.updated": return decode(DSHGoalUpdated.self, payload).map(DSHEventKind.goalUpdated) ?? .unknown
+        case "feedback.state": return decode(DSHFeedbackState.self, payload).map(DSHEventKind.feedbackState) ?? .unknown
+        case "feedback.changed": return decode(DSHFeedbackChange.self, payload).map(DSHEventKind.feedbackChanged) ?? .unknown
+        case "feedback.updated": return decode(DSHFeedbackReceipt.self, payload).map(DSHEventKind.feedbackUpdated) ?? .unknown
+        case "reference.candidates": return decode(DSHReferenceCandidates.self, payload).map(DSHEventKind.referenceCandidates) ?? .unknown
+        case "search.results": return decode(DSHSearchResults.self, payload).map(DSHEventKind.searchResults) ?? .unknown
+        case "history.window": return decode(DSHHistoryWindow.self, payload).map(DSHEventKind.historyWindow) ?? .unknown
+        case "history.page": return decode(DSHHistoryPage.self, payload).map(DSHEventKind.historyPage) ?? .unknown
+        case "schedule.projection": return decode(DSHScheduleProjection.self, payload).map(DSHEventKind.scheduleProjection) ?? .unknown
+        case "configuration.invalidated": return decode(DSHConfigurationInvalidation.self, payload).map(DSHEventKind.configurationInvalidated) ?? .unknown
+        case "configuration.models": return decode(DSHDiscoveredModels.self, payload).map(DSHEventKind.configurationModels) ?? .unknown
+        case "configuration.result": return decode(DSHConfigurationResult.self, payload).map(DSHEventKind.configurationResult) ?? .unknown
+        case "configuration.updated": return decode(DSHConfigurationReceipt.self, payload).map(DSHEventKind.configurationUpdated) ?? .unknown
+        case "plan.projection": return decode(DSHPlanProjection.self, payload).map(DSHEventKind.planProjection) ?? .unknown
+        case "workflow.changed": return decode(DSHWorkflowChanged.self, payload).map(DSHEventKind.workflowChanged) ?? .unknown
+        case "execution.recorded": return decode(DSHExecutionRecorded.self, payload).map(DSHEventKind.executionRecorded) ?? .unknown
+        case "execution.page": return decode(DSHExecutionPage.self, payload).map(DSHEventKind.executionPage) ?? .unknown
+        case "goal.activation": return decode(DSHGoalActivation.self, payload).map(DSHEventKind.goalActivation) ?? .unknown
+        case "goal.round": return decode(DSHGoalRound.self, payload).map(DSHEventKind.goalRound) ?? .unknown
         case "question.resolved": return decode(DSHQuestionResolution.self, payload).map(DSHEventKind.questionResolved) ?? .unknown
         case "protocol.error": return decode(DSHProtocolError.self, payload).map(DSHEventKind.protocolError) ?? .unknown
         case "history.started": return decode(DSHHistoryBatch.self, payload).map(DSHEventKind.historyStarted) ?? .unknown

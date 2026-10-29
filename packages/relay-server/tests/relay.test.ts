@@ -76,6 +76,19 @@ async function register(base: string, machineName: string): Promise<Registration
   return result.body;
 }
 
+describe("schema negotiation", () => {
+  it("keeps legacy greetings unchanged and proves the schema only to opted-in clients", async () => {
+    const server = await relay(), machine = await register(server.url, "Schema test"), phone = await pair(server.url, machine)
+    const legacy = await connect(server.url, phone.deviceToken)
+    expect(messages(legacy).find(message => message.type === 'relay.ready')).not.toHaveProperty('schemaRevision')
+    const current = new WebSocket(wsUrl(server.url) + '?schemaRevision=11', { headers: { authorization: `Bearer ${machine.machineToken}` } })
+    const received = messages(current)
+    await once(current, 'open')
+    expect(await waitForMessage(received, 'relay.ready', 5000)).toMatchObject({ schemaRevision: 11, role: 'machine' })
+    current.close(); legacy.close()
+  })
+})
+
 describe("public one-command enrollment", () => {
   it("serves private one-use installers for macOS, Linux, and Windows", async () => {
     const server = await publicEnrollmentRelay();
@@ -155,12 +168,20 @@ const wsUrl = (base: string): string => base.replace(/^http/, "ws") + "/v1/conne
 
 async function connect(base: string, token: string): Promise<WebSocket> {
   const socket = new WebSocket(wsUrl(base), { headers: { authorization: `Bearer ${token}` } });
+  const received = messages(socket);
   await once(socket, "open");
+  // A WebSocket upgrade precedes the persisted machine lease. Routing tests
+  // need a registered peer, matching the production clients' relay.ready gate.
+  await waitForMessage(received, "relay.ready", 5_000);
   return socket;
 }
 
+const messageHistory = new WeakMap<WebSocket, RelayMessage[]>();
 function messages(socket: WebSocket): RelayMessage[] {
+  const existing = messageHistory.get(socket);
+  if (existing !== undefined) return existing;
   const received: RelayMessage[] = [];
+  messageHistory.set(socket, received);
   socket.on("message", (raw) => received.push(JSON.parse(raw.toString()) as RelayMessage));
   return received;
 }

@@ -20,18 +20,63 @@ import {
   PromptSendPayloadSchema,
   PROTOCOL_VERSION,
   QuestionAnswerPayloadSchema,
+  GoalChangedPayloadSchema,
+  GoalUpdatePayloadSchema,
+  GoalUpdatedPayloadSchema,
+  TodoChangedPayloadSchema,
+  SessionForkPayloadSchema,
+  CommandCatalogPayloadSchema,
+  QueueUpdatePayloadSchema,
+  SubagentCatalogPayloadSchema,
+  SubagentPromptPayloadSchema,
+  SubagentInterruptPayloadSchema,
+  WorkspaceFilesCommandSchema,
+  WorkspaceFilesPayloadSchema,
+  WorkspaceBytesCommandSchema,
+  WorkspaceBytesPayloadSchema,
+  ExecutionListCommandSchema,
+  FeedbackUpdateSchema,
+  FeedbackUpdatedSchema,
+  ReferenceListSchema,
+  SearchCommandSchema,
+  SearchResultsSchema,
+  HistoryReadCommandSchema,
+  ScheduleGetSchema,
+  SCHEMA_REVISION,
+  supportsSchemaRevision,
+  ConfigurationDiscoverySchema,
+  ConfigurationReadSchema,
+  ConfigurationUpdateSchema,
   pairingLink,
   relayHTTPSURL,
   type EventEnvelope,
   type QuestionAnswerItem,
 } from '@dsh-anywhere/protocol'
 import { invokeNative } from './gateway.js'
+import { feedbackChanged, feedbackState } from './feedback.js'
+import { referenceCandidates } from './references.js'
+import { searchHistory, type NativeSearch } from './search.js'
+import { historyWindow, projectHistoryPage } from './history.js'
+import { ScheduleControlMirror } from './schedules.js'
+import { observeConfigurationChanges, discoverConfigurationModels, readConfiguration, updateConfiguration, configurationFailure } from './configuration.js'
 import { publishBridgeEndpoint, registeredBridgeToken } from './desktop.js'
 import { PairingAuthority } from './auth.js'
 import { HttpError, json, readJson, RetryableHttpError } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
-import { PendingQuestions, firstAnswered } from './pending-questions.js'
+import { PendingQuestions, firstAnswered, isQuestionCancellation } from './pending-questions.js'
 import { ReplayBuffer } from './replay.js'
+import { JobControlMirror } from './jobs.js'
+import { QueueControlMirror } from './queue.js'
+import { DecisionStateMirror } from './decisions.js'
+import { PlanControlMirror } from './plan.js'
+import { WorkflowRecords, workflowHistory } from './workflows.js'
+import { executionRecord, executionPrefix, executionPage, executionLifecycle } from './execution.js'
+
+// Live activation must never be overwritten by a slower baseline read.
+const goalActivationEpochs = new WeakMap<object, Map<string, number>>()
+const controlSnapshots = new WeakMap<object, (sessionId: string, deviceId: string) => void>()
+const workflowRecords = new WeakMap<object, WorkflowRecords>()
+const scheduleMirrors = new WeakMap<object, ScheduleControlMirror>()
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
@@ -363,6 +408,7 @@ interface NativeContext extends Context {
     findAttachmentByRequestId?(requestId: string, signal: AbortSignal): Promise<unknown | undefined | AttachmentUploadRecoveryResult>
     /** Available in current Harness builds; optional for older connectors. */
     rename?(request: { sessionId: string; title: string }): Promise<unknown>
+    fork?(request: { sessionId: string; atSeq?: number }): Promise<{ sessionId: string }>
     selectModel(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<unknown>
     modelCatalog(): Promise<unknown>
     resolveAgent(sessionId: string): Promise<{ agent: unknown } | { error: unknown }>
@@ -374,7 +420,11 @@ interface NativeContext extends Context {
       clientTimeZone?: string
     }, signal: AbortSignal): Promise<{ accepted: true }>
     cancel(request: { sessionId: string }): { accepted: true }
-    inspect(sessionId: string, signal?: AbortSignal): Promise<{ events: unknown[] }>
+    inspect(sessionId: string, signal?: AbortSignal): Promise<{ events: unknown[]; meta?: unknown; inheritedEventCount?: number }>
+    page?(request: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>
+    search?(request: { query: string }, signal: AbortSignal): Promise<unknown>
+    control?(signal: AbortSignal): AsyncIterable<unknown>
+    updateQueue?(request: { sessionId: string; itemId: string; action: { kind: 'edit'; content: { type: 'text'; text: string }[] } | { kind: 'remove' | 'steer' } }): Promise<unknown> | unknown
   }
   readonly workspaceRegistry?: {
     list(): readonly { id: string; path: string; title: string; sessionIds: readonly string[] }[]
@@ -1789,7 +1839,7 @@ function remoteMutationKeyFor(originDeviceId: string, path: string, requestId: s
  * stale captured response without reconstructing a bearer-scoped cache hash.
  */
 function durableHttpMutationKeyFor(originDeviceId: string, path: string, requestId: string): string | undefined {
-  if (path === '/workspaces' || /^\/sessions\/[^/]+\/command$/.test(path)) {
+  if (path === '/workspaces' || path === '/configuration' || /^\/sessions\/[^/]+\/(command|fork|queue|goal|feedback)$/.test(path) || /^\/sessions\/[^/]+\/subagents\/[^/]+\/(prompt|interrupt)$/.test(path)) {
     return remoteMutationKeyFor(originDeviceId, path, requestId)
   }
   const attachmentMatch = /^\/sessions\/([^/]+)\/attachments$/.exec(path)
@@ -2086,8 +2136,13 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const hasRemoteDecisionClient = (): boolean => relayDevices.size > 0 ||
     [...clientDeviceIds.values()].some((deviceId) => deviceId !== CONNECTOR_DEVICE_ID)
   const wss = new WebSocketServer({ noServer: true })
+  const decisions = new DecisionStateMirror()
+  const workflows = new WorkflowRecords()
+  workflowRecords.set(ctx, workflows)
+  const decisionSnapshot = (): Record<string, unknown> => decisions.snapshot()
 
   const publish = (event: NativeEventInput, recipients: Iterable<WebSocket> = clients): void => {
+    const payload = decisions.stamp(event.type, event.payload)
     const sequence = replay.latestSequence + 1
     const next = EventEnvelopeSchema.parse({
       version: PROTOCOL_VERSION,
@@ -2097,7 +2152,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       deviceId: event.deviceId ?? 'broadcast',
       sequence,
       type: event.type,
-      payload: event.payload,
+      payload,
       ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
       ...(event.historyBatchId === undefined ? {} : { historyBatchId: event.historyBatchId }),
     })
@@ -2107,6 +2162,49 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       if (client.readyState === WebSocket.OPEN) client.send(wire)
     }
   }
+
+  const jobs = new JobControlMirror((payload) => publish({ type: 'jobs.changed', sessionId: payload.sessionId, payload }))
+  const queue = new QueueControlMirror((payload) => publish({ type: 'queue.changed', sessionId: payload.sessionId, payload }),
+    (content) => contentAttachments(content, attachmentPathsOf(ctx)))
+  const plan = new PlanControlMirror((payload) => publish({ type: 'plan.projection', sessionId: payload.sessionId, payload }))
+  const schedules = new ScheduleControlMirror((payload) => publish({ type: 'schedule.projection', sessionId: payload.sessionId, payload }))
+  scheduleMirrors.set(ctx, schedules)
+  controlSnapshots.set(ctx, (sessionId, deviceId) => {
+    for (const payload of jobs.snapshot().filter((item) => item.sessionId === sessionId)) publish({ type: 'jobs.changed', sessionId, deviceId, payload })
+    for (const payload of queue.snapshot().filter((item) => item.sessionId === sessionId)) publish({ type: 'queue.changed', sessionId, deviceId, payload })
+    for (const payload of plan.snapshot(sessionId)) publish({ type: 'plan.projection', sessionId, deviceId, payload })
+    for (const payload of schedules.snapshot(sessionId)) publish({ type: 'schedule.projection', sessionId, deviceId, payload })
+  })
+  ctx.effect(() => {
+    if (ctx.sessionController.control === undefined) return () => undefined
+    const controller = new AbortController()
+    const run = async (): Promise<void> => {
+      while (!controller.signal.aborted) {
+        try {
+          for await (const frame of ctx.sessionController.control!(controller.signal)) {
+            if (controller.signal.aborted) return
+            jobs.apply(frame)
+            queue.apply(frame)
+            plan.apply(frame)
+            schedules.apply(frame)
+          }
+        } catch {
+          if (controller.signal.aborted) return
+        }
+        jobs.disconnect()
+        queue.disconnect()
+        plan.disconnect()
+        schedules.disconnect()
+        await new Promise<void>((resolve) => {
+          const finish = (): void => { clearTimeout(timer); controller.signal.removeEventListener('abort', finish); resolve() }
+          const timer = setTimeout(finish, 1_000)
+          controller.signal.addEventListener('abort', finish, { once: true })
+        })
+      }
+    }
+    void run().catch((error: unknown) => ctx.logger.warn(`Control stream stopped: ${String(error)}`))
+    return () => controller.abort()
+  })
 
   const route = ctx.webServer.register({
     kind: 'prefix',
@@ -2125,6 +2223,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             latestBridgeLeases,
             bridgeEpoch,
             connectorGenerationOf,
+            decisionSnapshot,
             () => {
               if (!hasRemoteDecisionClient()) {
                 approvals.rejectAll()
@@ -2157,8 +2256,14 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       const authenticatedDevice = authorization === undefined
         ? undefined
         : pairing.authenticate(authorization)
+      if (authenticatedDevice?.id === CONNECTOR_DEVICE_ID &&
+          new URL(req.url ?? '/', 'http://localhost').pathname !== `${prefix}/health` &&
+          !supportsSchemaRevision(header(req, 'x-dsh-schema-revision'))) {
+        json(res, 426, { error: `Connector 协议过旧，请更新 Connector 与 Bridge；至少需要 schemaRevision ${SCHEMA_REVISION}` })
+        return
+      }
       if (req.method === 'POST' && requestId !== undefined && requestId.length > 0 && requestId.length <= 256 &&
-          authenticatedDevice !== undefined) {
+          authenticatedDevice !== undefined && new URL(req.url ?? '/', 'http://localhost').pathname !== `${prefix}/configuration/discover`) {
         const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
         const routePath = pathname.slice(prefix.length) || '/'
         const originDeviceId = authenticatedDevice.id === CONNECTOR_DEVICE_ID
@@ -2170,6 +2275,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
           ? suppliedHash.toLowerCase()
           : undefined
+        if (routePath === '/configuration' && fingerprint === undefined) { json(res, 400, { error: 'configuration writes require a request fingerprint' }); return }
         const durableKey = durableHttpMutationKeyFor(originDeviceId, routePath, requestId)
         try {
           await idempotentResponses.respond(key, fingerprint, req, res, serve, durableKey)
@@ -2191,6 +2297,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
         socket.destroy()
         return
+      }
+      if (device.id === CONNECTOR_DEVICE_ID && !supportsSchemaRevision(header(req, 'x-dsh-schema-revision'))) {
+        socket.write('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n'); socket.destroy(); return
       }
       wss.handleUpgrade(req, socket, head, (client) => {
         // A WebSocket can emit `error` for a malformed frame or a peer-side
@@ -2249,6 +2358,15 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         void (async () => {
           const items = await listSummaries(ctx, metadata, false, device.id)
           publish({ deviceId: device.id, type: 'session.snapshot', payload: items }, [client])
+          for (const payload of jobs.snapshot()) {
+            publish({ deviceId: device.id, sessionId: payload.sessionId, type: 'jobs.changed', payload }, [client])
+          }
+          for (const payload of queue.snapshot()) {
+            publish({ deviceId: device.id, sessionId: payload.sessionId, type: 'queue.changed', payload }, [client])
+          }
+          for (const payload of plan.snapshot()) {
+            publish({ deviceId: device.id, sessionId: payload.sessionId, type: 'plan.projection', payload }, [client])
+          }
           await publishModelCatalog(ctx, publish, device.id)
           // Seed the live model projection from the authoritative snapshot
           // before the resume fast-path below. Existing sessions may not emit
@@ -2277,6 +2395,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             const historyToolNames = new Map<string, string>()
             const historyUsageCounters = new Map<string, UsageCounter>()
             const historyModelSelections = new Map<string, ModelSelectionProjection>()
+            const workflowReplay = workflowHistory(allEvents, recentStart)
             const batchId = randomUUID()
             let publishedUsage = false
             // Same brackets as publishSessionHistory: the fresh client must
@@ -2285,19 +2404,31 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             publish({ deviceId: device.id, sessionId: summary.id, type: 'history.started',
               historyBatchId: batchId,
               payload: { sessionId: summary.id, batchId } }, [client])
+            for (const item of workflowReplay.before) publish({ deviceId: device.id, sessionId: summary.id,
+              type: 'workflow.changed', historyBatchId: batchId, payload: { ...item, sessionId: summary.id } }, [client])
+            for (const record of executionPrefix(allEvents, recentStart)) publish({ deviceId: device.id, sessionId: summary.id,
+              type: 'execution.recorded', historyBatchId: batchId, payload: { sessionId: summary.id, record, inTranscript: false } }, [client])
             for (let index = 0; index < allEvents.length; index += 1) {
               const event = allEvents[index]
-              const normalized = normalizeSessionEvents(summary.id, event, historyToolNames, historyUsageCounters, historyModelSelections)
+              const normalized = normalizeSessionEvents(summary.id, event, historyToolNames, historyUsageCounters, historyModelSelections, undefined, attachmentPathsOf(ctx))
+              for (const item of workflowReplay.byIndex.get(index) ?? []) publish({ deviceId: device.id, sessionId: summary.id,
+                type: 'workflow.changed', historyBatchId: batchId, payload: { ...item, sessionId: summary.id } }, [client])
               if (index < recentStart) continue
               for (const next of normalized) {
                 if (next.type === 'usage.updated') publishedUsage = true
                 publish({ ...next, deviceId: device.id, historyBatchId: batchId }, [client])
               }
+              const record = executionRecord(event)
+              if (record !== undefined) publish({ deviceId: device.id, sessionId: summary.id, type: 'execution.recorded',
+                historyBatchId: batchId, payload: { sessionId: summary.id, record } }, [client])
             }
             // The phone only needs recent message/tool rows, but the footer
             // must include the complete durable session. Processing all events
             // above builds that accumulator without flooding a fresh client
             // with thousands of historical transcript cards.
+            for (const payload of workflows.seed(summary.id, allEvents)) {
+              publish({ deviceId: device.id, sessionId: summary.id, type: 'workflow.changed', payload: { ...payload, inTranscript: false } }, [client])
+            }
             const completeUsage = historyUsageCounters.get(summary.id)
             if (!publishedUsage && completeUsage !== undefined && hasUsage(completeUsage)) {
               publish({
@@ -2314,6 +2445,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
             publish({ deviceId: device.id, sessionId: summary.id, type: 'history.completed',
               historyBatchId: batchId,
               payload: { sessionId: summary.id, batchId } }, [client])
+            const window = historyWindow(summary.id, allEvents, recentStart)
+            if (window !== undefined) publish({ deviceId: device.id, sessionId: summary.id, type: 'history.window', payload: window }, [client])
             remaining -= recentCount
           }
         })().catch((error: unknown) => {
@@ -2408,10 +2541,16 @@ export function apply(baseCtx: Context, config: Config = {}): void {
 
   ctx.on('session/event' as never, ((session: { id: string }, event: unknown) => {
     if (isSilentSetupEcho(session.id, event)) return
+    if (recordOf(event).type === 'subagent/catalog') {
+      publish({ type: 'subagent.catalog.invalidated', sessionId: session.id, payload: { parentSessionId: session.id } })
+    }
     const normalized = normalizeSessionEvents(
-      session.id, event, toolNames, usageCounters, modelSelections, liveStreamMessageIDs,
+      session.id, event, toolNames, usageCounters, modelSelections, liveStreamMessageIDs, attachmentPathsOf(ctx),
     )
     for (const next of normalized) publish(next)
+    const record = executionRecord(event)
+    if (record !== undefined) publish({ type: 'execution.recorded', sessionId: session.id, payload: { sessionId: session.id, record } })
+    for (const payload of workflows.apply(session.id, event)) publish({ type: 'workflow.changed', sessionId: session.id, payload })
     if (recordOf(event).type === 'assistant/message') {
       const data = recordOf(recordOf(event).data)
       const key = liveStreamKey(session.id, data.turn, data.step)
@@ -2429,6 +2568,32 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         publish({ type: 'protocol.error', payload: { code: 'session-title-refresh-failed', message: String(error), retryable: true } })
       })
     }
+  }) as never, { global: true })
+
+  observeConfigurationChanges((event, listener) => { ctx.on(event as never, listener as never, { global: true }) }, publish)
+
+  ctx.on('commands/change' as never, (() => {
+    publish({ type: 'command.catalog.invalidated', payload: {} })
+  }) as never, { global: true })
+  ctx.on('skills/change' as never, (() => {
+    publish({ type: 'command.catalog.invalidated', payload: {} })
+  }) as never, { global: true })
+  ctx.on('agent-preset/selected' as never, ((value: unknown) => {
+    const sessionId = typeof value === 'string' ? value : recordOf(value).sessionId
+    if (typeof sessionId === 'string') publish({ type: 'command.catalog.invalidated', sessionId, payload: { sessionId } })
+  }) as never, { global: true })
+
+  ctx.on('goal/activation-changed' as never, ((value: unknown) => {
+    const data = recordOf(value)
+    const goal = recordOf(data.goal)
+    if (typeof data.sessionId !== 'string' || typeof goal.id !== 'string' ||
+      typeof goal.revision !== 'number' || !Number.isInteger(goal.revision) || goal.revision < 1 ||
+      (goal.activation !== 'armed' && goal.activation !== 'disarmed')) return
+    let epochs = goalActivationEpochs.get(ctx)
+    if (epochs === undefined) { epochs = new Map(); goalActivationEpochs.set(ctx, epochs) }
+    epochs.set(data.sessionId, (epochs.get(data.sessionId) ?? 0) + 1)
+    publish({ type: 'goal.activation', sessionId: data.sessionId,
+      payload: { sessionId: data.sessionId, id: goal.id, revision: goal.revision, activation: goal.activation } })
   }) as never, { global: true })
 
   ctx.on('session/created' as never, ((session: unknown) => {
@@ -2480,6 +2645,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     } catch {
       publish({ type: 'approval.resolved', sessionId: request.agent.id, payload: { id: pending.id, allowed: false } })
       return 'unavailable'
+    } finally {
+      approvals.discard(pending.id)
     }
   }) as never, { global: true, prepend: true })
 
@@ -2493,6 +2660,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
         question: string
         header?: string
         detail?: string
+        intent?: { kind: 'plan-review'; approve: string }
         options?: readonly { label: string; description?: string }[]
         multiSelect?: boolean
       }[]
@@ -2515,6 +2683,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
           question: question.question,
           ...(question.header === undefined ? {} : { header: question.header }),
           ...(question.detail === undefined ? {} : { detail: question.detail }),
+          ...(question.intent?.kind === 'plan-review' ? { intent: question.intent } : {}),
           ...(question.options === undefined ? {} : {
             options: question.options.map((option) => ({
               label: option.label,
@@ -2533,7 +2702,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       const winner = await firstAnswered(
         pending.result.then(
           (answers) => ({ answers }),
-          () => undefined,
+          (error: unknown) => { if (isQuestionCancellation(error)) throw error; return undefined },
         ),
         next(),
       )
@@ -2551,6 +2720,8 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     } catch (error) {
       publish({ type: 'question.resolved', sessionId, payload: { id: pending.id, sessionId } })
       throw error instanceof Error ? error : new Error(String(error))
+    } finally {
+      questions.discard(pending.id)
     }
   }) as never, { global: true, prepend: true })
 
@@ -2590,6 +2761,7 @@ async function handleHttp(
   }>,
   bridgeEpoch: string,
   connectorGenerationOf: (connectorId: string) => number | undefined,
+  decisionSnapshot: () => Record<string, unknown>,
   onRemotePresenceChanged: () => void,
 ): Promise<void> {
   await metadata.ready
@@ -2597,7 +2769,7 @@ async function handleHttp(
   const path = url.pathname.slice(prefix.length) || '/'
 
   if (req.method === 'GET' && path === '/health') {
-    json(res, 200, { ok: true, version: PROTOCOL_VERSION, machineId })
+    json(res, 200, { ok: true, version: PROTOCOL_VERSION, schemaRevision: SCHEMA_REVISION, minimumConnectorSchemaRevision: SCHEMA_REVISION, machineId })
     return
   }
   // The pairing page renders a live pairing secret, so it is deliberately
@@ -2664,6 +2836,11 @@ async function handleHttp(
     const keys = body.keys as string[]
     const removed = await metadata.compactSessionCreationRecords(keys)
     json(res, 200, { removed })
+    return
+  }
+
+  if (req.method === 'GET' && path === '/decisions') {
+    json(res, 200, decisionSnapshot())
     return
   }
 
@@ -2822,17 +2999,213 @@ async function handleHttp(
   const openMatch = /^\/sessions\/([^/]+)\/open$/.exec(path)
   if (req.method === 'POST' && openMatch !== null) {
     const sessionId = decodeURIComponent(openMatch[1]!)
-    const summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === sessionId)
-    if (summary === undefined) throw new HttpError(404, 'session not found')
     const body = objectOf(await readJson(req))
+    let summary
+    if (typeof body.parentSessionId === 'string') {
+      const catalog = await subagentCatalog(ctx, body.parentSessionId)
+      const child = catalog.entries.find((item) => item.kind === 'child' && item.id === sessionId)
+      if (child?.kind !== 'child' || child.mode !== body.subagentMode) throw new HttpError(403, 'child address does not belong to this parent catalog')
+      summary = normalizeSessionSummary({ id: sessionId, title: child.label ?? sessionId }, ctx, metadata)
+    } else {
+      if (body.subagentMode !== undefined) throw new HttpError(400, 'subagent mode requires its parent address')
+      summary = (await listSummaries(ctx, metadata, true, device.id)).find((item) => item.id === sessionId)
+    }
+    if (summary === undefined) throw new HttpError(404, 'session not found')
     const recipient = historyRecipient(device.id, body.deviceId)
     await publishSessionHistory(ctx, summary, recipient, publish)
+    controlSnapshots.get(ctx)?.(sessionId, recipient)
     json(res, 202, { accepted: true, sessionId })
+    return
+  }
+
+  if (path === '/configuration/discover' && req.method === 'POST') {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, '当前 Harness 未提供模型发现接口')
+    const parsed = ConfigurationDiscoverySchema.safeParse(await readJson(req))
+    if (!parsed.success) throw new HttpError(400, '模型发现参数无效')
+    json(res, 200, await discoverConfigurationModels(parsed.data, (namespace, method, args) => invokeNative(ctx, { namespace, method, args, signal: AbortSignal.timeout(30_000) })))
+    return
+  }
+
+  if (path === '/configuration' && (req.method === 'GET' || req.method === 'POST')) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, '当前 Harness 未提供电脑配置接口')
+    if (req.method === 'GET') {
+      let refs
+      try { refs = url.searchParams.has('refs') ? JSON.parse(url.searchParams.get('refs')!) : undefined } catch { throw new HttpError(400, 'invalid credential references') }
+      const parsed = ConfigurationReadSchema.safeParse({ section: url.searchParams.get('section'), ...(refs === undefined ? {} : { refs }) })
+      if (!parsed.success) throw new HttpError(400, 'invalid configuration read')
+      json(res, 200, await readConfiguration(parsed.data, (namespace, method, args) => invokeNative(ctx, { namespace, method, args, signal: AbortSignal.timeout(30_000) })))
+      return
+    }
+    const input = await readJson(req)
+    const parsed = ConfigurationUpdateSchema.safeParse(input)
+    if (!parsed.success) throw new HttpError(400, '配置保存参数无效，请检查后重试')
+    const requestId = header(req, 'x-dsh-request-id')
+    if (!requestId || requestId.length > 256) throw new HttpError(400, 'configuration writes require a stable request id')
+    const origin = device.id === CONNECTOR_DEVICE_ID ? header(req, 'x-dsh-origin-device-id') ?? device.id : device.id
+    if (origin.length === 0 || origin.length > 256 || (device.id === CONNECTOR_DEVICE_ID && origin !== CONNECTOR_DEVICE_ID && !relayDevices.has(origin))) throw new HttpError(403, 'origin device is not connected through Relay')
+    const hash = header(req, 'x-dsh-request-hash')
+    const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex')
+    if (hash?.toLowerCase() !== fingerprint) throw new HttpError(400, 'configuration request fingerprint does not match its content')
+    const key = remoteMutationKeyFor(origin, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
+    if (remembered?.pending) throw new HttpError(503, '保存结果尚未确认，请检查电脑状态；原请求已保留', 'unknown')
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    let invokedWrite = false, receipt
+    try {
+      receipt = await updateConfiguration(parsed.data, requestId, (namespace, method, args) => {
+        if ((namespace === 'settings' && method === 'mutate') || (namespace === 'credentials' && (method === 'set' || method === 'unset'))) invokedWrite = true
+        return invokeNative(ctx, { namespace, method, args, signal: AbortSignal.timeout(30_000) })
+      })
+    } catch (error) {
+      const failure = configurationFailure(error), code = recordOf(error).code
+      if (!invokedWrite || code === 'settings/conflict' || code === 'gateway/bad-request' || code === 'gateway/namespace-not-found' || code === 'gateway/method-not-found') {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw failure.status >= 500 ? new RetryableHttpError(failure.status, failure.message) : failure
+      }
+      throw new HttpError(failure.status, failure.message, 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 202, receipt)
+    json(res, 202, receipt)
     return
   }
 
   if (req.method === 'GET' && path === '/models') {
     json(res, 200, await ctx.sessionController.modelCatalog())
+    return
+  }
+  const workspaceFileMatch = /^\/sessions\/([^/]+)\/workspace\/(files|bytes)$/.exec(path)
+  if (req.method === 'GET' && workspaceFileMatch !== null) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness workspace file service is unavailable')
+    const sessionId = decodeURIComponent(workspaceFileMatch[1]!)
+    const signal = AbortSignal.timeout(15_000)
+    const call = async (method: string, args: Record<string, unknown>): Promise<JsonObject> => {
+      const raw = await invokeNative(ctx, { namespace: 'workspaceFiles', method,
+        args: { workspaceFileScopeId: sessionId, ...args }, signal })
+      const failure = recordOf(raw)
+      if (failure.ok === false) {
+        const code = recordOf(failure.error).code
+        throw new HttpError(code === 'gateway/method-not-found' || code === 'gateway/namespace-not-found' ? 501 : 400,
+          remoteFailureOf(raw) ?? 'Harness could not read this file')
+      }
+      return remoteValueOf(raw)
+    }
+    const filePath = url.searchParams.get('path') ?? ''
+    if (workspaceFileMatch[2] === 'files') {
+      const request = WorkspaceFilesCommandSchema.safeParse({ path: filePath })
+      if (!request.success) throw new HttpError(400, 'invalid workspace directory request')
+      const listing = await call('list', request.data)
+      json(res, 200, WorkspaceFilesPayloadSchema.parse({ sessionId, ...listing }))
+    } else {
+      const request = WorkspaceBytesCommandSchema.safeParse({ path: filePath,
+        offset: Number(url.searchParams.get('offset') ?? 0), length: Number(url.searchParams.get('length') ?? 0),
+        ...(url.searchParams.has('version') ? { version: url.searchParams.get('version') } : {}) })
+      if (!request.success) throw new HttpError(400, 'invalid workspace byte request')
+      const { offset, length, version } = request.data
+      const chunk = WorkspaceBytesPayloadSchema.parse({ sessionId,
+        ...await call('readBytes', { path: filePath, range: { offset, length } }) })
+      if (chunk.offset !== offset || (version !== undefined && chunk.version !== version)) {
+        throw new HttpError(409, 'File changed during download; start a fresh download')
+      }
+      // Native readBytes stats before reading. Also check after reading so even
+      // a single-chunk file cannot be silently exported while it is changing.
+      const current = await call('stat', { path: filePath })
+      if (current.version !== chunk.version || current.absolutePath !== chunk.absolutePath) {
+        throw new HttpError(409, 'File changed during download; start a fresh download')
+      }
+      json(res, 200, chunk)
+    }
+    return
+  }
+  const searchMatch = /^\/sessions\/([^/]+)\/search$/.exec(path)
+  const historyMatch = /^\/sessions\/([^/]+)\/history$/.exec(path)
+  const scheduleMatch = /^\/sessions\/([^/]+)\/schedules$/.exec(path)
+  if (req.method === 'GET' && (path === '/search' || searchMatch !== null || historyMatch !== null || scheduleMatch !== null)) {
+    const match = searchMatch ?? historyMatch ?? scheduleMatch
+    const sessionId = match === null ? undefined : decodeURIComponent(match[1]!)
+    const input = Object.fromEntries(url.searchParams)
+    const parsed = scheduleMatch !== null ? ScheduleGetSchema.safeParse(input) : historyMatch === null ? SearchCommandSchema.safeParse(input) : HistoryReadCommandSchema.safeParse({ ...input,
+      ...Object.fromEntries(['throughSeq', 'beforeSeq', 'atSeq'].filter((key) => url.searchParams.has(key)).map((key) => [key, Number(url.searchParams.get(key))])) })
+    if (!parsed.success) throw new HttpError(400, 'invalid history or search request')
+    const address = parsed.data
+    const summaries = await listSummaries(ctx, metadata, true, device.id)
+    if (address.parentSessionId !== undefined) {
+      if (sessionId === undefined) throw new HttpError(400, 'global search cannot use a child address')
+      const catalog = await subagentCatalog(ctx, address.parentSessionId)
+      const child = catalog.entries.find((item) => item.kind === 'child' && item.id === sessionId)
+      if (child?.kind !== 'child' || child.mode !== address.subagentMode) throw new HttpError(403, 'child address does not belong to this parent catalog')
+    } else if (sessionId !== undefined && !summaries.some((item) => item.id === sessionId)) throw new HttpError(404, 'session not found')
+    if (scheduleMatch !== null) {
+      const registry = ctx.get?.('sessionProjections') as { restore?: (checkpoint: object, events: unknown[], baseSeq: number, header: unknown, inheritedEventCount: number) => { snapshot: unknown } } | undefined
+      const mirror = scheduleMirrors.get(ctx)
+      if (registry?.restore === undefined || mirror === undefined) throw new HttpError(501, '当前 Harness 未提供原生提醒投影')
+      const generation = mirror.generation
+      const inspection = await ctx.sessionController.inspect(sessionId!, AbortSignal.timeout(30_000))
+      if (inspection.meta === undefined || !Number.isSafeInteger(inspection.inheritedEventCount) || inspection.inheritedEventCount! < 0) throw new HttpError(501, '当前 Harness 未提供提醒所需的会话元数据')
+      const { snapshot } = registry.restore({}, inspection.events, 0, inspection.meta, inspection.inheritedEventCount!)
+      if (mirror.generation !== generation) throw new HttpError(409, '提醒状态已重新同步，请重试读取')
+      json(res, 200, mirror.seed(sessionId!, snapshot, generation))
+      return
+    }
+    if (historyMatch === null) {
+      const request = SearchCommandSchema.parse(input)
+      const candidate: unknown = ctx.get?.('sessionQuery')
+      const service = candidate as Partial<NativeSearch> | undefined
+      if (typeof service?.searchSessions === 'function' && typeof service.searchEvents === 'function') {
+        json(res, 200, await searchHistory(service as NativeSearch, request.query, request.cursor, summaries, sessionId))
+      } else {
+        if (sessionId !== undefined || request.cursor !== undefined || ctx.sessionController.search === undefined) throw new HttpError(501, '电脑端未提供完整历史搜索，请更新 Harness')
+        const native = objectOf(await ctx.sessionController.search({ query: request.query }, AbortSignal.timeout(30_000)))
+        if (!Array.isArray(native.items)) throw new HttpError(502, 'Harness returned invalid search results')
+        const allowed = new Map(summaries.map((item) => [item.id, item]))
+        json(res, 200, SearchResultsSchema.parse({ query: request.query, bounded: true, hasMore: native.hasMore === true,
+          items: native.items.flatMap((value) => { const item = objectOf(value), session = allowed.get(String(item.sessionId));
+            return session === undefined ? [] : [{ sessionId: session.id, snippet: item.snippet, session }] }) }))
+      }
+      return
+    }
+    const request = HistoryReadCommandSchema.parse(address)
+    const inspection = await ctx.sessionController.inspect(sessionId!, AbortSignal.timeout(30_000))
+    const tail = Number(objectOf(inspection.events.at(-1)).seq ?? -1)
+    const throughSeq = request.throughSeq ?? tail
+    if (throughSeq > tail || (request.atSeq !== undefined && request.atSeq > throughSeq) || (request.beforeSeq !== undefined && request.beforeSeq > throughSeq + 1)) throw new HttpError(409, '历史位置已变化，请重新打开对话')
+    const beforeSeq = request.atSeq === undefined ? request.beforeSeq : request.atSeq + 1
+    const nativeAddress = request.parentSessionId === undefined ? { kind: 'session', sessionId } : {
+      kind: 'subagent', parentSessionId: request.parentSessionId, childSessionId: sessionId, mode: request.subagentMode }
+    for (let maxMessages = request.atSeq === undefined ? 50 : 20; maxMessages >= 1; maxMessages = Math.floor(maxMessages / 2)) {
+      const pageRequest = { address: nativeAddress, throughSeq, ...(beforeSeq === undefined ? {} : { beforeSeq }), maxMessages }
+      let page
+      if (ctx.sessionController.page !== undefined) page = await ctx.sessionController.page(pageRequest, AbortSignal.timeout(30_000))
+      else if (ctx.typertGateway !== undefined) page = await invokeNative(ctx, { namespace: 'session', method: 'page', args: { request: pageRequest }, signal: AbortSignal.timeout(30_000) })
+      else throw new HttpError(501, '电脑端未提供历史分页，请更新 Harness')
+      const usage = new Map<string, UsageCounter>(), selections = new Map<string, ModelSelectionProjection>()
+      const result = projectHistoryPage(sessionId!, inspection.events, page, throughSeq, beforeSeq,
+        (event, names) => normalizeSessionEvents(sessionId!, event, names, usage, selections, undefined, attachmentPathsOf(ctx)), request.atSeq)
+      if (Buffer.byteLength(JSON.stringify(result)) <= 12 * 1024 * 1024) { json(res, 200, result); return }
+    }
+    throw new HttpError(413, '单条完整历史记录过大，请在电脑端查看')
+  }
+
+  const executionMatch = /^\/sessions\/([^/]+)\/execution$/.exec(path)
+  if (req.method === 'GET' && executionMatch !== null) {
+    const sessionId = decodeURIComponent(executionMatch[1]!)
+    const parsed = ExecutionListCommandSchema.safeParse({
+      ...(url.searchParams.has('beforeSeq') ? { beforeSeq: Number(url.searchParams.get('beforeSeq')) } : {}),
+      ...(url.searchParams.has('limit') ? { limit: Number(url.searchParams.get('limit')) } : {}),
+      ...(url.searchParams.has('parentSessionId') ? { parentSessionId: url.searchParams.get('parentSessionId') } : {}),
+      ...(url.searchParams.has('subagentMode') ? { subagentMode: url.searchParams.get('subagentMode') } : {}),
+    })
+    if (!parsed.success) throw new HttpError(400, 'invalid execution page cursor')
+    if (parsed.data.parentSessionId !== undefined) {
+      const catalog = await subagentCatalog(ctx, parsed.data.parentSessionId)
+      const child = catalog.entries.find((entry) => entry.kind === 'child' && entry.id === sessionId)
+      if (child?.kind !== 'child' || child.mode !== parsed.data.subagentMode) throw new HttpError(403, 'child execution address does not belong to this parent catalog')
+    } else if (!(await listSummaries(ctx, metadata, true, device.id)).some((session) => session.id === sessionId)) {
+      throw new HttpError(404, 'session not found')
+    }
+    const inspection = await ctx.sessionController.inspect(sessionId, AbortSignal.timeout(15_000))
+    const lifecycle = executionLifecycle(inspection)
+    json(res, 200, { ...executionPage(sessionId, inspection.events, parsed.data.beforeSeq, parsed.data.limit), ...(lifecycle === undefined ? {} : { lifecycle }) })
     return
   }
   if (req.method === 'GET' && path === '/workspaces') {
@@ -3312,6 +3685,294 @@ async function handleHttp(
     return
   }
 
+  const subagentsMatch = /^\/sessions\/([^/]+)\/subagents$/.exec(path)
+  if (req.method === 'GET' && subagentsMatch !== null) {
+    json(res, 200, await subagentCatalog(ctx, decodeURIComponent(subagentsMatch[1]!)))
+    return
+  }
+
+  const subagentControlMatch = /^\/sessions\/([^/]+)\/subagents\/([^/]+)\/(prompt|interrupt)$/.exec(path)
+  if (req.method === 'POST' && subagentControlMatch !== null) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness subagent controls are unavailable')
+    const action = subagentControlMatch[3]!
+    const schema = action === 'prompt' ? SubagentPromptPayloadSchema : SubagentInterruptPayloadSchema
+    const parsed = schema.safeParse(await readJson(req, action === 'prompt' ? MAX_PROMPT_BODY_BYTES : undefined))
+    if (!parsed.success) throw new HttpError(400, 'invalid continuable subagent address or message')
+    const parentSessionId = decodeURIComponent(subagentControlMatch[1]!)
+    const childSessionId = decodeURIComponent(subagentControlMatch[2]!)
+    if (parsed.data.parentSessionId !== parentSessionId) throw new HttpError(400, 'subagent parent address mismatch')
+    const requestId = header(req, 'x-dsh-request-id')
+    if (!requestId || requestId.length > 256) throw new HttpError(400, 'subagent controls require a stable request id')
+    const origin = device.id === CONNECTOR_DEVICE_ID ? header(req, 'x-dsh-origin-device-id') ?? device.id : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && origin !== CONNECTOR_DEVICE_ID && !relayDevices.has(origin)) throw new HttpError(403, 'origin device is not connected through Relay')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex')
+    const key = remoteMutationKeyFor(origin, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
+    if (remembered?.pending) throw new HttpError(503, 'subagent control result is unknown', 'unknown')
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    let response: Record<string, unknown>
+    try {
+      const prompt = action === 'prompt' ? SubagentPromptPayloadSchema.parse(parsed.data) : undefined
+      const raw = recordOf(await invokeNative(ctx, { namespace: 'subagents',
+        method: prompt === undefined ? 'interruptByParent' : 'prompt',
+        args: prompt === undefined ? { parentSessionId, childSessionId, mode: 'continuable' } : {
+          request: { requestId, parentSessionId, childSessionId, mode: 'continuable',
+            delivery: prompt.delivery, content: [
+              ...(prompt.text.trim().length > 0 ? [{ type: 'text', text: prompt.text }] : []), ...(prompt.images ?? []) ],
+            ...(prompt.clientTimeZone === undefined ? {} : { clientTimeZone: prompt.clientTimeZone }) } },
+        signal: AbortSignal.timeout(15_000) }))
+      if (raw.ok === false) throw recordOf(raw.error)
+      const value = recordOf(raw.value ?? raw)
+      if (prompt === undefined ? value.accepted !== true : typeof value.messageId !== 'string' || value.messageId.length === 0) {
+        throw new Error('Harness returned an invalid subagent acknowledgement')
+      }
+      response = { accepted: true, ...(prompt === undefined ? {} : { messageId: value.messageId }) }
+    } catch (error) {
+      const code = recordOf(error).code
+      const message = error instanceof Error ? error.message : optionalStringOf(recordOf(error).message) ?? 'subagent control failed'
+      if (typeof code === 'string' && ['gateway/bad-request', 'subagent/parent-unavailable', 'subagent/not-resumable',
+        'subagent/unauthorized', 'subagent/attachment-invalid', 'subagent/delivery-unavailable', 'subagent/invalid-time-zone'].includes(code)) {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(409, message)
+      }
+      throw new HttpError(503, message, 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 202, response)
+    json(res, 202, response)
+    return
+  }
+
+  const commandCatalogMatch = /^\/sessions\/([^/]+)\/commands$/.exec(path)
+  if (req.method === 'GET' && commandCatalogMatch !== null) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness command directory is unavailable')
+    const sessionId = decodeURIComponent(commandCatalogMatch[1]!)
+    const raw = await invokeNative(ctx, { namespace: 'commands', method: 'list',
+      args: { agentId: sessionId }, signal: AbortSignal.timeout(15_000) })
+    const commands = Array.isArray(raw) ? raw : recordOf(raw).value
+    let skills: unknown
+    try {
+      const response = recordOf(await invokeNative(ctx, { namespace: 'skills', method: 'list',
+        args: { request: { sessionId } }, signal: AbortSignal.timeout(15_000) }))
+      const value = recordOf(response.value ?? response)
+      skills = value.skills
+    } catch { /* Skill discovery is optional; command discovery remains usable. */ }
+    const skillResult = CommandCatalogPayloadSchema.shape.skills.safeParse(skills)
+    const parsed = CommandCatalogPayloadSchema.safeParse({ sessionId, commands,
+      ...(skillResult.success && skillResult.data !== undefined ? { skills: skillResult.data } : {}) })
+    if (!parsed.success) throw new HttpError(502, 'Harness returned an invalid command directory')
+    json(res, 200, parsed.data)
+    return
+  }
+
+  const feedbackMatch = /^\/sessions\/([^/]+)\/feedback$/.exec(path)
+  const referenceMatch = /^\/sessions\/([^/]+)\/references$/.exec(path)
+  if (req.method === 'GET' && referenceMatch !== null) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness reference discovery is unavailable')
+    const parsed = ReferenceListSchema.safeParse({ kind: url.searchParams.get('kind'), query: url.searchParams.get('query') ?? '' })
+    if (!parsed.success) throw new HttpError(400, 'invalid reference query')
+    const sessionId = decodeURIComponent(referenceMatch[1]!)
+    const { kind, query } = parsed.data
+    const raw = await invokeNative(ctx, { namespace: kind === 'file' ? 'fileReferences' : 'sessionReferenceResolver',
+      method: kind === 'file' ? 'list' : 'candidates', args: { agentId: sessionId, query }, signal: AbortSignal.timeout(15_000) })
+    const result = recordOf(raw)
+    if (result.ok === false) {
+      const error = recordOf(result.error)
+      throw new HttpError(400, `无法读取引用：${stringOr(error.message, stringOr(error.code, '电脑端暂时无法提供此类引用'))}`)
+    }
+    json(res, 200, referenceCandidates(sessionId, kind, query, result.value ?? raw))
+    return
+  }
+  if (feedbackMatch !== null && (req.method === 'GET' || req.method === 'POST')) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness message feedback is unavailable')
+    const sessionId = decodeURIComponent(feedbackMatch[1]!)
+    if (req.method === 'GET') {
+      const result = recordOf(await invokeNative(ctx, { namespace: 'messageFeedback', method: 'list', args: { request: { sessionId } }, signal: AbortSignal.timeout(15_000) }))
+      if (result.ok === false) throw new HttpError(404, 'Feedback session is unavailable')
+      if (result.ok !== true || !Array.isArray(recordOf(result.value).items)) throw new HttpError(502, 'Harness returned an invalid feedback snapshot')
+      // Fold one immutable inspect result: its native watermark and contents
+      // come from the same snapshot, so a late HTTP reply cannot erase live puts.
+      json(res, 200, feedbackState(sessionId, (await ctx.sessionController.inspect(sessionId, AbortSignal.timeout(15_000))).events))
+      return
+    }
+    const parsed = FeedbackUpdateSchema.safeParse(await readJson(req))
+    if (!parsed.success) throw new HttpError(400, 'invalid message feedback')
+    const requestId = header(req, 'x-dsh-request-id')
+    if (!requestId || requestId.length > 256) throw new HttpError(400, 'message feedback requires a stable request id')
+    const origin = device.id === CONNECTOR_DEVICE_ID ? header(req, 'x-dsh-origin-device-id') ?? device.id : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && origin !== CONNECTOR_DEVICE_ID && !relayDevices.has(origin)) throw new HttpError(403, 'origin device is not connected through Relay')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex')
+    const key = remoteMutationKeyFor(origin, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
+    if (remembered?.pending) throw new HttpError(503, 'message feedback result is unknown', 'unknown')
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    let response
+    try {
+      const { action, ...request } = parsed.data
+      const result = recordOf(await invokeNative(ctx, { namespace: 'messageFeedback', method: action,
+        args: { request: { sessionId, ...request } }, signal: AbortSignal.timeout(15_000) }))
+      if (result.ok === false) {
+        const error = recordOf(result.error)
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(error.code === 'version-conflict' ? 409 : 400,
+          error.code === 'version-conflict' ? '评价已在其他端更新，请刷新后合并；你的备注已保留。' : `Harness 拒绝评价：${stringOr(error.code, 'unknown')}`)
+      }
+      if (result.ok !== true || (action === 'delete' && recordOf(result.value).absent !== true)) throw new Error('Native feedback acknowledgement is incomplete')
+      response = FeedbackUpdatedSchema.parse({ sessionId, requestId, messageId: parsed.data.messageId,
+        item: action === 'delete' ? null : result.value })
+      if (response.item !== null && response.item.messageId !== parsed.data.messageId) throw new Error('Native feedback acknowledgement target mismatch')
+    } catch (error) {
+      if (error instanceof HttpError) throw error
+      const code = recordOf(error).code
+      if (code === 'gateway/bad-request' || code === 'gateway/method-not-found' || code === 'gateway/namespace-not-found' || code === 'method-not-found') {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(501, '当前 Harness 尚不支持回答评价，请更新电脑端。')
+      }
+      throw new HttpError(503, error instanceof Error ? error.message : 'message feedback failed', 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 202, response)
+    json(res, 202, response)
+    return
+  }
+
+  const goalMatch = /^\/sessions\/([^/]+)\/goal$/.exec(path)
+  if (req.method === 'GET' && goalMatch !== null) {
+    json(res, 200, await readNativeGoalState(ctx, decodeURIComponent(goalMatch[1]!)))
+    return
+  }
+  if (req.method === 'POST' && goalMatch !== null) {
+    if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness goal controls are unavailable')
+    const parsed = GoalUpdatePayloadSchema.safeParse(await readJson(req))
+    if (!parsed.success) throw new HttpError(400, 'invalid goal mutation or expected revision')
+    const sessionId = decodeURIComponent(goalMatch[1]!)
+    const requestId = header(req, 'x-dsh-request-id')
+    if (!requestId || requestId.length > 256) throw new HttpError(400, 'goal controls require a stable request id')
+    const origin = device.id === CONNECTOR_DEVICE_ID ? header(req, 'x-dsh-origin-device-id') ?? device.id : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && origin !== CONNECTOR_DEVICE_ID && !relayDevices.has(origin)) throw new HttpError(403, 'origin device is not connected through Relay')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex')
+    const key = remoteMutationKeyFor(origin, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
+    if (remembered?.pending) throw new HttpError(503, 'goal mutation result is unknown', 'unknown')
+    const current = await readNativeGoalState(ctx, sessionId)
+    if (current.goal?.id !== parsed.data.ref.id || current.goal.revision !== parsed.data.ref.revision) {
+      throw new HttpError(409, '目标已在其他端更新，请重新载入后再操作。')
+    }
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    let response
+    try {
+      const request = parsed.data.action === 'edit' ? {
+        ...(parsed.data.objective === undefined ? {} : { objective: parsed.data.objective }),
+        ...(parsed.data.maxGoalRounds === undefined ? {} : { maxGoalRounds: parsed.data.maxGoalRounds }),
+      } : undefined
+      const raw = recordOf(await invokeNative(ctx, { namespace: 'goals', method: parsed.data.action,
+        args: { agentId: sessionId, ref: parsed.data.ref, ...(request === undefined ? {} : { request }) },
+        signal: AbortSignal.timeout(15_000) }))
+      if (raw.ok === false) throw recordOf(raw.error)
+      const result = recordOf(raw.value ?? raw)
+      response = GoalUpdatedPayloadSchema.parse({ sessionId, requestId, action: parsed.data.action,
+        ref: { id: result.id, revision: result.revision } })
+      if (response.ref.id !== parsed.data.ref.id || response.ref.revision <= parsed.data.ref.revision) throw new Error('invalid native goal revision acknowledgement')
+    } catch (error) {
+      const code = recordOf(error).code
+      const message = error instanceof Error ? error.message : optionalStringOf(recordOf(error).message) ?? 'goal mutation failed'
+      if (code === 'gateway/bad-request' || (typeof code === 'string' && code.startsWith('GOAL_'))) {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(409, message)
+      }
+      throw new HttpError(503, message, 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 202, response)
+    json(res, 202, response)
+    return
+  }
+
+  const queueMatch = /^\/sessions\/([^/]+)\/queue$/.exec(path)
+  if (req.method === 'POST' && queueMatch !== null) {
+    if (ctx.sessionController.updateQueue === undefined) throw new HttpError(501, 'Harness queue controls are unavailable')
+    const parsed = QueueUpdatePayloadSchema.safeParse(await readJson(req))
+    if (!parsed.success) throw new HttpError(400, 'invalid queue update')
+    const requestId = header(req, 'x-dsh-request-id')
+    if (!requestId || requestId.length > 256) throw new HttpError(400, 'queue updates require a stable request id')
+    const origin = device.id === CONNECTOR_DEVICE_ID ? header(req, 'x-dsh-origin-device-id') ?? device.id : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && origin !== CONNECTOR_DEVICE_ID && !relayDevices.has(origin)) throw new HttpError(403, 'origin device is not connected through Relay')
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex')
+    const key = remoteMutationKeyFor(origin, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) { json(res, remembered.status, remembered.response); return }
+    if (remembered?.pending) throw new HttpError(503, 'queue update result is unknown', 'unknown')
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    const action = parsed.data.action === 'edit'
+      ? { kind: 'edit' as const, content: [{ type: 'text' as const, text: parsed.data.text }] }
+      : { kind: parsed.data.action }
+    try {
+      await ctx.sessionController.updateQueue({ sessionId: decodeURIComponent(queueMatch[1]!), itemId: parsed.data.itemId, action })
+    } catch (error) {
+      const code = recordOf(error).code
+      if (code === 'session/queue-item-not-found' || code === 'session/steer-unavailable' || code === 'gateway/bad-request' || code === 'session/attachment-invalid') {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(409, error instanceof Error ? error.message : 'queue item is no longer editable')
+      }
+      throw new HttpError(503, error instanceof Error ? error.message : 'queue update result is unknown', 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 202, { accepted: true })
+    json(res, 202, { accepted: true })
+    return
+  }
+
+  const forkMatch = /^\/sessions\/([^/]+)\/fork$/.exec(path)
+  if (req.method === 'POST' && forkMatch !== null) {
+    if (ctx.sessionController.fork === undefined) throw new HttpError(501, 'Harness native fork is unavailable')
+    const parsed = SessionForkPayloadSchema.safeParse(await readJson(req))
+    if (!parsed.success) throw new HttpError(400, 'invalid native fork boundary')
+    const requestId = header(req, 'x-dsh-request-id')
+    if (requestId === undefined || requestId.length === 0 || requestId.length > 256) {
+      throw new HttpError(400, 'native fork requires a stable request id')
+    }
+    const originDeviceId = device.id === CONNECTOR_DEVICE_ID
+      ? (header(req, 'x-dsh-origin-device-id') ?? device.id) : device.id
+    if (device.id === CONNECTOR_DEVICE_ID && originDeviceId !== CONNECTOR_DEVICE_ID && !relayDevices.has(originDeviceId)) {
+      throw new HttpError(403, 'origin device is not connected through Relay')
+    }
+    const suppliedHash = header(req, 'x-dsh-request-hash')
+    const fingerprint = suppliedHash !== undefined && /^[a-f0-9]{64}$/i.test(suppliedHash)
+      ? suppliedHash.toLowerCase() : createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex')
+    const key = remoteMutationKeyFor(originDeviceId, path, requestId)
+    const remembered = metadata.remoteMutationEntry(key, fingerprint)
+    if (remembered?.response !== undefined && remembered.status !== undefined) {
+      json(res, remembered.status, remembered.response)
+      return
+    }
+    if (remembered?.pending === true) throw new HttpError(503, 'native fork result is unknown; reconcile before retrying', 'unknown')
+    await metadata.setRemoteMutationPending(key, fingerprint)
+    // Without a Host operation-id lookup, a crash during fork is uncertain.
+    // Retain the pending identity instead of risking a duplicate child.
+    let result: { sessionId: string }
+    try {
+      result = await ctx.sessionController.fork({ sessionId: decodeURIComponent(forkMatch[1]!),
+        ...(parsed.data.atSeq === undefined ? {} : { atSeq: parsed.data.atSeq }) })
+    } catch (error) {
+      const code = recordOf(error).code
+      if (code === 'session/fork-unavailable' || code === 'session/not-found') {
+        await metadata.markRemoteMutationNotCommitted(key, fingerprint)
+        throw new HttpError(409, error instanceof Error ? error.message : 'native fork is unavailable')
+      }
+      throw new HttpError(503, error instanceof Error ? error.message : 'native fork result is unknown', 'unknown')
+    }
+    await metadata.setRemoteMutationResult(key, fingerprint, 201, result)
+    json(res, 201, result)
+    return
+  }
+
   const commandMatch = /^\/sessions\/([^/]+)\/command$/.exec(path)
   if (req.method === 'POST' && commandMatch !== null) {
     const requestId = header(req, 'x-dsh-request-id')
@@ -3526,6 +4187,13 @@ async function handleHttp(
     return
   }
 
+  const cancelQuestionMatch = /^\/questions\/([^/]+)\/cancel$/.exec(path)
+  if (req.method === 'POST' && cancelQuestionMatch !== null) {
+    if (!questions.cancel(decodeURIComponent(cancelQuestionMatch[1]!))) throw new HttpError(409, 'question is no longer pending')
+    json(res, 202, { accepted: true })
+    return
+  }
+
   const answerMatch = /^\/questions\/([^/]+)\/answer$/.exec(path)
   if (req.method === 'POST' && answerMatch !== null) {
     // The path id is authoritative: a stale client cannot answer a different
@@ -3604,6 +4272,7 @@ async function publishSessionHistory(
   const historyToolNames = new Map<string, string>()
   const historyUsageCounters = new Map<string, UsageCounter>()
   const historyModelSelections = new Map<string, ModelSelectionProjection>()
+  const workflowReplay = workflowHistory(allEvents, recentStart)
   const batchId = randomUUID()
   let published = 0
   let publishedUsage = false
@@ -3611,6 +4280,15 @@ async function publishSessionHistory(
   publish({ deviceId, sessionId: session.id, type: 'history.started',
     historyBatchId: batchId,
     payload: { sessionId: session.id, batchId } }, recipients)
+  for (const item of workflowReplay.before) {
+    publish({ deviceId, sessionId: session.id, type: 'workflow.changed', historyBatchId: batchId,
+      payload: { ...item, sessionId: session.id } }, recipients)
+    published += 1
+  }
+  for (const record of executionPrefix(allEvents, recentStart)) {
+    publish({ deviceId, sessionId: session.id, type: 'execution.recorded', historyBatchId: batchId,
+      payload: { sessionId: session.id, record, inTranscript: false } }, recipients)
+  }
   for (let index = 0; index < allEvents.length; index += 1) {
     const normalized = normalizeSessionEvents(
       session.id,
@@ -3618,11 +4296,32 @@ async function publishSessionHistory(
       historyToolNames,
       historyUsageCounters,
       historyModelSelections,
+      undefined,
+      attachmentPathsOf(ctx),
     )
-    if (index < recentStart) continue
+    for (const item of workflowReplay.byIndex.get(index) ?? []) {
+      publish({ deviceId, sessionId: session.id, type: 'workflow.changed', historyBatchId: batchId,
+        payload: { ...item, sessionId: session.id } }, recipients)
+      published += 1
+    }
+    // Collaboration state may have been set long before the visible transcript
+    // window. Replay it even when its originating turn is outside that window.
+    if (index < recentStart) {
+      for (const next of normalized.filter((item) => item.type === 'plan.changed' || item.type === 'goal.changed' || item.type === 'goal.round' || item.type === 'todo.changed')) {
+        publish({ ...next, deviceId, historyBatchId: batchId }, recipients)
+        published += 1
+      }
+      continue
+    }
     for (const next of normalized) {
       if (next.type === 'usage.updated') publishedUsage = true
       publish({ ...next, deviceId, historyBatchId: batchId }, recipients)
+      published += 1
+    }
+    const record = executionRecord(allEvents[index])
+    if (record !== undefined) {
+      publish({ deviceId, sessionId: session.id, type: 'execution.recorded', historyBatchId: batchId,
+        payload: { sessionId: session.id, record } }, recipients)
       published += 1
     }
   }
@@ -3647,6 +4346,25 @@ async function publishSessionHistory(
   publish({ deviceId, sessionId: session.id, type: 'history.completed',
     historyBatchId: batchId,
     payload: { sessionId: session.id, batchId } }, recipients)
+  const window = historyWindow(session.id, allEvents, recentStart)
+  if (window !== undefined) publish({ deviceId, sessionId: session.id, type: 'history.window', payload: window }, recipients)
+  for (const payload of workflowRecords.get(ctx)?.seed(session.id, allEvents) ?? []) {
+    publish({ deviceId, sessionId: session.id, type: 'workflow.changed', payload: { ...payload, inTranscript: false } }, recipients)
+  }
+  if (ctx.typertGateway !== undefined) {
+    const epoch = goalActivationEpochs.get(ctx)?.get(session.id) ?? 0
+    try {
+      const raw = recordOf(await invokeNative(ctx, { namespace: 'goals', method: 'get',
+        args: { agentId: session.id }, signal: AbortSignal.timeout(5_000) }))
+      const goal = recordOf(raw.value ?? raw)
+      if ((goalActivationEpochs.get(ctx)?.get(session.id) ?? 0) === epoch &&
+        typeof goal.id === 'string' && typeof goal.revision === 'number' && goal.revision > 0 &&
+        (goal.activation === 'armed' || goal.activation === 'disarmed')) {
+        publish({ deviceId, sessionId: session.id, type: 'goal.activation',
+          payload: { sessionId: session.id, id: goal.id, revision: goal.revision, activation: goal.activation } }, recipients)
+      }
+    } catch { /* Older hosts and cold sessions have no live activation baseline. */ }
+  }
   return published
 }
 
@@ -3689,6 +4407,30 @@ function publishPermission(
     type: 'permission.updated',
     payload: { sessionId, mode, approvalPolicy: mode === 'never' ? 'never' : 'ask' },
   })
+}
+
+async function subagentCatalog(ctx: NativeContext, parentSessionId: string): Promise<ReturnType<typeof SubagentCatalogPayloadSchema.parse>> {
+  if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness subagent catalog is unavailable')
+  const raw = recordOf(await invokeNative(ctx, { namespace: 'subagents', method: 'list',
+    args: { parentSessionId }, signal: AbortSignal.timeout(15_000) }))
+  const value = recordOf(raw.value ?? raw)
+  return SubagentCatalogPayloadSchema.parse({ parentSessionId, ...value })
+}
+
+async function readNativeGoalState(ctx: NativeContext, sessionId: string): Promise<ReturnType<typeof GoalChangedPayloadSchema.parse>> {
+  if (ctx.typertGateway === undefined) throw new HttpError(501, 'Harness goal state is unavailable')
+  const raw = recordOf(await invokeNative(ctx, { namespace: 'goals', method: 'get',
+    args: { agentId: sessionId }, signal: AbortSignal.timeout(15_000) }))
+  if (raw.ok === false) throw new RetryableHttpError(503, remoteFailureOf(raw) ?? 'Harness could not read the current goal')
+  const value = raw.ok === true ? raw.value : raw
+  if (value === undefined || value === null) return { sessionId, goal: null, roundsStarted: 0 }
+  const goal = recordOf(value)
+  const parsed = GoalChangedPayloadSchema.safeParse({ sessionId,
+    goal: { id: goal.id, revision: goal.revision, objective: goal.objective, phase: goal.phase,
+      maxGoalRounds: goal.maxGoalRounds, ...(goal.blockedReason === undefined ? {} : { blockedReason: goal.blockedReason }) },
+    roundsStarted: goal.roundsStarted, activation: goal.activation })
+  if (!parsed.success) throw new RetryableHttpError(502, 'Harness returned an invalid goal state')
+  return parsed.data
 }
 
 async function executeCommand(
@@ -4276,15 +5018,56 @@ export function normalizeSessionEvents(
   usageCounters = new Map<string, UsageCounter>(),
   modelSelections = new Map<string, ModelSelectionProjection>(),
   liveStreamMessageIDs?: ReadonlyMap<string, string>,
+  attachmentPaths?: AttachmentPaths,
 ): NativeEventInput[] {
+  const events = normalizeBusinessEvents(sessionId, value, toolNames, usageCounters, modelSelections, liveStreamMessageIDs, attachmentPaths)
+  const seq = recordOf(value).seq
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0) return events
+  const positioned = new Set(['user.message.accepted', 'assistant.message.completed', 'tool.started', 'tool.completed', 'command.result', 'session.model.changed'])
+  // Each whitelisted payload is an object with this optional field in its
+  // schema. Keep every original field; publish() validates the full envelope.
+  return events.map((event) => positioned.has(event.type) ? { ...event,
+    payload: { ...recordOf(event.payload), nativeSequence: seq } as NativeEventInput['payload'] } : event)
+}
+
+function normalizeBusinessEvents(
+  sessionId: string,
+  value: unknown,
+  toolNames: Map<string, string>,
+  usageCounters = new Map<string, UsageCounter>(),
+  modelSelections = new Map<string, ModelSelectionProjection>(),
+  liveStreamMessageIDs?: ReadonlyMap<string, string>,
+  attachmentPaths?: AttachmentPaths,
+): NativeEventInput[] {
+  const feedback = feedbackChanged(sessionId, value)
+  if (feedback !== undefined) return [{ type: 'feedback.changed', sessionId, payload: feedback }]
   const event = recordOf(value)
   const type = typeof event.type === 'string' ? event.type : ''
   const data = recordOf(event.data)
 
+  if (type === 'plan/mode' && typeof data.active === 'boolean') {
+    return [{ type: 'plan.changed', sessionId, payload: { sessionId, active: data.active } }]
+  }
+  if (type === 'todo/write') {
+    const parsed = TodoChangedPayloadSchema.safeParse({ sessionId, todos: data.todos })
+    return parsed.success ? [{ type: 'todo.changed', sessionId, payload: parsed.data }] : []
+  }
+  if (type === 'goal/change') {
+    const payload = { sessionId, goal: data.operation === 'clear' ? null : data.goal,
+      roundsStarted: data.operation === 'clear' ? 0 : data.roundsStarted }
+    const parsed = GoalChangedPayloadSchema.safeParse(payload)
+    return parsed.success ? [{ type: 'goal.changed', sessionId, payload: parsed.data }] : []
+  }
+
   if (type === 'user/message') {
     const source = recordOf(data.source)
+    if (source.kind === 'goal' && typeof source.goalId === 'string' &&
+      typeof source.round === 'number' && Number.isInteger(source.round) && source.round > 0) {
+      return [{ type: 'goal.round', sessionId,
+        payload: { sessionId, id: source.goalId, round: source.round } }]
+    }
     if (source.kind !== 'user') return []
-    const attachments = contentAttachments(data.content)
+    const attachments = contentAttachments(data.content, attachmentPaths)
     const requestId = typeof data.requestId === 'string' && data.requestId.length > 0
       ? data.requestId : undefined
     return [{
@@ -4312,7 +5095,7 @@ export function normalizeSessionEvents(
     const sessionUsage = usage === undefined ? undefined : aggregateUsage(counters, usage, messageId)
     // Assistant-side images (model-returned or read back) travel the same
     // attachment path as user uploads, thumbnails included.
-    const attachments = contentAttachments(message.content)
+    const attachments = contentAttachments(message.content, attachmentPaths)
     const normalized: NativeEventInput[] = [{
       type: 'assistant.message.completed',
       sessionId,
@@ -4320,6 +5103,8 @@ export function normalizeSessionEvents(
         id: messageId,
         role: 'assistant',
         markdown: contentText(message.content),
+        ...(typeof data.interrupted === 'boolean' ? { interrupted: data.interrupted } : {}),
+        ...(typeof event.seq === 'number' && Number.isInteger(event.seq) && event.seq >= 0 ? { nativeSequence: event.seq } : {}),
         ...(attachments.length === 0 ? {} : { attachments }),
         ...(usage === undefined ? {} : { usage }),
         ...(typeof source.provider === 'string' ? { provider: source.provider } : {}),
@@ -4356,7 +5141,8 @@ export function normalizeSessionEvents(
     return [{
       type: 'tool.started',
       sessionId,
-      payload: { id: callId, name, status: 'running', detail: stringOr(data.arguments, '') },
+      payload: { id: callId, name, status: 'running', detail: stringOr(data.arguments, ''),
+        ...(typeof recordOf(value).time === 'number' ? { startedAt: recordOf(value).time as number } : {}) },
     }]
   }
   if (type === 'tool/result') {
@@ -4367,6 +5153,7 @@ export function normalizeSessionEvents(
     const failed = first.isError === true || data.error !== undefined
     const name = toolNames.get(callId) ?? 'tool'
     toolNames.delete(callId)
+    const attachments = contentAttachments(first.content, attachmentPaths)
     return [{
       type: 'tool.completed',
       sessionId,
@@ -4375,6 +5162,27 @@ export function normalizeSessionEvents(
         name,
         status: failed ? 'failed' : 'succeeded',
         detail: contentText(first.content),
+        ...(data.meta === undefined ? {} : { resultMeta: data.meta }),
+        ...(data.error === undefined ? {} : { error: data.error }),
+        ...(Array.isArray(first.content) ? { resultContent: first.content } : {}),
+        ...(typeof recordOf(value).time === 'number' ? { finishedAt: recordOf(value).time as number } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      },
+    }]
+  }
+  if (type === 'tool/ptc-dispatch-start' || type === 'tool/ptc-dispatch') {
+    if (typeof data.subCallId !== 'string' || typeof data.parentCallId !== 'string' || typeof data.rootCallId !== 'string') return []
+    const settled = type === 'tool/ptc-dispatch'
+    const args = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {})
+    const time = recordOf(value).time
+    const attachments = settled ? contentAttachments(data.content, attachmentPaths) : []
+    return [{ type: settled ? 'tool.completed' : 'tool.started', sessionId,
+      payload: { id: data.subCallId, name: stringOr(data.name, 'tool'), rootCallId: data.rootCallId,
+        parentCallId: data.parentCallId, status: settled ? data.isError === true ? 'failed' : 'succeeded' : 'running',
+        detail: settled ? contentText(data.content) : args,
+        ...(settled ? { arguments: args, ...(Array.isArray(data.content) ? { resultContent: data.content } : {}),
+          ...(attachments.length > 0 ? { attachments } : {}) } : {}),
+        ...(typeof time === 'number' ? settled ? { finishedAt: time } : { startedAt: time } : {}),
       },
     }]
   }
@@ -4434,8 +5242,9 @@ export function normalizeSessionEvents(
     return [{ type: 'turn.state.changed', sessionId, payload: { sessionId, state: 'running' } }]
   }
   if (type === 'turn/end') {
-    const reason = stringOr(data.reason, 'completed')
-    return [{ type: 'turn.state.changed', sessionId, payload: { sessionId, state: reason } }]
+    const reason = typeof data.reason === 'string' ? data.reason : recordOf(data.reason).kind
+    const state = reason === 'error' ? 'failed' : reason === 'aborted' ? 'cancelled' : stringOr(reason, 'completed')
+    return [{ type: 'turn.state.changed', sessionId, payload: { sessionId, state } }]
   }
   if (type === 'step/start') {
     const counters = usageCounterFor(usageCounters, sessionId)
@@ -4634,16 +5443,45 @@ function attachmentThumbnail(attachmentId: string, mediaType: string): string | 
   }
 }
 
-function contentAttachments(value: unknown): Array<{
+interface AttachmentPaths {
+  imageHostPath?(ref: JsonObject): string | undefined
+  fileHostPath?(ref: JsonObject): string | undefined
+}
+
+function attachmentPathsOf(ctx: NativeContext): AttachmentPaths | undefined {
+  // Cordis get() is the optional capability lookup. Declaring attachments as
+  // a required inject would disable the whole Bridge on older Hosts.
+  try {
+    const store: unknown = ctx.get?.('attachments')
+    return typeof store === 'object' && store !== null ? store as AttachmentPaths : undefined
+  } catch { return undefined }
+}
+
+function attachmentHostPath(paths: AttachmentPaths | undefined, kind: 'image' | 'file', ref: JsonObject): string | undefined {
+  try {
+    const path = kind === 'image' ? paths?.imageHostPath?.(ref) : paths?.fileHostPath?.(ref)
+    return typeof path === 'string' && path.length > 0 && path.length <= 8_192 ? path : undefined
+  } catch { return undefined }
+}
+
+function contentAttachments(value: unknown, paths?: AttachmentPaths): Array<{
   id: string
   name: string
   mediaType?: string | undefined
   receiptId?: string | undefined
   thumbnail?: string | undefined
+  hostPath?: string | undefined
 }> {
   if (!Array.isArray(value)) return []
   return value.flatMap((entry) => {
     const block = recordOf(entry)
+    const attachment = recordOf(block.attachment)
+    if (block.type === 'file' && typeof attachment.attachmentId === 'string' && typeof attachment.name === 'string') {
+      const hostPath = attachmentHostPath(paths, 'file', attachment)
+      const parsed = ChatAttachmentSchema.safeParse({ id: `file-${createHash('sha256').update(attachment.attachmentId + '\0' + attachment.name).digest('hex')}`,
+        name: attachment.name, ...(hostPath === undefined ? {} : { hostPath }) })
+      return parsed.success ? [parsed.data] : []
+    }
     if (block.type === 'file' && typeof block.receiptId === 'string') {
       const receiptId = block.receiptId
       const parsed = ChatAttachmentSchema.safeParse({
@@ -4658,7 +5496,6 @@ function contentAttachments(value: unknown): Array<{
       // Prefer the durable content reference as a stable id (a random id
       // duplicates the row on every replay) and embed a thumbnail: without
       // either, the phone renders a permanent empty slot it can never fill.
-      const attachment = recordOf(block.attachment)
       const attachmentId = typeof attachment.attachmentId === 'string' ? attachment.attachmentId : undefined
       const mediaType = typeof attachment.mediaType === 'string'
         ? attachment.mediaType
@@ -4667,11 +5504,13 @@ function contentAttachments(value: unknown): Array<{
       const thumbnail = attachmentId === undefined
         ? undefined
         : attachmentThumbnail(attachmentId, mediaType)
+      const hostPath = attachmentHostPath(paths, 'image', attachment)
       const parsed = ChatAttachmentSchema.safeParse({
         id,
         name: stringOr(attachment.name, stringOr(block.name, 'Image')),
         mediaType,
         ...(thumbnail === undefined ? {} : { thumbnail }),
+        ...(hostPath === undefined ? {} : { hostPath }),
       })
       return parsed.success ? [parsed.data] : []
     }
