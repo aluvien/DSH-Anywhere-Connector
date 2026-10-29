@@ -34,6 +34,7 @@ export async function searchHistory(service: NativeSearch, query: string, cursor
       break
     } catch (error) {
       const code = object(error).code
+      if (code === 'SESSION_QUERY_SEARCH_DISABLED') throw new HttpError(501, '电脑端尚未启用内容搜索索引，请在 Harness 配置中启用后重试。')
       if (code === 'SESSION_QUERY_STALE_CURSOR') throw new HttpError(409, '搜索索引已更新，请重新搜索')
       if (nativeCursor === undefined && code === 'SESSION_QUERY_INVALID_LIMIT' && limit > 1) { limit = Math.max(1, Math.floor(limit / 2)); continue }
       throw error

@@ -8,7 +8,7 @@
 - 生产 Relay、已加载的桌面 Bridge 与已安装 Connector 已按用户确认顺序升级为 schema 12，协议主版本仍为 1。Build 125 已完成签名、上传和 Apple 处理，App Store Connect 确认为 `VALID` / `IN_BETA_TESTING`。
 - 原生目标创建使用 `goals.create({agentId, request})`，提供目标和可选总轮次上限；不需要伪造 GoalRef，也不依赖 `/goal` 是否注册。当前存在未完成目标时禁止覆盖；已完成目标可按 Native 语义直接替换，新目标轮次从 0 开始。创建回执、未知结果和重试使用同一持久请求；已存在目标沿用原生 CAS 控制。静态 profile 的 disabled 值不能代表最终运行目录，不据此推断命令实际缺失。
 - 真实联调发现并修复：Native 无目标直接返回 undefined 时需保留空基线；手机根目录空路径需转换为 Native `.`；Native 文件异常可能直接抛出，需映射到明确能力/访问错误。独立 AppModel 注入配对存储，使测试不使用或改变开发者的手机配对。
-- TypeScript 构建、类型检查和 295 项回归通过（协议 37、Relay 23、Bridge 179、Connector 56），覆盖旧 schema 11 拒绝与新的创建请求。当前修订的真实 Native 流程与 CI 结果见下方最新记录。
+- TypeScript 构建、类型检查和 296 项回归通过（协议 37、Relay 23、Bridge 180、Connector 56），覆盖旧 schema 11 拒绝与新的创建请求。当前修订的真实 Native 流程与 CI 结果见下方最新记录。
 - 独立 Native CRUD 验收时禁用测试实例的 goal-round-driver；另行启用该驱动并连接本地确定性模型，验证真实自动轮次、原生 round-limit 阻塞及 activation 解除。真实流式思考、回答和交互工具已另外验收。生产 Harness 不修改此插件。
 
 ## 当前已实现，仍需跨端验收
@@ -194,3 +194,7 @@
 - 原生 fork 的真实验收发现父会话标记同时用于普通分支与子代理。分类改为只使用明确的 `origin=subagent`，并读取实时 Native header 的 origin / parentSession，保证普通分支可见、真正的子代理仍隐藏在主会话列表之外。
 - 修复后，Native 指定回复位置的分支、相同请求重放、完整继承历史和独立生命周期统计通过；真实 iOS → Relay → Connector → Native 创建分支后刷新目录、打开历史和读取生命周期也通过。与目标创建/配置/文件/重连的实际手机链路合并运行，两项测试全部通过。
 - 以上交互使用本机 Native Harness 0.1.5-rc.1、隔离配对和确定性本地模型。没有把模拟器与合成数据结果当作物理 iPhone、第三方模型服务或系统分享面板验收。
+
+- 提交 `66a6cb1` 的 push 与 PR 两组 TypeScript / iOS CI 全部通过。真实队列的手机编辑/删除、评价写入/清除与原生版本、提醒投影只读恢复、文件引用，以及启用隔离索引后的精确内容搜索均通过。
+- Native 默认关闭内容索引时，手机明确提示电脑端未启用，不再把它显示为普通服务器错误；不自动修改生产 Harness 的索引策略。新增能力分支回归后共 296 项 TypeScript 测试通过。
+- 已录制浅深色各一次慢速上/下滚动，逐帧检查实际位移和顶部 inset；同步复查键盘与输入框区域。录像使用真实 ConversationView 和原生 scroll edge，测试先暂停跟随最新消息，排除脚本滚动被自动回底部干扰。最终视频为本地 `artifacts/ios/harness-parity/progressive-top-edge-light-dark.mp4`，另有对应截图；已核对正文进入顶部时逐渐模糊、标题清楚，无标题分隔线。系统弹窗已在最终录像中排除。

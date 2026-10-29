@@ -4,6 +4,13 @@ import { searchHistory } from './search.js'
 const summaries = [{ id: 's', title: 'A', updatedAt: 1000 }]
 const hit = (seq: number, sessionId = 's') => ({ sessionId, seq, type: 'assistant/message', time: 1000, surface: 'current', snippet: '匹配内容' })
 describe('native history search', () => {
+  it('reports a disabled Native index as an unavailable capability without retrying', async () => {
+    const disabled = vi.fn().mockRejectedValue({ code: 'SESSION_QUERY_SEARCH_DISABLED' })
+    const service = { searchSessions: disabled, searchEvents: disabled }
+    await expect(searchHistory(service, 'x', undefined, summaries)).rejects.toMatchObject({ status: 501, message: expect.stringContaining('尚未启用') })
+    await expect(searchHistory(service, 'x', undefined, summaries, 's')).rejects.toMatchObject({ status: 501 })
+    expect(disabled).toHaveBeenCalledTimes(2)
+  })
   it('uses native filters, positions and cursors and does not expose hidden child sessions', async () => {
     const searchSessions = vi.fn().mockResolvedValueOnce({ items: [{ bestMatch: hit(4) }, { bestMatch: hit(1, 'hidden-child') }], nextCursor: 'native-cursor' }).mockResolvedValueOnce({ items: [{ bestMatch: hit(9) }] })
     const service = { searchSessions, searchEvents: vi.fn() }
