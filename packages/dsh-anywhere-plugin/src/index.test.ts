@@ -494,6 +494,7 @@ describe('native bridge mutations', () => {
   const connectorToken = 'test-connector-token-that-is-long-enough'
 
   function mount(options: {
+    list?: () => Promise<{ items: unknown[] }>
     control?: (signal: AbortSignal) => AsyncIterable<unknown>
     inspect?: (sessionId: string) => Promise<{ events: unknown[]; meta?: unknown; inheritedEventCount?: number }>
     page?: (request: unknown) => Promise<unknown>
@@ -511,6 +512,7 @@ describe('native bridge mutations', () => {
     attachmentStore?: unknown
     upgrade?: (handler: (req: IncomingMessage, socket: never, head: Buffer) => void) => void
     responseHeaders?: (headers: unknown) => void
+    on?: (name: string, callback: unknown) => void
     findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined | { state: 'found' | 'not-committed' | 'unknown'; response?: unknown }>
     dataDir?: string
   } = {}) {
@@ -537,7 +539,7 @@ describe('native bridge mutations', () => {
         ...(options.page === undefined ? {} : { page: options.page }),
         ...(options.updateQueue === undefined ? {} : { updateQueue: options.updateQueue }),
         ...(options.fork === undefined ? {} : { fork: options.fork }),
-        list: async () => ({ items: [] }),
+        list: options.list ?? (async () => ({ items: [] })),
         create: options.create ?? (async () => ({ sessionId: 'session-new' })),
         ...(options.findAttachmentByRequestId === undefined ? {} : {
           findAttachmentByRequestId: options.findAttachmentByRequestId,
@@ -561,7 +563,7 @@ describe('native bridge mutations', () => {
         invoke: options.invoke ?? (async () => ({ ok: true, value: { presets: [] } })),
       },
       ...(options.directoryPicker === undefined ? {} : { directoryPicker: options.directoryPicker }),
-      on: () => undefined,
+      on: options.on ?? (() => undefined),
       effect: (callback: () => unknown) => {
         if (options.control !== undefined) {
           const cleanup = callback()
@@ -916,6 +918,39 @@ describe('native bridge mutations', () => {
     await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', { atSeq: 42 }, 'fork-1'))
       .resolves.toMatchObject({ status: 201, body: { sessionId: 'child' } })
     expect(calls).toBe(1)
+  })
+  it('keeps a Native fork visible and readable while excluding a real subagent', async () => {
+    const request = mount({
+      list: async () => ({ items: [
+        { sessionId: 'fork', parentSessionId: 'parent', cwd: '/workspace' },
+        { sessionId: 'agent', parentSessionId: 'parent', origin: 'subagent', cwd: '/workspace' },
+      ] }),
+      inspect: async (sessionId) => {
+        expect(sessionId).toBe('fork')
+        return { events: [], inheritedEventCount: 0 }
+      },
+    })
+    const listed = await request('GET', '/dsh-anywhere/v1/sessions')
+    expect(listed).toMatchObject({ status: 200, body: { items: [{ id: 'fork', parentSessionId: 'parent' }] } })
+    expect((listed.body as { items: unknown[] }).items).toHaveLength(1)
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/fork/execution?limit=100'))
+      .resolves.toMatchObject({ status: 200, body: { sessionId: 'fork' } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/fork/open', {}))
+      .resolves.toMatchObject({ status: 202 })
+  })
+  it('classifies live Native headers without hiding a fork or leaking a subagent', () => {
+    let created: ((session: unknown) => void) | undefined
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    const request = mount({ on: (name, callback) => {
+      if (name === 'session/created') created = callback as (session: unknown) => void
+    } })
+    try {
+      created!({ id: 'fork', header: { parentSession: 'parent', isSeeded: true, cwd: '/workspace' } })
+      created!({ id: 'agent', header: { parentSession: 'parent', origin: 'subagent', cwd: '/workspace' } })
+      const events = appended.mock.calls.map(([event]) => event).filter((event) => event.type === 'session.created')
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({ payload: { id: 'fork', parentSessionId: 'parent' } })
+    } finally { request.dispose(); appended.mockRestore() }
   })
   it('reads a Native undefined goal as an empty baseline and creates through goals.create exactly once', async () => {
     let created = false, mutations = 0
@@ -1803,10 +1838,8 @@ describe('pairing page material', () => {
 });
 
 describe('subagent sessions stay out of the user list', () => {
-  it('recognises a subagent by its spawn link or its origin marker', () => {
-    // Either signal alone is enough: 18 of 40 rows were subagents in practice,
-    // each titled with the task prompt handed to it.
-    expect(isSubagentSession({ parentSessionId: 'session-parent' })).toBe(true)
+  it('uses Native ownership rather than treating an ordinary fork as a subagent', () => {
+    expect(isSubagentSession({ parentSessionId: 'session-parent' })).toBe(false)
     expect(isSubagentSession({ origin: 'subagent' })).toBe(true)
     expect(isSubagentSession({ title: 'iOS客户端开发' })).toBe(false)
   })

@@ -1761,6 +1761,62 @@ final class DSHConversationViewportTests: XCTestCase {
         await settle()
         capture("conversation-glass-scrolled")
     }
+
+    // Opt-in visual acceptance fixture, recorded with simctl. Keep the real
+    // conversation chrome and move the same text through the native top edge.
+    func testProgressiveTopEdgeSlowScrollPreview() async throws {
+        guard ProcessInfo.processInfo.environment["DSH_RECORD_SCROLL_PREVIEW"] == "1" else {
+            throw XCTSkip("Enable DSH_RECORD_SCROLL_PREVIEW to record the slow-scroll preview")
+        }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let model = DSHAppModel.preview(longConversation: true)
+            model.collapseComposerControls = true
+            let host = UIHostingController(rootView: NavigationStack {
+                ConversationView(sessionID: "preview-session").environmentObject(model)
+            })
+            window.overrideUserInterfaceStyle = style
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            try await Task.sleep(for: .milliseconds(800))
+            window.layoutIfNeeded()
+            await settle()
+            let scroll = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UIScrollView }
+                .max { $0.bounds.height < $1.bounds.height })
+            // Programmatic scrolling does not produce a user pan. Disarm the
+            // existing follow coordinator exactly as a reader's drag would.
+            let probe = try XCTUnwrap(descendants(host.view).compactMap { $0 as? DSHScrollProbeView }.first)
+            try XCTUnwrap(probe.coordinator).pauseFollowing()
+            await settle()
+            let lower = max(-scroll.adjustedContentInset.top, scroll.contentSize.height / 2 - 250)
+            let upper = min(lower + 500, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+            XCTAssertGreaterThan(upper - lower, 300)
+            scroll.setContentOffset(CGPoint(x: 0, y: lower), animated: false)
+            try await Task.sleep(for: .milliseconds(500))
+            let headerInset = scroll.adjustedContentInset.top
+            for forward in [true, false] {
+                for step in 0...120 {
+                    let progress = CGFloat(step) / 120
+                    let y = forward ? lower + (upper - lower) * progress : upper - (upper - lower) * progress
+                    scroll.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+                    try await Task.sleep(for: .milliseconds(50))
+                    XCTAssertEqual(scroll.contentOffset.y, y, accuracy: 1)
+                    XCTAssertEqual(scroll.adjustedContentInset.top, headerInset, accuracy: 0.5)
+                    if forward && step == 60 {
+                        let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                        })
+                        shot.name = "native-edge-slow-scroll-\(style == .dark ? "dark" : "light")"
+                        shot.lifetime = .keepAlways
+                        add(shot)
+                    }
+                }
+            }
+        }
+    }
 }
 #endif
 
@@ -2085,6 +2141,19 @@ extension DSHModelPanelLayoutTests {
         XCTAssertEqual(restored.namespaces.first { $0.ns == "ui-theme" }?.value.executionObject["preference"], theme.value.executionObject["preference"])
         model.executeCommand("/plan off", for: sessionID)
         try await until("Native plan exit") { model.commandResults(for: sessionID).contains { $0.text?.contains("Plan mode off") == true } }
+        if let sourceID = ProcessInfo.processInfo.environment["DSH_PARITY_FORK_SESSION_ID"] {
+            model.openSession(sourceID)
+            try await until("Native fork source history") { model.messages(for: sourceID).contains { $0.role == .assistant && $0.nativeSequence != nil } }
+            let answer = try XCTUnwrap(model.messages(for: sourceID).first { $0.role == .assistant && $0.nativeSequence != nil })
+            let childID = try await model.forkSession(sourceID, atSeq: answer.nativeSequence)
+            try await until("Native fork remains in ordinary session list") { model.sessions.contains { $0.id == childID } }
+            model.openSession(childID)
+            try await until("Native fork opens with inherited answer") { model.messages(for: childID).contains { $0.id == answer.id } }
+            let childPage = try await model.executionPage(sessionID: childID)
+            XCTAssertGreaterThan(childPage.lifecycle?.inheritedEventCount ?? 0, 0)
+            XCTAssertEqual(childPage.lifecycle?.turnsStarted, 0)
+            XCTAssertEqual(childPage.lifecycle?.endedTurnMilliseconds, 0)
+        }
     }
 }
 #endif

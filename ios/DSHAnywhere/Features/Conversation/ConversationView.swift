@@ -699,7 +699,7 @@ final class DSHScrollCoordinator: NSObject {
 /// (not update-based): SwiftUI skips updateUIView when the representable's
 /// inputs never change, so an update-only walk can stay nil forever when its
 /// first call races attachment.
-private final class DSHScrollProbeView: UIView {
+final class DSHScrollProbeView: UIView {
     weak var coordinator: DSHScrollCoordinator?
 
     override func didMoveToSuperview() {

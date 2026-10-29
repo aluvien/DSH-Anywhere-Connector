@@ -4372,11 +4372,11 @@ async function publishSessionHistory(
 }
 
 /**
- * Subagent sessions link back to the session that spawned them. `origin` is the
- * explicit marker; the parent link is the fallback for builds that set only it.
+ * Native forks also carry a parent link. Only the explicit ownership marker
+ * identifies a subagent; a parent link alone must not hide an ordinary fork.
  */
 export function isSubagentSession(item: { origin?: string; parentSessionId?: string }): boolean {
-  return item.origin === 'subagent' || item.parentSessionId !== undefined
+  return item.origin === 'subagent'
 }
 
 function isSessionTitleEvent(value: unknown): boolean {
@@ -4657,7 +4657,8 @@ function normalizeLiveSession(value: unknown, ctx?: NativeContext, metadata?: Se
   // apart from a session the user just started.
   const parentSessionId = typeof session.parentSessionId === 'string'
     ? session.parentSessionId
-    : typeof header.parentSessionId === 'string' ? header.parentSessionId : undefined
+    : typeof header.parentSessionId === 'string' ? header.parentSessionId
+    : typeof header.parentSession === 'string' ? header.parentSession : undefined
   const agentPreset = typeof session.agentPreset === 'string'
     ? session.agentPreset
     : typeof header.agentPreset === 'string' ? header.agentPreset : undefined
@@ -4675,7 +4676,7 @@ function normalizeLiveSession(value: unknown, ctx?: NativeContext, metadata?: Se
     ...(agentPreset === undefined ? {} : { agentPreset }),
     ...(mode === undefined ? {} : { mode }),
     ...(branch === undefined ? {} : { branch }),
-    ...(session.origin === 'subagent' ? { origin: 'subagent' } : {}),
+    ...(session.origin === 'subagent' || header.origin === 'subagent' ? { origin: 'subagent' } : {}),
   }, ctx, metadata)
 }
 
