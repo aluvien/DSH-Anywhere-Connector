@@ -5462,6 +5462,9 @@ final class DSHAppModel: ObservableObject {
         guard case .protocolError(let error) = event.kind else { return }
         guard !uploadWaitRequestIDs.contains(event.envelope.messageId) else { return }
         guard fileReadRequests[event.envelope.messageId] == nil else { return }
+        // Catalog discovery is a passive read performed while opening a chat.
+        // Keep the existing suggestions when it fails; do not interrupt reading.
+        guard !commandCatalogRequestIDs.values.contains(event.envelope.messageId) else { return }
         if isReplayResynchronizationNotice(error) {
             scheduleReplayResynchronization(for: event)
             return

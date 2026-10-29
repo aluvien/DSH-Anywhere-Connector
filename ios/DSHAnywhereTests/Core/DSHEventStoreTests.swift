@@ -1101,6 +1101,31 @@ final class DSHEventStoreTests: XCTestCase {
         model.disconnect()
     }
     @MainActor
+    func testPassiveCommandCatalogFailureDoesNotInterruptConversation() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        model.requestCommands(for: "s")
+        var command: DSHCommand?
+        for _ in 0..<100 {
+            command = await transport.lastCommand(ofType: "command.catalog")
+            if command != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let requestID = try XCTUnwrap(command?.requestId)
+        await transport.emit(event(type: "protocol.error", messageID: requestID, sequence: 1,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("command.catalog HTTP 502"), "retryable": .bool(true)])))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertNil(model.errorMessage)
+        await transport.emit(event(type: "protocol.error", messageID: "explicit-action", sequence: 2,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("Explicit action failed"), "retryable": .bool(false)])))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(model.errorMessage, "Explicit action failed")
+    }
+    @MainActor
     func testCommandInvalidationRejectsInflightOldCatalogAndRefreshesVisibleSession() async throws {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }

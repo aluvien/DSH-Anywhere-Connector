@@ -3754,7 +3754,16 @@ async function handleHttp(
     const sessionId = decodeURIComponent(commandCatalogMatch[1]!)
     const raw = await invokeNative(ctx, { namespace: 'commands', method: 'list',
       args: { agentId: sessionId }, signal: AbortSignal.timeout(15_000) })
-    const commands = Array.isArray(raw) ? raw : recordOf(raw).value
+    const nativeCommands = Array.isArray(raw) ? raw : recordOf(raw).value
+    // Desktop command descriptors can add Host-only metadata (definitionId).
+    // Project the mobile wire fields instead of rejecting the whole catalog.
+    const commands = Array.isArray(nativeCommands) ? nativeCommands.map((value) => {
+      const command = recordOf(value)
+      const input = recordOf(command.input)
+      return { name: command.name, description: command.description,
+        ...(command.input === undefined ? {} : { input: { hint: input.hint,
+          ...(input.attachments === undefined ? {} : { attachments: input.attachments }) } }) }
+    }) : nativeCommands
     let skills: unknown
     try {
       const response = recordOf(await invokeNative(ctx, { namespace: 'skills', method: 'list',

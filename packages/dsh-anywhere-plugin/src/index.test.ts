@@ -1052,7 +1052,7 @@ describe('native bridge mutations', () => {
       { name: 'custom', description: 'Plugin command' }]
     const request = mount({ invoke: async (value) => {
       expect(value).toMatchObject({ namespace: 'commands', method: 'list', args: { agentId: 's' } })
-      return { ok: true, value: commands }
+      return { ok: true, value: commands.map((command) => ({ ...command, definitionId: 'desktop-command-definition' })) }
     } })
     await expect(request('GET', '/dsh-anywhere/v1/sessions/s/commands'))
       .resolves.toMatchObject({ status: 200, body: { sessionId: 's', commands } })

@@ -1663,7 +1663,7 @@ struct ConversationView: View {
                         .font(.subheadline.weight(.semibold))
                 }
                 .padding(10)
-                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
             }
             if model.goalState(for: sessionID)?.goal != nil { DSHGoalCard(sessionID: sessionID) }
 
@@ -3004,13 +3004,22 @@ private struct DSHGoalCard: View {
     @State private var busy = false
     @State private var operationError: String?
     @State private var showObjective = false
+    @State private var isExpanded = false
 
     var body: some View {
         if let state = model.goalState(for: sessionID), let goal = state.goal {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
-                        Label("目标", systemImage: "target").font(.subheadline.weight(.semibold))
+                        Button { isExpanded.toggle() } label: {
+                            HStack {
+                                Label("目标", systemImage: "target")
+                                Image(systemName: isExpanded ? "chevron.down" : "chevron.right").font(.caption)
+                            }.font(.subheadline.weight(.semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isExpanded ? "收起目标" : "展开目标")
+                        .frame(minHeight: 30)
                         Text(phaseLabel(goal.phase)).font(.caption).foregroundStyle(.secondary)
                     }
                     .fixedSize(horizontal: false, vertical: true)
@@ -3030,19 +3039,21 @@ private struct DSHGoalCard: View {
                     } label: { Image(systemName: "ellipsis.circle").frame(width: 44, height: 44) }
                         .disabled(busy || model.connectionState != .connected)
                 }
+                if isExpanded {
                 Button { showObjective = true } label: {
                     Text(goal.objective).font(.subheadline).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
                         .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint("查看完整目标")
+                }
                 Text("轮次 \(state.roundsStarted)/\(goal.maxGoalRounds) · \(activationLabel(state.activation))")
                     .font(.caption).foregroundStyle(.secondary)
-                if let reason = goal.blockedReason { Text(reason.message).font(.caption).foregroundStyle(.secondary) }
+                if isExpanded, let reason = goal.blockedReason { Text(reason.message).font(.caption).foregroundStyle(.secondary) }
                 if let operationError { Text(operationError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             }
             .padding(10)
-            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
             .task(id: goal.id) { model.requestGoalState(for: sessionID) }
             .sheet(item: $editingGoal) { snapshot in DSHGoalEditor(sessionID: sessionID, goal: snapshot).environmentObject(model) }
             .sheet(isPresented: $showObjective) {

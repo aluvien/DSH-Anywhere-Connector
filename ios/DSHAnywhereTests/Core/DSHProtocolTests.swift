@@ -2117,6 +2117,32 @@ extension DSHModelPanelLayoutTests {
             let stored = try await model.downloadFile(storedRef)
             XCTAssertEqual(try Data(contentsOf: stored), contents)
             try? FileManager.default.removeItem(at: stored.deletingLastPathComponent())
+            let previewScene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+            let previewWindow = UIWindow(windowScene: previewScene)
+            let preview = UIHostingController(rootView: DSHRemoteFilePreview(reference: storedRef).environmentObject(model))
+            previewWindow.rootViewController = preview
+            previewWindow.makeKeyAndVisible()
+            defer { previewWindow.isHidden = true }
+            func views(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(views) }
+            func shareControl() -> UIControl? {
+                views(preview.view).compactMap { $0 as? UIControl }.first { $0.accessibilityLabel == "分享或存储" }
+            }
+            try await until("Native attachment preview share action") { shareControl() != nil }
+            try XCTUnwrap(shareControl()).sendActions(for: .touchUpInside)
+            func activityController(_ controller: UIViewController) -> UIActivityViewController? {
+                if let activity = controller as? UIActivityViewController { return activity }
+                if let presented = controller.presentedViewController, let activity = activityController(presented) { return activity }
+                return controller.children.compactMap(activityController).first
+            }
+            try await until("System share sheet presented") {
+                guard let activity = activityController(preview) else { return false }
+                return activity.viewIfLoaded?.window != nil && !activity.isBeingPresented && activity.transitionCoordinator == nil
+            }
+            let shareShot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: previewWindow.bounds).image { _ in
+                previewWindow.drawHierarchy(in: previewWindow.bounds, afterScreenUpdates: true)
+            })
+            shareShot.name = "live-native-attachment-system-share"; shareShot.lifetime = .keepAlways; add(shareShot)
+            activityController(preview)?.dismiss(animated: false)
         }
         model.requestSubagents(for: sessionID)
         model.requestGoalState(for: sessionID)
