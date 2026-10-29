@@ -312,8 +312,14 @@ final class DSHModelPanelLayoutTests: XCTestCase {
             window.overrideUserInterfaceStyle = dark ? .dark : .light
             host.rootView = AnyView(DSHFeedbackEditor(sessionID: "s", messageID: "a", initialRating: "negative")
                 .environmentObject(model).dynamicTypeSize(dark ? .accessibility2 : .large).frame(width: 320).id(UUID()))
-            try await Task.sleep(for: .milliseconds(450))
+            // The editor requests feedback from its appearance task; CI may need more
+            // than one animation interval to mount the view and deliver the reply.
+            let feedbackDeadline = Date().addingTimeInterval(5)
+            while model.feedback(for: "a", in: "s")?.version != "v2", Date() < feedbackDeadline {
+                try await Task.sleep(for: .milliseconds(25))
+            }
             XCTAssertEqual(model.feedback(for: "a", in: "s")?.version, "v2")
+            try await Task.sleep(for: .milliseconds(150))
             let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) })
             attachment.name = "feedback-conflict-\(dark ? "dark-large-text" : "light")"; attachment.lifetime = .keepAlways; add(attachment)
             if dark {
