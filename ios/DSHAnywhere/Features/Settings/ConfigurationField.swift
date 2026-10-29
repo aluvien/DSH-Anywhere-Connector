@@ -101,7 +101,7 @@ struct DSHConfigurationField: View {
             } else if kind == "boolean" {
                 Toggle("启用", isOn: Binding(get: { current == .bool(true) }, set: { draft.edit(path: path, value: .bool($0), arrayRoot: arrayRoot) }))
             } else if kind == "number" {
-                TextField("未设置", text: Binding(get: { draft.rawNumbers[identity] ?? current?.executionNumber.map(numberText) ?? "" }, set: editNumber))
+                TextField("未设置", text: Binding(get: { draft.rawNumbers[identity] ?? current?.executionNumber.map { numberText($0) } ?? "" }, set: { editNumber($0) }))
                     .keyboardType(.numbersAndPunctuation).textInputAutocapitalization(.never).autocorrectionDisabled()
                 if draft.invalidNumbers.contains(identity) { Text("请输入有效数字，并遵守字段的最小值、最大值和整数要求。").font(.caption).foregroundStyle(.red) }
             } else if kind == "string" {
