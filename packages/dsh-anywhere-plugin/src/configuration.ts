@@ -79,7 +79,10 @@ export async function discoverConfigurationModels(input: unknown, invoke: Invoke
     const models = await invoke('llm', 'discoverModels', request)
     return ConfigurationModelsSchema.parse({ settingsNs: request.settingsNs, models })
   } catch (error) {
-    if (['gateway/namespace-not-found', 'gateway/method-not-found', 'method-not-found'].includes(String(object(error).code))) throw new HttpError(501, '当前 Harness 尚未提供模型发现能力，请更新电脑端')
+    const code = object(error).code, cause = object(object(error).cause).code
+    if (code === 'llm/model-discovery-rejected' && (cause === 'NO_DISCOVERY' || cause === 'DISCOVERY_UNSUPPORTED')) throw new HttpError(501, '此服务暂未提供可读取的模型目录，请在配置中手动添加模型')
+    if (code === 'llm/model-discovery-rejected' && cause === 'INVALID_DISCOVERY') throw new HttpError(400, '模型发现需要提供方或服务地址，请补齐配置')
+    if (['gateway/namespace-not-found', 'gateway/method-not-found', 'method-not-found'].includes(String(code))) throw new HttpError(501, '当前 Harness 尚未提供模型发现能力，请更新电脑端')
     throw new HttpError(502, '模型发现未成功，请检查电脑端服务地址、协议与凭据')
   }
 }

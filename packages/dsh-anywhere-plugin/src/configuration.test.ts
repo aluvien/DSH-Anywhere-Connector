@@ -42,6 +42,8 @@ describe('native computer configuration', () => {
     expect(invoke).toHaveBeenCalledExactlyOnceWith('llm', 'discoverModels', input)
     await expect(discoverConfigurationModels(input, async () => { throw new Error(input.request.apiKey) })).rejects.toMatchObject({ status: 502, message: expect.not.stringContaining(input.request.apiKey) })
     await expect(discoverConfigurationModels(input, async () => { throw { code: 'gateway/method-not-found' } })).rejects.toMatchObject({ status: 501 })
+    for (const code of ['NO_DISCOVERY', 'DISCOVERY_UNSUPPORTED']) await expect(discoverConfigurationModels(input, async () => { throw { code: 'llm/model-discovery-rejected', cause: { code, message: input.request.apiKey } } })).rejects.toMatchObject({ status: 501, message: expect.not.stringContaining(input.request.apiKey) })
+    await expect(discoverConfigurationModels(input, async () => { throw { code: 'llm/model-discovery-rejected', cause: { code: 'INVALID_DISCOVERY' } } })).rejects.toMatchObject({ status: 400 })
     await expect(discoverConfigurationModels(input, async () => [{ id: 'bad', apiKey: input.request.apiKey }])).rejects.toMatchObject({ status: 502 })
   })
   it('passes exact Native CAS operations and refuses stale, readonly or secret-container replacement before writing', async () => {

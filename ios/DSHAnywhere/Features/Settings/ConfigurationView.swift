@@ -30,7 +30,7 @@ struct DSHComputerConfigurationView: View {
                                 } label: {
                                     VStack(alignment: .leading, spacing: 5) {
                                         Text(provider.displayName).font(.headline)
-                                        Text("\(provider.provider) · \(providers.registered.contains { $0.id == provider.provider } ? "已激活" : "已声明，尚未激活")").font(.caption).foregroundStyle(.secondary)
+                                        Text("\(provider.provider) · \(providers.registered.contains { $0.id == provider.provider } ? "已激活" : provider.declared == false ? "可配置，尚未添加" : "已声明，尚未激活")").font(.caption).foregroundStyle(.secondary)
                                         if let error = provider.error { Text(error).font(.caption).foregroundStyle(.red) }
                                     }.fixedSize(horizontal: false, vertical: true)
                                 }

@@ -1380,6 +1380,8 @@ export class DSHAnywhereConnector {
     );
     const configuration = command.type === "configuration.read" || command.type === "configuration.update" || command.type === "configuration.discover";
     const reason = configuration ? resultUnknown ? "保存结果尚未确认，请保留原请求，检查电脑状态后重试"
+      : command.type === "configuration.discover" && error instanceof BridgeRequestError && error.status === 501 ? "此服务暂不提供模型发现，可返回配置手动编辑模型列表"
+      : error instanceof BridgeRequestError && error.status === 426 ? "电脑端组件版本不匹配，请一并更新 Connector 与 Bridge"
       : error instanceof BridgeRequestError && error.status === 409 ? "配置已在其他端更新，请刷新并合并；你的修改已保留"
       : error instanceof BridgeRequestError && error.status === 403 ? "当前配置或凭据来源只读，无法从手机保存"
       : error instanceof BridgeRequestError && (error.status === 501 || error.status === 404) ? "当前电脑尚未提供此配置能力，请更新 Harness 与 Bridge"

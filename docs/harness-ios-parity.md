@@ -118,14 +118,14 @@
 
 ## 验证与发布
 
-- [ ] 新旧协议和客户端组合有明确兼容策略，不能因新增字段丢掉整个问题。
-- [ ] 协议、Bridge、Connector、Store 和关键交互测试通过。
+- [x] 新旧协议和客户端组合有明确兼容策略，不能因新增字段丢掉整个问题。
+- [x] 协议、Bridge、Connector、Store 和关键交互测试通过。
 - [ ] 同一真实会话的桌面/iOS 双向操作与重连验证。
 - [ ] 真机浅深色、大字体、小屏、键盘、长历史和流式输出验证。
 - [ ] 截图、滚动与操作视频保存并对照。
 - [ ] 发布构建通过签名与上传验证；如本批未发布，明确记录。
 
-注意：目标自动推进由 Harness 执行，iOS 不另建驱动器。动态能力以连接的电脑为准。新协议须部署匹配的 Relay/Connector/Bridge；已实现逐连接版本协商和旧 Connector 拒绝，混合版本及恢复测试已通过，真实部署尚未验收。
+注意：目标自动推进由 Harness 执行，iOS 不另建驱动器。动态能力以连接的电脑为准。新协议须部署匹配的 Relay/Connector/Bridge；已实现逐连接版本协商和旧 Connector 拒绝，混合版本及恢复测试已通过，线上 Relay 已升级并验证；电脑组件和 App 的匹配部署、真实双端操作仍待验收。
 
 配置与凭据批次：`pnpm build`、`pnpm check` 通过，共 272 项 TypeScript 测试；236 项完整 iOS 测试全部通过，使用本机 ad hoc 签名验证真实 Keychain，不启用明文回退。结果位于 `/tmp/DSHAnywhere-parity-build/Logs/Test/Test-DSHAnywhere-2026.10.29_22-10-44-+0800.xcresult`。320 点宽、浅色/深色大字配置、冲突和凭据表单截图已存放在 `artifacts/ios/harness-parity/`。
 
@@ -135,11 +135,23 @@
 
 版本组合批次：协议主版本固定为 1，共享 schemaRevision 11。新版 Connector 每次 Relay 连接等待显式协商，未确认前保留完整事件并拒绝分派手机操作；缺失/旧版本和握手超时返回旧版可识别的升级诊断并关闭连接，按退避重连。升级后保持原生位置、计划 Markdown、审阅意图及决策版本，不能删字段迁就旧 Relay。新版 Bridge 在 HTTP 幂等预留之前和 WebSocket 重放之前拒绝未声明 schema 11 的旧 Connector（HTTP 426）；健康信息提供最低版本。Relay 只有对明确请求协商的连接才附加 schemaRevision，原有客户端的握手格式保持一致。`pnpm build`、`pnpm check` 通过，共 288 项 TypeScript 测试（协议 36、Relay 23、Bridge 174、Connector 55）；桌面安装器独立测试通过。
 
-真实 Harness 初步验证：使用本机已安装 `@deepseek-ai/dsh 0.1.5-rc.1` 在 `/tmp/dsh-parity-native-20261029` 独立 DSH_HOME 启动，端口 18931；没有加载现有配置、会话与凭据。新 Bridge 的健康检查、Native settings.describe（14 个命名空间）、llm 提供方目录、pluginInventory 清单均真实返回 200。尚未将此只读结果等同配置写入、冲突、双端或 iPhone 实机验收。线上 Relay 只读检查仍为 schema 10；已通过 Termius 的 ALI-BJ 连接确认 `/opt/dsh-anywhere` 与 `relay-relay-1`，升级待执行。
+真实 Harness 初步验证：使用本机已安装 `@deepseek-ai/dsh 0.1.5-rc.1` 在 `/tmp/dsh-parity-native-20261029` 独立 DSH_HOME 启动，端口 18931；没有加载现有配置、会话与凭据。新 Bridge 的健康检查、Native settings.describe（14 个命名空间）、llm 提供方目录、pluginInventory 清单均真实返回 200。尚未将此只读结果等同配置写入、冲突、双端或 iPhone 实机验收。线上 Relay 初次只读检查为 schema 10；随后已通过 Termius 的 ALI-BJ 完成升级，详见下方实际部署记录。
 
 ## 后续执行顺序
 
 1. 做真实电脑配置与双端冲突验收：`settings.describe` 返回脱敏的 schema/value/base/user、secret 路径和 revision；编辑使用 `settings.mutate({ns, ops, expectedRevision})`，按路径保存并保留未知字段，出现冲突时保留草稿并显式合并。`pluginInventory.list` 保留主机条目及各 Agent preset 的启用条件、运行阶段和损坏说明。
 2. 验收已完成的模型发现、配置变更同步及凭据界面：`llm.listConfigurableProviders` 提供 provider/displayName/settingsNs/settingsPath，结合 `llm.listProviders` 显示已激活与只声明的配置；凭据只走 Native `credentials.describe({refs})`、`set({ref,value})`、`unset({ref})`。Native describe 只返回 configured/source/writable，不返回密钥。密钥不能进入普通明文草稿、历史、事件缓存或 mutation journal；创建配置和保存密钥是可分别恢复的两个真实步骤。模型发现使用 Native `llm.discoverModels({settingsNs, request})`，以安装版本的 wire 参数为准。
 3. 验收已实现的子任务生命周期统计：读取 `SessionInspection.meta.createdAt` 和 `inheritedEventCount`，把父会话继承部分与子任务自己的轮次严格分开，避免把继承历史或空闲等待算作子任务执行时间。当前已在执行轨迹中展示读取时统计，仍需真实单次/可继续子任务、跨轮次空闲、继承历史、重启后未结束日志的对照验收。
-4. 完成升级组合策略：除了手机新命令的 schemaRevision 预检，还需处理新 Connector/Bridge 的广播附加字段遇到旧 Relay 严格校验的情形；不能声称已兼容。随后部署匹配构建，做真实桌面/iPhone 双向、重连、附件、分享及长历史/键盘/流式滚动验收，保存视频，再完成发布与 GitHub/README 更新。
+4. 升级组合策略与线上 Relay 升级已完成。继续部署匹配的电脑组件和 App，做真实桌面/iOS 双向、重连、附件、分享及长历史/键盘/流式滚动验收，保存视频，再完成发布与安装器固定版本更新。
+
+
+## 2026-10-29 实际部署与 Native 配置验收
+
+- GitHub 分支 `codex/harness-ios-parity` 已推送，草稿 PR：[Harness mobile parity #1](https://github.com/aluvien/DSH-Anywhere-Connector/pull/1)。主分支尚未合并，本轮尚未上传新 TestFlight。
+- ALI-BJ 的生产 Relay 已由固定提交 `4246f429eaaeb2a5482aefeb7bbb0c6ea1303fdf` 构建、预检并部署。公网与容器内 `/health` 均返回 schemaRevision 11、build 2026-10-29，生产容器 `relay-relay-1` 为 healthy。没有修改现有 `.env` 或数据卷。
+- 升级前备份位于服务器 `/opt/dsh-backup-parity-20261029-aSprxK`，旧镜像保留为 `dsh-relay:before-parity-4246f42`；新镜像 `dsh-relay:parity-4246f42`。升级前后比对确认 1 台现有机器和 1 台未过期设备的身份、令牌哈希和配对信息保持不变。备份包含敏感配置，仅保留于服务器受限目录。
+- 独立预检容器只绑定 loopback，验证真实打包镜像的旧手机握手保持原格式、新 Connector schema 11 协商、完整计划问题 Markdown/意图/决策版本不丢失，以及新目标命令携带认证设备身份。结果为 `/opt/dsh-parity-4246f42/preflight-result.json`；生产升级结果为同目录 `deployment-result.json`。预检容器已停止，生产配置校验和仍一致。
+- 独立 Native Harness 0.1.5-rc.1 的真实配置写入验收通过：原生 settings.mutate、相同请求幂等回执、旧 revision 409、外部 settings.yaml 更新后失效通知、测试凭据写入/读取状态/0600 权限/脱敏日志、凭据删除、用户覆盖清除后恢复基础值。共读取 14 个命名空间、接收 13 条仅含标识的失效通知；未读取或改变用户现有凭据。结果：`artifacts/ios/harness-parity/native-configuration-20261029.json`。
+- Native 模型发现经真正的 llm-pi-ai 适配器请求独立 loopback 模型目录，验证 API 地址与临时测试凭据、模型 ID/上下文/输出限制映射；畸形目录错误不回显凭据。官方 llm-deepseek 当前没有发现适配器，修正为 501 和手动添加提示；请求参数不完整为 400。结果：`artifacts/ios/harness-parity/native-discovery-20261029.json`。
+- 上述发现能力回退修复后，`pnpm build`、`pnpm check` 全部通过：288 项 TypeScript。iOS 最新完整回归为 239 项通过；提供方标签改为“可配置，尚未添加”后，布局定向测试通过，结果位于 `/tmp/DSHAnywhere-parity-build/Logs/Test/Test-DSHAnywhere-2026.10.29_23-11-22-+0800.xcresult`。
+- 这些证据不等同已完成实体 iPhone 双向、系统分享和动态滚动验收。线上电脑仍需加载匹配 Bridge/Connector，新 App 仍需发布。
