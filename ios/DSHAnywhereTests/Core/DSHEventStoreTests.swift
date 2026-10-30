@@ -842,6 +842,40 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.decisionVersion?.epoch, "host-2")
     }
 
+    func testHistoryTodoEditsPublishOnlyFinalStateAndKeepLiveUpdates() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var sequence: Int64 = 0
+        func send(_ type: String, batch: String? = nil, content: String = "", into state: inout DSHStoreState) throws {
+            sequence += 1
+            let payload: String = type == "todo.changed"
+                ? "{\"sessionId\":\"s\",\"todos\":[{\"content\":\"\(content)\",\"status\":\"pending\"}]}"
+                : "{\"sessionId\":\"s\",\"batchId\":\"b\"}"
+            let value = try JSONDecoder().decode(DSHJSONValue.self, from: Data(payload.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "r\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: batch, sequence: sequence, type: type, payload: value)), into: &state)
+        }
+        try send("history.started", into: &state)
+        for n in 1...200 {
+            try send("todo.changed", batch: "b", content: "old-\(n)", into: &state)
+            XCTAssertNil(state.todoBySession?["s"], "First load must not play historical task edits")
+        }
+        try send("history.completed", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "old-200")
+        try send("history.started", into: &state)
+        try send("todo.changed", batch: "b", content: "old", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "old-200", "Keep the cached dock stable")
+        try send("todo.changed", content: "live", into: &state)
+        try send("todo.changed", batch: "b", content: "stale", into: &state)
+        try send("history.completed", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "live")
+        try send("todo.changed", batch: "b", content: "late", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "live")
+        try send("history.started", into: &state)
+        try send("history.completed", into: &state)
+        XCTAssertNil(state.todoBySession?["s"], "An authoritative empty history clears cached tasks")
+    }
+
     @MainActor
     func testStaleQuestionAnswerRefreshesAuthoritativeStateWithoutGlobalAlertOrResend() async throws {
         let restore = installCorrelationTestProfile(); defer { restore() }
@@ -1072,13 +1106,18 @@ final class DSHEventStoreTests: XCTestCase {
                                                   expectedMachineID: model.machineID)
         model.connect()
         try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        for _ in 0..<100 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(model.connectionState, .connected)
         let cancel = Task { @MainActor in try await model.cancelQuestion(request) }
         defer { cancel.cancel(); model.disconnect() }
-        try await Task.sleep(for: .milliseconds(60))
+        let command = try await transport.waitForCommand(ofType: "question.cancel")
         XCTAssertEqual(model.pendingQuestions.count, 1)
-        let command = await transport.lastCommand(ofType: "question.cancel")
         XCTAssertEqual(command?.payload, .object(["questionId": .string("q")]))
-        await transport.emit(event(type: "question.resolved", messageID: "resolved", sequence: 1,
+        await transport.emit(event(type: "question.resolved", messageID: "resolved", sequence: 2,
             payload: .object(["id": .string("q"), "sessionId": .string("s")])))
         try await cancel.value
         XCTAssertTrue(model.pendingQuestions.isEmpty)

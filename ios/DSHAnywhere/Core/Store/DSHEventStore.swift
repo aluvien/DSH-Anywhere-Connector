@@ -89,6 +89,8 @@ public struct DSHHistoryCarryOver: Codable, Sendable, Equatable {
     public var tools: [DSHToolActivity] = []
     public var commandResults: [DSHCommandResult] = []
     public var modelChanges: [DSHModelChangeNotice] = []
+    public var replayedTodo: DSHTodoState?
+    public var receivedLiveTodo: Bool?
 
     public init(batchId: String) { self.batchId = batchId }
 }
@@ -508,6 +510,19 @@ public struct DSHEventReducer: Sendable {
             if state.schedulesBySession == nil { state.schedulesBySession = [:] }
             state.schedulesBySession?[snapshot.sessionId] = snapshot
         case .todoChanged(let todo):
+            if event.envelope.historyBatchId != nil {
+                // Historical edits describe one final dock state, not a live
+                // animation of every past task list. Late replay rows cannot
+                // replace a newer live update or a completed batch.
+                if var carry = state.historyCarryOverBySession[todo.sessionId] {
+                    carry.replayedTodo = todo
+                    state.historyCarryOverBySession[todo.sessionId] = carry
+                }
+                break
+            }
+            if state.historyCarryOverBySession[todo.sessionId] != nil {
+                state.historyCarryOverBySession[todo.sessionId]?.receivedLiveTodo = true
+            }
             if state.todoBySession == nil { state.todoBySession = [:] }
             state.todoBySession?[todo.sessionId] = todo
         case .executionRecorded(let update):
@@ -594,7 +609,6 @@ public struct DSHEventReducer: Sendable {
             state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
             if error.code == "bridge-request-failed", error.retryable { state.bridgeReachable = false }
         case .historyStarted(let batch):
-            state.todoBySession?.removeValue(forKey: batch.sessionId)
             state.planBySession?.removeValue(forKey: batch.sessionId)
             if state.liveGoalSessions?.contains(batch.sessionId) != true { state.goalBySession?.removeValue(forKey: batch.sessionId) }
             // A replay rebuilds this session's transcript in stored order.
@@ -700,6 +714,14 @@ public struct DSHEventReducer: Sendable {
         guard let carry = state.historyCarryOverBySession[sessionId] else { return }
         if let batchId, carry.batchId != batchId { return }
         state.historyCarryOverBySession.removeValue(forKey: sessionId)
+        if batchId != nil, carry.receivedLiveTodo != true {
+            if let todo = carry.replayedTodo {
+                if state.todoBySession == nil { state.todoBySession = [:] }
+                state.todoBySession?[sessionId] = todo
+            } else {
+                state.todoBySession?.removeValue(forKey: sessionId)
+            }
+        }
         appendMissing(carry.messages, to: &state.messagesBySession[sessionId, default: []])
         appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
         appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
