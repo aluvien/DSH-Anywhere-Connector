@@ -73,7 +73,14 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in fake })
         _ = await connection.connect()
         for sequence in 1...600 {
-            fake.enqueue(try relaySnapshot(messageID: "event-\(sequence)", sequence: Int64(sequence), title: "Event"))
+            // Unsolicited session snapshots are intentionally filtered unless
+            // they use a push identity. Use ordinary transcript events to
+            // actually exercise the bounded consumer buffer.
+            let event = DSHEvent(envelope: DSHEnvelope(messageId: "event-\(sequence)", deviceId: "device", machineId: "machine",
+                sessionId: "s", sequence: Int64(sequence), type: "assistant.message.completed",
+                payload: .object(["id": .string("a-\(sequence)"), "role": .string("assistant"), "markdown": .string("Event")])))
+            let relay = try DSHRelayPayloadMessage.wrapping(machineId: "machine", sender: .machine, body: event)
+            fake.enqueue(.data(try JSONEncoder().encode(relay)))
         }
         let state = try await waitForFailure(connection)
 
@@ -103,10 +110,16 @@ final class DSHWebSocketConnectionTests: XCTestCase {
             return fake
         })
         _ = await connection.connect()
-        try await Task.sleep(nanoseconds: 20_000_000)
+        // Handshake tasks run asynchronously; slow CI hosts may need more
+        // than one fixed 20 ms scheduling slice. Keep all wire assertions.
+        for _ in 0..<500 {
+            if fake.sentCommands.count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(fake.resumeCount, 1)
-        let commands = await fake.sentCommands
+        let commands = fake.sentCommands
         XCTAssertEqual(commands.count, 2)
+        guard commands.count >= 2 else { await connection.disconnect(); return }
         XCTAssertEqual(commands[0].type, "connection.resume")
         XCTAssertEqual(commands[0].deviceId, "device")
         XCTAssertEqual(commands[0].machineId, "machine")
@@ -142,7 +155,7 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         let command = DSHCommand(version: 1, deviceId: "device", machineId: "machine",
                                   type: "model.catalog", payload: .object([:]))
         try await connection.send(command)
-        let commands = await fake.sentCommands
+        let commands = fake.sentCommands
         XCTAssertEqual(commands.map(\.type), ["connection.resume", "session.list", "model.catalog"])
         await connection.disconnect()
     }
@@ -284,8 +297,11 @@ final class DSHWebSocketConnectionTests: XCTestCase {
 }
 
 private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Sendable {
-    private(set) var resumeCount = 0
-    private(set) var sentCommands: [DSHCommand] = []
+    private let lock = NSLock()
+    private var recordedResumeCount = 0
+    private var recordedCommands: [DSHCommand] = []
+    var resumeCount: Int { lock.withLock { recordedResumeCount } }
+    var sentCommands: [DSHCommand] { lock.withLock { recordedCommands } }
     var responseStatusCode: Int?
     var closeCodeRawValue: Int?
     var receiveError: Error?
@@ -297,10 +313,12 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
         self.additionalMessages = additionalMessages
     }
 
-    func resume() { resumeCount += 1 }
+    func resume() { lock.withLock { recordedResumeCount += 1 } }
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        receiveContinuation?.resume(throwing: DSHWebSocketError.closed)
-        receiveContinuation = nil
+        let pending = lock.withLock {
+            let pending = receiveContinuation; receiveContinuation = nil; return pending
+        }
+        pending?.resume(throwing: DSHWebSocketError.closed)
     }
     func send(_ message: URLSessionWebSocketTask.Message) async throws {
         let data: Data
@@ -308,26 +326,31 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
         let relay = try DSHRelayMessage(from: data)
         guard case .payload(let payload) = relay,
               payload.sender == .device else { return }
-        sentCommands.append(try payload.decodeBody(DSHCommand.self))
+        let command = try payload.decodeBody(DSHCommand.self)
+        lock.withLock { recordedCommands.append(command) }
     }
     func receive() async throws -> URLSessionWebSocketTask.Message {
-        if let receiveError { throw receiveError }
-        if !sentReady {
-            sentReady = true
-            let ready = DSHRelayReadyMessage(type: "relay.ready", machineId: "machine", role: .device,
-                                             connectionId: "connection", serverTime: 1)
-            return .data(try JSONEncoder().encode(ready))
+        try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                if let receiveError { continuation.resume(throwing: receiveError); return }
+                if !sentReady {
+                    sentReady = true
+                    let ready = DSHRelayReadyMessage(type: "relay.ready", machineId: "machine", role: .device,
+                                                     connectionId: "connection", serverTime: 1)
+                    do { continuation.resume(returning: .data(try JSONEncoder().encode(ready))) }
+                    catch { continuation.resume(throwing: error) }
+                } else if !additionalMessages.isEmpty {
+                    continuation.resume(returning: additionalMessages.removeFirst())
+                } else { receiveContinuation = continuation }
+            }
         }
-        if !additionalMessages.isEmpty { return additionalMessages.removeFirst() }
-        return try await withCheckedThrowingContinuation { continuation in receiveContinuation = continuation }
     }
 
     func enqueue(_ message: URLSessionWebSocketTask.Message) {
-        if let continuation = receiveContinuation {
-            receiveContinuation = nil
-            continuation.resume(returning: message)
-        } else {
-            additionalMessages.append(message)
+        let pending = lock.withLock { () -> CheckedContinuation<URLSessionWebSocketTask.Message, Error>? in
+            if let pending = receiveContinuation { receiveContinuation = nil; return pending }
+            additionalMessages.append(message); return nil
         }
+        pending?.resume(returning: message)
     }
 }

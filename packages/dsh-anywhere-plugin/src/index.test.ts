@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Readable } from 'node:stream'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -10,8 +10,62 @@ import { EventEnvelopeSchema } from '@dsh-anywhere/protocol'
 import { historyRecipient, CONNECTOR_DEVICE_ID, LIVE_REASONING_TRAIL_LIMIT, PairingRateLimiter, apply, inject, isSubagentSession, liveReasoningTrail, liveStreamChunkEvent, modeCatalogFromRemote, normalizeSessionEvent, normalizeSessionEvents, normalizeSessionSummary, readPairingMaterial, workspaceCatalog } from './index.js'
 import { HttpError } from './http.js'
 import type { Context } from '@deepseek-ai/cordis'
+import { ReplayBuffer } from './replay.js'
 
 describe('DeepSeek Harness event normalization', () => {
+  it('keeps durable file attachments and uses only Host-owned storage paths for original bytes', () => {
+    const file = { attachmentId: 'sha256:' + 'ab'.repeat(32), name: 'report.pdf', bytes: 10 }
+    const image = { attachmentId: 'sha256:' + 'cd'.repeat(32), mediaType: 'image/png', width: 1, height: 1, bytes: 10 }
+    const source = { type: 'user/message', data: { id: 'u', source: { kind: 'user' }, content: [
+      { type: 'file', attachment: file, hostPath: '/untrusted/block-path' }, { type: 'image', attachment: image } ] } }
+    const paths = { fileHostPath: vi.fn(() => '/host/files/report.pdf'), imageHostPath: vi.fn(() => '/host/objects/image') }
+    const result = normalizeSessionEvents('s', source, new Map(), undefined, undefined, undefined, paths)
+    expect(result[0]).toMatchObject({ type: 'user.message.accepted', payload: { attachments: [
+      { name: 'report.pdf', hostPath: '/host/files/report.pdf' }, { hostPath: '/host/objects/image', mediaType: 'image/png' } ] } })
+    expect(paths.fileHostPath).toHaveBeenCalledWith(file)
+    expect(paths.imageHostPath).toHaveBeenCalledWith(image)
+    const fallback = normalizeSessionEvents('s', source, new Map())
+    expect(fallback[0]).toMatchObject({ payload: { attachments: [{ name: 'report.pdf' }, { mediaType: 'image/png' }] } })
+    expect((fallback[0]?.payload as { attachments: unknown[] }).attachments.every((item) => !('hostPath' in (item as object)))).toBe(true)
+    expect(normalizeSessionEvents('s', source, new Map())[0]?.payload).toEqual(fallback[0]?.payload)
+    const invalid = normalizeSessionEvents('s', source, new Map(), undefined, undefined, undefined, { fileHostPath: () => { throw new Error('invalid ref') } })
+    expect(invalid[0]).toMatchObject({ payload: { attachments: [{ name: 'report.pdf' }, { mediaType: 'image/png' }] } })
+  })
+  it('preserves structured turn terminal reasons instead of treating every object as completed', () => {
+    for (const [kind, state] of [['error', 'failed'], ['aborted', 'cancelled'], ['max-tokens', 'max-tokens'], ['interrupted', 'interrupted']]) {
+      expect(normalizeSessionEvents('s', { type: 'turn/end', data: { turn: 1, reason: { kind } } }, new Map()))
+        .toEqual([{ type: 'turn.state.changed', sessionId: 's', payload: { sessionId: 's', state } }])
+    }
+  })
+  it('retains the Host sequence as the native fork boundary', () => {
+    const events = normalizeSessionEvents('s', { seq: 42, type: 'assistant/message',
+      data: { message: { id: 'a', content: [{ type: 'text', text: 'Done' }] } } }, new Map())
+    expect(events).toContainEqual({ type: 'assistant.message.completed', sessionId: 's',
+      payload: { id: 'a', role: 'assistant', markdown: 'Done', nativeSequence: 42 } })
+  })
+  it('replays todo whole-list snapshots and preserves an explicit empty list', () => {
+    const todos = [{ content: 'Read source', status: 'completed' }, { content: 'Verify', status: 'in_progress' }]
+    expect(normalizeSessionEvents('s', { type: 'todo/write', data: { todos } }, new Map()))
+      .toEqual([{ type: 'todo.changed', sessionId: 's', payload: { sessionId: 's', todos } }])
+    expect(normalizeSessionEvents('s', { type: 'todo/write', data: { todos: [] } }, new Map()))
+      .toEqual([{ type: 'todo.changed', sessionId: 's', payload: { sessionId: 's', todos: [] } }])
+    expect(normalizeSessionEvents('s', { type: 'todo/write', data: { todos: [{ content: 'bad', status: 'invented' }] } }, new Map())).toEqual([])
+  })
+  it('preserves durable plan and goal changes without inventing activation', () => {
+    const tools = new Map<string, string>()
+    expect(normalizeSessionEvents('s', { type: 'plan/mode', data: { active: true } }, tools))
+      .toEqual([{ type: 'plan.changed', sessionId: 's', payload: { sessionId: 's', active: true } }])
+    const goal = { id: 'g', revision: 1, objective: 'Ship it', phase: 'active', maxGoalRounds: 12 }
+    expect(normalizeSessionEvents('s', {
+      type: 'goal/change', data: { operation: 'create', goal, roundsStarted: 0 },
+    }, tools)).toEqual([{ type: 'goal.changed', sessionId: 's', payload: { sessionId: 's', goal, roundsStarted: 0 } }])
+    expect(normalizeSessionEvents('s', { type: 'goal/change', data: { operation: 'clear' } }, tools))
+      .toEqual([{ type: 'goal.changed', sessionId: 's', payload: { sessionId: 's', goal: null, roundsStarted: 0 } }])
+    expect(normalizeSessionEvents('s', { type: 'goal/change', data: { operation: 'create', goal: {} } }, tools)).toEqual([])
+    expect(normalizeSessionEvents('s', { type: 'user/message', data: {
+      source: { kind: 'goal', goalId: 'g', revision: 1, round: 3 },
+    } }, tools)).toEqual([{ type: 'goal.round', sessionId: 's', payload: { sessionId: 's', id: 'g', round: 3 } }])
+  })
   it('injects the workspace registry used by the Harness archive source of truth', () => {
     expect(inject).toContain('workspaceRegistry')
   })
@@ -116,8 +170,34 @@ describe('DeepSeek Harness event normalization', () => {
       data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: '/tmp' }] }] } },
     }, tools)).toEqual({
       type: 'tool.completed', sessionId: 's1',
-      payload: { id: 'c1', name: 'shell', status: 'succeeded', detail: '/tmp' },
+      payload: { id: 'c1', name: 'shell', status: 'succeeded', detail: '/tmp', resultContent: [{ type: 'text', text: '/tmp' }] },
     })
+  })
+
+  it('keeps native result metadata, failure diagnostics and full image references on tools', () => {
+    const meta = { diffs: [{ path: 'src/中文.swift', oldText: 'before', newText: 'after' }] }
+    const error = { message: 'denied', code: 'PERMISSION' }
+    const content = [{ type: 'text', text: 'diagnostic' }, { type: 'image', attachment: { attachmentId: 'sha256:' + 'ef'.repeat(32), mediaType: 'image/png' } }]
+    const result = normalizeSessionEvents('s', { seq: 7, time: 2500, type: 'tool/result',
+      data: { meta, error, message: { content: [{ type: 'tool-result', toolCallId: 'c', isError: true, content }] } } },
+      new Map([['c', 'edit']]), undefined, undefined, undefined, { imageHostPath: () => '/native/image' })
+    expect(result[0]).toMatchObject({ type: 'tool.completed', payload: { id: 'c', name: 'edit', status: 'failed',
+      detail: 'diagnostic', resultMeta: meta, resultContent: content, error, nativeSequence: 7, finishedAt: 2500,
+      attachments: [{ mediaType: 'image/png', hostPath: '/native/image' }] } })
+    expect(EventEnvelopeSchema.safeParse({ version: 1, messageId: 'e', deviceId: 'd', machineId: 'm',
+      sequence: 1, timestamp: Date.now(), ...result[0] }).success).toBe(true)
+  })
+
+  it('keeps exact subcall addresses, arguments, outcomes and native times during replay', () => {
+    const data = { rootCallId: 'root', parentCallId: 'nested', subCallId: 'child', name: 'grep', arguments: { pattern: '检查' } }
+    const started = normalizeSessionEvents('s', { seq: 8, time: 1000, type: 'tool/ptc-dispatch-start', data }, new Map())
+    expect(started).toEqual([{ type: 'tool.started', sessionId: 's', payload: { id: 'child', name: 'grep',
+      rootCallId: 'root', parentCallId: 'nested', status: 'running', detail: '{"pattern":"检查"}', startedAt: 1000, nativeSequence: 8 } }])
+    const finished = normalizeSessionEvents('s', { seq: 9, time: 1500, type: 'tool/ptc-dispatch',
+      data: { ...data, isError: true, content: [{ type: 'text', text: 'aborted' }] } }, new Map())
+    expect(finished[0]).toMatchObject({ type: 'tool.completed', payload: { id: 'child', rootCallId: 'root', parentCallId: 'nested',
+      name: 'grep', arguments: '{"pattern":"检查"}', detail: 'aborted', status: 'failed', finishedAt: 1500, nativeSequence: 9 } })
+    expect(normalizeSessionEvents('s', { type: 'tool/ptc-dispatch', data: { name: 'grep' } }, new Map())).toEqual([])
   })
 
   it('keeps reasoning out of the answer and emits it as its own event', () => {
@@ -414,6 +494,14 @@ describe('native bridge mutations', () => {
   const connectorToken = 'test-connector-token-that-is-long-enough'
 
   function mount(options: {
+    list?: () => Promise<{ items: unknown[] }>
+    control?: (signal: AbortSignal) => AsyncIterable<unknown>
+    inspect?: (sessionId: string) => Promise<{ events: unknown[]; meta?: unknown; inheritedEventCount?: number }>
+    page?: (request: unknown) => Promise<unknown>
+    sessionQuery?: unknown
+    sessionProjections?: unknown
+    updateQueue?: (request: unknown) => Promise<unknown>
+    fork?: (request: { sessionId: string; atSeq?: number }) => Promise<{ sessionId: string }>
     create?: (request: { cwd?: string; workspaceId?: string; agentPreset?: string }) => Promise<{ sessionId: string }>
     prompt?: () => Promise<{ accepted: true }>
     rename?: (request: { sessionId: string; title: string }) => Promise<unknown>
@@ -421,7 +509,10 @@ describe('native bridge mutations', () => {
     directoryPicker?: unknown
     invoke?: (request: unknown) => Promise<unknown>
     connection?: unknown
+    attachmentStore?: unknown
+    upgrade?: (handler: (req: IncomingMessage, socket: never, head: Buffer) => void) => void
     responseHeaders?: (headers: unknown) => void
+    on?: (name: string, callback: unknown) => void
     findAttachmentByRequestId?: (requestId: string, signal: AbortSignal) => Promise<unknown | undefined | { state: 'found' | 'not-committed' | 'unknown'; response?: unknown }>
     dataDir?: string
   } = {}) {
@@ -432,17 +523,23 @@ describe('native bridge mutations', () => {
     process.env.DSH_ANYWHERE_DATA_DIR = options.dataDir
       ?? mkdtempSync(join(tmpdir(), 'dsh-anywhere-bridge-test-'))
     let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
+    const cleanups: Array<() => unknown> = []
     const context = {
+      get: (name: string) => name === 'attachments' ? options.attachmentStore : name === 'sessionQuery' ? options.sessionQuery : name === 'sessionProjections' ? options.sessionProjections : undefined,
       logger: { info: () => undefined, warn: () => undefined },
       webServer: {
         register: (route: { handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }) => {
           handler = route.handler
           return () => undefined
         },
-        registerUpgrade: () => () => undefined,
+        registerUpgrade: (route: { handler: (req: IncomingMessage, socket: never, head: Buffer) => void }) => { options.upgrade?.(route.handler); return () => undefined },
       },
       sessionController: {
-        list: async () => ({ items: [] }),
+        ...(options.control === undefined ? {} : { control: options.control }),
+        ...(options.page === undefined ? {} : { page: options.page }),
+        ...(options.updateQueue === undefined ? {} : { updateQueue: options.updateQueue }),
+        ...(options.fork === undefined ? {} : { fork: options.fork }),
+        list: options.list ?? (async () => ({ items: [] })),
         create: options.create ?? (async () => ({ sessionId: 'session-new' })),
         ...(options.findAttachmentByRequestId === undefined ? {} : {
           findAttachmentByRequestId: options.findAttachmentByRequestId,
@@ -453,7 +550,7 @@ describe('native bridge mutations', () => {
         resolveAgent: async () => ({ error: 'none' }),
         prompt: options.prompt ?? (async () => ({ accepted: true })),
         cancel: () => ({ accepted: true }),
-        inspect: async () => ({ events: [] }),
+        inspect: options.inspect ?? (async () => ({ events: [] })),
       },
       workspaceRegistry: {
         list: () => [],
@@ -466,19 +563,26 @@ describe('native bridge mutations', () => {
         invoke: options.invoke ?? (async () => ({ ok: true, value: { presets: [] } })),
       },
       ...(options.directoryPicker === undefined ? {} : { directoryPicker: options.directoryPicker }),
-      on: () => undefined,
-      effect: () => undefined,
+      on: options.on ?? (() => undefined),
+      effect: (callback: () => unknown) => {
+        if (options.control !== undefined) {
+          const cleanup = callback()
+          if (typeof cleanup === 'function') cleanups.push(cleanup as () => unknown)
+        }
+      },
     } as unknown as Context
     apply(context, { connectorToken })
-    return async (method: string, url: string, body?: unknown, requestId?: string,
-                  authorization = `Bearer ${connectorToken}`): Promise<{ status: number; body: unknown }> => {
+    const send = async (method: string, url: string, body?: unknown, requestId?: string,
+                  authorization = `Bearer ${connectorToken}`, schemaRevision: string | null = "12"): Promise<{ status: number; body: unknown }> => {
       const request = Readable.from([body === undefined ? '' : JSON.stringify(body)]) as unknown as IncomingMessage
       Object.assign(request, {
         method,
         url,
         headers: {
           authorization,
+          ...(schemaRevision === null ? {} : { 'x-dsh-schema-revision': schemaRevision }),
           ...(requestId === undefined ? {} : { 'x-dsh-request-id': requestId }),
+          ...(url.endsWith('/configuration') && body !== undefined ? { 'x-dsh-request-hash': createHash('sha256').update(JSON.stringify(body)).digest('hex') } : {}),
         },
         socket: { remoteAddress: '127.0.0.1' },
       })
@@ -491,7 +595,560 @@ describe('native bridge mutations', () => {
       await handler!(request, reply)
       return { status, body: response.length === 0 ? undefined : JSON.parse(response) }
     }
+    return Object.assign(send, { dispose: () => { for (const cleanup of cleanups.reverse()) cleanup() } })
   }
+
+  it('refuses legacy Connector websocket upgrades before replaying richer events', () => {
+    let upgrade: ((req: IncomingMessage, socket: never, head: Buffer) => void) | undefined
+    mount({ upgrade: handler => { upgrade = handler } })
+    const socket = { write: vi.fn(), destroy: vi.fn() }
+    for (const revision of [undefined, '10', '11']) {
+      const request = { url: '/dsh-anywhere/v1/events', headers: { authorization: `Bearer ${connectorToken}`, ...(revision === undefined ? {} : { 'x-dsh-schema-revision': revision }) } } as IncomingMessage
+      upgrade!(request, socket as never, Buffer.alloc(0))
+      expect(socket.write).toHaveBeenLastCalledWith(expect.stringContaining('426 Upgrade Required'))
+    }
+    expect(socket.destroy).toHaveBeenCalledTimes(3)
+  })
+  it('rejects an obsolete Connector before reads, writes or idempotency reservation, while keeping health readable', async () => {
+    const invoke = vi.fn(async () => ({ TEST_KEY: { configured: false, writable: true } }))
+    const request = mount({ invoke })
+    const body = { kind: 'credential', action: 'set', ref: 'TEST_KEY', value: 'never-forward' }
+    await expect(request('GET', '/dsh-anywhere/v1/health', undefined, undefined, `Bearer ${connectorToken}`, null)).resolves.toMatchObject({ status: 200, body: { schemaRevision: 12, minimumConnectorSchemaRevision: 12 } })
+    for (const revision of [null, '10', '11', '11junk']) {
+      await expect(request('POST', '/dsh-anywhere/v1/configuration', body, 'same-id', `Bearer ${connectorToken}`, revision)).resolves.toMatchObject({ status: 426 })
+      await expect(request('GET', '/dsh-anywhere/v1/configuration?section=credentials&refs=%5B%22TEST_KEY%22%5D', undefined, undefined, `Bearer ${connectorToken}`, revision)).resolves.toMatchObject({ status: 426 })
+    }
+    expect(invoke).not.toHaveBeenCalled()
+    await expect(request('GET', '/dsh-anywhere/v1/configuration?section=credentials&refs=%5B%22TEST_KEY%22%5D', undefined, undefined, `Bearer ${connectorToken}`, '12')).resolves.toMatchObject({ status: 200 })
+    expect(invoke).toHaveBeenCalledTimes(1)
+  })
+  it('does not cache or journal model probes under a repeated request id', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-discovery-'))
+    let calls = 0
+    const request = mount({ dataDir, invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'llm', method: 'discoverModels', args: { settingsNs: 'llm-test', request: { apiKey: 'temporary-secret' } } })
+      calls += 1; return [{ id: `model-${calls}` }]
+    } })
+    const body = { settingsNs: 'llm-test', request: { apiKey: 'temporary-secret' } }
+    await expect(request('POST', '/dsh-anywhere/v1/configuration/discover', body, 'probe')).resolves.toEqual({ status: 200, body: { settingsNs: 'llm-test', models: [{ id: 'model-1' }] } })
+    await expect(request('POST', '/dsh-anywhere/v1/configuration/discover', body, 'probe')).resolves.toMatchObject({ body: { models: [{ id: 'model-2' }] } })
+    expect(calls).toBe(2)
+    const persisted = await readFile(join(dataDir, 'session-metadata.json'), 'utf8').catch(() => '')
+    expect(persisted).not.toContain('temporary-secret'); expect(persisted).not.toContain('model-1')
+  })
+  it('journals credential acknowledgements and fingerprints without storing the submitted secret', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dsh-configuration-secret-'))
+    let writes = 0
+    const request = mount({ dataDir, invoke: async (value) => {
+      const call = value as { namespace: string; method: string; args: unknown }
+      if (call.namespace === 'credentials' && call.method === 'describe') return { TEST_KEY: { configured: false, writable: true } }
+      expect(call).toMatchObject({ namespace: 'credentials', method: 'set', args: { ref: 'TEST_KEY', value: 'not-a-real-secret-never-persist' } })
+      writes += 1; return undefined
+    } })
+    const body = { kind: 'credential', action: 'set', ref: 'TEST_KEY', value: 'not-a-real-secret-never-persist' }
+    const expected = { status: 202, body: { kind: 'credential', requestId: 'credential-1', ref: 'TEST_KEY' } }
+    await expect(request('POST', '/dsh-anywhere/v1/configuration', body, 'credential-1')).resolves.toEqual(expected)
+    await expect(request('POST', '/dsh-anywhere/v1/configuration', body, 'credential-1')).resolves.toEqual(expected)
+    await expect(request('POST', '/dsh-anywhere/v1/configuration', { ...body, value: 'different' }, 'credential-1')).resolves.toMatchObject({ status: 409 })
+    expect(writes).toBe(1)
+    const persisted = await readFile(join(dataDir, 'session-metadata.json'), 'utf8')
+    expect(persisted).not.toContain(body.value)
+    expect(persisted).toContain('fingerprint')
+  })
+  it('keeps uncertain configuration writes parked and does not echo adapter exceptions', async () => {
+    let writes = 0
+    const request = mount({ invoke: async (value) => {
+      const call = value as { method: string }
+      if (call.method === 'describe') return { TEST_KEY: { configured: false, writable: true } }
+      writes += 1; throw new Error('secret-must-not-appear-in-errors')
+    } })
+    const body = { kind: 'credential', action: 'set', ref: 'TEST_KEY', value: 'secret-must-not-appear-in-errors' }
+    const first = await request('POST', '/dsh-anywhere/v1/configuration', body, 'unknown-setting')
+    expect(first.status).toBe(503); expect(JSON.stringify(first.body)).not.toContain(body.value)
+    await expect(request('POST', '/dsh-anywhere/v1/configuration', body, 'unknown-setting')).resolves.toMatchObject({ status: 503 })
+    expect(writes).toBe(1)
+    await expect(request('GET', '/dsh-anywhere/v1/configuration?section=credentials&refs=%5B%22NOT-A-REF%22%5D')).resolves.toMatchObject({ status: 400 })
+  })
+  it('saves native message feedback once and returns the same confirmed receipt on retry', async () => {
+    const item = { messageId: 'a', rating: 'negative', note: '保留备注', version: 'v2', createdAt: 1, updatedAt: 2 }
+    const invoke = vi.fn(async () => ({ ok: true, value: item }))
+    const request = mount({ invoke })
+    const payload = { action: 'put', messageId: 'a', rating: 'negative', note: '保留备注', ifVersion: 'v1' }
+    const expected = { status: 202, body: { sessionId: 's', messageId: 'a', requestId: 'f1', item } }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/feedback', payload, 'f1')).resolves.toEqual(expected)
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/feedback', payload, 'f1')).resolves.toEqual(expected)
+    expect(invoke).toHaveBeenCalledTimes(1)
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'messageFeedback', method: 'put', args: { request: {
+      sessionId: 's', messageId: 'a', rating: 'negative', note: '保留备注', ifVersion: 'v1' } } }))
+  })
+
+  it('reads references through Agent-scoped native interfaces and preserves canonical session mentions', async () => {
+    const invoke = vi.fn(async (request: unknown) => (request as { namespace: string }).namespace === 'fileReferences'
+      ? { ok: true, value: [{ path: '目录/a b.ts', kind: 'file' }] }
+      : { ok: true, value: [{ sessionId: 'a/b', label: 'Another session', mention: '@[Another session](dsh-session:ImEvYiI)', sameWorkspace: false }] })
+    const request = mount({ invoke })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/references?kind=file&query=%E7%9B%AE%E5%BD%95%2F')).resolves.toMatchObject({ status: 200,
+      body: { sessionId: 's', kind: 'file', query: '目录/', items: [{ insertion: '@"目录/a b.ts"' }] } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'fileReferences', method: 'list', args: { agentId: 's', query: '目录/' } }))
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/references?kind=session&query=Another')).resolves.toMatchObject({ status: 200,
+      body: { items: [{ sourceSessionId: 'a/b', insertion: '@[Another session](dsh-session:ImEvYiI)' }] } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'sessionReferenceResolver', method: 'candidates', args: { agentId: 's', query: 'Another' } }))
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/references?kind=invented')).resolves.toMatchObject({ status: 400 })
+  })
+
+  it('keeps uncertain feedback parked and makes explicit CAS conflicts reviewable', async () => {
+    const invoke = vi.fn(async () => { throw new Error('response lost') })
+    const uncertain = mount({ invoke })
+    const payload = { action: 'put', messageId: 'a', rating: 'positive', ifVersion: null }
+    await expect(uncertain('POST', '/dsh-anywhere/v1/sessions/s/feedback', payload, 'unknown')).resolves.toMatchObject({ status: 503 })
+    await expect(uncertain('POST', '/dsh-anywhere/v1/sessions/s/feedback', payload, 'unknown')).resolves.toMatchObject({ status: 503 })
+    expect(invoke).toHaveBeenCalledTimes(1)
+    const rejected = mount({ invoke: async () => ({ ok: false, error: { code: 'version-conflict', current: null } }) })
+    await expect(rejected('POST', '/dsh-anywhere/v1/sessions/s/feedback', payload, 'conflict')).resolves.toMatchObject({ status: 409 })
+  })
+
+  it('returns a coherent feedback snapshot and uses the native delete token', async () => {
+    const item = { messageId: 'a', rating: 'positive', version: 'v1', createdAt: 1, updatedAt: 1 }
+    const invoke = vi.fn(async (input: unknown) => (input as { method: string }).method === 'list'
+      ? { ok: true, value: { items: [item] } } : { ok: true, value: { absent: true } })
+    const request = mount({ invoke, inspect: async () => ({ events: [
+      { seq: 7, type: 'feedback/message-put', data: { sessionId: 's', item } }, { seq: 8, type: 'step/end', data: {} } ] }) })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/feedback')).resolves.toEqual({ status: 200, body: { sessionId: 's', nativeSequence: 8, items: [item] } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/feedback', { action: 'delete', messageId: 'a', ifVersion: 'v1' }, 'delete'))
+      .resolves.toEqual({ status: 202, body: { sessionId: 's', messageId: 'a', requestId: 'delete', item: null } })
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ method: 'delete', args: { request: { sessionId: 's', messageId: 'a', ifVersion: 'v1' } } }))
+  })
+
+  it('replays existing control state to a phone that opens after the control baseline', async () => {
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    const request = mount({
+      control: async function* (signal) {
+        yield { type: 'baseline', value: {
+          queues: { child: [{ id: 'item', placement: 'queued', message: { id: 'item', content: [
+            { type: 'text', text: 'Next' },
+            { type: 'image', attachment: { attachmentId: 'sha256:' + 'ef'.repeat(32), mediaType: 'image/png' } },
+            { type: 'file', attachment: { attachmentId: 'sha256:' + 'ab'.repeat(32), name: 'spec.pdf', bytes: 1 } },
+          ] } }] },
+          jobs: { child: [{ id: 'job', kind: 'shell', label: 'Build', status: 'running', startedAt: 1 }] },
+          projections: { child: { asOfSeq: 8, values: { plan: { active: false, pending: true } } } },
+        } }
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+      attachmentStore: { imageHostPath: () => '/host/image', fileHostPath: () => '/host/spec.pdf' },
+      invoke: async (value) => (value as { namespace: string }).namespace === 'subagents'
+        ? { ok: true, value: { parentAvailable: true, entries: [{ kind: 'child', id: 'child', mode: 'continuable', label: 'Task', activity: 'running', hasChildren: false }] } }
+        : { ok: true, value: undefined },
+    })
+    try {
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/child/open',
+        { parentSessionId: 'parent', subagentMode: 'continuable', deviceId: 'late-phone' })).resolves.toMatchObject({ status: 202 })
+      const targeted = appended.mock.calls.map(([event]) => event).filter((event) => event.deviceId === 'late-phone')
+      expect(targeted).toContainEqual(expect.objectContaining({ type: 'jobs.changed', payload: expect.objectContaining({ sessionId: 'child', available: true, jobs: expect.arrayContaining([expect.objectContaining({ id: 'job' })]) }) }))
+      expect(targeted).toContainEqual(expect.objectContaining({ type: 'queue.changed', payload: expect.objectContaining({ sessionId: 'child', items: expect.arrayContaining([expect.objectContaining({ id: 'item' })]) }) }))
+      expect(targeted).toContainEqual(expect.objectContaining({ type: 'queue.changed', payload: expect.objectContaining({ items: expect.arrayContaining([
+        expect.objectContaining({ attachments: expect.arrayContaining([expect.objectContaining({ hostPath: '/host/image' }), expect.objectContaining({ name: 'spec.pdf', hostPath: '/host/spec.pdf' })]) }) ]) }) }))
+      expect(targeted).toContainEqual(expect.objectContaining({ type: 'plan.projection', payload: expect.objectContaining({ sessionId: 'child', active: false, pending: true }) }))
+    } finally { request.dispose(); appended.mockRestore() }
+  })
+
+  it('serves an authenticated empty pending-decision baseline with a Host epoch', async () => {
+    const request = mount()
+    const result = await request('GET', '/dsh-anywhere/v1/decisions')
+    expect(result).toMatchObject({ status: 200, body: { approvals: [], questions: [], stateVersion: { revision: 0 } } })
+    expect((result.body as { stateVersion: { epoch: string } }).stateVersion.epoch).toBeTruthy()
+    await expect(request('GET', '/dsh-anywhere/v1/decisions', undefined, undefined, 'Bearer wrong'))
+      .resolves.toMatchObject({ status: 401 })
+  })
+  it('reads optional reminders with the Host cold projector and exact fork inheritance metadata', async () => {
+    const meta = { id: 'child', createdAt: 1000 }, events = [{ seq: 0, type: 'schedule/change', data: { inherited: true } }]
+    const restore = vi.fn((_checkpoint: unknown, _events: unknown, _base: unknown, _meta: unknown, _inherited: unknown) => ({ snapshot: { asOfSeq: 0, values: { schedule: [] } } }))
+    const invoke = async () => ({ ok: true, value: { parentAvailable: false,
+      entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] } })
+    const request = mount({ inspect: async () => ({ events, meta, inheritedEventCount: 1 }), sessionProjections: { restore }, invoke })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/schedules?parentSessionId=p&subagentMode=one-shot')).resolves.toMatchObject({ status: 200, body: { supported: true, available: true, items: [], seq: 0 } })
+    expect(restore).toHaveBeenCalledWith({}, events, 0, meta, 1)
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/schedules?parentSessionId=p&subagentMode=continuable')).resolves.toMatchObject({ status: 403 })
+    await expect(mount({ invoke })('GET', '/dsh-anywhere/v1/sessions/child/schedules?parentSessionId=p&subagentMode=one-shot')).resolves.toMatchObject({ status: 501 })
+  })
+  it('reads exact native history pages through a verified child address without activating it', async () => {
+    const events = [{ seq: 0, time: 0, type: 'request/header', data: { header: { config: { model: 'm' } } } },
+      { seq: 1, time: 1000, type: 'user/message', data: { id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text: 'Hello' }] } }]
+    const nativePage = vi.fn(async (_request: unknown) => ({ records: events.map((event) => ({ type: 'event', event })), hasMore: false }))
+    const request = mount({ inspect: async () => ({ events }), page: nativePage, invoke: async () => ({ ok: true, value: { parentAvailable: false,
+      entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] } }) })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/history')).resolves.toMatchObject({ status: 404 })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/history?parentSessionId=parent&subagentMode=continuable')).resolves.toMatchObject({ status: 403 })
+    expect(nativePage).not.toHaveBeenCalled()
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/history?parentSessionId=parent&subagentMode=one-shot&atSeq=1')).resolves.toMatchObject({ status: 200,
+      body: { sessionId: 'child', throughSeq: 1, fromSeq: 0, toSeq: 1, hasMore: false, focus: { nativeSequence: 1 }, rows: [{ type: 'user.message.accepted' }] } })
+    expect(nativePage.mock.calls[0]![0]).toEqual({ address: { kind: 'subagent', parentSessionId: 'parent', childSessionId: 'child', mode: 'one-shot' }, throughSeq: 1, beforeSeq: 2, maxMessages: 20 })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/history?parentSessionId=parent&subagentMode=one-shot&throughSeq=5')).resolves.toMatchObject({ status: 409 })
+  })
+  it('routes native search read-only and rejects invalid or unavailable capability', async () => {
+    const searchSessions = vi.fn(async (_request: unknown) => ({ items: [], nextCursor: undefined }))
+    const request = mount({ sessionQuery: { searchSessions, searchEvents: vi.fn() } })
+    await expect(request('GET', '/dsh-anywhere/v1/search?query=%E4%BD%A0%E5%A5%BD')).resolves.toMatchObject({ status: 200, body: { query: '你好', items: [], hasMore: false } })
+    expect(searchSessions.mock.calls[0]![0]).toMatchObject({ query: '你好', sessionFilters: [{ kind: 'id', values: [] }] })
+    await expect(request('GET', '/dsh-anywhere/v1/search?query=%20%20')).resolves.toMatchObject({ status: 400 })
+    await expect(mount()('GET', '/dsh-anywhere/v1/search?query=x')).resolves.toMatchObject({ status: 501 })
+  })
+  it('returns full child lifecycle independently of the requested execution page', async () => {
+    const events = [{ seq: 0, time: 1000, type: 'turn/start', data: { turn: 0 } }, { seq: 1, time: 2000, type: 'turn/end', data: { turn: 0, reason: { kind: 'completed' } } },
+      { seq: 2, time: 10000, type: 'turn/start', data: { turn: 1 } }, { seq: 3, time: 13000, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }]
+    const request = mount({ inspect: async () => ({ events, meta: { createdAt: 9000 }, inheritedEventCount: 2 }),
+      invoke: async () => ({ parentAvailable: false, entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] }) })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution?parentSessionId=parent&subagentMode=one-shot&limit=1&beforeSeq=3')).resolves.toMatchObject({ status: 200,
+      body: { records: [{ nativeSequence: 2 }], lifecycle: { inheritedEventCount: 2, ownEventCount: 2, throughSeq: 3, turnsStarted: 1, turnsEnded: 1, endedTurnMilliseconds: 3000 } } })
+  })
+  it('pages execution history only through a verified parent address', async () => {
+    const events = [{ seq: 0, type: 'turn/start', data: { turn: 1 } }, { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 5, type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: 'user' } } }]
+    const request = mount({ inspect: async () => ({ events }), invoke: async () => ({ ok: true, value: { parentAvailable: false,
+      entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] } }) })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution')).resolves.toMatchObject({ status: 404 })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution?parentSessionId=parent&subagentMode=continuable')).resolves.toMatchObject({ status: 403 })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution?parentSessionId=parent&subagentMode=one-shot&limit=2')).resolves.toMatchObject({ status: 200,
+      body: { sessionId: 'child', hasMore: true, beforeSeq: 2, records: [{ nativeSequence: 2 }, { nativeSequence: 5 }] } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution?parentSessionId=parent&subagentMode=one-shot&beforeSeq=2')).resolves.toMatchObject({ status: 200,
+      body: { hasMore: false, beforeSeq: 0, records: [{ nativeSequence: 0 }] } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/child/execution?beforeSeq=-1')).resolves.toMatchObject({ status: 400 })
+  })
+
+  it('publishes workflow history and a complete catalog to the opening phone', async () => {
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    const events = [
+      { seq: 0, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 2, time: 1_000, type: 'tool-workflow/run-start', data: { runId: 'run', name: 'Review' } },
+      { seq: 3, type: 'tool-workflow/agent-start', data: { runId: 'run', seq: 1, label: 'Read source', phase: '', childId: 'member' } },
+      { seq: 4, type: 'tool-workflow/agent-end', data: { runId: 'run', seq: 1, outcome: 'failed' } },
+      { seq: 5, time: 5_000, type: 'tool-workflow/run-end', data: { runId: 'run', stopReason: 'completed' } },
+    ]
+    const request = mount({ inspect: async () => ({ events }), invoke: async (value) =>
+      (value as { namespace: string }).namespace === 'subagents'
+        ? { ok: true, value: { parentAvailable: false, entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] } }
+        : { ok: true, value: undefined },
+    })
+    try {
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/child/open',
+        { parentSessionId: 'parent', subagentMode: 'one-shot', deviceId: 'phone-workflow' })).resolves.toMatchObject({ status: 202 })
+      const workflow = appended.mock.calls.map(([event]) => event).filter((event) => event.type === 'workflow.changed' && event.deviceId === 'phone-workflow')
+      expect(workflow).toContainEqual(expect.objectContaining({ historyBatchId: expect.any(String),
+        payload: expect.objectContaining({ sessionId: 'child', run: expect.objectContaining({ id: 'run', status: 'completed',
+          members: [expect.objectContaining({ phase: '', childId: 'member', status: 'failed' })] }) }) }))
+      expect(workflow.at(-1)).toMatchObject({ payload: { sessionId: 'child', inTranscript: false, run: { id: 'run', status: 'completed' } } })
+    } finally { request.dispose(); appended.mockRestore() }
+  })
+
+  it('lists workspace files through the native session scope and requires authentication', async () => {
+    const calls: unknown[] = []
+    const request = mount({ invoke: async (value) => {
+      calls.push(value)
+      expect(value).toMatchObject({ namespace: 'workspaceFiles', method: 'list', args: { workspaceFileScopeId: 's', path: '项目' } })
+      return { ok: true, value: { path: '项目', entries: [{ name: '图.png', type: 'file', size: 5 }, { name: 'src', type: 'directory' }], truncated: false } }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=%E9%A1%B9%E7%9B%AE', undefined, undefined, 'Bearer wrong')).resolves.toMatchObject({ status: 401 })
+    expect(calls).toHaveLength(0)
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=%E9%A1%B9%E7%9B%AE')).resolves.toMatchObject({ status: 200,
+      body: { sessionId: 's', path: '项目', entries: [{ name: '图.png' }, { name: 'src' }], truncated: false } })
+    expect(calls).toHaveLength(1)
+  })
+  it('translates the mobile root path to Native dot and maps thrown Host capability failures', async () => {
+    const request = mount({ invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'workspaceFiles', method: 'list', args: { workspaceFileScopeId: 's', path: '.' } })
+      return { path: '', entries: [], truncated: false }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=')).resolves.toMatchObject({ status: 200, body: { path: '', entries: [] } })
+    const unavailable = mount({ invoke: async () => { throw { code: 'gateway/namespace-not-found', message: 'No Native files capability' } } })
+    await expect(unavailable('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=')).resolves.toMatchObject({ status: 501 })
+  })
+  it('reads bounded original bytes and checks the native version after reading', async () => {
+    const request = mount({ invoke: async (value) => {
+      const call = value as { method: string }
+      expect(value).toMatchObject({ namespace: 'workspaceFiles', args: { workspaceFileScopeId: 's', path: '图.png' } })
+      if (call.method === 'readBytes') {
+        expect(value).toMatchObject({ args: { range: { offset: 3, length: 3 } } })
+        return { ok: true, value: { absolutePath: '/workspace/图.png', version: 'v1', bytes: 6, offset: 3, data: 'YWJj', eof: true } }
+      }
+      expect(call.method).toBe('stat')
+      return { ok: true, value: { absolutePath: '/workspace/图.png', version: 'v1', bytes: 6 } }
+    } })
+    const path = '/dsh-anywhere/v1/sessions/s/workspace/bytes?path=%E5%9B%BE.png&offset=3&length=3&version=v1'
+    await expect(request('GET', path)).resolves.toMatchObject({ status: 200, body: { sessionId: 's', offset: 3, data: 'YWJj', version: 'v1', eof: true } })
+    await expect(request('GET', path.replace('version=v1', 'version=old'))).resolves.toMatchObject({ status: 409 })
+    await expect(request('GET', path.replace('length=3', 'length=9999999'))).resolves.toMatchObject({ status: 400 })
+  })
+  it('rejects files that change while reading and preserves Host access failures', async () => {
+    const request = mount({ invoke: async (value) => (value as { method: string }).method === 'readBytes'
+      ? { ok: true, value: { absolutePath: '/workspace/a', version: 'v1', offset: 0, data: 'YQ==', eof: true } }
+      : { ok: true, value: { absolutePath: '/workspace/a', version: 'v2' } } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/workspace/bytes?path=a&offset=0&length=3')).resolves.toMatchObject({ status: 409 })
+    const denied = mount({ invoke: async () => ({ ok: false, error: { code: 'fs/denied', message: 'Host denied file access' } }) })
+    await expect(denied('GET', '/dsh-anywhere/v1/sessions/s/workspace/bytes?path=/outside&offset=0&length=3')).resolves.toMatchObject({ status: 400, body: { error: 'Host denied file access' } })
+    const old = mount({ invoke: async () => ({ ok: false, error: { code: 'gateway/namespace-not-found', message: 'No workspaceFiles service' } }) })
+    await expect(old('GET', '/dsh-anywhere/v1/sessions/s/workspace/files?path=')).resolves.toMatchObject({ status: 501 })
+  })
+
+  it('uses the optional native attachment service when replaying a child record', async () => {
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    const request = mount({ attachmentStore: { fileHostPath: () => '/host/files/a.pdf' },
+      inspect: async () => ({ events: [{ type: 'user/message', data: { id: 'u', source: { kind: 'user' }, content: [
+        { type: 'file', attachment: { attachmentId: 'sha256:' + 'ab'.repeat(32), name: 'a.pdf', bytes: 3 } }] } }] }),
+      invoke: async () => ({ ok: true, value: { parentAvailable: false, entries: [{ kind: 'child', id: 'child', mode: 'one-shot', activity: 'inactive', hasChildren: false }] } }),
+    })
+    try {
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/child/open', { parentSessionId: 'parent', subagentMode: 'one-shot', deviceId: 'phone' })).resolves.toMatchObject({ status: 202 })
+      expect(appended.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ deviceId: 'phone', type: 'user.message.accepted',
+        payload: expect.objectContaining({ attachments: [expect.objectContaining({ name: 'a.pdf', hostPath: '/host/files/a.pdf' })] }) }))
+    } finally { request.dispose(); appended.mockRestore() }
+  })
+
+  it('forks the native log at the exact boundary once across retries', async () => {
+    let calls = 0
+    const request = mount({ fork: async (value) => {
+      expect(value).toEqual({ sessionId: 'parent', atSeq: 42 })
+      calls += 1
+      return { sessionId: 'child' }
+    } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', { atSeq: 42 }, 'fork-1'))
+      .resolves.toMatchObject({ status: 201, body: { sessionId: 'child' } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', { atSeq: 42 }, 'fork-1'))
+      .resolves.toMatchObject({ status: 201, body: { sessionId: 'child' } })
+    expect(calls).toBe(1)
+  })
+  it('keeps a Native fork visible and readable while excluding a real subagent', async () => {
+    const request = mount({
+      list: async () => ({ items: [
+        { sessionId: 'fork', parentSessionId: 'parent', cwd: '/workspace' },
+        { sessionId: 'agent', parentSessionId: 'parent', origin: 'subagent', cwd: '/workspace' },
+      ] }),
+      inspect: async (sessionId) => {
+        expect(sessionId).toBe('fork')
+        return { events: [], inheritedEventCount: 0 }
+      },
+    })
+    const listed = await request('GET', '/dsh-anywhere/v1/sessions')
+    expect(listed).toMatchObject({ status: 200, body: { items: [{ id: 'fork', parentSessionId: 'parent' }] } })
+    expect((listed.body as { items: unknown[] }).items).toHaveLength(1)
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/fork/execution?limit=100'))
+      .resolves.toMatchObject({ status: 200, body: { sessionId: 'fork' } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/fork/open', {}))
+      .resolves.toMatchObject({ status: 202 })
+  })
+  it('classifies live Native headers without hiding a fork or leaking a subagent', () => {
+    let created: ((session: unknown) => void) | undefined
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    const request = mount({ on: (name, callback) => {
+      if (name === 'session/created') created = callback as (session: unknown) => void
+    } })
+    try {
+      created!({ id: 'fork', header: { parentSession: 'parent', isSeeded: true, cwd: '/workspace' } })
+      created!({ id: 'agent', header: { parentSession: 'parent', origin: 'subagent', cwd: '/workspace' } })
+      const events = appended.mock.calls.map(([event]) => event).filter((event) => event.type === 'session.created')
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({ payload: { id: 'fork', parentSessionId: 'parent' } })
+    } finally { request.dispose(); appended.mockRestore() }
+  })
+  it('reads a Native undefined goal as an empty baseline and creates through goals.create exactly once', async () => {
+    let created = false, mutations = 0
+    const goal = { id: 'native-goal', revision: 1, objective: 'Read on mobile', phase: 'active', maxGoalRounds: 7, roundsStarted: 0, activation: 'armed' }
+    const request = mount({ invoke: async (value) => {
+      const call = value as { method: string }
+      if (call.method === 'get') return created ? goal : undefined
+      expect(value).toMatchObject({ namespace: 'goals', method: 'create', args: { agentId: 's', request: { objective: 'Read on mobile', maxGoalRounds: 7 } } })
+      expect((value as { args: Record<string, unknown> }).args).not.toHaveProperty('ref')
+      created = true; mutations += 1
+      return { ref: { id: goal.id, revision: goal.revision } }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/goal')).resolves.toMatchObject({ status: 200, body: { goal: null, roundsStarted: 0 } })
+    const body = { action: 'create', objective: goal.objective, maxGoalRounds: 7 }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-create')).resolves.toMatchObject({ status: 202, body: { action: 'create', ref: { id: goal.id, revision: 1 } } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-create')).resolves.toMatchObject({ status: 202 })
+    expect(mutations).toBe(1)
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'new-create')).resolves.toMatchObject({ status: 409 })
+    expect(mutations).toBe(1)
+  })
+  it('retains an unknown Native goal creation without creating it a second time', async () => {
+    let mutations = 0
+    const request = mount({ invoke: async (value) => {
+      if ((value as { method: string }).method === 'get') return undefined
+      mutations += 1; throw new Error('Native creation acknowledgement lost')
+    } })
+    const body = { action: 'create', objective: 'Keep original request' }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'unknown-create')).resolves.toMatchObject({ status: 503 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'unknown-create')).resolves.toMatchObject({ status: 503 })
+    expect(mutations).toBe(1)
+  })
+  it('edits the exact goal revision once and keeps the native edit request envelope', async () => {
+    let mutations = 0
+    const goal = { id: 'g', revision: 2, objective: 'Original', phase: 'active', maxGoalRounds: 12,
+      roundsStarted: 3, activation: 'armed', createdAt: 1, updatedAt: 2 }
+    const request = mount({ invoke: async (value) => {
+      const call = value as { method: string }
+      if (call.method === 'get') return { ok: true, value: goal }
+      expect(value).toMatchObject({ namespace: 'goals', method: 'edit', args: { agentId: 's',
+        ref: { id: 'g', revision: 2 }, request: { objective: 'Updated', maxGoalRounds: 18 } } })
+      mutations += 1
+      return { ok: true, value: { ...goal, revision: 3, objective: 'Updated', maxGoalRounds: 18 } }
+    } })
+    const body = { action: 'edit', ref: { id: 'g', revision: 2 }, objective: 'Updated', maxGoalRounds: 18 }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-edit'))
+      .resolves.toMatchObject({ status: 202, body: { sessionId: 's', requestId: 'goal-edit', action: 'edit', ref: { id: 'g', revision: 3 } } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/goal', body, 'goal-edit')).resolves.toMatchObject({ status: 202 })
+    expect(mutations).toBe(1)
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/goal')).resolves.toMatchObject({ status: 200, body: {
+      sessionId: 's', goal: { id: 'g', revision: 2 }, roundsStarted: 3, activation: 'armed' } })
+  })
+  it('rejects stale goal revisions before mutation and retains unknown native outcomes', async () => {
+    let mutations = 0
+    const goal = { id: 'g', revision: 2, objective: 'Original', phase: 'active', maxGoalRounds: 12, roundsStarted: 3, activation: 'armed' }
+    const request = mount({ invoke: async (value) => {
+      if ((value as { method: string }).method === 'get') return { ok: true, value: goal }
+      mutations += 1
+      throw new Error('lost native goal response')
+    } })
+    const path = '/dsh-anywhere/v1/sessions/s/goal'
+    await expect(request('POST', path, { action: 'pause', ref: { id: 'g', revision: 1 } }, 'stale-goal')).resolves.toMatchObject({ status: 409 })
+    expect(mutations).toBe(0)
+    const body = { action: 'pause', ref: { id: 'g', revision: 2 } }
+    await expect(request('POST', path, body, 'unknown-goal')).resolves.toMatchObject({ status: 503 })
+    await expect(request('POST', path, body, 'unknown-goal')).resolves.toMatchObject({ status: 503 })
+    expect(mutations).toBe(1)
+  })
+  it('edits the exact native queue occurrence once and preserves authored text', async () => {
+    let calls = 0
+    const request = mount({ updateQueue: async (value) => {
+      expect(value).toEqual({ sessionId: 's', itemId: 'item-1', action: { kind: 'edit', content: [{ type: 'text', text: '  revised\ntext  ' }] } })
+      calls += 1
+      return { accepted: true }
+    } })
+    const body = { itemId: 'item-1', action: 'edit', text: '  revised\ntext  ' }
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/queue', body, 'queue-1')).resolves.toMatchObject({ status: 202 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/queue', body, 'queue-1')).resolves.toMatchObject({ status: 202 })
+    expect(calls).toBe(1)
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/s/queue', { itemId: 'item-1', action: 'edit', text: '  ' }, 'bad-edit')).resolves.toMatchObject({ status: 400 })
+  })
+
+  it('does not retry a native fork whose result is uncertain', async () => {
+    let calls = 0
+    const request = mount({ fork: async () => { calls += 1; throw new Error('lost native response') } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', {}, 'fork-unknown'))
+      .resolves.toMatchObject({ status: 503 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/parent/fork', {}, 'fork-unknown'))
+      .resolves.toMatchObject({ status: 503 })
+    expect(calls).toBe(1)
+  })
+
+  it('reports unsupported native fork instead of copying conversation text', async () => {
+    await expect(mount()('POST', '/dsh-anywhere/v1/sessions/parent/fork', {}, 'fork-old'))
+      .resolves.toMatchObject({ status: 501 })
+  })
+
+  it('reads the native session command directory including attachment declarations', async () => {
+    const commands = [{ name: 'plan', description: 'Plan first', input: { hint: 'Task', attachments: true } },
+      { name: 'custom', description: 'Plugin command' }]
+    const request = mount({ invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'commands', method: 'list', args: { agentId: 's' } })
+      return { ok: true, value: commands.map((command) => ({ ...command, definitionId: 'desktop-command-definition' })) }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/commands'))
+      .resolves.toMatchObject({ status: 200, body: { sessionId: 's', commands } })
+  })
+  it('reads native child catalogs and validates the complete address before history', async () => {
+    const catalog = { parentAvailable: false, entries: [{ kind: 'child', id: 'child', mode: 'one-shot',
+      activity: 'inactive', hasChildren: false, label: 'Inspect source' }] }
+    const request = mount({ invoke: async (value) => {
+      const call = value as { namespace: string; args: unknown }
+      if (call.namespace !== 'subagents') return {}
+      expect(call.args).toEqual({ parentSessionId: 'parent' })
+      return { ok: true, value: catalog }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/parent/subagents'))
+      .resolves.toMatchObject({ status: 200, body: { parentSessionId: 'parent', ...catalog } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/child/open',
+      { parentSessionId: 'parent', subagentMode: 'one-shot' })).resolves.toMatchObject({ status: 202 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/child/open',
+      { parentSessionId: 'parent', subagentMode: 'continuable' })).resolves.toMatchObject({ status: 403 })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/not-owned/open',
+      { parentSessionId: 'parent', subagentMode: 'one-shot' })).resolves.toMatchObject({ status: 403 })
+  })
+
+  it('delivers continuable messages once through the exact live parent address', async () => {
+    let calls = 0
+    const request = mount({ invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'subagents', method: 'prompt', args: { request: {
+        requestId: 'child-prompt', parentSessionId: 'parent', childSessionId: 'child', mode: 'continuable',
+        delivery: 'steer', content: [{ type: 'text', text: '  Continue\ncarefully  ' }], clientTimeZone: 'Asia/Shanghai' } } })
+      calls += 1
+      return { ok: true, value: { messageId: 'inbox-message' } }
+    } })
+    const body = { parentSessionId: 'parent', mode: 'continuable', delivery: 'steer', text: '  Continue\ncarefully  ', clientTimeZone: 'Asia/Shanghai' }
+    const path = '/dsh-anywhere/v1/sessions/parent/subagents/child/prompt'
+    await expect(request('POST', path, body, 'child-prompt')).resolves.toMatchObject({ status: 202, body: { accepted: true, messageId: 'inbox-message' } })
+    await expect(request('POST', path, body, 'child-prompt')).resolves.toMatchObject({ status: 202 })
+    expect(calls).toBe(1)
+    await expect(request('POST', path, { ...body, parentSessionId: 'wrong' }, 'wrong-parent')).resolves.toMatchObject({ status: 400 })
+    await expect(request('POST', path, { ...body, mode: 'one-shot' }, 'wrong-mode')).resolves.toMatchObject({ status: 400 })
+    expect(calls).toBe(1)
+  })
+
+  it('keeps child image admission in the native parent transport and deduplicates the complete multipart request', async () => {
+    const image = { type: 'image', mediaType: 'image/jpeg', name: 'photo.jpg', data: 'A'.repeat(1_100_000) }
+    const invoke = vi.fn(async () => ({ ok: true, value: { messageId: 'image-inbox' } }))
+    const request = mount({ invoke })
+    const path = '/dsh-anywhere/v1/sessions/parent/subagents/child/prompt'
+    const body = { parentSessionId: 'parent', mode: 'continuable', delivery: 'queue', text: '', images: [image] }
+    await expect(request('POST', path, body, 'image-child')).resolves.toMatchObject({ status: 202 })
+    await expect(request('POST', path, body, 'image-child')).resolves.toMatchObject({ status: 202 })
+    expect(invoke).toHaveBeenCalledTimes(1)
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ namespace: 'subagents', method: 'prompt', args: { request: {
+      requestId: 'image-child', parentSessionId: 'parent', childSessionId: 'child', mode: 'continuable', delivery: 'queue', content: [image] } } }))
+    await expect(request('POST', path, { ...body, text: '看图回答' }, 'image-and-text')).resolves.toMatchObject({ status: 202 })
+    expect(invoke).toHaveBeenLastCalledWith(expect.objectContaining({ args: { request: expect.objectContaining({ content: [{ type: 'text', text: '看图回答' }, image] }) } }))
+    await expect(request('POST', path, { ...body, images: [{ type: 'image', attachment: { attachmentId: 'forged' } }] }, 'forged-child')).resolves.toMatchObject({ status: 400 })
+    expect(invoke).toHaveBeenCalledTimes(2)
+  })
+
+  it('interrupts by parent without requiring an available parent catalog', async () => {
+    const request = mount({ invoke: async (value) => {
+      expect(value).toMatchObject({ namespace: 'subagents', method: 'interruptByParent',
+        args: { parentSessionId: 'offline-parent', childSessionId: 'child', mode: 'continuable' } })
+      return { ok: true, value: { accepted: true } }
+    } })
+    await expect(request('POST', '/dsh-anywhere/v1/sessions/offline-parent/subagents/child/interrupt',
+      { parentSessionId: 'offline-parent', mode: 'continuable' }, 'stop-child')).resolves.toMatchObject({ status: 202 })
+  })
+
+  it('retains uncertain subagent acceptance and handles explicit native rejection', async () => {
+    let calls = 0
+    const uncertain = mount({ invoke: async () => { calls += 1; throw new Error('lost response') } })
+    const body = { parentSessionId: 'parent', mode: 'continuable', delivery: 'queue', text: 'continue' }
+    const path = '/dsh-anywhere/v1/sessions/parent/subagents/child/prompt'
+    await expect(uncertain('POST', path, body, 'uncertain-child')).resolves.toMatchObject({ status: 503 })
+    await expect(uncertain('POST', path, body, 'uncertain-child')).resolves.toMatchObject({ status: 503 })
+    expect(calls).toBe(1)
+    const rejected = mount({ invoke: async () => ({ ok: false, error: { code: 'subagent/unauthorized', message: 'wrong parent' } }) })
+    await expect(rejected('POST', path, body, 'unauthorized-child')).resolves.toMatchObject({ status: 409 })
+  })
+
+  it('does not treat a malformed command directory as an empty catalog', async () => {
+    await expect(mount({ invoke: async () => ({ ok: true, value: [{}] }) })('GET', '/dsh-anywhere/v1/sessions/s/commands'))
+      .resolves.toMatchObject({ status: 502 })
+  })
+  it('uses the native skill request envelope and keeps skill invocation policy', async () => {
+    const skills = [{ name: 'review', description: 'Review code', modelInvocable: false }]
+    const request = mount({ invoke: async (value) => {
+      const call = value as { namespace: string; method: string; args: unknown }
+      if (call.namespace === 'commands') return { ok: true, value: [] }
+      expect(call).toMatchObject({ namespace: 'skills', method: 'list', args: { request: { sessionId: 's' } } })
+      return { ok: true, value: { skills } }
+    } })
+    await expect(request('GET', '/dsh-anywhere/v1/sessions/s/commands'))
+      .resolves.toMatchObject({ status: 200, body: { sessionId: 's', commands: [], skills } })
+  })
 
   it('reads modes through a Host-created Peer on the new gateway', async () => {
     const peer = { signal: new AbortController().signal, dispose: async () => undefined }
@@ -1181,10 +1838,8 @@ describe('pairing page material', () => {
 });
 
 describe('subagent sessions stay out of the user list', () => {
-  it('recognises a subagent by its spawn link or its origin marker', () => {
-    // Either signal alone is enough: 18 of 40 rows were subagents in practice,
-    // each titled with the task prompt handed to it.
-    expect(isSubagentSession({ parentSessionId: 'session-parent' })).toBe(true)
+  it('uses Native ownership rather than treating an ordinary fork as a subagent', () => {
+    expect(isSubagentSession({ parentSessionId: 'session-parent' })).toBe(false)
     expect(isSubagentSession({ origin: 'subagent' })).toBe(true)
     expect(isSubagentSession({ title: 'iOS客户端开发' })).toBe(false)
   })

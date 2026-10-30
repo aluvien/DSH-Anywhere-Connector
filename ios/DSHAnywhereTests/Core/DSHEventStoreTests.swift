@@ -2,6 +2,1407 @@ import XCTest
 @testable import DSHAnywhere
 
 final class DSHEventStoreTests: XCTestCase {
+    @MainActor
+    func testModelDiscoveryIsRequestScopedAndConfigurationInvalidationsDoNotPersistValues() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        var discovered: DSHDiscoveredModels?
+        let read = Task { discovered = try await model.discoverModels(settingsNs: "llm-test", request: ["apiKey": .string("temporary-test-secret")]) }; defer { read.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "configuration.discover"), request = try XCTUnwrap(captured)
+        let before = model.configurationChangeRevision
+        await transport.emit(event(type: "configuration.models", messageID: request.requestId, sequence: 2, payload: .object(["settingsNs": .string("other"), "models": .array([])])))
+        await transport.emit(event(type: "configuration.invalidated", messageID: "settings-change", sequence: 3, payload: .object(["section": .string("settings"), "ns": .string("llm-test")])))
+        await transport.emit(event(type: "configuration.invalidated", messageID: "credential-change", sequence: 4, payload: .object(["section": .string("credentials"), "ref": .string("TEST_KEY")])))
+        try await Task.sleep(for: .milliseconds(100)); XCTAssertNil(discovered)
+        XCTAssertEqual(model.configurationChangeRevision, before + 2)
+        await transport.emit(event(type: "configuration.models", messageID: request.requestId, sequence: 5, payload: .object(["settingsNs": .string("llm-test"), "models": .array([.object(["id": .string("new")])])])))
+        try await read.value
+        XCTAssertEqual(discovered?.models.first?.id, "new")
+        XCTAssertTrue(model.state.unknownEvents.isEmpty)
+        let serialized = String(data: try JSONEncoder().encode(model.state), encoding: .utf8) ?? ""
+        XCTAssertFalse(serialized.contains("temporary-test-secret")); XCTAssertFalse(serialized.contains("settings-change"))
+    }
+    @MainActor
+    func testConfigurationConflictRetainsNativeStatusAndReadRepliesStayRequestScoped() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        let command = model.configurationCommand(payload: .object(["kind": .string("settings"), "ns": .string("llm-test"), "expectedRevision": .number(4), "ops": .array([.object(["op": .string("unset"), "path": .array([.string("baseURL")])])])]))
+        let save = Task { try await model.updateConfiguration(command) }; defer { save.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2, payload: .object(["code": .string("bridge-request-failed"), "message": .string("配置已更新"), "retryable": .bool(false), "httpStatus": .number(409)])))
+        do { _ = try await save.value; XCTFail("Expected CAS rejection") } catch let error as DSHConfigurationRequestError { XCTAssertTrue(error.definitelyNotCommitted); XCTAssertEqual(error.failure.httpStatus, 409) }
+        var result: DSHConfigurationResult?
+        let read = Task { result = try await model.readConfiguration("credentials", refs: ["TEST_KEY"]) }; defer { read.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "configuration.read"), request = try XCTUnwrap(captured)
+        let wrong = DSHJSONValue.object(["section": .string("credentials"), "value": .object(["OTHER_KEY": .object(["configured": .bool(true), "writable": .bool(true)])])])
+        await transport.emit(event(type: "configuration.result", messageID: request.requestId, sequence: 3, payload: wrong))
+        try await Task.sleep(for: .milliseconds(80)); XCTAssertNil(result)
+        await transport.emit(event(type: "configuration.result", messageID: request.requestId, sequence: 4, payload: .object(["section": .string("credentials"), "value": .object(["TEST_KEY": .object(["configured": .bool(false), "writable": .bool(true)])])])) )
+        try await read.value
+        XCTAssertEqual(result?.value.executionObject.keys.sorted(), ["TEST_KEY"])
+    }
+    @MainActor
+    func testConcurrentConfigurationReadersShareOneWriteAndDoNotUsePlaintextMutationJournal() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("secure-config-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true, transactionDirectory: directory)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        let command = model.configurationCommand(payload: .object(["kind": .string("credential"), "action": .string("set"), "ref": .string("TEST_KEY"), "value": .string("not-a-real-test-secret")]))
+        let first = Task { try await model.updateConfiguration(command) }, second = Task { try await model.updateConfiguration(command) }
+        defer { first.cancel(); second.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let count = await transport.commandCount(ofType: "configuration.update")
+        XCTAssertEqual(count, 1)
+        let wrong = DSHJSONValue.object(["kind": .string("credential"), "requestId": .string(command.requestId), "ref": .string("OTHER_KEY")])
+        await transport.emit(event(type: "configuration.updated", messageID: command.requestId, sequence: 2, payload: wrong))
+        try await Task.sleep(for: .milliseconds(70))
+        let receipt = DSHJSONValue.object(["kind": .string("credential"), "requestId": .string(command.requestId), "ref": .string("TEST_KEY")])
+        await transport.emit(event(type: "configuration.updated", messageID: command.requestId, sequence: 3, payload: receipt))
+        let a = try await first.value, b = try await second.value
+        XCTAssertEqual(a, b)
+        XCTAssertTrue(model.state.unknownEvents.isEmpty)
+        XCTAssertFalse(String(data: try JSONEncoder().encode(model.state), encoding: .utf8)?.contains("not-a-real-test-secret") == true)
+        if let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)?.allObjects as? [URL] {
+            for file in files where file.pathExtension == "json" { XCTAssertFalse((try String(contentsOf: file, encoding: .utf8)).contains("not-a-real-test-secret")) }
+        }
+    }
+    @MainActor
+    func testNativeHistoryLocationRequiresTheExactWaiterTargetAndChildAddress() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        var loaded: DSHHistoryPage?
+        let read = Task { loaded = try await model.historyPage(sessionID: "child", atSeq: 0, parentID: "parent", mode: "one-shot") }
+        defer { read.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "history.read"), command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload.executionObject, ["atSeq": .number(0), "parentSessionId": .string("parent"), "subagentMode": .string("one-shot")])
+        func reply(_ requestID: String, _ target: Int, _ sequence: Int64) throws -> DSHEvent {
+            let json = "{\"sessionId\":\"child\",\"throughSeq\":1,\"fromSeq\":0,\"toSeq\":1,\"hasMore\":false,\"rows\":[{\"nativeSequence\":0,\"time\":1000,\"type\":\"user.message.accepted\",\"payload\":{\"id\":\"old-message\",\"role\":\"user\",\"markdown\":\"Found\"}}],\"focus\":{\"nativeSequence\":\(target),\"type\":\"user/message\",\"data\":{}}}"
+            return DSHEvent(envelope: .init(messageId: requestID, deviceId: "device", machineId: "machine", sessionId: "child", sequence: sequence,
+                type: "history.page", payload: try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))))
+        }
+        await transport.emit(try reply("other-request", 0, 2))
+        await transport.emit(try reply(command.requestId, 1, 3))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(loaded); XCTAssertTrue(model.messages(for: "child").isEmpty)
+        await transport.emit(try reply(command.requestId, 0, 4))
+        try await read.value
+        XCTAssertEqual(loaded?.focus?.nativeSequence, 0)
+        XCTAssertEqual(model.messages(for: "child").first?.nativeSequence, 0)
+        XCTAssertEqual(model.historyCoverage(for: "child")?.ranges, [.init(lower: 0, upper: 1)])
+    }
+    func testScheduleProjectionKeepsNewerNativeStateAndRetiresDisconnectedEpochs() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ epoch: String, _ native: Int, _ sequence: Int64, _ items: String = "[]") throws {
+            let json = "{\"sessionId\":\"s\",\"epoch\":\"\(epoch)\",\"seq\":\(native),\"available\":true,\"supported\":true,\"items\":\(items)}"
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            XCTAssertTrue(reducer.reduce(DSHEvent(envelope: .init(messageId: "r", deviceId: "d", machineId: "m", sessionId: "s", sequence: sequence, type: "schedule.projection", payload: payload)), into: &state), "A stale read still acknowledges its requesting waiter")
+        }
+        try apply("old", 4, 1, #"[{"id":"r","kind":"every","prompt":"Check","everySeconds":300,"scheduledAt":"2026-10-30T00:00:00.000Z"}]"#)
+        try apply("old", 5, 2)
+        try apply("old", 4, 3, #"[{"id":"r","kind":"every","prompt":"Check","everySeconds":300,"scheduledAt":"2026-10-30T00:00:00.000Z"}]"#)
+        XCTAssertEqual(state.schedulesBySession?["s"]?.items, [])
+        reducer.reduce(DSHEvent(envelope: .init(messageId: "offline", deviceId: "d", machineId: "m", sequence: 0, type: "transport.state", payload: .object(["state": .string("disconnected")]))), into: &state)
+        XCTAssertEqual(state.schedulesBySession?["s"]?.available, false)
+        try apply("new", -1, 4)
+        try apply("old", 20, 5)
+        XCTAssertEqual(state.schedulesBySession?["s"]?.epoch, "new")
+        XCTAssertEqual(state.schedulesBySession?["s"]?.seq, -1)
+    }
+    func testNativeHistoryPagesKeepNewestTurnAndLiveStateWithoutRewindingTransport() throws {
+        var state = DSHStoreState()
+        state.messagesBySession["s"] = [.init(id: "latest-user", role: .user, markdown: "New", nativeSequence: 100)]
+        state.turnStateBySession["s"] = "running"
+        let reducer = DSHEventReducer()
+        func reduce(_ type: String, _ json: String, _ sequence: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: .init(messageId: "r", deviceId: "d", machineId: "m", sessionId: "s", sequence: sequence, type: type, payload: payload)), into: &state)
+        }
+        try reduce("history.window", #"{"sessionId":"s","throughSeq":99,"fromSeq":90,"toSeq":99,"hasMore":true}"#, 10)
+        try reduce("history.page", #"{"sessionId":"s","throughSeq":99,"fromSeq":10,"toSeq":19,"hasMore":true,"rows":[{"nativeSequence":10,"time":1000,"type":"user.message.accepted","payload":{"id":"old-user","role":"user","markdown":"Old"}},{"nativeSequence":11,"time":2000,"type":"assistant.message.completed","payload":{"id":"old-answer","role":"assistant","markdown":"Interrupted","interrupted":true}}]}"#, 11)
+        XCTAssertEqual(state.lastSequence, 11)
+        XCTAssertEqual(state.turnStateBySession["s"], "running")
+        XCTAssertEqual(state.messagesBySession["s"]?.map(\.id), ["old-user", "old-answer", "latest-user"])
+        XCTAssertEqual(state.messagesBySession["s"]?[1].interrupted, true)
+        XCTAssertNil(state.messagesBySession["s"]?[1].completedAt)
+        XCTAssertEqual(state.messagesBySession["s"]?[1].timestamp, 2000)
+        XCTAssertEqual(state.historyCoverage?["s"]?.gaps, [.init(lower: 20, upper: 89)])
+        XCTAssertEqual(state.historyCoverage?["s"]?.nextBefore, 90)
+        let encoded = try JSONEncoder().encode(state)
+        XCTAssertEqual(try JSONDecoder().decode(DSHStoreState.self, from: encoded).historyCoverage, state.historyCoverage)
+    }
+
+    func testNativeHistoryPageRejectsCrossSessionAndRecursiveRowsAtomically() throws {
+        for row in [#"{"nativeSequence":0,"type":"execution.recorded","payload":{"sessionId":"other","record":{"nativeSequence":0,"type":"turn/start","data":{"turn":1}}}}"#,
+                    #"{"nativeSequence":0,"type":"history.page","payload":{}}"#] {
+            var state = DSHStoreState()
+            let json = "{\"sessionId\":\"s\",\"throughSeq\":0,\"fromSeq\":0,\"toSeq\":0,\"hasMore\":false,\"rows\":[\(row)]}"
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            DSHEventReducer().reduce(DSHEvent(envelope: .init(messageId: "r", deviceId: "d", machineId: "m", sessionId: "s", sequence: 1, type: "history.page", payload: payload)), into: &state)
+            XCTAssertTrue(state.messagesBySession.isEmpty)
+            XCTAssertNil(state.executionBySession)
+            XCTAssertNil(state.historyCoverage)
+        }
+    }
+
+    @MainActor
+    func testSearchRepliesAreScopedToTheirRequestQueryAndSession() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        var result: DSHSearchResults?
+        let read = Task { result = try await model.searchHistory(query: "needle") }
+        defer { read.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "session.search"), command = try XCTUnwrap(captured)
+        func reply(_ query: String, scope: String? = nil) -> DSHJSONValue {
+            var value: [String: DSHJSONValue] = ["query": .string(query), "items": .array([]), "hasMore": .bool(false)]
+            if let scope { value["scopeSessionId"] = .string(scope) }
+            return .object(value)
+        }
+        await transport.emit(event(type: "search.results", messageID: command.requestId, sequence: 2, payload: reply("old-query")))
+        await transport.emit(event(type: "search.results", messageID: command.requestId, sequence: 3, payload: reply("needle", scope: "other-session")))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(result)
+        await transport.emit(event(type: "search.results", messageID: command.requestId, sequence: 4, payload: reply("needle")))
+        try await read.value
+        XCTAssertEqual(result?.query, "needle")
+        XCTAssertNil(result?.scopeSessionId)
+    }
+    @MainActor
+    func testChildImageLocalUpgradeRejectionFinishesImmediatelyAndDoesNotLeaveUnknownDelivery() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(upgradeRejectedTypes: ["subagent.prompt"]), model = makeModel(transport: transport, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        let catalog = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":true,"entries":[{"kind":"child","id":"child","mode":"continuable","activity":"running","hasChildren":false,"label":"Task"}]}"#.utf8))
+        await transport.emit(event(type: "subagent.catalog", messageID: "catalog", sequence: 2, payload: catalog))
+        try await Task.sleep(for: .milliseconds(100))
+        let images: [DSHJSONValue] = [.object(["type": .string("image"), "mediaType": .string("image/jpeg"), "data": .string("YQ==")])]
+        var finished = false
+        let first = Task { do { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", images: images); XCTFail("Expected upgrade rejection") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("更新 Relay")); finished = true } }
+        defer { first.cancel() }
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertTrue(finished, "A local preflight failure must not wait for the native acknowledgement deadline")
+        if !finished { first.cancel() }
+        await first.value
+        let captured = await transport.lastCommand(ofType: "subagent.prompt"), rejected = try XCTUnwrap(captured)
+        let retry = Task { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", images: images) }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let retried = await transport.lastCommand(ofType: "subagent.prompt"), command = try XCTUnwrap(retried)
+        XCTAssertNotEqual(command.requestId, rejected.requestId, "A proven unsent request does not need an unknown-outcome tombstone")
+        await transport.emit(event(type: "subagent.receipt", messageID: command.requestId, sequence: 3, payload: .object([
+            "parentSessionId": .string("parent"), "childSessionId": .string("child"), "requestId": .string(command.requestId), "action": .string("prompt"), "messageId": .string("inbox")])))
+        try await retry.value
+    }
+    @MainActor
+    func testImageOnlySubagentPromptRetriesTheSameMultipartCommandAndNeverUsesOrdinaryPrompt() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        let catalog = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":true,"entries":[{"kind":"child","id":"child","mode":"continuable","activity":"running","hasChildren":false,"label":"Task"}]}"#.utf8))
+        await transport.emit(event(type: "subagent.catalog", messageID: "catalog", sequence: 2, payload: catalog))
+        try await Task.sleep(for: .milliseconds(100))
+        let images: [DSHJSONValue] = [.object(["type": .string("image"), "mediaType": .string("image/jpeg"), "name": .string("photo.jpg"), "data": .string(Data([0xff, 0xd8, 1]).base64EncodedString())])]
+        let first = Task { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", delivery: "steer", images: images) }
+        defer { first.cancel() }
+        let captured = try await transport.waitForCommand(ofType: "subagent.prompt"), command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload.executionObject["images"], .array(images)); XCTAssertEqual(command.payload.executionObject["text"], .string(""))
+        XCTAssertEqual(command.payload.executionObject["parentSessionId"], .string("parent"))
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 3,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown image result"), "retryable": .bool(false)])))
+        do { try await first.value; XCTFail("Unknown image result must be retained") } catch { }
+        let retry = Task { try await model.controlSubagent(childID: "child", parentID: "parent", text: "", delivery: "steer", images: images) }
+        defer { retry.cancel() }
+        let retried = try await transport.waitForCommand(ofType: "subagent.prompt", count: 2)
+        XCTAssertEqual(retried?.requestId, command.requestId); XCTAssertEqual(retried?.payload, command.payload)
+        await transport.emit(event(type: "subagent.receipt", messageID: command.requestId, sequence: 4, payload: .object([
+            "parentSessionId": .string("parent"), "childSessionId": .string("child"), "requestId": .string(command.requestId), "action": .string("prompt"), "messageId": .string("inbox")])))
+        try await retry.value
+        let ordinary = await transport.commandCount(ofType: "prompt.send"); XCTAssertEqual(ordinary, 0)
+    }
+    @MainActor
+    func testSubagentImageDraftRestoresExactAddressAndOnlyConsumesConfirmedUnchangedComposition() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "subagent-draft-\(UUID().uuidString)", defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let address = DSHSubagentDraftAddress(machineID: "m", parentID: "p", childID: "c")
+        let first = DSHSubagentComposerDrafts(storage: DSHSubagentMediaStorage(directory: directory), defaults: defaults)
+        let image = DSHStagedAttachment(name: "photo.jpg", data: Data([0xff, 0xd8, 1, 2]), isImage: true)
+        try await first.load(address)
+        first.setText("保留草稿", for: address); first.setDelivery("steer", for: address)
+        try await first.setImages([image], for: address)
+        let reopened = DSHSubagentComposerDrafts(storage: DSHSubagentMediaStorage(directory: directory), defaults: defaults)
+        try await reopened.load(address)
+        XCTAssertEqual(reopened.images(for: address), [image]); XCTAssertEqual(reopened.text(for: address), "保留草稿")
+        XCTAssertEqual(reopened.delivery(for: address), "steer")
+        let other = DSHSubagentDraftAddress(machineID: "m", parentID: "other", childID: "c")
+        try await reopened.load(other); XCTAssertTrue(reopened.images(for: other).isEmpty)
+        reopened.setText("后来编辑", for: address)
+        try await reopened.consume(text: "保留草稿", delivery: "steer", images: [image], address: address)
+        XCTAssertEqual(reopened.images(for: address), [image]); XCTAssertEqual(reopened.text(for: address), "后来编辑")
+        try await reopened.consume(text: "后来编辑", delivery: "steer", images: [image], address: address)
+        XCTAssertTrue(reopened.images(for: address).isEmpty); XCTAssertEqual(reopened.text(for: address), "")
+        let afterReceipt = DSHSubagentComposerDrafts(storage: DSHSubagentMediaStorage(directory: directory), defaults: defaults)
+        try await afterReceipt.load(address); XCTAssertTrue(afterReceipt.images(for: address).isEmpty)
+    }
+
+    @MainActor
+    func testConfirmedChildImageTombstoneFencesLeftoverBytesAfterAnotherTextOnlyReceipt() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "subagent-receipt-\(UUID().uuidString)", defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let storage = DSHSubagentMediaStorage(directory: directory), address = DSHSubagentDraftAddress(machineID: "m", parentID: "p", childID: "c")
+        let drafts = DSHSubagentComposerDrafts(storage: storage, defaults: defaults)
+        let image = DSHStagedAttachment(name: "photo.jpg", data: Data([1, 2, 3]), isImage: true)
+        try await drafts.load(address); try await drafts.setImages([image], for: address)
+        try await drafts.consume(text: "", delivery: "queue", images: [image], address: address)
+        drafts.setText("new", for: address)
+        try await drafts.consume(text: "new", delivery: "queue", images: [], address: address)
+        // Simulate bytes left on disk after an interrupted cleanup. A later
+        // text-only receipt must not discard the accepted image's identity.
+        try await storage.save([image], key: address.key, revision: 100)
+        let reopened = DSHSubagentComposerDrafts(storage: DSHSubagentMediaStorage(directory: directory), defaults: defaults)
+        try await reopened.load(address)
+        XCTAssertTrue(reopened.images(for: address).isEmpty)
+    }
+
+    func testSubagentMediaPersistenceRejectsOlderWritesAndBoundsOriginalDraftBytes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storage = DSHSubagentMediaStorage(directory: directory)
+        let newer = DSHStagedAttachment(name: "new.jpg", data: Data([1]), isImage: true)
+        let older = DSHStagedAttachment(name: "old.jpg", data: Data([2]), isImage: true)
+        try await storage.save([newer], key: "key", revision: 2)
+        try await storage.save([older], key: "key", revision: 1)
+        let actual = try await storage.load("key")
+        XCTAssertEqual(actual, [newer])
+        let oversized = DSHStagedAttachment(name: "large.jpg", data: Data(repeating: 0, count: 6 * 1_024 * 1_024 + 1), isImage: true)
+        do { try await storage.save([oversized], key: "key", revision: 3); XCTFail("Oversized media must be rejected") } catch { }
+        let after = try await storage.load("key"); XCTAssertEqual(after, [newer])
+        try await storage.save([], key: "key", revision: 4)
+        let empty = try await storage.load("key"); XCTAssertTrue(empty.isEmpty)
+    }
+    @MainActor
+    func testReferenceQueryRepliesKeepExactRequestKindAndQueryWithoutEnteringChatState() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        var completed = false
+        let task = Task { let result = try await model.referenceCandidates(in: "s", kind: "file", query: "目录/"); completed = true; return result }
+        defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "reference.list"), command = try XCTUnwrap(captured)
+        func payload(_ query: String) -> DSHJSONValue { .object(["sessionId": .string("s"), "kind": .string("file"), "query": .string(query), "items": .array([
+            .object(["id": .string("f"), "label": .string("目录/a b.ts"), "kind": .string("file"), "path": .string("目录/a b.ts"), "insertion": .string("@\"目录/a b.ts\"")])])]) }
+        await transport.emit(event(type: "reference.candidates", messageID: command.requestId, sequence: 2, payload: payload("old")))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(completed)
+        await transport.emit(event(type: "reference.candidates", messageID: command.requestId, sequence: 3, payload: payload("目录/")))
+        let result = try await task.value
+        XCTAssertEqual(result.items.first?.insertion, "@\"目录/a b.ts\"")
+        XCTAssertTrue(model.messages(for: "s").isEmpty)
+        XCTAssertTrue(model.state.unknownEvents.isEmpty)
+    }
+    func testFeedbackNativeWatermarksKeepNewerEditsAndDeletionFromLateSnapshots() throws {
+        var state = DSHStoreState(); let reducer = DSHEventReducer()
+        func apply(_ type: String, _ json: String, _ seq: Int64) throws {
+            reducer.reduce(event(type: type, messageID: "f-\(seq)", sequence: seq,
+                payload: try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))), into: &state)
+        }
+        try apply("feedback.changed", #"{"sessionId":"s","messageId":"a","nativeSequence":8,"item":{"messageId":"a","rating":"negative","note":"最新备注","version":"v2","createdAt":1,"updatedAt":2}}"#, 1)
+        try apply("feedback.state", #"{"sessionId":"s","nativeSequence":7,"items":[]}"#, 2)
+        XCTAssertEqual(state.feedbackBySession?["s"]?.items.first?.note, "最新备注")
+        try apply("feedback.changed", #"{"sessionId":"s","messageId":"a","nativeSequence":10,"item":null}"#, 3)
+        try apply("feedback.changed", #"{"sessionId":"s","messageId":"a","nativeSequence":8,"item":{"messageId":"a","rating":"negative","version":"v2","createdAt":1,"updatedAt":2}}"#, 4)
+        XCTAssertTrue(state.feedbackBySession?["s"]?.items.isEmpty == true)
+        XCTAssertEqual(state.feedbackBySession?["s"]?.nativeSequence, 10)
+    }
+
+    @MainActor
+    func testFeedbackReadRejectsAnotherRequestAndOldSnapshotAfterNewLiveEdit() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let task = Task { try await model.loadFeedback(for: "s") }; defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "feedback.list"), command = try XCTUnwrap(captured)
+        let old: DSHJSONValue = .object(["sessionId": .string("s"), "nativeSequence": .number(3), "items": .array([])])
+        await transport.emit(event(type: "feedback.state", messageID: "not-mine", sequence: 2, payload: old))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertNil(model.state.feedbackBySession?["s"])
+        let live = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","messageId":"a","nativeSequence":9,"item":{"messageId":"a","rating":"positive","version":"new","createdAt":1,"updatedAt":2}}"#.utf8))
+        await transport.emit(event(type: "feedback.changed", messageID: "live", sequence: 3, payload: live))
+        await transport.emit(event(type: "feedback.state", messageID: command.requestId, sequence: 4, payload: old))
+        try await task.value
+        XCTAssertEqual(model.feedback(for: "a", in: "s")?.version, "new")
+    }
+
+    @MainActor
+    func testFeedbackUnknownOutcomeKeepsRequestIdentityAndConfirmedReceiptEndsRetry() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let first = Task { try await model.updateFeedback(messageID: "a", in: "s", action: "put", rating: "negative", note: "保留备注", category: "other", ifVersion: nil) }
+        defer { first.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "feedback.update"), command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload.executionObject["ifVersion"], .null)
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown feedback result"), "retryable": .bool(false)])))
+        do { try await first.value; XCTFail("Unknown result must be reported") } catch { }
+        let retry = Task { try await model.updateFeedback(messageID: "a", in: "s", action: "put", rating: "negative", note: "保留备注", category: "other", ifVersion: nil) }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let retried = await transport.lastCommand(ofType: "feedback.update")
+        XCTAssertEqual(retried?.requestId, command.requestId)
+        let receipt: DSHJSONValue = .object(["sessionId": .string("s"), "messageId": .string("a"), "requestId": .string(command.requestId),
+            "item": .object(["messageId": .string("a"), "rating": .string("negative"), "note": .string("保留备注"), "version": .string("v1"), "createdAt": .number(1), "updatedAt": .number(1)])])
+        await transport.emit(event(type: "feedback.updated", messageID: command.requestId, sequence: 3, payload: receipt))
+        try await retry.value
+        let sentPrompts = await transport.commandCount(ofType: "prompt.send")
+        XCTAssertEqual(sentPrompts, 0)
+    }
+    func testSubcallResultReplayPreservesFullOutcomeAndStartTiming() throws {
+        var state = DSHStoreState(); let reducer = DSHEventReducer()
+        func apply(_ type: String, _ json: String, sequence: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "tool-\(sequence)", deviceId: "device", machineId: "machine", sessionId: "s", sequence: sequence, type: type, payload: payload)), into: &state)
+        }
+        try apply("tool.started", #"{"id":"child","name":"read","status":"running","rootCallId":"root","parentCallId":"root","startedAt":1000,"detail":"{}","nativeSequence":3}"#, sequence: 1)
+        try apply("tool.completed", #"{"id":"child","name":"read","status":"succeeded","finishedAt":1500,"detail":"result","resultMeta":{"path":"a","offset":1,"lines":[],"totalLines":0},"resultContent":[{"type":"text","text":"result"}],"nativeSequence":4}"#, sequence: 2)
+        try apply("tool.started", #"{"id":"child","name":"read","status":"running","detail":"{}","startedAt":1000,"nativeSequence":3}"#, sequence: 3)
+        try apply("tool.completed", #"{"id":"child","name":"read","status":"succeeded","detail":"result","nativeSequence":4}"#, sequence: 4)
+        let tool = try XCTUnwrap(state.toolsBySession["s"]?.first)
+        XCTAssertEqual(tool.status, "succeeded"); XCTAssertEqual(tool.arguments, "{}")
+        XCTAssertEqual(tool.startedAt, 1000); XCTAssertEqual(tool.finishedAt, 1500)
+        XCTAssertEqual(tool.parentCallId, "root"); XCTAssertEqual(tool.nativeSequence, 3)
+        XCTAssertEqual(tool.sequence, 1); XCTAssertEqual(tool.resultContent?.count, 1)
+        guard case .read = DSHToolResult.parse(tool) else { return XCTFail("Structured replay was lost") }
+    }
+    func testReplayedToolStartKeepsTerminalResultAndRestoresNativeStartPosition() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        let complete = DSHEvent(envelope: DSHEnvelope(messageId: "done", deviceId: "device", machineId: "machine", sessionId: "s", sequence: 1,
+            type: "tool.completed", payload: .object(["id": .string("t"), "name": .string("read"), "status": .string("succeeded"), "detail": .string("Result"), "nativeSequence": .number(10)])))
+        reducer.reduce(complete, into: &state)
+        let start = DSHEvent(envelope: DSHEnvelope(messageId: "start", deviceId: "device", machineId: "machine", sessionId: "s", sequence: 2,
+            type: "tool.started", payload: .object(["id": .string("t"), "name": .string("read"), "status": .string("running"), "detail": .string("{}"), "nativeSequence": .number(8)])))
+        reducer.reduce(start, into: &state)
+        let tool = try XCTUnwrap(state.toolsBySession["s"]?.first)
+        XCTAssertEqual(tool.status, "succeeded")
+        XCTAssertEqual(tool.detail, "Result")
+        XCTAssertEqual(tool.arguments, "{}")
+        XCTAssertEqual(tool.nativeSequence, 8)
+    }
+    func testExecutionPagesMergeByNativeSequenceWithoutInventingTranscriptRows() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        func apply(_ type: String, _ json: String, seq: Int64) throws {
+            reducer.reduce(event(type: type, messageID: "execution-\(seq)", sequence: seq,
+                payload: try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))), into: &state)
+        }
+        try apply("execution.page", #"{"sessionId":"s","hasMore":false,"beforeSeq":0,"records":[{"nativeSequence":0,"type":"turn/start","data":{"turn":1}},{"nativeSequence":4,"type":"llm/retry","data":{"retryId":"r","turn":1,"step":1,"retry":1}}]}"#, seq: 1)
+        XCTAssertEqual(state.executionBySession?["s"]?.map(\.nativeSequence), [0, 4])
+        XCTAssertTrue(DSHExecutionNotice.build(state.executionBySession?["s"] ?? []).allSatisfy { $0.sequence == nil })
+        try apply("execution.recorded", #"{"sessionId":"s","record":{"nativeSequence":4,"type":"llm/retry","data":{"retryId":"r","turn":1,"step":1,"retry":1}}}"#, seq: 2)
+        try apply("execution.page", #"{"sessionId":"s","hasMore":false,"records":[{"nativeSequence":4,"type":"llm/retry","data":{"retryId":"r","turn":999,"retry":99}}]}"#, seq: 3)
+        let notice = try XCTUnwrap(DSHExecutionNotice.build(state.executionBySession?["s"] ?? []).first)
+        XCTAssertEqual(notice.latestRetry?.turn, 1)
+        XCTAssertEqual(notice.sequence, 2)
+        XCTAssertEqual(state.executionBySession?["s"]?.count, 2)
+    }
+
+    @MainActor
+    func testExecutionPageWaiterKeepsChildIdentityAndRejectsOtherRequestReplies() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport(), model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let task = Task { try await model.executionPage(sessionID: "child", beforeSeq: 10, parentID: "parent", mode: "one-shot") }
+        defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "execution.list")
+        let command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload, .object(["beforeSeq": .number(10), "limit": .number(100), "parentSessionId": .string("parent"), "subagentMode": .string("one-shot")]))
+        let payload: DSHJSONValue = .object(["sessionId": .string("child"), "hasMore": .bool(false), "beforeSeq": .number(0), "records": .array([
+            .object(["nativeSequence": .number(0), "type": .string("turn/start"), "data": .object(["turn": .number(1)])])])])
+        await transport.emit(event(type: "execution.page", messageID: "unrequested", sequence: 2, payload: payload))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(model.executionRecords(for: "child").isEmpty)
+        await transport.emit(event(type: "execution.page", messageID: command.requestId, sequence: 3, payload: payload))
+        let page = try await task.value
+        XCTAssertEqual(page.beforeSeq, 0)
+        XCTAssertEqual(model.executionRecords(for: "child").map(\.nativeSequence), [0])
+        XCTAssertTrue(model.transcriptEntries(for: "child").isEmpty)
+    }
+    @MainActor
+    func testFileDownloadKeepsScopeVersionAndOffsetsWithoutPersistingBytes() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        var progress: [Int] = []
+        let task = Task { try await model.downloadFile(.init(sessionID: "s", path: "图.txt", name: "../下载.txt")) { count, _ in progress.append(count) } }
+        defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let firstCaptured = await transport.lastCommand(ofType: "workspace.bytes")
+        let first = try XCTUnwrap(firstCaptured)
+        XCTAssertEqual(first.sessionId, "s")
+        XCTAssertEqual(first.payload, .object(["path": .string("图.txt"), "offset": .number(0), "length": .number(196608)]))
+        // A response carrying the request id but another Session is ignored.
+        func payload(_ scope: String, offset: Int, data: String, eof: Bool) -> DSHJSONValue {
+            .object(["sessionId": .string(scope), "absolutePath": .string("/workspace/图.txt"), "version": .string("v1"),
+                     "bytes": .number(6), "offset": .number(Double(offset)), "data": .string(data), "eof": .bool(eof)])
+        }
+        await transport.emit(event(type: "workspace.bytes", messageID: first.requestId, sequence: 2, payload: payload("wrong", offset: 0, data: "eHl6", eof: false)))
+        await transport.emit(event(type: "workspace.bytes", messageID: first.requestId, sequence: 3, payload: payload("s", offset: 0, data: "YWJj", eof: false)))
+        for _ in 0..<30 {
+            if await transport.commandCount(ofType: "workspace.bytes") >= 2 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let secondCaptured = await transport.lastCommand(ofType: "workspace.bytes")
+        let second = try XCTUnwrap(secondCaptured)
+        XCTAssertNotEqual(first.requestId, second.requestId)
+        XCTAssertEqual(second.payload, .object(["path": .string("图.txt"), "offset": .number(3), "length": .number(196608), "version": .string("v1")]))
+        await transport.emit(event(type: "workspace.bytes", messageID: second.requestId, sequence: 4, payload: payload("s", offset: 3, data: "ZGVm", eof: true)))
+        let url = try await task.value
+        XCTAssertEqual(url.lastPathComponent, "下载.txt")
+        XCTAssertTrue(url.deletingLastPathComponent().lastPathComponent.hasPrefix("DSH-file-"))
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "abcdef")
+        XCTAssertEqual(progress, [3, 6])
+        XCTAssertFalse(model.state.unknownEvents.contains { $0.type == "workspace.bytes" })
+    }
+
+    @MainActor
+    func testFileFailureStaysInlineAndDoesNotSendPromptOrExposePartialFile() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let task = Task { try await model.downloadFile(.init(sessionID: "s", path: "a.pdf")) }
+        defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "workspace.bytes")
+        let command = try XCTUnwrap(captured)
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("File changed"), "retryable": .bool(false)])))
+        do { _ = try await task.value; XCTFail("Changed file must fail") }
+        catch { XCTAssertEqual(error.localizedDescription, "File changed") }
+        XCTAssertNil(model.errorMessage, "The file view owns its error; do not show a second global alert")
+        let sends = await transport.commandCount(ofType: "prompt.send")
+        XCTAssertEqual(sends, 0)
+        XCTAssertFalse(model.state.protocolErrorsByRequestID.keys.contains(command.requestId))
+    }
+
+    @MainActor
+    func testFileDownloadRejectsOversizeBeforeSharing() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let task = Task { try await model.downloadFile(.init(sessionID: "s", path: "big.bin")) }
+        defer { task.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "workspace.bytes")
+        let command = try XCTUnwrap(captured)
+        await transport.emit(event(type: "workspace.bytes", messageID: command.requestId, sequence: 2, payload: .object([
+            "sessionId": .string("s"), "absolutePath": .string("/big.bin"), "version": .string("v"), "offset": .number(0),
+            "data": .string("YQ=="), "bytes": .number(100 * 1_024 * 1_024), "eof": .bool(false)])))
+        do { _ = try await task.value; XCTFail("Oversized file must fail") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("64 MB")) }
+        let count = await transport.commandCount(ofType: "workspace.bytes")
+        XCTAssertEqual(count, 1)
+    }
+
+    @MainActor
+    func testCancellingFileReadStopsFurtherChunksAndRemovesTemporaryFile() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        func downloads() -> Set<String> {
+            Set(((try? FileManager.default.contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("DSH-file-") })
+        }
+        let before = downloads()
+        let task = Task { try await model.downloadFile(.init(sessionID: "s", path: "a.bin")) }
+        try await Task.sleep(for: .milliseconds(80))
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Cancelled download must not return a file") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(downloads(), before)
+        let count = await transport.commandCount(ofType: "workspace.bytes")
+        XCTAssertEqual(count, 1)
+    }
+
+    func testWorkflowCatalogDoesNotPolluteTimelineAndOldReplayCannotRegressMembers() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ json: String, seq: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(event(type: "workflow.changed", messageID: "workflow-\(seq)", sequence: seq, payload: payload), into: &state)
+        }
+        try apply(#"{"sessionId":"s","inTranscript":false,"run":{"id":"r","name":"Review","status":"completed","nativeSequence":10,"updatedNativeSequence":20,"members":[{"seq":1,"label":"Read","childId":"child","status":"completed"}]}}"#, seq: 2)
+        XCTAssertNil(state.workflowsBySession?["s"]?.first?.sequence)
+        try apply(#"{"sessionId":"s","run":{"id":"r","name":"Review","status":"running","nativeSequence":10,"updatedNativeSequence":11,"members":[{"seq":1,"label":"Read","childId":"child","status":"running"}]}}"#, seq: 4)
+        let run = try XCTUnwrap(state.workflowsBySession?["s"]?.first)
+        XCTAssertEqual(run.status, "completed")
+        XCTAssertEqual(run.members.first?.status, "completed")
+        XCTAssertEqual(run.sequence, 4)
+        let messages = [DSHChatMessage(id: "user", role: .user, markdown: "Task", sequence: 1),
+                        DSHChatMessage(id: "answer", role: .assistant, markdown: "Done", sequence: 5)]
+        XCTAssertEqual(messages.transcriptEntries(with: [], workflows: [run]).map(\.id), ["turn-user", "workflow-r", "turn-answer"])
+    }
+
+    @MainActor
+    func testWorkflowPayloadInvalidatesTranscriptCacheAndKeepsOneRowAcrossUpdates() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        XCTAssertTrue(model.transcriptEntries(for: "s").isEmpty)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        let started = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","run":{"id":"r","name":"Review","status":"running","nativeSequence":1,"updatedNativeSequence":1,"members":[]}}"#.utf8))
+        await transport.emit(event(type: "workflow.changed", messageID: "start", sequence: 1, payload: started))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(model.transcriptEntries(for: "s").map(\.id), ["workflow-r"])
+        let finished = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","run":{"id":"r","name":"Review","status":"cancelled","nativeSequence":1,"updatedNativeSequence":2,"members":[]}}"#.utf8))
+        await transport.emit(event(type: "workflow.changed", messageID: "end", sequence: 2, payload: finished))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(model.transcriptEntries(for: "s").count, 1)
+        guard case .workflow(let run) = model.transcriptEntries(for: "s").first else { return XCTFail("Missing workflow row") }
+        XCTAssertEqual(run.status, "cancelled")
+    }
+
+    @MainActor
+    func testWorkflowNavigationUsesVerifiedParentCatalogAndAllowsCachedOfflineReading() async throws {
+        let catalog = try JSONDecoder().decode(DSHSubagentCatalog.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":false,"entries":[{"kind":"child","id":"child","mode":"one-shot","activity":"inactive","hasChildren":false}]}"#.utf8))
+        var state = DSHStoreState()
+        state.subagentCatalogs = ["parent": catalog]
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: state, isPaired: false)
+        let child = try await model.workflowChild("child", parentID: "parent")
+        XCTAssertEqual(child.mode, "one-shot")
+        model.openSubagent(child, parentID: "parent")
+        do { _ = try await model.workflowChild("child", parentID: "wrong-parent"); XCTFail("Cannot guess a child address") } catch { }
+        let opens = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(opens, 0, "Offline cached reading must not attempt a failing network operation")
+        model.disconnect()
+    }
+    @MainActor
+    func testGoalSnapshotReplyCannotOverwriteLaterLiveRevisionInSameBatch() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        model.requestGoalState(for: "s")
+        try await Task.sleep(for: .milliseconds(50))
+        let captured = await transport.lastCommand(ofType: "goal.get")
+        let command = try XCTUnwrap(captured)
+        let live = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":3,"objective":"Live","phase":"active","maxGoalRounds":12},"roundsStarted":4}"#.utf8))
+        let old = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"Old","phase":"paused","maxGoalRounds":12},"roundsStarted":3,"activation":"disarmed"}"#.utf8))
+        await transport.emit(event(type: "goal.changed", messageID: "new", sequence: 1, payload: live))
+        await transport.emit(event(type: "goal.state", messageID: command.requestId, sequence: 2, payload: old))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.goalState(for: "s")?.goal?.objective, "Live")
+        XCTAssertEqual(model.goalState(for: "s")?.goal?.revision, 3)
+    }
+
+    func testNativeGoalConflictDoesNotMarkBridgeUnreachable() {
+        var state = DSHStoreState()
+        state.bridgeReachable = true
+        let reducer = DSHEventReducer()
+        reducer.reduce(event(type: "protocol.error", messageID: "conflict", sequence: 1,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("Goal revision changed"),
+                "retryable": .bool(false)])), into: &state)
+        XCTAssertEqual(state.bridgeReachable, true)
+    }
+    @MainActor
+    func testGoalControlsKeepExpectedRevisionAndRejectStaleLocalEdits() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        let original = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":3}"#.utf8))
+        await transport.emit(event(type: "goal.changed", messageID: "goal-2", sequence: 2, payload: original))
+        try await Task.sleep(for: .milliseconds(80))
+        let goal = try XCTUnwrap(model.goalState(for: "s")?.goal)
+        let pause = Task { @MainActor in try await model.updateGoal(goal, in: "s", action: "pause") }
+        defer { pause.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let captured = await transport.lastCommand(ofType: "goal.update")
+        let command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload, .object(["action": .string("pause"), "ref": .object(["id": .string("g"), "revision": .number(2)])]))
+        let paused = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":3,"objective":"Ship","phase":"paused","maxGoalRounds":12},"roundsStarted":3,"activation":"disarmed"}"#.utf8))
+        await transport.emit(event(type: "goal.changed", messageID: "goal-3", sequence: 3, payload: paused))
+        await transport.emit(event(type: "goal.updated", messageID: command.requestId, sequence: 4,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(command.requestId), "action": .string("pause"),
+                "ref": .object(["id": .string("g"), "revision": .number(3)])])))
+        try await pause.value
+        XCTAssertEqual(model.goalState(for: "s")?.goal?.revision, 3)
+        do { try await model.updateGoal(goal, in: "s", action: "edit", objective: "Old edit"); XCTFail("Old revision must not be sent") } catch { }
+        let count = await transport.commandCount(ofType: "goal.update")
+        XCTAssertEqual(count, 1)
+        let pausedGoal = try XCTUnwrap(model.goalState(for: "s")?.goal)
+        let resume = Task { @MainActor in try await model.updateGoal(pausedGoal, in: "s", action: "resume") }
+        defer { resume.cancel() }
+        let resumeValue = try await transport.waitForCommand(ofType: "goal.update", count: 2)
+        let resumeCommand = try XCTUnwrap(resumeValue)
+        XCTAssertEqual(resumeCommand.payload, .object(["action": .string("resume"), "ref": .object(["id": .string("g"), "revision": .number(3)])]))
+        let resumed = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":4,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":3,"activation":"armed"}"#.utf8))
+        await transport.emit(event(type: "goal.changed", messageID: "goal-4", sequence: 5, payload: resumed))
+        await transport.emit(event(type: "goal.updated", messageID: resumeCommand.requestId, sequence: 6,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(resumeCommand.requestId), "action": .string("resume"),
+                "ref": .object(["id": .string("g"), "revision": .number(4)])])))
+        try await resume.value
+        XCTAssertEqual(model.goalState(for: "s")?.goal?.phase, "active")
+    }
+
+    @MainActor
+    func testGoalMutationUnknownOutcomeRetainsRequestIdentity() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        var state = DSHStoreState()
+        let original = try JSONDecoder().decode(DSHGoalState.self, from: Data(#"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":3}"#.utf8))
+        state.goalBySession = ["s": original]
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(60))
+        let goal = try XCTUnwrap(original.goal)
+        let first = Task { @MainActor in try await model.updateGoal(goal, in: "s", action: "pause") }
+        defer { first.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "goal.update")
+        let command = try XCTUnwrap(captured)
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown result"), "retryable": .bool(false)])))
+        do { try await first.value; XCTFail("Unknown outcome must be reported") } catch { }
+        let retry = Task { @MainActor in try await model.updateGoal(goal, in: "s", action: "pause") }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let retried = await transport.lastCommand(ofType: "goal.update")
+        XCTAssertEqual(retried?.requestId, command.requestId)
+        await transport.emit(event(type: "goal.updated", messageID: command.requestId, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(command.requestId), "action": .string("pause"),
+                "ref": .object(["id": .string("g"), "revision": .number(3)])])))
+        try await retry.value
+    }
+
+    @MainActor
+    func testNativeGoalCreationKeepsUnknownRequestAndUsesCreateReceipt() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let live = makeModel(transport: transport, isPaired: true)
+        _ = await live.preparePromptPersistence(expectedMachineGeneration: live.currentMachineGeneration, expectedMachineID: live.machineID)
+        live.connect(); defer { live.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(60))
+        let create = Task { @MainActor in try await live.createGoal(in: "s", objective: "Read all Native information", maxGoalRounds: 7) }
+        defer { create.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let captured = await transport.lastCommand(ofType: "goal.update"), command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload, .object(["action": .string("create"), "objective": .string("Read all Native information"), "maxGoalRounds": .number(7)]))
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown create"), "retryable": .bool(false)])))
+        do { try await create.value; XCTFail("Unknown creation must retain its original identity") } catch { }
+        let retry = Task { @MainActor in try await live.createGoal(in: "s", objective: "Read all Native information", maxGoalRounds: 7) }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(80))
+        let repeated = await transport.lastCommand(ofType: "goal.update")
+        XCTAssertEqual(repeated?.requestId, command.requestId)
+        await transport.emit(event(type: "goal.updated", messageID: command.requestId, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(command.requestId), "action": .string("create"), "ref": .object(["id": .string("native"), "revision": .number(1)])])))
+        try await retry.value
+    }
+
+    func testLiveGoalStateSurvivesHistoricalReplayAndClearedGoalCannotReappear() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ type: String, _ json: String, _ seq: Int64, historical: Bool = false) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "g-\(seq)", deviceId: "d", machineId: "m",
+                historyBatchId: historical ? "batch" : nil, sequence: seq, type: type, payload: payload)), into: &state)
+        }
+        try apply("goal.state", #"{"sessionId":"s","goal":{"id":"g","revision":3,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":4,"activation":"armed"}"#, 1)
+        try apply("history.started", #"{"sessionId":"s","batchId":"batch"}"#, 2)
+        try apply("goal.changed", #"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"Old","phase":"paused","maxGoalRounds":12},"roundsStarted":3}"#, 3, historical: true)
+        XCTAssertEqual(state.goalBySession?["s"]?.goal?.revision, 3)
+        XCTAssertEqual(state.goalBySession?["s"]?.activation, "armed")
+        try apply("goal.changed", #"{"sessionId":"s","goal":null,"roundsStarted":0}"#, 4)
+        try apply("goal.changed", #"{"sessionId":"s","goal":{"id":"g","revision":3,"objective":"Ship","phase":"active","maxGoalRounds":12},"roundsStarted":4}"#, 5, historical: true)
+        XCTAssertNil(state.goalBySession?["s"]?.goal)
+        XCTAssertEqual(state.goalBySession?["s"]?.roundsStarted, 0)
+    }
+
+    @MainActor
+    func testPlanProjectionWinsOverHistoryAndIgnoresOldGeneration() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ json: String, _ seq: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(event(type: "plan.projection", messageID: "p-\(seq)", sequence: seq, payload: payload), into: &state)
+        }
+        try apply(#"{"sessionId":"s","epoch":"one","seq":10,"active":true,"pending":true,"available":true,"supported":true}"#, 1)
+        try apply(#"{"sessionId":"s","epoch":"one","seq":9,"active":false,"pending":false,"available":true,"supported":true}"#, 2)
+        XCTAssertEqual(state.planProjections?["s"]?.pending, true)
+        try apply(#"{"sessionId":"s","epoch":"two","seq":5,"active":false,"pending":true,"available":true,"supported":true}"#, 3)
+        try apply(#"{"sessionId":"s","epoch":"one","seq":20,"active":true,"pending":false,"available":true,"supported":true}"#, 4)
+        XCTAssertEqual(state.planProjections?["s"]?.epoch, "two")
+        state.planBySession = ["s": DSHPlanState(sessionId: "s", active: true)]
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: state)
+        XCTAssertEqual(model.planState(for: "s")?.active, false)
+        XCTAssertEqual(model.planState(for: "s")?.pending, true)
+    }
+    func testDecisionSnapshotCannotResurrectResolvedQuestionsOrRetiredBridgeEpoch() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ type: String, _ json: String, _ sequence: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(event(type: type, messageID: "decision-\(sequence)", sequence: sequence, payload: payload), into: &state)
+        }
+        try apply("decisions.snapshot", #"{"stateVersion":{"epoch":"host-1","revision":1},"approvals":[],"questions":[{"id":"q","sessionId":"s","questions":[{"id":"item","question":"Continue?"}]}]}"#, 1)
+        XCTAssertEqual(state.pendingQuestions.count, 1)
+        try apply("question.resolved", #"{"id":"q","sessionId":"s","stateVersion":{"epoch":"host-1","revision":2}}"#, 2)
+        try apply("decisions.snapshot", #"{"stateVersion":{"epoch":"host-1","revision":1},"approvals":[],"questions":[{"id":"q","sessionId":"s","questions":[{"id":"item","question":"Continue?"}]}]}"#, 3)
+        XCTAssertTrue(state.pendingQuestions.isEmpty)
+        try apply("decisions.snapshot", #"{"stateVersion":{"epoch":"host-2","revision":0},"approvals":[],"questions":[]}"#, 4)
+        try apply("question.asked", #"{"id":"q","sessionId":"s","questions":[{"id":"item","question":"Continue?"}],"stateVersion":{"epoch":"host-1","revision":3}}"#, 5)
+        XCTAssertTrue(state.pendingQuestions.isEmpty)
+        XCTAssertEqual(state.decisionVersion?.epoch, "host-2")
+    }
+
+    func testAtomicHistoryKeepsVisibleContentStableAndMergesLiveOnce() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var seq: Int64 = 0
+        func send(_ type: String, _ payload: [String: DSHJSONValue], batch: String? = nil) {
+            seq += 1
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "atomic-\(seq)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: batch, sequence: seq, type: type, payload: .object(payload))), into: &state)
+        }
+        let marker: [String: DSHJSONValue] = ["sessionId": .string("s"), "batchId": .string("batch")]
+        send("history.started", marker, batch: "batch")
+        for n in 1...200 {
+            send("user.message.accepted", ["id": .string("old-\(n)"), "role": .string("user"), "markdown": .string("历史问题 \(n)")], batch: "batch")
+            send("tool.completed", ["id": .string("tool-\(n)"), "name": .string("bash"), "status": .string("completed"), "detail": .string("old")], batch: "batch")
+            XCTAssertTrue(state.messagesBySession["s", default: []].isEmpty)
+            XCTAssertTrue(state.toolsBySession["s", default: []].isEmpty)
+        }
+        send("assistant.message.completed", ["id": .string("answer"), "role": .string("assistant"), "markdown": .string("hello")], batch: "batch")
+        send("assistant.message.delta", ["messageId": .string("answer"), "text": .string(" world")])
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 1, "Live output stays available while historical rows remain hidden")
+        send("tool.completed", ["id": .string("tool-200"), "name": .string("bash"), "status": .string("failed"), "detail": .string("live failure")])
+        send("history.completed", marker, batch: "batch")
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 201)
+        XCTAssertEqual(state.messagesBySession["s"]?.last?.markdown, "hello world", "Never apply live deltas twice")
+        XCTAssertEqual(state.toolsBySession["s"]?.last?.status, "failed")
+        XCTAssertNil(state.pendingSessionHistory?["s"])
+        let settled = state.messagesBySession["s"]
+        send("assistant.message.delta", ["messageId": .string("answer"), "text": .string("stale")], batch: "batch")
+        XCTAssertEqual(state.messagesBySession["s"], settled)
+        send("history.started", ["sessionId": .string("s"), "batchId": .string("abandoned")], batch: "abandoned")
+        send("user.message.accepted", ["id": .string("discard"), "role": .string("user"), "markdown": .string("incomplete")], batch: "abandoned")
+        reducer.abandonHistory(session: "s", into: &state)
+        XCTAssertEqual(state.messagesBySession["s"], settled)
+        XCTAssertNotNil(state.historyFailures?["s"])
+    }
+
+    func testHistoricalUsageCommitsOnceAndProtectsLiveAndNewerBatches() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var sequence: Int64 = 0
+        func send(_ type: String, batch: String? = nil, value: Int = 0, session: String = "s") throws {
+            sequence += 1
+            var payload: [String: DSHJSONValue] = ["sessionId": .string(session)]
+            if type == "usage.updated" {
+                let usage = DSHSessionUsage(rounds: value, steps: value * 10, totalTokens: Double(value * 1000),
+                    cacheHitPercent: Double(value) / 10, tokensPerSecond: Double(value))
+                payload["usage"] = try JSONDecoder().decode(DSHJSONValue.self, from: JSONEncoder().encode(usage))
+            } else { payload["batchId"] = .string(batch ?? "b") }
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "u\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: session, historyBatchId: batch, sequence: sequence, type: type, payload: .object(payload))), into: &state)
+        }
+        try send("history.started", batch: "b")
+        for value in 1...200 {
+            try send("usage.updated", batch: "b", value: value)
+            XCTAssertNil(state.usageBySession["s"])
+        }
+        try send("history.completed", batch: "b")
+        let final = try XCTUnwrap(state.usageBySession["s"])
+        XCTAssertEqual(final.rounds, 200); XCTAssertEqual(final.steps, 2000)
+        XCTAssertEqual(final.totalTokens, 200000); XCTAssertEqual(final.tokensPerSecond, 200)
+        XCTAssertEqual(final.cacheHitPercent, 20)
+        try send("history.started", batch: "old")
+        try send("usage.updated", batch: "old", value: 1)
+        XCTAssertEqual(state.usageBySession["s"], final)
+        try send("history.started", batch: "new")
+        try send("usage.updated", batch: "new", value: 201)
+        try send("history.completed", batch: "old")
+        XCTAssertEqual(state.usageBySession["s"], final)
+        try send("history.completed", batch: "new")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 201)
+        try send("history.started", batch: "live")
+        try send("usage.updated", value: 300)
+        try send("usage.updated", batch: "live", value: 202)
+        try send("history.completed", batch: "live")
+        try send("usage.updated", batch: "live", value: 203)
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("history.started", batch: "timeout")
+        try send("usage.updated", batch: "timeout", value: 2)
+        reducer.completeHistory(sessionId: "s", batchId: nil, into: &state)
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("history.started", batch: "empty")
+        try send("history.completed", batch: "empty")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("usage.updated", value: 5, session: "other")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        XCTAssertEqual(state.usageBySession["other"]?.rounds, 5)
+    }
+
+    func testOrphanToolsAndCompactionFoldIntoTaskWithoutHidingAnswers() {
+        let user = DSHChatMessage(id: "u", role: .user, markdown: "start", sequence: 1)
+        let answer = DSHChatMessage(id: "a", role: .assistant, markdown: "final answer", sequence: 5)
+        let tool = DSHToolActivity(id: "t", name: "bash", status: "failed", sequence: 2)
+        let record = DSHExecutionRecord(nativeSequence: 3, type: "compaction/prune", time: nil, data: [:], sequence: 3)
+        let notice = DSHExecutionNotice(id: "prune", kind: "prune", records: [record], boundary: nil)
+        let entries: [DSHTranscriptEntry] = [.turn(.init(id: user.id, messages: [user])), .tool(tool),
+            .execution(notice), .turn(.init(id: answer.id, messages: [answer])),
+            .turn(.init(id: "next", messages: [.init(id: "next", role: .user, markdown: "next", sequence: 6)]))]
+        let sections = entries.groupedTurns().withTaskTimelines()
+        XCTAssertEqual(sections.count, 3)
+        guard case .turn(let block, _) = sections[1] else { return XCTFail("Expected collapsed task header") }
+        XCTAssertEqual(block.visibleMessages.map(\.markdown), ["final answer"])
+        XCTAssertEqual(block.taskTimeline?.tools.map(\.id), ["t"])
+        XCTAssertEqual(block.taskTimeline?.execution.map(\.id), ["prune"])
+        XCTAssertEqual(block.taskTimeline?.activities.map(\.id), ["tool-t", "execution-prune"])
+        let orphan = [DSHTranscriptEntry.tool(tool), .execution(notice)].groupedTurns().withTaskTimelines()
+        XCTAssertEqual(orphan.count, 1)
+        guard case .turn(let synthetic, _) = orphan[0] else { return XCTFail("Missing history-edge summary") }
+        XCTAssertTrue(synthetic.visibleMessages.isEmpty)
+        XCTAssertEqual(synthetic.taskTimeline?.tools.count, 1)
+        XCTAssertEqual(synthetic.taskTimeline?.execution.count, 1)
+    }
+
+    func testHistoryTodoEditsPublishOnlyFinalStateAndKeepLiveUpdates() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var sequence: Int64 = 0
+        func send(_ type: String, batch: String? = nil, content: String = "", into state: inout DSHStoreState) throws {
+            sequence += 1
+            let payload: String = type == "todo.changed"
+                ? "{\"sessionId\":\"s\",\"todos\":[{\"content\":\"\(content)\",\"status\":\"pending\"}]}"
+                : "{\"sessionId\":\"s\",\"batchId\":\"b\"}"
+            let value = try JSONDecoder().decode(DSHJSONValue.self, from: Data(payload.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "r\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: batch, sequence: sequence, type: type, payload: value)), into: &state)
+        }
+        try send("history.started", into: &state)
+        for n in 1...200 {
+            try send("todo.changed", batch: "b", content: "old-\(n)", into: &state)
+            XCTAssertNil(state.todoBySession?["s"], "First load must not play historical task edits")
+        }
+        try send("history.completed", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "old-200")
+        try send("history.started", into: &state)
+        try send("todo.changed", batch: "b", content: "old", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "old-200", "Keep the cached dock stable")
+        try send("todo.changed", content: "live", into: &state)
+        try send("todo.changed", batch: "b", content: "stale", into: &state)
+        try send("history.completed", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "live")
+        try send("todo.changed", batch: "b", content: "late", into: &state)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "live")
+        try send("history.started", into: &state)
+        try send("history.completed", into: &state)
+        XCTAssertNil(state.todoBySession?["s"], "An authoritative empty history clears cached tasks")
+    }
+
+    @MainActor
+    func testStaleQuestionAnswerRefreshesAuthoritativeStateWithoutGlobalAlertOrResend() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let request = DSHQuestionRequest(id: "stale-question", sessionId: "s", questions: [DSHQuestion(id: "item", question: "Continue?")])
+        var initial = DSHStoreState(); initial.pendingQuestions = [request]
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: initial, isPaired: true)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        for _ in 0..<100 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let draft = DSHQuestionDraft(questions: request.questions, selections: [:], custom: ["item": "keep this draft"], skipped: [])
+        model.saveQuestionDraft(draft, for: request)
+        let beforeRefresh = await transport.commandCount(ofType: "decisions.list")
+        let answer = Task { try await model.answer(request, answers: [.init(id: "item", selected: [], custom: "keep this draft")]) }
+        defer { answer.cancel() }
+        let sent = try await transport.waitForCommand(ofType: "question.answer")
+        let command = try XCTUnwrap(sent)
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 2,
+            payload: .object(["code": .string("bridge-request-failed"), "retryable": .bool(false),
+                "message": .string("Local DSH bridge request failed (question.answer, HTTP 409)")])))
+        do { try await answer.value; XCTFail("The stale answer must not be reported as accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("同步最新问题状态")) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.questionDraft(for: request), draft)
+        XCTAssertEqual(model.pendingQuestions.count, 1, "Only the authoritative snapshot may retire the question")
+        let refreshed = try await transport.waitForCommand(ofType: "decisions.list", count: beforeRefresh + 1)
+        XCTAssertNotNil(refreshed)
+        await transport.emit(event(type: "decisions.snapshot", messageID: "fresh-decisions", sequence: 3,
+            payload: .object(["stateVersion": .object(["epoch": .string("host"), "revision": .number(2)]),
+                "approvals": .array([]), "questions": .array([])])))
+        for _ in 0..<100 {
+            if model.pendingQuestions.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(model.pendingQuestions.isEmpty)
+        XCTAssertNil(model.questionDraft(for: request))
+        let sends = await transport.commandCount(ofType: "question.answer")
+        XCTAssertEqual(sends, 1)
+    }
+
+    @MainActor
+    func testQuestionAnswerFailurePreservesDraftAndCanRetryUntilResolution() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let request = DSHQuestionRequest(id: "draft-\(UUID().uuidString)", sessionId: "s", questions: [DSHQuestion(id: "item", question: "Continue?")])
+        var state = DSHStoreState()
+        state.pendingQuestions = [request]
+        let transport = CorrelationTransport(failFirstTypes: ["question.answer"])
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(60))
+        let draft = DSHQuestionDraft(questions: request.questions, selections: [:], custom: ["item": "Keep going"], skipped: [])
+        model.saveQuestionDraft(draft, for: request)
+        let answers = [DSHQuestionAnswer(id: "item", selected: [], custom: "Keep going")]
+        do { try await model.answer(request, answers: answers); XCTFail("First send must fail") } catch { }
+        XCTAssertEqual(model.questionDraft(for: request), draft)
+        XCTAssertEqual(model.pendingQuestions.count, 1)
+        let retry = Task { @MainActor in try await model.answer(request, answers: answers) }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "question.resolved", messageID: "resolved", sequence: 2,
+            payload: .object(["id": .string(request.id), "sessionId": .string("s")])))
+        try await retry.value
+        XCTAssertNil(model.questionDraft(for: request))
+    }
+
+    @MainActor
+    func testApprovalFailureKeepsPendingDecisionAndExpiredApprovalCannotSend() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let request = DSHApprovalRequest(id: "approval", sessionId: "s", toolName: "shell", reason: "Run?")
+        let expired = DSHApprovalRequest(id: "expired", sessionId: "s", toolName: "shell", reason: "Run?", expiresAt: 1)
+        var state = DSHStoreState()
+        state.pendingApprovals = [request, expired]
+        let transport = CorrelationTransport(failingTypes: ["approval.decide"])
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(60))
+        do { try await model.decide(request, allow: true); XCTFail("Transport must fail") } catch { }
+        XCTAssertEqual(model.pendingApprovals.count, 2)
+        XCTAssertEqual(model.approvalDecisionDraft(for: request), true)
+        let before = await transport.commandCount(ofType: "approval.decide")
+        do { try await model.decide(expired, allow: false); XCTFail("Expired decision must not send") } catch { }
+        let after = await transport.commandCount(ofType: "approval.decide")
+        XCTAssertEqual(after, before)
+        await transport.emit(event(type: "approval.resolved", messageID: "resolved", sequence: 2,
+            payload: .object(["id": .string(request.id), "allowed": .bool(false)])))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertNil(model.approvalDecisionDraft(for: request))
+    }
+    @MainActor
+    func testContinuableSubagentUsesParentAddressAndStableRetryIdentity() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration,
+                                                  expectedMachineID: model.machineID)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        let catalog = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"parentSessionId":"parent","parentAvailable":true,"entries":[{"kind":"child","id":"child","mode":"continuable","activity":"running","hasChildren":false,"label":"Task"}]}"#.utf8))
+        await transport.emit(event(type: "subagent.catalog", messageID: "catalog", sequence: 2, payload: catalog))
+        try await Task.sleep(for: .milliseconds(100))
+        let first = Task { @MainActor in try await model.controlSubagent(childID: "child", parentID: "parent", text: "continue", delivery: "steer") }
+        defer { first.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let captured = await transport.lastCommand(ofType: "subagent.prompt")
+        let command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.sessionId, "child")
+        guard case .object(let payload) = command.payload else { return XCTFail("Missing child address") }
+        XCTAssertEqual(payload["parentSessionId"], .string("parent"))
+        XCTAssertEqual(payload["mode"], .string("continuable"))
+        XCTAssertEqual(payload["delivery"], .string("steer"))
+        await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: 3,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown"), "retryable": .bool(false)])))
+        do { try await first.value; XCTFail("Uncertain result must keep request identity") } catch { }
+        let retry = Task { @MainActor in try await model.controlSubagent(childID: "child", parentID: "parent", text: "continue", delivery: "steer") }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let retried = await transport.lastCommand(ofType: "subagent.prompt")
+        XCTAssertEqual(retried?.requestId, command.requestId)
+        await transport.emit(event(type: "subagent.receipt", messageID: command.requestId, sequence: 4,
+            payload: .object(["parentSessionId": .string("parent"), "childSessionId": .string("child"),
+                "requestId": .string(command.requestId), "action": .string("prompt"), "messageId": .string("inbox")])))
+        try await retry.value
+        let ordinary = await transport.commandCount(ofType: "prompt.send")
+        XCTAssertEqual(ordinary, 0)
+    }
+
+    @MainActor
+    func testSubagentInvalidationRejectsOldCatalogReplyInSameBatch() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(80))
+        let token = UUID()
+        model.watchSubagents(for: "parent", token: token)
+        defer { model.unwatchSubagents(for: "parent", token: token) }
+        try await Task.sleep(for: .milliseconds(60))
+        let captured = await transport.lastCommand(ofType: "subagent.catalog")
+        let old = try XCTUnwrap(captured)
+        await transport.emit(event(type: "subagent.catalog.invalidated", messageID: "invalidate", sequence: 2,
+            payload: .object(["parentSessionId": .string("parent")])))
+        await transport.emit(event(type: "subagent.catalog", messageID: old.requestId, sequence: 3,
+            payload: .object(["parentSessionId": .string("parent"), "parentAvailable": .bool(true), "entries": .array([])])))
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(model.subagentCatalog(for: "parent"))
+        let refreshed = await transport.lastCommand(ofType: "subagent.catalog")
+        XCTAssertNotEqual(refreshed?.requestId, old.requestId)
+    }
+    @MainActor
+    func testAuthoritativeQueueRetiresLocalEchoAndMutatesExactOccurrence() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration,
+                                                  expectedMachineID: model.machineID)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        model.noteQueuedPrompt(text: "Task", mode: "queue", requestId: "rpc", for: "s")
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(#"{"sessionId":"s","available":true,"items":[{"id":"item","placement":"queued","rpcId":"rpc","message":{"id":"item","content":[{"type":"text","text":"Task"}]}}]}"#.utf8))
+        await transport.emit(event(type: "queue.changed", messageID: "queue", sequence: 2, payload: payload))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(model.queuedPrompts(for: "s").isEmpty)
+        let item = try XCTUnwrap(model.serverQueue(for: "s")?.items.first)
+        let remove = Task { @MainActor in try await model.updateServerQueue(item, in: "s", action: "remove") }
+        defer { remove.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        let captured = await transport.lastCommand(ofType: "queue.update")
+        let command = try XCTUnwrap(captured)
+        XCTAssertEqual(command.payload, .object(["itemId": .string("item"), "action": .string("remove")]))
+        await transport.emit(event(type: "queue.updated", messageID: command.requestId, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "itemId": .string("item"), "requestId": .string(command.requestId)])))
+        await transport.emit(event(type: "queue.changed", messageID: "empty", sequence: 4,
+            payload: .object(["sessionId": .string("s"), "available": .bool(true), "items": .array([])])))
+        try await remove.value
+        XCTAssertEqual(model.serverQueue(for: "s")?.items.count, 0)
+    }
+    func testBackgroundJobListsReplaceAndClearWithinTheirOwnSession() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ json: String, _ seq: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "jobs-\(seq)", deviceId: "phone",
+                machineId: "mac", sequence: seq, type: "jobs.changed", payload: payload)), into: &state)
+        }
+        try apply(#"{"sessionId":"s","available":true,"jobs":[{"id":"j","kind":"shell","label":"Build","status":"running","startedAt":100}]}"#, 1)
+        XCTAssertEqual(state.jobsBySession?["s"]?.jobs.first?.status, "running")
+        XCTAssertNil(state.jobsBySession?["other"])
+        reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "offline", deviceId: "phone", machineId: "mac",
+            sequence: 0, type: "transport.state", payload: .object(["state": .string("disconnected")]))), into: &state)
+        XCTAssertEqual(state.jobsBySession?["s"]?.available, false)
+        try apply(#"{"sessionId":"s","available":false,"jobs":[{"id":"j","kind":"shell","label":"Build","status":"running","startedAt":100}]}"#, 2)
+        XCTAssertEqual(state.jobsBySession?["s"]?.available, false)
+        try apply(#"{"sessionId":"s","available":true,"jobs":[]}"#, 3)
+        XCTAssertEqual(state.jobsBySession?["s"]?.jobs.count, 0)
+    }
+    @MainActor
+    func testQuestionCancellationWaitsForResolutionAndDoesNotSubmitAnAnswer() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let request = DSHQuestionRequest(id: "q", sessionId: "s", questions: [DSHQuestion(id: "item", question: "Approve?")])
+        var state = DSHStoreState()
+        state.pendingQuestions = [request]
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration,
+                                                  expectedMachineID: model.machineID)
+        model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        for _ in 0..<100 {
+            if model.connectionState == .connected { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(model.connectionState, .connected)
+        let cancel = Task { @MainActor in try await model.cancelQuestion(request) }
+        defer { cancel.cancel(); model.disconnect() }
+        let command = try await transport.waitForCommand(ofType: "question.cancel")
+        XCTAssertEqual(model.pendingQuestions.count, 1)
+        XCTAssertEqual(command?.payload, .object(["questionId": .string("q")]))
+        await transport.emit(event(type: "question.resolved", messageID: "resolved", sequence: 2,
+            payload: .object(["id": .string("q"), "sessionId": .string("s")])))
+        try await cancel.value
+        XCTAssertTrue(model.pendingQuestions.isEmpty)
+        let answers = await transport.commandCount(ofType: "question.answer")
+        XCTAssertEqual(answers, 0)
+    }
+
+    @MainActor
+    func testQuestionCancellationFailureKeepsQuestionAvailableForRetry() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let request = DSHQuestionRequest(id: "q", sessionId: "s", questions: [DSHQuestion(id: "item", question: "Approve?")])
+        var state = DSHStoreState()
+        state.pendingQuestions = [request]
+        let model = makeModel(transport: CorrelationTransport(failingTypes: ["question.cancel"]), initialState: state, isPaired: true)
+        do { try await model.cancelQuestion(request); XCTFail("Cancellation should fail while disconnected") }
+        catch { XCTAssertEqual(model.pendingQuestions, [request]) }
+        model.disconnect()
+    }
+    @MainActor
+    func testStagedCommandUploadsReceiptAndNeverSendsOrdinaryPrompt() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true,
+                                transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration,
+                                                  expectedMachineID: model.machineID)
+        model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        let requestID = "command-\(UUID().uuidString)"
+        let attachment = DSHStagedAttachment(name: "spec.txt", data: Data("spec".utf8), isImage: false)
+        let task = Task { @MainActor in
+            try await model.sendStagedPromptPersisted("/plan use this", attachments: [attachment], to: "s",
+                                                       mode: "command", requestId: requestID)
+        }
+        defer { task.cancel(); model.disconnect() }
+        try await Task.sleep(for: .milliseconds(100))
+        let upload = await transport.lastCommand(ofType: "attachment.upload")
+        let uploadID = try XCTUnwrap(upload?.requestId)
+        await transport.emit(event(type: "attachment.uploaded", messageID: uploadID, sequence: 1,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(uploadID),
+                              "receiptId": .string("receipt-command"), "name": .string("spec.txt")])))
+        try await Task.sleep(for: .milliseconds(150))
+        let capturedCommand = await transport.lastCommand(ofType: "command.execute")
+        let command = try XCTUnwrap(capturedCommand)
+        XCTAssertEqual(command.requestId, requestID)
+        XCTAssertEqual(command.payload, .object(["line": .string("/plan use this"),
+            "attachments": .array([.object(["type": .string("file"), "receiptId": .string("receipt-command")])])]))
+        await transport.emit(event(type: "protocol.error", messageID: requestID, sequence: 2,
+            payload: .object(["code": .string("bridge-result-unknown"), "message": .string("Unknown result"), "retryable": .bool(false)])))
+        do { _ = try await task.value; XCTFail("The unknown result must preserve the draft for retry") } catch { }
+        XCTAssertEqual(model.stagedPromptRequestID(text: "/plan use this", attachments: [attachment], sessionID: "s"), requestID)
+        let retry = Task { @MainActor in
+            try await model.sendStagedPromptPersisted("/plan use this", attachments: [attachment], to: "s",
+                                                       mode: "command", requestId: requestID)
+        }
+        defer { retry.cancel() }
+        try await Task.sleep(for: .milliseconds(150))
+        let uploads = await transport.commandCount(ofType: "attachment.upload")
+        XCTAssertEqual(uploads, 1, "A completed upload must not run again after an uncertain command result")
+        let executions = await transport.commandCount(ofType: "command.execute")
+        XCTAssertEqual(executions, 2)
+        let retried = await transport.lastCommand(ofType: "command.execute")
+        XCTAssertEqual(retried?.requestId, requestID)
+        XCTAssertEqual(retried?.payload, command.payload)
+        await transport.emit(event(type: "command.result", messageID: requestID, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "requestId": .string(requestID), "matched": .bool(true),
+                              "kind": .string("success")])))
+        let sent = try await retry.value
+        XCTAssertTrue(sent)
+        XCTAssertEqual(model.pendingSendCount(for: "s"), 0)
+        let prompts = await transport.commandCount(ofType: "prompt.send")
+        XCTAssertEqual(prompts, 0)
+        model.disconnect()
+    }
+    @MainActor
+    func testPassiveCommandCatalogFailureDoesNotInterruptConversation() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        model.requestCommands(for: "s")
+        var command: DSHCommand?
+        for _ in 0..<100 {
+            command = await transport.lastCommand(ofType: "command.catalog")
+            if command != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let requestID = try XCTUnwrap(command?.requestId)
+        await transport.emit(event(type: "protocol.error", messageID: requestID, sequence: 1,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("command.catalog HTTP 502"), "retryable": .bool(true)])))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertNil(model.errorMessage)
+        await transport.emit(event(type: "protocol.error", messageID: "explicit-action", sequence: 2,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("Explicit action failed"), "retryable": .bool(false)])))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(model.errorMessage, "Explicit action failed")
+    }
+    @MainActor
+    func testCommandInvalidationRejectsInflightOldCatalogAndRefreshesVisibleSession() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration,
+                                                  expectedMachineID: model.machineID)
+        model.connect()
+        model.setConversationVisible("s", visible: true)
+        model.requestCommands(for: "s")
+        try await Task.sleep(for: .milliseconds(60))
+        let old = await transport.lastCommand(ofType: "command.catalog")
+        let oldID = try XCTUnwrap(old?.requestId)
+        await transport.emit(event(type: "command.catalog.invalidated", messageID: "invalidate", sequence: 1, payload: .object([:])))
+        await transport.emit(event(type: "command.catalog", messageID: oldID, sequence: 2,
+            payload: .object(["sessionId": .string("s"), "commands": .array([.object(["name": .string("old"), "description": .string("Old")])])])))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(model.commandCatalog(for: "s"))
+        let fresh = await transport.lastCommand(ofType: "command.catalog")
+        let freshID = try XCTUnwrap(fresh?.requestId)
+        XCTAssertNotEqual(oldID, freshID)
+        await transport.emit(event(type: "command.catalog", messageID: freshID, sequence: 3,
+            payload: .object(["sessionId": .string("s"), "commands": .array([])])))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.commandCatalog(for: "s")?.commands.count, 0)
+        model.disconnect()
+    }
+    func testTodoSnapshotsReplaceListsAndExplicitEmptyClearsProgress() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ json: String, _ seq: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "todo-\(seq)", deviceId: "phone",
+                machineId: "mac", sequence: seq, type: "todo.changed", payload: payload)), into: &state)
+        }
+        try apply(#"{"sessionId":"s","todos":[{"content":"Read","status":"in_progress"}]}"#, 1)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.status, "in_progress")
+        try apply(#"{"sessionId":"s","todos":[{"content":"Verify","status":"completed"}]}"#, 2)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.count, 1)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos.first?.content, "Verify")
+        XCTAssertNil(state.todoBySession?["other"])
+        try apply(#"{"sessionId":"s","todos":[]}"#, 3)
+        XCTAssertEqual(state.todoBySession?["s"]?.todos, [])
+    }
+    func testCollaborationStateIsSessionScopedAndClearRemovesGoal() throws {
+        var state = DSHStoreState()
+        let reducer = DSHEventReducer()
+        func apply(_ type: String, _ json: String, _ seq: Int64) throws {
+            let payload = try JSONDecoder().decode(DSHJSONValue.self, from: Data(json.utf8))
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "e\(seq)", deviceId: "phone",
+                machineId: "mac", sequence: seq, type: type, payload: payload)), into: &state)
+        }
+        try apply("plan.changed", #"{"sessionId":"s","active":true}"#, 1)
+        XCTAssertEqual(state.planBySession?["s"]?.active, true)
+        XCTAssertNil(state.planBySession?["other"])
+        try apply("goal.changed", #"{"sessionId":"s","goal":{"id":"g","revision":2,"objective":"Ship","phase":"paused","maxGoalRounds":12},"roundsStarted":3}"#, 2)
+        XCTAssertEqual(state.goalBySession?["s"]?.goal?.phase, "paused")
+        XCTAssertEqual(state.goalBySession?["s"]?.roundsStarted, 3)
+        try apply("goal.activation", #"{"sessionId":"s","id":"g","revision":1,"activation":"armed"}"#, 3)
+        XCTAssertNil(state.goalBySession?["s"]?.activation, "A stale goal revision cannot arm the current goal")
+        try apply("goal.activation", #"{"sessionId":"s","id":"g","revision":2,"activation":"disarmed"}"#, 4)
+        XCTAssertEqual(state.goalBySession?["s"]?.activation, "disarmed")
+        try apply("goal.round", #"{"sessionId":"s","id":"other","round":10}"#, 5)
+        XCTAssertEqual(state.goalBySession?["s"]?.roundsStarted, 3)
+        try apply("goal.round", #"{"sessionId":"s","id":"g","round":4}"#, 6)
+        XCTAssertEqual(state.goalBySession?["s"]?.roundsStarted, 4)
+        try apply("goal.round", #"{"sessionId":"s","id":"g","round":2}"#, 7)
+        XCTAssertEqual(state.goalBySession?["s"]?.roundsStarted, 4)
+        try apply("goal.changed", #"{"sessionId":"s","goal":null,"roundsStarted":0}"#, 8)
+        XCTAssertNil(state.goalBySession?["s"]?.goal)
+    }
     func testStartupWaitsForPresenceAndBridgeInsteadOfReportingUnreachable() {
         var state = DSHStoreState()
         let reducer = DSHEventReducer()
@@ -46,7 +1447,9 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testPairedLaunchTreatsTransactionRestoreAsConnectionPreparation() {
-        let model = DSHAppModel(transport: DSHPreviewTransport(),
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let model = makeModel(transport: DSHPreviewTransport(),
                                 initialState: DSHStoreState(), isPaired: true)
 
         XCTAssertTrue(model.isPreparingInitialConnection,
@@ -947,7 +2350,7 @@ final class DSHEventStoreTests: XCTestCase {
         // Unique session id: the queue persists to UserDefaults per machine,
         // so a fixed id would leak entries across test runs.
         let sid = "q-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         model.holdQueuedPrompt(text: "  first  ", for: sid)
         model.holdQueuedPrompt(text: "second", for: sid)
         XCTAssertEqual(model.queuedPrompts(for: sid).map(\.text), ["first", "second"])
@@ -980,7 +2383,7 @@ final class DSHEventStoreTests: XCTestCase {
     func testQueuedPromptPreservesFullBodyBeyondPreviewLength() {
         let sid = "q-long-\(UUID().uuidString)"
         let body = String(repeating: "界", count: 2_001)
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         model.holdQueuedPrompt(text: body, for: sid)
         XCTAssertEqual(model.queuedPrompts(for: sid).first?.text, body)
         let item = model.queuedPrompts(for: sid).first!
@@ -990,7 +2393,7 @@ final class DSHEventStoreTests: XCTestCase {
     @MainActor
     func testPendingSendMatchParkAndRetry() {
         let sid = "send-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         // Sending records a pending ack; acceptance retires it.
         model.sendPrompt("hello", to: sid)
         XCTAssertEqual(model.pendingSendCount(for: sid), 1)
@@ -1015,8 +2418,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testSessionCreationFailureRetainsRequestIdentityForRetry() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport(failingTypes: ["session.create"])
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         let workspace = DSHWorkspaceOption(id: "workspace", name: "Workspace")
 
         XCTAssertTrue(model.createSession(in: workspace, mode: "standard",
@@ -1040,8 +2445,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testSessionCreationTimeoutBecomesRecoverableAndOldTimerCannotFailRetry() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 0.12
         model.connect()
         try await Task.sleep(for: .milliseconds(30))
@@ -1058,15 +2465,20 @@ final class DSHEventStoreTests: XCTestCase {
         let retryCommand = await transport.lastCommand(ofType: "session.create")
         XCTAssertEqual(retryCommand?.requestId, requestID)
 
-        try await Task.sleep(for: .milliseconds(90))
+        for _ in 0..<200 {
+            if model.sessionCreationFailure(for: requestID)?.resultUnknown == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.resultUnknown == true)
         model.disconnect()
     }
 
     @MainActor
     func testUnknownCreateCanBeKeptWhileEditingAndLateResultStillSettlesOriginal() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 0.04
         model.connect()
         try await Task.sleep(for: .milliseconds(30))
@@ -1099,8 +2511,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testSessionCreationRecoveryCanResumeAfterShortHttpWindow() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 0.01
         model.sessionCreationRetryWindow = 0.05
         model.connect()
@@ -1124,8 +2538,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testSessionCreationTransactionRestoresAfterDisconnect() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 30
         model.connect()
         try await Task.sleep(for: .milliseconds(30))
@@ -1136,7 +2552,10 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.recoverableSessionCreationRequestID())
 
         model.connect()
-        try await Task.sleep(for: .milliseconds(30))
+        for _ in 0..<200 {
+            if model.recoverableSessionCreationRequestID() == requestID { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         XCTAssertEqual(model.recoverableSessionCreationRequestID(), requestID)
         XCTAssertEqual(model.sessionCreationDraft(for: requestID)?.text, "restore me")
         model.disconnect()
@@ -1144,8 +2563,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testInitialMessageTransactionRestoresAfterDisconnect() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 1
         model.connect()
         try await Task.sleep(for: .milliseconds(30))
@@ -1158,8 +2579,7 @@ final class DSHEventStoreTests: XCTestCase {
                                     "title": .string("First message"),
                                     "updatedAt": .number(1),
                                    ])))
-        try await Task.sleep(for: .milliseconds(80))
-        let firstPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let firstPromptValue = try await transport.waitForCommand(ofType: "prompt.send")
         let firstPrompt = try XCTUnwrap(firstPromptValue)
         model.disconnect()
 
@@ -1168,9 +2588,11 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(model.failedInitialMessage(for: "session-first-message")?.text,
                        "send after reconnect")
         let failure = try XCTUnwrap(model.failedInitialMessage(for: "session-first-message"))
+        // Reconnection preserves the in-flight acknowledgement window. Exercise
+        // the actual retry state after that original attempt has timed out.
+        model.timeoutPendingSend(requestId: firstPrompt.requestId)
         model.retryFailedInitialMessage(failure)
-        try await Task.sleep(for: .milliseconds(40))
-        let retriedPromptValue = await transport.lastCommand(ofType: "prompt.send")
+        let retriedPromptValue = try await transport.waitForCommand(ofType: "prompt.send", count: 2)
         let retriedPrompt = try XCTUnwrap(retriedPromptValue)
         XCTAssertEqual(retriedPrompt.requestId, firstPrompt.requestId,
                        "The first message retry must keep its prompt identity")
@@ -1184,8 +2606,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testTwoSessionCreationResultsInOneEventBatchRemainRequestScoped() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: DSHStoreState(), isPaired: true)
         model.sessionCreationAckTimeout = 30
         model.connect()
         try await Task.sleep(for: .milliseconds(30))
@@ -1208,10 +2632,12 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testSessionCreationRejectsModeFromAnotherMacCatalog() {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         var state = DSHStoreState()
         state.modeCatalog = DSHModeCatalog(defaultMode: "mac-b",
                                            modes: [DSHModeOption(id: "mac-b", name: "Mac B")])
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
 
         XCTAssertFalse(model.createSession(mode: "mac-a", initialPrompt: "stale"))
         XCTAssertEqual(model.errorMessage, "所选模式不属于当前 Mac，请重新选择。")
@@ -1223,7 +2649,7 @@ final class DSHEventStoreTests: XCTestCase {
     func testPureAttachmentAcceptanceUsesRequestIdWhenMessageHasNoText() {
         let sid = "attachment-send-\(UUID().uuidString)"
         let requestID = "attachment-request-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         model.sendPrompt("", attachments: ["receipt-1"], to: sid, requestId: requestID)
         XCTAssertEqual(model.pendingSendCount(for: sid), 1)
 
@@ -1246,7 +2672,7 @@ final class DSHEventStoreTests: XCTestCase {
     func testOldPromptTimeoutCannotFailAReusedRequestId() async {
         let sid = "retry-timer-\(UUID().uuidString)"
         let requestID = "retry-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         model.sendAckTimeout = 0.05
         model.sendPrompt("first", attachments: [], to: sid, requestId: requestID)
         try? await Task.sleep(nanoseconds: 20_000_000)
@@ -1268,7 +2694,7 @@ final class DSHEventStoreTests: XCTestCase {
     func testLateFailureFromOlderPromptAttemptCannotOverwriteRetry() {
         let sid = "retry-error-\(UUID().uuidString)"
         let requestID = "retry-error-request-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
         model.sendPrompt("first", attachments: [], to: sid, requestId: requestID)
         let first = DSHCommand.sendPrompt(deviceId: "ios-device", machineId: "machine",
                                           sessionId: sid, text: "first", requestId: requestID)
@@ -1284,7 +2710,7 @@ final class DSHEventStoreTests: XCTestCase {
         let secondSession = "failed-session-two-\(UUID().uuidString)"
         let firstRequest = "failed-request-one-\(UUID().uuidString)"
         let secondRequest = "failed-request-two-\(UUID().uuidString)"
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: DSHStoreState(), isPaired: true)
 
         model.sendPrompt("first", attachments: [], to: firstSession, requestId: firstRequest)
         model.sendPrompt("second", attachments: [], to: secondSession, requestId: secondRequest)
@@ -1651,7 +3077,7 @@ final class DSHEventStoreTests: XCTestCase {
         state.pendingApprovals = [
             DSHApprovalRequest(id: "ap", sessionId: "waiting", toolName: "bash", reason: "run?"),
         ]
-        let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+        let model = makeModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
         XCTAssertEqual(model.sessionDot(for: quiet), .none)
         XCTAssertEqual(model.sessionDot(for: failed), .red)
         XCTAssertEqual(model.sessionDot(for: waiting), .yellow)
@@ -1660,8 +3086,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testLocalTransportFailureClearsWorkspaceAndDirectoryLoading() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport(failingTypes: ["workspace.create", "directory.list"])
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
 
         model.createWorkspace(at: "/Users/me/Project")
         try? await Task.sleep(for: .milliseconds(80))
@@ -1677,7 +3105,7 @@ final class DSHEventStoreTests: XCTestCase {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
         model.connect()
         try? await Task.sleep(for: .milliseconds(30))
         model.setConversationVisible("active-session", visible: true)
@@ -1731,7 +3159,7 @@ final class DSHEventStoreTests: XCTestCase {
         state.connectionState = .connected
         state.machineOnline = true
         let transport = CorrelationTransport(failFirstTypes: ["session.open"])
-        let model = DSHAppModel(transport: transport, initialState: state, isPaired: true)
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
         model.connect()
         try? await Task.sleep(for: .milliseconds(30))
         await transport.emit(event(type: "transport.state", messageID: "initial-ready", sequence: 0,
@@ -1762,7 +3190,7 @@ final class DSHEventStoreTests: XCTestCase {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
         model.connect()
         try? await Task.sleep(for: .milliseconds(40))
         model.setConversationVisible("no-longer-visible", visible: true)
@@ -1798,7 +3226,7 @@ final class DSHEventStoreTests: XCTestCase {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
         model.connect()
         try? await Task.sleep(for: .milliseconds(30))
         await transport.emit(event(type: "protocol.error", messageID: "real-error", sequence: 1,
@@ -1814,8 +3242,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testWorkspaceCreationDismissesOnlyForMatchingRemoteAcknowledgement() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
         model.connect()
         model.createWorkspace(at: "/Users/me/Existing")
         try? await Task.sleep(for: .milliseconds(80))
@@ -1845,8 +3275,10 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testOnlyLatestDirectoryReplyUpdatesFolderBrowser() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: .init(), isPaired: true)
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
         model.connect()
         model.listDirectory(at: "/Users/me")
         try? await Task.sleep(for: .milliseconds(50))
@@ -1872,6 +3304,8 @@ final class DSHEventStoreTests: XCTestCase {
 
     @MainActor
     func testTranscriptCacheRefreshesForLiveDeltaAndLocalHide() async {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
         UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey)
         defer { UserDefaults.standard.removeObject(forKey: DSHAppModel.hiddenMessagesKey) }
 
@@ -1880,7 +3314,7 @@ final class DSHEventStoreTests: XCTestCase {
             DSHChatMessage(id: "question", role: .user, markdown: "Hello", sequence: 1),
         ]
         let transport = CorrelationTransport()
-        let model = DSHAppModel(transport: transport, initialState: state, isPaired: true)
+        let model = makeModel(transport: transport, initialState: state, isPaired: true)
 
         // Prime both caches before the live event arrives.
         XCTAssertEqual(model.transcriptEntries(for: "s").map(\.id), ["turn-question"])
@@ -1913,6 +3347,14 @@ final class DSHEventStoreTests: XCTestCase {
     /// DSHAppModel deliberately reconciles pairing/profile state while its
     /// pending transaction ledger loads. These transport tests need a real
     /// matching active profile so that guard is exercised instead of bypassed.
+    @MainActor
+    private func makeModel(transport: any DSHAppTransport, initialState: DSHStoreState = .init(),
+                           isPaired: Bool? = nil, transactionDirectory: URL? = nil) -> DSHAppModel {
+        DSHAppModel(transport: transport, initialState: initialState, isPaired: isPaired,
+            transactionDirectory: transactionDirectory ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent("DSHStoreTests-\(UUID().uuidString)", isDirectory: true))
+    }
+
     private func installCorrelationTestProfile() -> () -> Void {
         let defaults = UserDefaults.standard
         let previousProfiles = defaults.object(forKey: DSHProfileStore.profilesKey)
@@ -1948,10 +3390,12 @@ private actor CorrelationTransport: DSHAppTransport {
     private var commands: [DSHCommand] = []
     private let failingTypes: Set<String>
     private var failFirstTypes: Set<String>
+    private var upgradeRejectedTypes: Set<String>
 
-    init(failingTypes: Set<String> = [], failFirstTypes: Set<String> = []) {
+    init(failingTypes: Set<String> = [], failFirstTypes: Set<String> = [], upgradeRejectedTypes: Set<String> = []) {
         self.failingTypes = failingTypes
         self.failFirstTypes = failFirstTypes
+        self.upgradeRejectedTypes = upgradeRejectedTypes
     }
 
     func pair(serverAddress: String, machineId: String, credential: DSHPairingCredential,
@@ -1970,6 +3414,7 @@ private actor CorrelationTransport: DSHAppTransport {
 
     func send(_ command: DSHCommand) async throws {
         commands.append(command)
+        if upgradeRejectedTypes.remove(command.type) != nil { throw DSHRelayFeatureUpgradeRequired() }
         if failingTypes.contains(command.type) {
             throw DSHWebSocketError.notConnected
         }
@@ -1984,6 +3429,16 @@ private actor CorrelationTransport: DSHAppTransport {
     func removeMachine(_ machineId: String) async throws {}
     func pairedDevices() async throws -> [DSHRelayDevice] { [] }
     func revokeDevice(_ deviceId: String) async throws {}
+
+    /// Observe the asynchronous send itself; a fixed sleep races persistence and task scheduling on CI.
+    func waitForCommand(ofType type: String, count: Int = 1) async throws -> DSHCommand? {
+        let deadline = Date().addingTimeInterval(5)
+        while commandCount(ofType: type) < count, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        guard commandCount(ofType: type) >= count else { return nil }
+        return lastCommand(ofType: type)
+    }
 
     func lastCommand(ofType type: String) -> DSHCommand? {
         commands.last(where: { $0.type == type })

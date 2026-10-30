@@ -1,19 +1,38 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  FeedbackStateSchema,
+  FeedbackUpdatedSchema,
+  ReferenceCandidatesSchema,
+  SearchResultsSchema,
+  HistoryPageSchema,
+  ScheduleProjectionSchema,
+  ConfigurationModelsSchema,
+  ConfigurationResultSchema,
+  ConfigurationUpdatedSchema,
   CommandEnvelopeSchema,
   AttachmentUploadedPayloadSchema,
   CommandResultPayloadSchema,
+  CommandCatalogPayloadSchema,
+  SubagentCatalogPayloadSchema,
+  GoalChangedPayloadSchema,
+  GoalUpdatedPayloadSchema,
+  DecisionsSnapshotPayloadSchema,
   EventEnvelopeSchema,
   ModelCatalogPayloadSchema,
   ModeCatalogPayloadSchema,
   PromptAcceptedPayloadSchema,
   PROTOCOL_VERSION,
+  SCHEMA_REVISION,
+  supportsSchemaRevision,
   RelayMessageSchema,
   RelayPayloadMessageSchema,
   SessionSummarySchema,
   WorkspaceCatalogPayloadSchema,
   WorkspaceSchema,
   DirectoryListPayloadSchema,
+  WorkspaceFilesPayloadSchema,
+  WorkspaceBytesPayloadSchema,
+  ExecutionPagePayloadSchema,
   type CommandEnvelope,
   type EventEnvelope,
   type SessionSummary,
@@ -112,6 +131,8 @@ export class DSHAnywhereConnector {
   private bridgeEpoch: string | undefined;
   /** Bridge replays events before its ready envelope; hold them until the
    * epoch/cursor contract has been checked. */
+  private relayVerified = false;
+  private relayHandshakeTimer: NodeJS.Timeout | undefined;
   private bridgeReady = false;
   private bridgeBufferedEvents: EventEnvelope[] = [];
   private relay: WebSocketLike | undefined;
@@ -240,6 +261,7 @@ export class DSHAnywhereConnector {
     this.relay?.close(1000, "connector stopped");
     this.bridge?.close(1000, "connector stopped");
     this.relay = undefined;
+    this.relayVerified = false;
     this.bridge = undefined;
     this.bridgeConnectorId = undefined;
     this.relayLeaseGeneration = undefined;
@@ -276,15 +298,17 @@ export class DSHAnywhereConnector {
   private connectRelay(): void {
     if (!this.running) return;
     this.state = this.relayAttempts === 0 ? "connecting" : "reconnecting";
+    this.relayVerified = false;
     const socket = this.webSocketFactory(relayConnectURL(this.config.relayURL), authorization(this.config.machineToken));
     this.relay = socket;
     socket.on("open", () => {
       if (this.relay !== socket || !this.running) return;
-      this.relayAttempts = 0;
-      this.state = "connected";
       this.startHeartbeat(socket);
-      this.flushPendingEvents();
-      this.log("info", "Relay connected");
+      this.clearRelayHandshakeTimer();
+      this.relayHandshakeTimer = setTimeout(() => {
+        if (this.relay === socket && !this.relayVerified) this.rejectRelaySchema(socket);
+      }, 10_000);
+      this.relayHandshakeTimer.unref?.();
     });
     socket.on("message", (raw: RawData) => this.onRelayMessage(socket, raw));
     socket.on("pong", () => {
@@ -294,6 +318,8 @@ export class DSHAnywhereConnector {
     socket.on("close", (code?: number) => {
       if (this.relay !== socket) return;
       this.stopHeartbeat();
+      this.clearRelayHandshakeTimer();
+      this.relayVerified = false;
       this.relay = undefined;
       const relayGeneration = this.relayLeaseGeneration;
       const relayEpoch = this.relayEpoch;
@@ -342,7 +368,7 @@ export class DSHAnywhereConnector {
     this.bridgeBufferedEvents = [];
     const socket = this.webSocketFactory(
       bridgeEventsURL(baseURL, connectorId, this.bridgeAfterSequence),
-      authorization(this.config.bridgeToken),
+      { ...authorization(this.config.bridgeToken), "x-dsh-schema-revision": String(SCHEMA_REVISION) },
     );
     this.bridge = socket;
     socket.on("open", () => {
@@ -483,6 +509,15 @@ export class DSHAnywhereConnector {
       return;
     }
     if (message.data.type === "relay.ready") {
+      if (message.data.machineId !== this.config.machineId || message.data.role !== "machine" || !supportsSchemaRevision(message.data.schemaRevision)) {
+        this.rejectRelaySchema(socket); return;
+      }
+      this.clearRelayHandshakeTimer();
+      this.relayVerified = true;
+      this.relayAttempts = 0;
+      this.state = "connected";
+      this.flushPendingEvents();
+      this.log("info", `Relay schema ${message.data.schemaRevision} verified`);
       // Presence fencing needs the Relay-issued monotonic lease. A wall-clock
       // timestamp or a made-up legacy epoch cannot order delayed reports after
       // a Relay restart, so keep the transport connected but do not announce
@@ -503,6 +538,7 @@ export class DSHAnywhereConnector {
       }
       return;
     }
+    if (!this.relayVerified) return;
     if (message.data.type === "relay.presence") {
       if (message.data.role === "device" && message.data.deviceId !== undefined) {
         if (message.data.online) this.onlineRelayDevices.add(message.data.deviceId);
@@ -567,6 +603,11 @@ export class DSHAnywhereConnector {
   }
 
   private dispatchCommand(command: CommandEnvelope): Promise<void> {
+    // File pages are repeatable reads, scoped to an active phone waiter. Do
+    // not retain their bytes in mutation/result caches or chat replay history.
+    if (command.type === "workspace.files" || command.type === "workspace.bytes" || command.type === "execution.list" || command.type === "feedback.list" || command.type === "reference.list" || command.type === "session.search" || command.type === "conversation.search" || command.type === "history.read" || command.type === "schedule.get" || command.type === "configuration.read" || command.type === "configuration.update" || command.type === "configuration.discover") {
+      return this.executeCommand(command).then(() => undefined);
+    }
     const now = Date.now();
     for (const [key, execution] of this.commandExecutions) {
       if (execution.expiresAt <= now) this.commandExecutions.delete(key);
@@ -671,6 +712,18 @@ export class DSHAnywhereConnector {
       await this.emitCommandResult(command, response, sessionSnapshotGeneration, workspaceCatalogGeneration);
       return { state: "completed" };
     } catch (error) {
+      if (command.type === "decisions.list" && error instanceof BridgeRequestError &&
+          (error.status === 404 || error.status === 501)) return { state: "completed" };
+      if (command.type === "subagent.catalog" && error instanceof BridgeRequestError &&
+          (error.status === 404 || error.status === 501)) {
+        await this.emitCommandResult(command, { parentSessionId: requireSessionId(command), parentAvailable: false, supported: false, entries: [] });
+        return { state: "completed" };
+      }
+      if (command.type === "command.catalog" && error instanceof BridgeRequestError &&
+          (error.status === 404 || error.status === 501)) {
+        await this.emitCommandResult(command, { sessionId: requireSessionId(command), supported: false, commands: [] });
+        return { state: "completed" };
+      }
       const staleSessionList = command.type === "session.list" &&
         sessionSnapshotGeneration !== undefined &&
         !this.isCurrentSessionSnapshotQuery(command.deviceId, sessionSnapshotGeneration);
@@ -703,6 +756,7 @@ export class DSHAnywhereConnector {
       method: request.method,
       headers: {
         ...authorization(this.config.bridgeToken),
+        "x-dsh-schema-revision": String(SCHEMA_REVISION),
         ...request.headers,
         ...(idempotencyKey === undefined ? {} : { "x-dsh-request-id": idempotencyKey }),
         ...(encodedBody === undefined ? {} : {
@@ -802,10 +856,123 @@ export class DSHAnywhereConnector {
   private async emitCommandResult(command: CommandEnvelope, response: unknown,
                                   sessionSnapshotGeneration?: number,
                                   workspaceCatalogGeneration?: number): Promise<void> {
+    if (command.type === "configuration.read" || command.type === "configuration.update" || command.type === "configuration.discover") {
+      const event = command.type === "configuration.read" ? { type: "configuration.result" as const, payload: ConfigurationResultSchema.parse(response) }
+        : command.type === "configuration.discover" ? { type: "configuration.models" as const, payload: ConfigurationModelsSchema.parse(response) }
+        : { type: "configuration.updated" as const, payload: ConfigurationUpdatedSchema.parse(response) };
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId, machineId: this.config.machineId, deviceId: command.deviceId,
+        sequence: ++this.sequence, timestamp: Date.now(), ...event });
+      return;
+    }
+    if (command.type === "schedule.get") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId, machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(), type: "schedule.projection", payload: ScheduleProjectionSchema.parse(response) });
+      return;
+    }
+    if (command.type === "session.search" || command.type === "conversation.search" || command.type === "history.read") {
+      const event = command.type === "history.read" ? { type: "history.page" as const, payload: HistoryPageSchema.parse(response) }
+        : { type: "search.results" as const, payload: SearchResultsSchema.parse(response) };
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId, machineId: this.config.machineId, deviceId: command.deviceId,
+        ...(command.sessionId === undefined ? {} : { sessionId: command.sessionId }), sequence: ++this.sequence, timestamp: Date.now(), ...event });
+      return;
+    }
+    if (command.type === "reference.list") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId, machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(), type: "reference.candidates", payload: ReferenceCandidatesSchema.parse(response) });
+      return;
+    }
+    if (command.type === "feedback.list" || command.type === "feedback.update") {
+      const event = command.type === "feedback.list"
+        ? { type: "feedback.state" as const, payload: FeedbackStateSchema.parse(response) }
+        : { type: "feedback.updated" as const, payload: FeedbackUpdatedSchema.parse(response) };
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId, machineId: this.config.machineId,
+        deviceId: command.deviceId, sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(), ...event });
+      return;
+    }
+    if (command.type === "execution.list") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId, sessionId: requireSessionId(command),
+        sequence: ++this.sequence, timestamp: Date.now(), type: "execution.page", payload: ExecutionPagePayloadSchema.parse(response) });
+      return;
+    }
+    if (command.type === "workspace.files" || command.type === "workspace.bytes") {
+      const event = command.type === "workspace.files"
+        ? { type: "workspace.files" as const, payload: WorkspaceFilesPayloadSchema.parse(response) }
+        : { type: "workspace.bytes" as const, payload: WorkspaceBytesPayloadSchema.parse(response) };
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId, sessionId: requireSessionId(command),
+        sequence: ++this.sequence, timestamp: Date.now(), ...event });
+      return;
+    }
+    if (command.type === "goal.get" || command.type === "goal.update") {
+      const event = command.type === "goal.get"
+        ? { type: "goal.state" as const, payload: GoalChangedPayloadSchema.parse(response) }
+        : { type: "goal.updated" as const, payload: GoalUpdatedPayloadSchema.parse(response) };
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId, sessionId: requireSessionId(command),
+        sequence: ++this.sequence, timestamp: Date.now(), ...event });
+      return;
+    }
+    if (command.type === "decisions.list") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sequence: ++this.sequence, timestamp: Date.now(), type: "decisions.snapshot",
+        payload: DecisionsSnapshotPayloadSchema.parse(response) });
+      return;
+    }
     if (command.type === "session.open") {
       // The bridge publishes the requested historical events over its existing
       // event socket. There is no extra command-result card for opening a
       // conversation; the phone only needs the transcript events themselves.
+      return;
+    }
+    if (command.type === "command.catalog") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(),
+        type: "command.catalog", payload: CommandCatalogPayloadSchema.parse(response) });
+      return;
+    }
+    if (command.type === "subagent.catalog") {
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(),
+        type: "subagent.catalog", payload: SubagentCatalogPayloadSchema.parse(response) });
+      return;
+    }
+    if (command.type === "subagent.prompt" || command.type === "subagent.interrupt") {
+      const data = asRecord(response);
+      if (data.accepted !== true || (command.type === "subagent.prompt" &&
+        (typeof data.messageId !== "string" || data.messageId.length === 0))) {
+        throw new BridgeRequestError(502, "subagent control was not acknowledged");
+      }
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(),
+        type: "subagent.receipt", payload: { parentSessionId: command.payload.parentSessionId,
+          childSessionId: requireSessionId(command), requestId: command.requestId,
+          action: command.type === "subagent.prompt" ? "prompt" : "interrupt",
+          ...(command.type === "subagent.prompt" ? { messageId: data.messageId as string } : {}) } });
+      return;
+    }
+    if (command.type === "queue.update") {
+      if (asRecord(response).accepted !== true) throw new BridgeRequestError(502, "queue update was not acknowledged");
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: requireSessionId(command), sequence: ++this.sequence, timestamp: Date.now(),
+        type: "queue.updated", payload: { sessionId: requireSessionId(command), itemId: command.payload.itemId, requestId: command.requestId } });
+      return;
+    }
+    if (command.type === "session.fork") {
+      const data = asRecord(response);
+      if (typeof data.sessionId !== "string" || data.sessionId.length === 0) {
+        throw new BridgeRequestError(502, "bridge fork response lacks sessionId");
+      }
+      this.sendEvent({ version: PROTOCOL_VERSION, messageId: command.requestId,
+        machineId: this.config.machineId, deviceId: command.deviceId,
+        sessionId: data.sessionId, sequence: ++this.sequence, timestamp: Date.now(),
+        type: "session.forked", payload: { sessionId: data.sessionId,
+          parentSessionId: requireSessionId(command), requestId: command.requestId } });
       return;
     }
     if (command.type === "prompt.send") {
@@ -1201,7 +1368,8 @@ export class DSHAnywhereConnector {
       // dispatchCommand, so session.create is definitely unaccepted too.
       (error.status >= 500 && error.outcome === "retryable")
     );
-    const readOnly = ["session.list", "workspace.catalog", "directory.list", "mode.catalog", "model.catalog"].includes(command.type);
+    const readOnly = ["session.list", "workspace.catalog", "directory.list", "mode.catalog", "model.catalog",
+      "command.catalog", "subagent.catalog", "decisions.list", "goal.get", "workspace.files", "workspace.bytes", "execution.list", "feedback.list", "reference.list", "session.search", "conversation.search", "history.read", "schedule.get", "configuration.read", "configuration.discover"].includes(command.type);
     const timedOut = error instanceof Error && error.name === "TimeoutError";
     const resultUnknown = !readOnly && !definitelyRejected && (
       (error instanceof Error && error.name === "TimeoutError")
@@ -1210,7 +1378,15 @@ export class DSHAnywhereConnector {
       || (error instanceof BridgeRequestError && error.outcome === "retryable-durable")
       || command.type === "session.create"
     );
-    const reason = resultUnknown
+    const configuration = command.type === "configuration.read" || command.type === "configuration.update" || command.type === "configuration.discover";
+    const reason = configuration ? resultUnknown ? "保存结果尚未确认，请保留原请求，检查电脑状态后重试"
+      : command.type === "configuration.discover" && error instanceof BridgeRequestError && error.status === 501 ? "此服务暂不提供模型发现，可返回配置手动编辑模型列表"
+      : error instanceof BridgeRequestError && error.status === 426 ? "电脑端组件版本不匹配，请一并更新 Connector 与 Bridge"
+      : error instanceof BridgeRequestError && error.status === 409 ? "配置已在其他端更新，请刷新并合并；你的修改已保留"
+      : error instanceof BridgeRequestError && error.status === 403 ? "当前配置或凭据来源只读，无法从手机保存"
+      : error instanceof BridgeRequestError && (error.status === 501 || error.status === 404) ? "当前电脑尚未提供此配置能力，请更新 Harness 与 Bridge"
+      : "电脑配置请求失败，请检查字段格式、隐藏凭据和电脑端状态"
+      : resultUnknown
       ? "Local operation did not confirm completion before the deadline; its result is unknown"
       : readOnly && timedOut
         ? `Local DSH bridge read timed out (${command.type}); please retry`
@@ -1239,6 +1415,7 @@ export class DSHAnywhereConnector {
       payload: {
         code: resultUnknown ? "bridge-result-unknown" : "bridge-request-failed",
         message: reason,
+        ...(configuration && error instanceof BridgeRequestError ? { httpStatus: error.status } : {}),
         // A retry keeps this request id. The Bridge's idempotency layer then
         // either starts an unaccepted request after recovery or returns the
         // result of a side effect that was already accepted.
@@ -1429,16 +1606,17 @@ export class DSHAnywhereConnector {
       payload,
       sequence: ++this.sequence,
     });
-    this.rememberEvent(body);
+    const ephemeralFile = body.type === "workspace.files" || body.type === "workspace.bytes" || body.type === "execution.page" || body.type === "feedback.state" || body.type === "reference.candidates" || body.type === "search.results" || body.type === "history.page" || body.type === "configuration.result" || body.type === "configuration.updated" || body.type === "configuration.models" || body.type === "configuration.invalidated";
+    if (!ephemeralFile) this.rememberEvent(body);
     if (commandRequestId !== undefined) {
       this.rememberCommandResult(commandKey(body.machineId, body.deviceId, commandRequestId), body);
     }
     const relay = this.relay;
-    if (relay === undefined || relay.readyState !== WebSocket.OPEN) {
+    if (relay === undefined || relay.readyState !== WebSocket.OPEN || !this.relayVerified) {
       // Cache the canonical event before placing it in the bounded transport
       // queue. A request result must remain replayable even if unrelated
       // offline events later evict their wire copies.
-      this.queueEvent(body);
+      if (!ephemeralFile) this.queueEvent(body);
       return;
     }
     // A bridge/command response carries its intended recipient in the event
@@ -1448,9 +1626,9 @@ export class DSHAnywhereConnector {
     this.sendRelayEvent(body, targetDeviceId ?? (body.deviceId === "broadcast" ? undefined : body.deviceId));
   }
 
-  private sendRelayEvent(body: EventEnvelope, targetDeviceId?: string): void {
+  private sendRelayEvent(body: EventEnvelope, targetDeviceId?: string, compatibilityDiagnostic = false): void {
     const relay = this.relay;
-    if (relay === undefined || relay.readyState !== WebSocket.OPEN) return;
+    if (relay === undefined || relay.readyState !== WebSocket.OPEN || (!this.relayVerified && !compatibilityDiagnostic)) return;
     if ((relay.bufferedAmount ?? 0) > MAX_RELAY_BUFFERED_BYTES) {
       relay.terminate?.();
       return;
@@ -1532,7 +1710,8 @@ export class DSHAnywhereConnector {
       // requests a fresh authoritative snapshot instead.
       if (event.type === "session.snapshot" || event.type === "workspace.catalog"
           || event.type === "workspace.created" || event.type === "mode.catalog"
-          || event.type === "directory.list") continue;
+          || event.type === "directory.list" || event.type === "decisions.snapshot"
+          || event.type === "workspace.files" || event.type === "workspace.bytes" || event.type === "execution.page" || event.type === "feedback.state" || event.type === "reference.candidates" || event.type === "search.results" || event.type === "history.page" || event.type === "configuration.result" || event.type === "configuration.updated" || event.type === "configuration.models" || event.type === "configuration.invalidated") continue;
       if (event.deviceId !== "broadcast" && event.deviceId !== targetDeviceId) continue;
       if (event.sequence > lastSequence) this.sendRelayEvent(event, targetDeviceId);
     }
@@ -1554,7 +1733,7 @@ export class DSHAnywhereConnector {
   }
 
   private flushPendingEvents(): void {
-    if (this.relay === undefined || this.relay.readyState !== WebSocket.OPEN) return;
+    if (this.relay === undefined || this.relay.readyState !== WebSocket.OPEN || !this.relayVerified) return;
     const pending = this.pendingEvents.splice(0);
     const dropped = this.pendingEventsDropped;
     this.pendingEventBytes = 0;
@@ -1611,6 +1790,23 @@ export class DSHAnywhereConnector {
     this.pairingCodeTimer = undefined;
   }
 
+  private clearRelayHandshakeTimer(): void {
+    if (this.relayHandshakeTimer !== undefined) clearTimeout(this.relayHandshakeTimer);
+    this.relayHandshakeTimer = undefined;
+  }
+
+  private rejectRelaySchema(socket: WebSocketLike): void {
+    this.relayVerified = false;
+    this.clearRelayHandshakeTimer();
+    const message = `Relay 协议版本过旧或未完成协商，请先升级 Relay 至 schemaRevision ${SCHEMA_REVISION} 或以上，再更新 Connector、Bridge 和 iOS App。此次连接尚未转发聊天与配置操作。`;
+    this.log("warn", message);
+    // The pinned v1 error shape is understood by old Relays. It contains no
+    // parity fields, allowing paired phones to see the upgrade requirement.
+    this.sendRelayEvent({ version: PROTOCOL_VERSION, messageId: randomUUID(), machineId: this.config.machineId, deviceId: "broadcast",
+      sequence: ++this.sequence, timestamp: Date.now(), type: "protocol.error", payload: { code: "relay-upgrade-required", message, retryable: false } }, undefined, true);
+    socket.close(4406, "Relay schema upgrade required");
+  }
+
   private startHeartbeat(socket: WebSocketLike): void {
     this.stopHeartbeat();
     this.awaitingPong = false;
@@ -1653,6 +1849,7 @@ export class DSHAnywhereConnector {
   }
 
   private clearTimers(): void {
+    this.clearRelayHandshakeTimer();
     if (this.relayTimer !== undefined) clearTimeout(this.relayTimer);
     if (this.bridgeTimer !== undefined) clearTimeout(this.bridgeTimer);
     this.relayTimer = undefined;
@@ -1679,8 +1876,73 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
       return {
         method: "POST",
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/open`,
-        body: { deviceId: command.deviceId },
+        body: { deviceId: command.deviceId,
+          ...(command.payload.parentSessionId === undefined ? {} : { parentSessionId: command.payload.parentSessionId }),
+          ...(command.payload.subagentMode === undefined ? {} : { subagentMode: command.payload.subagentMode }) },
       };
+    case "session.fork":
+      return { method: "POST", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/fork`,
+        headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
+    case "command.catalog":
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/commands` };
+    case "subagent.catalog":
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/subagents` };
+    case "decisions.list":
+      return { method: "GET", path: "/decisions" };
+    case "subagent.prompt":
+    case "subagent.interrupt":
+      return { method: "POST", path: `/sessions/${encodeURIComponent(command.payload.parentSessionId)}/subagents/${encodeURIComponent(requireSessionId(command))}/${command.type === "subagent.prompt" ? "prompt" : "interrupt"}`,
+        headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
+    case "queue.update":
+      return { method: "POST", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/queue`,
+        headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
+    case "goal.get":
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/goal` };
+    case "feedback.list":
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/feedback` };
+    case "reference.list": {
+      const query = new URLSearchParams(command.payload);
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/references?${query.toString()}` };
+    }
+    case "session.search":
+    case "conversation.search":
+    case "history.read": {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(command.payload)) query.set(key, String(value));
+      const path = command.type === "session.search" ? "/search" : `/sessions/${encodeURIComponent(requireSessionId(command))}/${command.type === "history.read" ? "history" : "search"}`;
+      return { method: "GET", path: `${path}?${query.toString()}` };
+    }
+    case "schedule.get": {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(command.payload)) query.set(key, String(value));
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/schedules?${query.toString()}` };
+    }
+    case "configuration.read": {
+      const query = new URLSearchParams({ section: command.payload.section });
+      if (command.payload.section === "credentials") query.set("refs", JSON.stringify(command.payload.refs));
+      return { method: "GET", path: `/configuration?${query.toString()}` };
+    }
+    case "configuration.discover":
+      return { method: "POST", path: "/configuration/discover", body: command.payload };
+    case "configuration.update":
+      return { method: "POST", path: "/configuration", headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
+    case "feedback.update":
+      return { method: "POST", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/feedback`,
+        headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
+    case "execution.list": {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(command.payload)) query.set(key, String(value));
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/execution?${query.toString()}` };
+    }
+    case "workspace.files":
+    case "workspace.bytes": {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(command.payload)) query.set(key, String(value));
+      return { method: "GET", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/workspace/${command.type === "workspace.files" ? "files" : "bytes"}?${query.toString()}` };
+    }
+    case "goal.update":
+      return { method: "POST", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/goal`,
+        headers: { "x-dsh-origin-device-id": command.deviceId }, body: command.payload };
     case "session.create":
       return {
         method: "POST",
@@ -1725,6 +1987,8 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         path: `/questions/${encodeURIComponent(command.payload.questionId)}/answer`,
         body: { answers: command.payload.answers },
       };
+    case "question.cancel":
+      return { method: "POST", path: `/questions/${encodeURIComponent(command.payload.questionId)}/cancel`, body: {} };
     case "session.archive":
       return {
         method: "POST",
@@ -1803,8 +2067,13 @@ export function bridgeTimeoutFor(command: CommandEnvelope): number {
     // operation cannot be reported as failed while it is still executing.
     case "session.create":
     case "session.open":
+    case "session.fork":
     case "command.execute":
+    case "subagent.prompt":
+    case "subagent.interrupt":
+    case "goal.update":
     case "permission.set":
+    case "feedback.update":
     case "attachment.upload":
     case "workspace.create":
     case "workspace.delete":
@@ -1815,7 +2084,9 @@ export function bridgeTimeoutFor(command: CommandEnvelope): number {
 }
 
 export function relayConnectURL(relayURL: string): string {
-  return new URL("v1/connect", trailingSlash(relayURL)).toString();
+  const url = new URL("v1/connect", trailingSlash(relayURL));
+  url.searchParams.set("schemaRevision", String(SCHEMA_REVISION));
+  return url.toString();
 }
 
 export function bridgeEventsURL(bridgeBaseURL: string, connectorInstanceId?: string,
@@ -1883,8 +2154,9 @@ function isSessionProjectionMutation(command: CommandEnvelope): boolean {
 }
 
 function requiresDevicePresence(command: CommandEnvelope): boolean {
-  return command.type === "session.create" || command.type === "attachment.upload"
-    || command.type === "command.execute" || command.type === "workspace.create";
+  return command.type === "session.create" || command.type === "session.fork" || command.type === "attachment.upload"
+    || command.type === "command.execute" || command.type === "workspace.create" || command.type === "queue.update"
+    || command.type === "subagent.prompt" || command.type === "subagent.interrupt" || command.type === "goal.update" || command.type === "feedback.update" || command.type === "configuration.update" || command.type === "configuration.discover";
 }
 
 function trailingSlash(value: string): string {

@@ -1,6 +1,18 @@
 import { randomBytes } from 'node:crypto'
 import type { QuestionAnswerItem } from '@dsh-anywhere/protocol'
 
+/** The host user-question seam restores this wire-safe error into its own
+ * UserQuestionError instance, preserving the plan tool's ASK_CANCELLED path. */
+export class QuestionCancelledError extends Error {
+  readonly code = 'ASK_CANCELLED'
+  constructor() { super('The user dismissed the question to continue the conversation'); this.name = 'UserQuestionError' }
+}
+
+export function isQuestionCancellation(value: unknown): boolean {
+  return value instanceof Error && value.name === 'UserQuestionError' &&
+    'code' in value && value.code === 'ASK_CANCELLED'
+}
+
 interface PendingQuestion {
   readonly resolve: (answers: readonly QuestionAnswerItem[]) => void
   readonly reject: (error: Error) => void
@@ -60,6 +72,7 @@ export class PendingQuestions {
     item.reject(error)
     return true
   }
+  cancel(id: string): boolean { return this.reject(id, new QuestionCancelledError()) }
 
   rejectAll(error: Error): void {
     for (const id of [...this.pending.keys()]) this.reject(id, error)
@@ -106,7 +119,7 @@ export async function firstAnswered<T>(
   browser: Promise<T>,
   isAnswer: (value: T) => boolean = () => true,
 ): Promise<T | undefined> {
-  return await new Promise<T | undefined>((resolve) => {
+  return await new Promise<T | undefined>((resolve, reject) => {
     let phoneOpen = true
     let browserOpen = true
     const resolveIfBothClosed = (): void => {
@@ -118,7 +131,8 @@ export async function firstAnswered<T>(
         if (answer === undefined || !isAnswer(answer)) resolveIfBothClosed()
         else resolve(answer)
       },
-      () => {
+      (error: unknown) => {
+        if (isQuestionCancellation(error)) { reject(error); return }
         phoneOpen = false
         resolveIfBothClosed()
       },
@@ -129,7 +143,8 @@ export async function firstAnswered<T>(
         if (isAnswer(answer)) resolve(answer)
         else resolveIfBothClosed()
       },
-      () => {
+      (error: unknown) => {
+        if (isQuestionCancellation(error)) { reject(error); return }
         browserOpen = false
         resolveIfBothClosed()
       },

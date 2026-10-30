@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP, type AddressInfo } from "node:net";
 import {
   PROTOCOL_VERSION,
+  SCHEMA_REVISION,
   CommandEnvelopeSchema,
   EventEnvelopeSchema,
   RelayErrorMessageSchema,
@@ -49,8 +50,13 @@ const DEFAULT_ENROLLMENT_RATE_LIMIT = 5;
  *    acknowledgement can be replayed without inferring identity from text.
  * 10: added Relay lease generation/epoch metadata for Bridge presence
  *     ownership and Bridge reconnect cursor recovery.
+ * 11: native collaboration state/control, command and skill catalogs, fork,
+ *     workflows, decision recovery, execution records, workspace file transfer,
+ *     structured tool outcomes, per-answer feedback and native references.
+ *     Attachment hostPath is optional but requires a matching Relay schema.
+ * 12: Native goal creation via goal.update action=create and its receipt.
  */
-const RELAY_SCHEMA_REVISION = 10;
+const RELAY_SCHEMA_REVISION = SCHEMA_REVISION;
 
 /**
  * Deployment date shown on /health. The docker image bakes the build day
@@ -246,11 +252,11 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
       return;
     }
     wss.handleUpgrade(request, socket, head, (ws) => {
-      void connect(ws, principal);
+      void connect(ws, principal, url.searchParams.has("schemaRevision"));
     });
   });
 
-  const connect = async (ws: WebSocket, principal: RelayPrincipal): Promise<void> => {
+  const connect = async (ws: WebSocket, principal: RelayPrincipal, negotiatedSchema = false): Promise<void> => {
     const connection: RelayConnection = { id: randomUUID(), ws, principal };
     const pendingMessages: RawData[] = [];
     let pendingMessageBytes = 0;
@@ -323,6 +329,7 @@ export async function createRelayServer(options: RelayServerOptions): Promise<Ru
     pendingMessageBytes = 0;
     send(connection, {
       type: "relay.ready",
+      ...(negotiatedSchema ? { schemaRevision: RELAY_SCHEMA_REVISION } : {}),
       machineId: principal.machineId,
       role: principal.role,
       connectionId: connection.id,

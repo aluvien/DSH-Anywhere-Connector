@@ -929,3 +929,21 @@ private func remotePointMapper(in rect: CGRect) -> (_ x: CGFloat, _ y: CGFloat) 
                 y: rect.minY + (y / 32) * rect.height)
     }
 }
+
+/// Continuous frosted surface for the entire conversation dock, including the
+/// spaces between its controls. Keep the material at full strength so only
+/// blurred background colors, rather than readable transcript glyphs, show through.
+struct DSHComposerBackdrop: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        Group {
+            if reduceTransparency {
+                Color(.systemBackground)
+            } else {
+                Rectangle().fill(.regularMaterial)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}

@@ -12,34 +12,35 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("电脑端") { NavigationLink { DSHComputerConfigurationView().environmentObject(model) } label: { Label("模型、凭据与插件配置", systemImage: "server.rack") } }
                 Section("Sessions") {
                     Toggle(isOn: Binding(
                         get: { model.groupsSessionsByWorkspace },
-                        set: model.setGroupsSessionsByWorkspace
+                        set: { model.setGroupsSessionsByWorkspace($0) }
                     )) {
                         Label("Group by workspace", systemImage: "square.grid.2x2")
                     }
                     Toggle(isOn: Binding(
                         get: { model.showArchivedSessions },
-                        set: model.setShowArchived
+                        set: { model.setShowArchived($0) }
                     )) {
                         Label("Show archived", systemImage: "archivebox")
                     }
                     Toggle(isOn: Binding(
                         get: { model.collapseComposerControls },
-                        set: model.setCollapseComposerControls
+                        set: { model.setCollapseComposerControls($0) }
                     )) {
                         Label("Collapse composer controls", systemImage: "rectangle.compress.vertical")
                     }
                     Toggle(isOn: Binding(
                         get: { model.showUsageFooter },
-                        set: model.setShowUsageFooter
+                        set: { model.setShowUsageFooter($0) }
                     )) {
                         Label("Show session usage", systemImage: "chart.bar.xaxis")
                     }
                     Toggle(isOn: Binding(
                         get: { model.showMessageActionsByDefault },
-                        set: model.setShowMessageActionsByDefault
+                        set: { model.setShowMessageActionsByDefault($0) }
                     )) {
                         Label("Show message actions by default", systemImage: "ellipsis.circle")
                     }

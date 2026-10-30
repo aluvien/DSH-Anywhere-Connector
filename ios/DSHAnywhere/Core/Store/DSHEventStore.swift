@@ -9,6 +9,29 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var toolsBySession: [String: [DSHToolActivity]] = [:]
     public var pendingApprovals: [DSHApprovalRequest] = []
     public var pendingQuestions: [DSHQuestionRequest] = []
+    public var decisionVersion: DSHDecisionVersion?
+    public var retiredDecisionEpochs: [String]?
+    public var planBySession: [String: DSHPlanState]?
+    public var planProjections: [String: DSHPlanProjection]?
+    public var retiredPlanEpochs: [String: [String]]?
+    public var todoBySession: [String: DSHTodoState]?
+    public var workflowsBySession: [String: [DSHWorkflowRun]]?
+    public var executionBySession: [String: [DSHExecutionRecord]]?
+    public var historyCoverage: [String: DSHHistoryCoverage]?
+    public var schedulesBySession: [String: DSHScheduleProjection]?
+    public var retiredScheduleEpochs: [String: [String]]?
+    public var feedbackBySession: [String: DSHFeedbackState]?
+    public var feedbackReceipts: [String: DSHFeedbackReceipt]?
+    public var jobsBySession: [String: DSHJobsState]?
+    public var serverQueues: [String: DSHServerQueue]?
+    public var queueReceipts: [String: DSHQueueUpdated]?
+    public var subagentCatalogs: [String: DSHSubagentCatalog]?
+    public var subagentReceipts: [String: DSHSubagentReceipt]?
+    public var forksByRequestID: [String: DSHSessionForked]?
+    public var commandCatalogs: [String: DSHCommandCatalog]?
+    public var goalBySession: [String: DSHGoalState]?
+    public var liveGoalSessions: Set<String>?
+    public var goalReceipts: [String: DSHGoalUpdated]?
     public var turnStateBySession: [String: String] = [:]
     public var modelCatalog: DSHModelCatalog?
     /// Workspace and mode catalogs are complete, remote-owned lists. They are
@@ -17,6 +40,10 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var modeCatalog: DSHModeCatalog?
     public var directoryListing: DSHDirectoryListing?
     public var usageBySession: [String: DSHSessionUsage] = [:]
+    public var historyUsageBySession: [String: DSHHistoryUsage]?
+    public var pendingSessionHistory: [String: DSHPendingSessionHistory]?
+    public var retiredHistoryBatches: [String: [String]]?
+    public var historyFailures: [String: String]?
     public var permissionBySession: [String: DSHPermissionUpdate] = [:]
     public var metadataBySession: [String: DSHSessionMetadataUpdate] = [:]
     public var modelChangesBySession: [String: [DSHModelChangeNotice]] = [:]
@@ -66,8 +93,103 @@ public struct DSHHistoryCarryOver: Codable, Sendable, Equatable {
     public var tools: [DSHToolActivity] = []
     public var commandResults: [DSHCommandResult] = []
     public var modelChanges: [DSHModelChangeNotice] = []
+    public var replayedTodo: DSHTodoState?
+    public var receivedLiveTodo: Bool?
 
     public init(batchId: String) { self.batchId = batchId }
+}
+
+/// A separate projection buffer lets overlapping transcript replays retain
+/// their existing carry behavior while statistics follow the newest batch.
+public struct DSHHistoryUsage: Codable, Sendable, Equatable {
+    public var batchId: String
+    public var usage: DSHSessionUsage?
+    public var receivedLive = false
+}
+
+/// A per-session baseline plus staged wire events. Historical content becomes
+/// visible at one commit; live events continue on the visible state meanwhile.
+public struct DSHPendingSessionHistory: Codable, Sendable, Equatable {
+    public var batchId: String
+    public var baseline: DSHHistoryContent
+    public var historical: [DSHEnvelope] = []
+    public var live: [DSHEnvelope] = []
+}
+
+public struct DSHHistoryContent: Codable, Sendable, Equatable {
+    var messages: [DSHChatMessage]?
+    var tools: [DSHToolActivity]?
+    var commands: [DSHCommandResult]?
+    var models: [DSHModelChangeNotice]?
+    var attachments: [DSHUploadedAttachment]?
+    var workflows: [DSHWorkflowRun]?
+    var execution: [DSHExecutionRecord]?
+    var todo: DSHTodoState?
+    var goal: DSHGoalState?
+    var plan: DSHPlanState?
+    var planProjection: DSHPlanProjection?
+    var usage: DSHSessionUsage?
+    var permission: DSHPermissionUpdate?
+    var metadata: DSHSessionMetadataUpdate?
+    var liveGoal: Bool
+    init(_ state: DSHStoreState, session: String) {
+        messages = state.messagesBySession[session]
+        tools = state.toolsBySession[session]
+        commands = state.commandResultsBySession[session]
+        models = state.modelChangesBySession[session]
+        attachments = state.attachmentsBySession[session]
+        workflows = state.workflowsBySession?[session]
+        execution = state.executionBySession?[session]
+        todo = state.todoBySession?[session]
+        goal = state.goalBySession?[session]
+        plan = state.planBySession?[session]
+        planProjection = state.planProjections?[session]
+        usage = state.usageBySession[session]
+        permission = state.permissionBySession[session]
+        metadata = state.metadataBySession[session]
+        liveGoal = state.liveGoalSessions?.contains(session) == true
+    }
+    func restore(into state: inout DSHStoreState, session: String) {
+        state.messagesBySession[session] = messages
+        state.toolsBySession[session] = tools
+        state.commandResultsBySession[session] = commands
+        state.modelChangesBySession[session] = models
+        state.attachmentsBySession[session] = attachments
+        if workflows != nil || state.workflowsBySession != nil {
+            if state.workflowsBySession == nil { state.workflowsBySession = [:] }
+            state.workflowsBySession?[session] = workflows
+        }
+        if execution != nil || state.executionBySession != nil {
+            if state.executionBySession == nil { state.executionBySession = [:] }
+            state.executionBySession?[session] = execution
+        }
+        if todo != nil || state.todoBySession != nil {
+            if state.todoBySession == nil { state.todoBySession = [:] }
+            state.todoBySession?[session] = todo
+        }
+        if goal != nil || state.goalBySession != nil {
+            if state.goalBySession == nil { state.goalBySession = [:] }
+            state.goalBySession?[session] = goal
+        }
+        if plan != nil || state.planBySession != nil {
+            if state.planBySession == nil { state.planBySession = [:] }
+            state.planBySession?[session] = plan
+        }
+        if planProjection != nil || state.planProjections != nil {
+            if state.planProjections == nil { state.planProjections = [:] }
+            state.planProjections?[session] = planProjection
+        }
+        state.usageBySession[session] = usage
+        state.permissionBySession[session] = permission
+        state.metadataBySession[session] = metadata
+        if liveGoal {
+            if state.liveGoalSessions == nil { state.liveGoalSessions = [] }
+            state.liveGoalSessions?.insert(session)
+        }
+        if let usage, let index = state.sessions.firstIndex(where: { $0.id == session }) {
+            state.sessions[index].usage = usage
+        }
+    }
 }
 
 /// Pure, deterministic event reducer.  Keeping this separate from the
@@ -83,6 +205,21 @@ public struct DSHEventReducer: Sendable {
         case .transportState(let value):
             state.transportState = value
             if value != .connected {
+                for session in Array(state.pendingSessionHistory?.keys ?? Dictionary<String, DSHPendingSessionHistory>().keys) {
+                    abandonHistory(session: session, into: &state)
+                }
+                state.historyUsageBySession = nil
+            }
+            if value != .connected {
+                state.liveGoalSessions = nil
+                for (id, _) in state.planProjections ?? [:] { state.planProjections?[id]?.available = false }
+                for id in (state.schedulesBySession ?? [:]).keys { state.schedulesBySession?[id]?.available = false }
+                for (id, queue) in state.serverQueues ?? [:] {
+                    state.serverQueues?[id] = DSHServerQueue(sessionId: id, available: false, items: queue.items)
+                }
+                for (sessionId, jobs) in state.jobsBySession ?? [:] {
+                    state.jobsBySession?[sessionId] = DSHJobsState(sessionId: sessionId, available: false, jobs: jobs.jobs)
+                }
                 state.machineOnline = false
                 state.confirmedMachinePresence = nil
                 state.bridgeReachable = nil
@@ -90,6 +227,17 @@ public struct DSHEventReducer: Sendable {
             }
             return true
         case .machinePresence(let online):
+            if !online {
+                state.liveGoalSessions = nil
+                for (id, _) in state.planProjections ?? [:] { state.planProjections?[id]?.available = false }
+                for id in (state.schedulesBySession ?? [:]).keys { state.schedulesBySession?[id]?.available = false }
+                for (id, queue) in state.serverQueues ?? [:] {
+                    state.serverQueues?[id] = DSHServerQueue(sessionId: id, available: false, items: queue.items)
+                }
+                for (sessionId, jobs) in state.jobsBySession ?? [:] {
+                    state.jobsBySession?[sessionId] = DSHJobsState(sessionId: sessionId, available: false, jobs: jobs.jobs)
+                }
+            }
             state.confirmedMachinePresence = online
             if !online || !state.machineOnline { state.bridgeReachable = nil }
             state.machineOnline = online
@@ -116,6 +264,47 @@ public struct DSHEventReducer: Sendable {
         // an old event must not duplicate a message or roll state backwards.
         guard event.sequence > state.lastSequence else { return false }
         state.lastSequence = event.sequence
+
+        if case .historyStarted(let batch) = event.kind {
+            if state.pendingSessionHistory?[batch.sessionId]?.batchId == batch.batchId { return true }
+            state.retiredHistoryBatches?[batch.sessionId]?.removeAll { $0 == batch.batchId }
+            if let old = state.pendingSessionHistory?[batch.sessionId], old.batchId != batch.batchId {
+                retireHistory(old.batchId, session: batch.sessionId, into: &state)
+            }
+            if state.pendingSessionHistory == nil { state.pendingSessionHistory = [:] }
+            let baseline = DSHHistoryContent(state, session: batch.sessionId)
+            state.pendingSessionHistory?[batch.sessionId] = DSHPendingSessionHistory(
+                batchId: batch.batchId, baseline: baseline)
+            state.historyFailures?.removeValue(forKey: batch.sessionId)
+            var carry = DSHHistoryCarryOver(batchId: batch.batchId)
+            carry.messages = state.messagesBySession[batch.sessionId] ?? []
+            carry.tools = state.toolsBySession[batch.sessionId] ?? []
+            carry.commandResults = state.commandResultsBySession[batch.sessionId] ?? []
+            carry.modelChanges = state.modelChangesBySession[batch.sessionId] ?? []
+            state.historyCarryOverBySession[batch.sessionId] = carry
+            return true
+        }
+        if case .historyCompleted(let batch) = event.kind {
+            completeHistory(sessionId: batch.sessionId, batchId: batch.batchId, into: &state)
+            return true
+        }
+        let contentSession = event.envelope.sessionId ?? event.envelope.payload.executionObject["sessionId"]?.executionString
+        if let batch = event.envelope.historyBatchId, let session = contentSession {
+            if state.retiredHistoryBatches?[session]?.contains(batch) == true { return true }
+            if let pending = state.pendingSessionHistory?[session] {
+                if pending.batchId == batch { state.pendingSessionHistory?[session]?.historical.append(event.envelope) }
+                return true
+            }
+        } else if let session = contentSession, state.pendingSessionHistory?[session] != nil {
+            state.pendingSessionHistory?[session]?.live.append(event.envelope)
+        }
+        return apply(event, into: &state)
+    }
+
+    /// Page rows share one transport receipt but retain independent Native
+    /// positions. Never rewind the replay watermark to insert old history.
+    @discardableResult
+    private func apply(_ event: DSHEvent, into state: inout DSHStoreState) -> Bool {
 
         switch event.kind {
         case .connectionReady:
@@ -218,8 +407,48 @@ public struct DSHEventReducer: Sendable {
                                                 timestamp: event.envelope.timestamp))
             }
             state.messagesBySession[sessionId] = messages
+        case .referenceCandidates:
+            break // Discovery replies live only in their requesting picker.
+        case .searchResults:
+            break
+        case .configurationResult, .configurationUpdated, .configurationInvalidated, .configurationModels:
+            break // Ephemeral, redacted configuration belongs to its requesting view.
+        case .historyWindow(let window):
+            guard window.isValid, event.envelope.sessionId == window.sessionId else { break }
+            if state.historyCoverage == nil { state.historyCoverage = [:] }
+            state.historyCoverage?[window.sessionId, default: .init()].include(window)
+        case .historyPage(let page):
+            guard let events = page.events(in: event.envelope) else { break }
+            for row in events { apply(row, into: &state) }
+            state.messagesBySession[page.sessionId] = dshHistoryOrder(state.messagesBySession[page.sessionId] ?? [], native: { $0.nativeSequence })
+            if state.historyCoverage == nil { state.historyCoverage = [:] }
+            state.historyCoverage?[page.sessionId, default: .init()].include(page.window)
+        case .feedbackState(let snapshot):
+            guard snapshot.nativeSequence >= (state.feedbackBySession?[snapshot.sessionId]?.nativeSequence ?? -1) else { break }
+            if state.feedbackBySession == nil { state.feedbackBySession = [:] }
+            state.feedbackBySession?[snapshot.sessionId] = snapshot
+        case .feedbackChanged(let change):
+            guard change.item == nil || change.item?.messageId == change.messageId else { break }
+            var snapshot = state.feedbackBySession?[change.sessionId] ?? DSHFeedbackState(sessionId: change.sessionId, items: [], nativeSequence: -1)
+            guard change.nativeSequence > snapshot.nativeSequence else { break }
+            snapshot.items.removeAll { $0.messageId == change.messageId }
+            if let item = change.item { snapshot.items.append(item) }
+            snapshot.nativeSequence = change.nativeSequence
+            if state.feedbackBySession == nil { state.feedbackBySession = [:] }
+            state.feedbackBySession?[change.sessionId] = snapshot
+        case .feedbackUpdated(let receipt):
+            if state.feedbackReceipts == nil { state.feedbackReceipts = [:] }
+            state.feedbackReceipts?[receipt.requestId] = receipt
         case .toolStarted(let tool):
             var stamped = tool
+            if let existing = event.envelope.sessionId.flatMap({ state.toolsBySession[$0]?.first { $0.id == tool.id } }), existing.status != "running" {
+                stamped = existing
+                if stamped.arguments == nil { stamped.arguments = tool.detail }
+                if stamped.startedAt == nil { stamped.startedAt = tool.startedAt }
+                if let native = tool.nativeSequence { stamped.nativeSequence = min(stamped.nativeSequence ?? native, native) }
+                appendOrReplace(stamped, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
+                break
+            }
             // The start payload's detail carries the call arguments: keep a
             // copy so the row title ("读取 · path") survives the completion,
             // which replaces detail with the result text.
@@ -242,25 +471,42 @@ public struct DSHEventReducer: Sendable {
                 .first { $0.id == tool.id }
             if let existing {
                 stamped.sequence = existing.sequence
+                if let native = existing.nativeSequence { stamped.nativeSequence = min(stamped.nativeSequence ?? native, native) }
                 // The completion replaces detail with the result text; carry
                 // the call arguments forward for the row title.
                 if stamped.arguments == nil { stamped.arguments = existing.arguments }
+                if stamped.startedAt == nil { stamped.startedAt = existing.startedAt }
+                if stamped.parentCallId == nil { stamped.parentCallId = existing.parentCallId }
+                if stamped.rootCallId == nil { stamped.rootCallId = existing.rootCallId }
+                if stamped.finishedAt == nil { stamped.finishedAt = existing.finishedAt }
+                if stamped.resultMeta == nil { stamped.resultMeta = existing.resultMeta }
+                if stamped.resultContent == nil { stamped.resultContent = existing.resultContent }
+                if stamped.error == nil { stamped.error = existing.error }
+                if stamped.attachments == nil { stamped.attachments = existing.attachments }
             } else {
                 stamped.sequence = event.envelope.sequence
             }
             appendOrReplace(stamped, in: &state.toolsBySession, sessionId: event.envelope.sessionId)
         case .approvalRequested(let approval):
+            guard acceptDecisionVersion(approval.stateVersion, into: &state) else { return false }
             if !state.pendingApprovals.contains(where: { $0.id == approval.id }) {
                 state.pendingApprovals.append(approval)
             }
         case .approvalResolved(let resolution):
+            guard acceptDecisionVersion(resolution.stateVersion, into: &state) else { return false }
             state.pendingApprovals.removeAll { $0.id == resolution.id }
         case .questionAsked(let request):
+            guard acceptDecisionVersion(request.stateVersion, into: &state) else { return false }
             if !state.pendingQuestions.contains(where: { $0.id == request.id }) {
                 state.pendingQuestions.append(request)
             }
         case .questionResolved(let resolution):
+            guard acceptDecisionVersion(resolution.stateVersion, into: &state) else { return false }
             state.pendingQuestions.removeAll { $0.id == resolution.id }
+        case .decisionsSnapshot(let snapshot):
+            guard acceptDecisionVersion(snapshot.stateVersion, into: &state) else { return false }
+            state.pendingApprovals = snapshot.approvals
+            state.pendingQuestions = snapshot.questions
         case .turnStateChanged(let turn):
             // History replays describe a stored terminal state, not the
             // current live turn.  Applying it here can make a running turn
@@ -292,10 +538,14 @@ public struct DSHEventReducer: Sendable {
         case .directoryListing(let listing):
             state.directoryListing = listing
         case .usageUpdated(let update):
-            state.usageBySession[update.sessionId] = update.usage
-            if let index = state.sessions.firstIndex(where: { $0.id == update.sessionId }) {
-                state.sessions[index].usage = update.usage
+            if let batchID = event.envelope.historyBatchId {
+                if state.historyUsageBySession?[update.sessionId]?.batchId == batchID {
+                    state.historyUsageBySession?[update.sessionId]?.usage = update.usage
+                }
+                break
             }
+            state.historyUsageBySession?[update.sessionId]?.receivedLive = true
+            setUsage(update.usage, sessionID: update.sessionId, into: &state)
         case .permissionUpdated(let update):
             // Historical replay carries the permission that was in effect
             // for an older turn. It is useful to the history renderer but
@@ -372,6 +622,121 @@ public struct DSHEventReducer: Sendable {
             if let index = values.firstIndex(where: { $0.id == stamped.id }) { values[index] = stamped }
             else { values.append(stamped) }
             state.commandResultsBySession[stamped.sessionId] = values
+        case .planChanged(let plan):
+            if state.planBySession == nil { state.planBySession = [:] }
+            state.planBySession?[plan.sessionId] = plan
+        case .planProjection(let plan):
+            if state.retiredPlanEpochs?[plan.sessionId]?.contains(plan.epoch) == true { return false }
+            if let current = state.planProjections?[plan.sessionId] {
+                if current.epoch == plan.epoch, current.seq > plan.seq { return false }
+                if current.epoch != plan.epoch {
+                    if state.retiredPlanEpochs == nil { state.retiredPlanEpochs = [:] }
+                    let retired = Array(((state.retiredPlanEpochs?[plan.sessionId] ?? []) + [current.epoch]).suffix(32))
+                    state.retiredPlanEpochs?[plan.sessionId] = retired
+                }
+            }
+            if state.planProjections == nil { state.planProjections = [:] }
+            state.planProjections?[plan.sessionId] = plan
+        case .scheduleProjection(let snapshot):
+            if state.retiredScheduleEpochs?[snapshot.sessionId]?.contains(snapshot.epoch) == true { break }
+            if let current = state.schedulesBySession?[snapshot.sessionId] {
+                if current.epoch == snapshot.epoch, current.seq > snapshot.seq { break }
+                if current.epoch != snapshot.epoch {
+                    if state.retiredScheduleEpochs == nil { state.retiredScheduleEpochs = [:] }
+                    let retired = Array(((state.retiredScheduleEpochs?[snapshot.sessionId] ?? []) + [current.epoch]).suffix(32))
+                    state.retiredScheduleEpochs?[snapshot.sessionId] = retired
+                }
+            }
+            if state.schedulesBySession == nil { state.schedulesBySession = [:] }
+            state.schedulesBySession?[snapshot.sessionId] = snapshot
+        case .todoChanged(let todo):
+            if event.envelope.historyBatchId != nil {
+                // Historical edits describe one final dock state, not a live
+                // animation of every past task list. Late replay rows cannot
+                // replace a newer live update or a completed batch.
+                if var carry = state.historyCarryOverBySession[todo.sessionId] {
+                    carry.replayedTodo = todo
+                    state.historyCarryOverBySession[todo.sessionId] = carry
+                }
+                break
+            }
+            if state.historyCarryOverBySession[todo.sessionId] != nil {
+                state.historyCarryOverBySession[todo.sessionId]?.receivedLiveTodo = true
+            }
+            if state.todoBySession == nil { state.todoBySession = [:] }
+            state.todoBySession?[todo.sessionId] = todo
+        case .executionRecorded(let update):
+            mergeExecution([update.record], sessionID: update.sessionId,
+                           sequence: update.inTranscript == false ? nil : event.sequence, into: &state)
+        case .executionPage(let page):
+            mergeExecution(page.records, sessionID: page.sessionId, sequence: nil, into: &state)
+        case .workflowChanged(let update):
+            var runs = state.workflowsBySession?[update.sessionId] ?? []
+            let index = runs.firstIndex(where: { $0.id == update.run.id })
+            var run = update.run
+            run.sequence = index.flatMap { runs[$0].sequence }
+            if update.inTranscript != false, run.sequence == nil { run.sequence = event.envelope.sequence }
+            if let index, let currentSeq = runs[index].updatedNativeSequence,
+               currentSeq > (update.run.updatedNativeSequence ?? -1) {
+                if runs[index].sequence == nil, let sequence = run.sequence { runs[index].sequence = sequence }
+            } else if let index { runs[index] = run }
+            else { runs.append(run) }
+            if state.workflowsBySession == nil { state.workflowsBySession = [:] }
+            state.workflowsBySession?[update.sessionId] = runs
+        case .jobsChanged(let jobs):
+            if state.jobsBySession == nil { state.jobsBySession = [:] }
+            state.jobsBySession?[jobs.sessionId] = jobs
+        case .queueChanged(let queue):
+            if state.serverQueues == nil { state.serverQueues = [:] }
+            state.serverQueues?[queue.sessionId] = queue
+        case .queueUpdated(let receipt):
+            if state.queueReceipts == nil { state.queueReceipts = [:] }
+            state.queueReceipts?[receipt.requestId] = receipt
+        case .subagentCatalog(let catalog):
+            if state.subagentCatalogs == nil { state.subagentCatalogs = [:] }
+            state.subagentCatalogs?[catalog.parentSessionId] = catalog
+        case .subagentCatalogInvalidated:
+            break // Keep the list visible while the model refreshes its authoritative catalog.
+        case .subagentReceipt(let receipt):
+            if state.subagentReceipts == nil { state.subagentReceipts = [:] }
+            state.subagentReceipts?[receipt.requestId] = receipt
+        case .sessionForked(let fork):
+            if state.forksByRequestID == nil { state.forksByRequestID = [:] }
+            state.forksByRequestID?[fork.requestId] = fork
+        case .commandCatalog(let catalog):
+            if state.commandCatalogs == nil { state.commandCatalogs = [:] }
+            state.commandCatalogs?[catalog.sessionId] = catalog
+        case .commandCatalogInvalidated(let update):
+            if let sessionID = update.sessionId { state.commandCatalogs?.removeValue(forKey: sessionID) }
+            else { state.commandCatalogs = nil }
+        case .goalChanged(let goal):
+            if event.envelope.historyBatchId != nil, state.liveGoalSessions?.contains(goal.sessionId) == true { break }
+            if event.envelope.historyBatchId == nil {
+                if state.liveGoalSessions == nil { state.liveGoalSessions = [] }
+                state.liveGoalSessions?.insert(goal.sessionId)
+            }
+            applyGoal(goal, into: &state)
+        case .goalState(let goal):
+            if state.liveGoalSessions == nil { state.liveGoalSessions = [] }
+            state.liveGoalSessions?.insert(goal.sessionId)
+            applyGoal(goal, into: &state)
+        case .goalUpdated(let receipt):
+            if state.goalReceipts == nil { state.goalReceipts = [:] }
+            state.goalReceipts?[receipt.requestId] = receipt
+        case .goalActivation(let update):
+            if state.goalBySession?[update.sessionId]?.goal?.id == update.id,
+               state.goalBySession?[update.sessionId]?.goal?.revision == update.revision {
+                state.goalBySession?[update.sessionId]?.activation = update.activation
+                if event.envelope.historyBatchId == nil {
+                    if state.liveGoalSessions == nil { state.liveGoalSessions = [] }
+                    state.liveGoalSessions?.insert(update.sessionId)
+                }
+            }
+        case .goalRound(let update):
+            if var current = state.goalBySession?[update.sessionId], current.goal?.id == update.id {
+                current.roundsStarted = max(current.roundsStarted, update.round)
+                state.goalBySession?[update.sessionId] = current
+            }
         case .attachmentUploaded(let attachment):
             var values = state.attachmentsBySession[attachment.sessionId, default: []]
             if !values.contains(where: { $0.id == attachment.id }) { values.append(attachment) }
@@ -382,8 +747,12 @@ public struct DSHEventReducer: Sendable {
             break
         case .protocolError(let error):
             state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
-            if error.code == "bridge-request-failed" { state.bridgeReachable = false }
+            if error.code == "bridge-request-failed", error.retryable { state.bridgeReachable = false }
         case .historyStarted(let batch):
+            if state.historyUsageBySession == nil { state.historyUsageBySession = [:] }
+            state.historyUsageBySession?[batch.sessionId] = DSHHistoryUsage(batchId: batch.batchId)
+            state.planBySession?.removeValue(forKey: batch.sessionId)
+            if state.liveGoalSessions?.contains(batch.sessionId) != true { state.goalBySession?.removeValue(forKey: batch.sessionId) }
             // A replay rebuilds this session's transcript in stored order.
             // Set the rows seen so far aside (unpersisted live output) and
             // start from empty so replayed rows cannot renumber them.
@@ -416,12 +785,59 @@ public struct DSHEventReducer: Sendable {
             }
         case .historyCompleted(let batch):
             completeHistory(sessionId: batch.sessionId, batchId: batch.batchId, into: &state)
-        case .transportState, .machinePresence:
+        case .transportState, .machinePresence, .workspaceFiles, .workspaceBytes:
             break
         case .unknown:
             state.unknownEvents.append(event.envelope)
         }
         return true
+    }
+
+    private func mergeExecution(_ records: [DSHExecutionRecord], sessionID: String, sequence: Int64?, into state: inout DSHStoreState) {
+        var existing = state.executionBySession?[sessionID] ?? []
+        var indexes = Dictionary(uniqueKeysWithValues: existing.enumerated().map { ($0.element.id, $0.offset) })
+        for var record in records {
+            if let index = indexes[record.id] {
+                // Native durable records are immutable. A paged copy can add
+                // missing history, but cannot rewrite a live record's content.
+                if existing[index].sequence == nil { existing[index].sequence = sequence }
+            } else {
+                record.sequence = sequence
+                indexes[record.id] = existing.count
+                existing.append(record)
+            }
+        }
+        existing.sort { $0.nativeSequence < $1.nativeSequence }
+        if state.executionBySession == nil { state.executionBySession = [:] }
+        state.executionBySession?[sessionID] = existing
+    }
+
+    private func acceptDecisionVersion(_ version: DSHDecisionVersion?, into state: inout DSHStoreState) -> Bool {
+        guard let version else { return state.decisionVersion == nil }
+        if state.retiredDecisionEpochs?.contains(version.epoch) == true { return false }
+        if let current = state.decisionVersion {
+            if current.epoch == version.epoch {
+                guard version.revision >= current.revision else { return false }
+            } else {
+                state.retiredDecisionEpochs = Array(((state.retiredDecisionEpochs ?? []) + [current.epoch]).suffix(32))
+                state.pendingApprovals.removeAll()
+                state.pendingQuestions.removeAll()
+            }
+        }
+        state.decisionVersion = version
+        return true
+    }
+
+    private func applyGoal(_ goal: DSHGoalState, into state: inout DSHStoreState) {
+        var next = goal
+        if let current = state.goalBySession?[goal.sessionId], current.goal?.id == goal.goal?.id {
+            if let currentRevision = current.goal?.revision, let nextRevision = goal.goal?.revision,
+               currentRevision > nextRevision { return }
+            next.roundsStarted = max(current.roundsStarted, next.roundsStarted)
+            if current.goal?.revision == next.goal?.revision, next.activation == nil { next.activation = current.activation }
+        }
+        if state.goalBySession == nil { state.goalBySession = [:] }
+        state.goalBySession?[goal.sessionId] = next
     }
 
     private func upsert(_ session: DSHSessionSummary, into sessions: inout [DSHSessionSummary]) {
@@ -437,13 +853,75 @@ public struct DSHEventReducer: Sendable {
     /// whatever is open, which is what the app-level timeout does when the
     /// closing bracket never arrives.
     public func completeHistory(sessionId: String, batchId: String?, into state: inout DSHStoreState) {
+        if let pending = state.pendingSessionHistory?[sessionId] {
+            guard let batchId else { abandonHistory(session: sessionId, into: &state); return }
+            guard pending.batchId == batchId else { return }
+            var built = DSHStoreState()
+            pending.baseline.restore(into: &built, session: sessionId)
+            // Build privately using the same reducer semantics, without
+            // rewinding the live transport sequence or triggering UI effects.
+            let marker = DSHEvent(envelope: DSHEnvelope(messageId: batchId, deviceId: "history", machineId: "history",
+                sessionId: sessionId, historyBatchId: batchId, sequence: 0, type: "history.started",
+                payload: .object(["sessionId": .string(sessionId), "batchId": .string(batchId)])))
+            _ = apply(marker, into: &built)
+            for envelope in pending.historical { _ = apply(DSHEvent(envelope: envelope), into: &built) }
+            // Apply live deltas exactly once before closing the carry so
+            // deduplication and live-priority projections keep their semantics.
+            for envelope in pending.live { _ = apply(DSHEvent(envelope: envelope), into: &built) }
+            completeHistory(sessionId: sessionId, batchId: batchId, into: &built)
+            DSHHistoryContent(built, session: sessionId).restore(into: &state, session: sessionId)
+            state.pendingSessionHistory?.removeValue(forKey: sessionId)
+            state.historyCarryOverBySession.removeValue(forKey: sessionId)
+            state.historyUsageBySession?.removeValue(forKey: sessionId)
+            state.historyFailures?.removeValue(forKey: sessionId)
+            retireHistory(batchId, session: sessionId, into: &state)
+            return
+        }
+
+        if let pending = state.historyUsageBySession?[sessionId], batchId == nil || pending.batchId == batchId {
+            state.historyUsageBySession?.removeValue(forKey: sessionId)
+            if batchId != nil, !pending.receivedLive, let usage = pending.usage {
+                setUsage(usage, sessionID: sessionId, into: &state)
+            }
+        }
         guard let carry = state.historyCarryOverBySession[sessionId] else { return }
         if let batchId, carry.batchId != batchId { return }
         state.historyCarryOverBySession.removeValue(forKey: sessionId)
+        if batchId != nil, carry.receivedLiveTodo != true {
+            if let todo = carry.replayedTodo {
+                if state.todoBySession == nil { state.todoBySession = [:] }
+                state.todoBySession?[sessionId] = todo
+            } else {
+                state.todoBySession?.removeValue(forKey: sessionId)
+            }
+        }
         appendMissing(carry.messages, to: &state.messagesBySession[sessionId, default: []])
         appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
         appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
         appendMissingModelChanges(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
+    }
+
+    private func retireHistory(_ batch: String, session: String, into state: inout DSHStoreState) {
+        if state.retiredHistoryBatches == nil { state.retiredHistoryBatches = [:] }
+        let retired = Array(((state.retiredHistoryBatches?[session] ?? []) + [batch]).suffix(64))
+        state.retiredHistoryBatches?[session] = retired
+    }
+
+    public func abandonHistory(session: String, into state: inout DSHStoreState) {
+        if let pending = state.pendingSessionHistory?.removeValue(forKey: session) {
+            state.historyCarryOverBySession.removeValue(forKey: session)
+            state.historyUsageBySession?.removeValue(forKey: session)
+            retireHistory(pending.batchId, session: session, into: &state)
+            if state.historyFailures == nil { state.historyFailures = [:] }
+            state.historyFailures?[session] = "历史加载未完成，已保留当前内容，请重试。"
+        }
+    }
+
+    private func setUsage(_ usage: DSHSessionUsage, sessionID: String, into state: inout DSHStoreState) {
+        state.usageBySession[sessionID] = usage
+        if let index = state.sessions.firstIndex(where: { $0.id == sessionID }) {
+            state.sessions[index].usage = usage
+        }
     }
 
     private func appendMissing<T: Identifiable>(_ values: [T], to store: inout [T]) where T.ID: Equatable {

@@ -15,7 +15,17 @@ on the server itself; do not proxy this domain directly to one user's Mac.
 
 3. Add `nginx-location.conf` to the HTTPS server block for the Relay domain and
    reload Nginx.
-4. Verify `https://your-relay.example/health` returns `{ "ok": true }`.
+4. Verify `https://your-relay.example/health` returns `ok: true` and
+   `schemaRevision >= 12` before upgrading the computer components. Restarting
+   an old image without rebuilding does not update its protocol schema.
+
+Upgrade Relay first, then Connector and Bridge together, then the iOS app. New
+Connectors request schema negotiation on every WebSocket connection and keep
+messages and phone operations quarantined until the Relay confirms support. A
+missing or older revision produces a phone-visible upgrade diagnostic and
+reconnect backoff. New Bridges reject obsolete Connectors with HTTP 426 before
+HTTP mutation dispatch or WebSocket replay. Legacy Relay clients that omit the
+negotiation request retain the original greeting shape.
 
 When the two public installer URLs are configured, users install and register a
 computer without receiving the bootstrap token:
