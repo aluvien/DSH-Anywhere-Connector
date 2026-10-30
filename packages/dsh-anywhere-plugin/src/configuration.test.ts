@@ -34,6 +34,14 @@ describe('native computer configuration', () => {
     await expect(readConfiguration({ section: 'settings' }, async () => ({ ...snapshot, namespaces: [{ ...nativeNamespace, revision: 'bad' }] })))
       .rejects.toMatchObject({ status: 502 })
   })
+  it('accepts Native 0.2 preset inventory without removed origin classification', async () => {
+    const native = { managementAvailable: true, entries: [], agentPresets: [{ id: 'standard', isDefault: true,
+      rows: [{ entryId: null, moduleName: 'plugin', enabled: 'conditional', fiberPhase: null }] }] }
+    const result = await readConfiguration({ section: 'plugins' }, async () => native)
+    expect(result).toEqual({ section: 'plugins', value: { entries: [], agentPresets: [{
+      id: 'standard', isDefault: true, trust: 'user', rows: native.agentPresets[0]!.rows,
+    }] } })
+  })
   it('publishes only identifiers for raw/resolved settings, credentials, adapters and plugin lifecycle changes', () => {
     const handlers = new Map<string, (...args: unknown[]) => void>(), publish = vi.fn()
     observeConfigurationChanges((event, listener) => { handlers.set(event, listener) }, publish)

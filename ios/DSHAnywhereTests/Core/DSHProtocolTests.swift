@@ -95,9 +95,12 @@ private actor DSHFileLayoutTransport: DSHAppTransport {
     func removeMachine(_ machineId: String) async throws { }
     func pairedDevices() async throws -> [DSHRelayDevice] { [] }
     func revokeDevice(_ deviceId: String) async throws { }
-    private func emit(type: String, id: String, payload: DSHJSONValue, sessionID: String? = nil) {
+    func emitHistoryFrame(type: String, id: String, payload: DSHJSONValue, batch: String?) {
+        emit(type: type, id: id, payload: payload, sessionID: "preview-session", batch: batch)
+    }
+    private func emit(type: String, id: String, payload: DSHJSONValue, sessionID: String? = nil, batch: String? = nil) {
         sequence += 1
-        continuation?.yield(DSHEvent(envelope: DSHEnvelope(messageId: id, deviceId: "device", machineId: "machine", sessionId: sessionID, sequence: sequence, type: type, payload: payload)))
+        continuation?.yield(DSHEvent(envelope: DSHEnvelope(messageId: id, deviceId: "device", machineId: "machine", sessionId: sessionID, historyBatchId: batch, sequence: sequence, type: type, payload: payload)))
     }
 }
 
@@ -1680,6 +1683,72 @@ final class DSHConversationViewportTests: XCTestCase {
         XCTAssertEqual(dshReasoningIntensity(full, selectedEffortID: "xhigh"), 1)
         XCTAssertEqual(dshOrderedReasoningEfforts(full.reversed()).map(\.id), full.map(\.id))
         XCTAssertEqual(dshNearestReasoningEffortIndex(full, to: "ultra"), 5)
+    }
+
+    func testSlowHistoryLoadsOnceWithoutLiveTrailPlayback() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        for dark in [false, true] {
+            let suite = "atomic-history-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let profiles = DSHProfileStore(defaults: defaults)
+            profiles.upsert(DSHRemoteProfile(relayBaseURL: URL(string: "https://preview.invalid")!,
+                deviceId: "device", machineId: "machine", machineName: "Fixture Mac"))
+            var state = DSHAppModel.preview().state
+            state.messagesBySession["preview-session"] = []
+            state.toolsBySession["preview-session"] = []
+            state.turnStateBySession["preview-session"] = "running"
+            state.connectionState = .disconnected
+            state.transportState = .disconnected
+            let transport = DSHFileLayoutTransport()
+            let model = DSHAppModel(transport: transport, initialState: state, isPaired: true,
+                transactionDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(suite), profileStore: profiles)
+            model.machineID = "machine"
+            _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+            model.connect()
+            defer { model.disconnect(); defaults.removePersistentDomain(forName: suite) }
+            for _ in 0..<100 { if model.connectionState == .connected { break }; try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertEqual(model.connectionState, .connected)
+            let host = UIHostingController(rootView: NavigationStack {
+                ConversationView(sessionID: "preview-session").environmentObject(model)
+            })
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = host; window.makeKeyAndVisible()
+            func capture(_ phase: String) {
+                let shot = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                    window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                })
+                shot.name = "atomic-history-\(dark ? "dark" : "light")-\(phase)"
+                shot.lifetime = .keepAlways; add(shot)
+            }
+            let batch = "slow-\(dark)"
+            let marker: DSHJSONValue = .object(["sessionId": .string("preview-session"), "batchId": .string(batch)])
+            await transport.emitHistoryFrame(type: "history.started", id: batch, payload: marker, batch: batch)
+            try await Task.sleep(for: .milliseconds(350))
+            XCTAssertNotNil(model.state.pendingSessionHistory?["preview-session"], "The received batch must be registered before historical rows arrive")
+            capture("loading")
+            for n in 1...16 {
+                await transport.emitHistoryFrame(type: "assistant.message.completed", id: "old-\(n)", payload: .object([
+                    "id": .string("old-\(n)"), "role": .string("assistant"), "markdown": .string("历史记录 \(n)：正文只在历史就绪后一次显示。")]), batch: batch)
+                await transport.emitHistoryFrame(type: "tool.completed", id: "tool-\(n)", payload: .object([
+                    "id": .string("tool-\(n)"), "name": .string("bash"), "status": .string("completed"), "detail": .string("历史工具进度 \(n)")]), batch: batch)
+                try await Task.sleep(for: .milliseconds(80))
+                XCTAssertTrue(model.messages(for: "preview-session").isEmpty, "row \(n), pending=\(model.state.pendingSessionHistory?["preview-session"]?.batchId ?? "none"), seq=\(model.state.lastSequence)")
+                XCTAssertTrue(model.tools(for: "preview-session").isEmpty, "tool \(n)")
+                XCTAssertNil(DSHLiveTurnStatusProjection.trail(messages: model.messages(for: "preview-session"), tools: model.tools(for: "preview-session")))
+            }
+            capture("midway")
+            await transport.emitHistoryFrame(type: "turn.state.changed", id: "settled", payload: .object([
+                "sessionId": .string("preview-session"), "state": .string("idle")]), batch: nil)
+            await transport.emitHistoryFrame(type: "history.completed", id: "done", payload: marker, batch: batch)
+            for _ in 0..<100 { if model.messages(for: "preview-session").count == 16 { break }; try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertEqual(model.messages(for: "preview-session").count, 16)
+            XCTAssertEqual(model.tools(for: "preview-session").count, 16)
+            XCTAssertFalse(model.isLoadingHistory(for: "preview-session"))
+            try await Task.sleep(for: .milliseconds(400))
+            await settle(); capture("ready")
+        }
     }
 
     func testCompletedTaskSummaryAndNeutralTodoPreview() async throws {

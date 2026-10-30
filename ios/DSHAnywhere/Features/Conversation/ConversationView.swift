@@ -1174,12 +1174,12 @@ struct ConversationView: View {
     /// budget. Empty when everything is already shown.
     @ViewBuilder
     private func loadEarlierBanner(proxy: ScrollViewProxy) -> some View {
-        if hiddenSectionCount > 0 || model.historyCoverage(for: sessionID)?.nextBefore != nil || model.historyCoverage(for: sessionID) == nil {
+        if !model.isLoadingHistory(for: sessionID) && (hiddenSectionCount > 0 || model.historyCoverage(for: sessionID)?.nextBefore != nil || model.historyCoverage(for: sessionID) == nil) {
             // Scrolling to the very top pages automatically; appearing
             // without a disappear cycle does not refire, so this cannot loop.
             Color.clear
                 .frame(height: 1)
-                .onAppear { if hiddenSectionCount > 0 { loadEarlierSections(proxy: proxy) } }
+                .onAppear { if hiddenSectionCount > 0 && !isFollowingLatest { loadEarlierSections(proxy: proxy) } }
             HStack {
                 Spacer(minLength: 0)
                 Button {
@@ -1192,7 +1192,16 @@ struct ConversationView: View {
                 Spacer(minLength: 0)
             }
         }
-        if historyLoading { ProgressView("读取电脑历史…") }
+        if historyLoading || model.isLoadingHistory(for: sessionID) {
+            ProgressView(hasRenderedContent ? "正在同步历史…" : "正在读取历史…")
+                .frame(maxWidth: .infinity, minHeight: 44)
+        }
+        if let loadError = model.historyLoadError(for: sessionID) {
+            HStack {
+                Text(loadError).font(.caption).foregroundStyle(.secondary)
+                Button("重试") { model.openSession(sessionID) }
+            }
+        }
         if let historyError { Text(historyError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
     }
 
@@ -1281,7 +1290,7 @@ struct ConversationView: View {
                         .overlay { if highlightedSection == section.id { RoundedRectangle(cornerRadius: 12).stroke(Color.accentColor.opacity(0.6), lineWidth: 1).allowsHitTesting(false) } }
                 }
                 inlineDecisionCards()
-                if !hasRenderedContent {
+                if !hasRenderedContent && !model.isLoadingHistory(for: sessionID) {
                     emptyConversationState
                 }
                 bottomAnchorView()
@@ -1991,7 +2000,7 @@ struct ConversationView: View {
     private var liveTurnStatus: some View {
         VStack(alignment: .leading, spacing: 2) {
             TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                Text("深度求索中… \(liveElapsedText(now: context.date))")
+                Text(liveElapsedStart == nil ? "深度求索中…" : "深度求索中… \(liveElapsedText(now: context.date))")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Color.accentColor)
             }
@@ -2003,7 +2012,7 @@ struct ConversationView: View {
         }
         .padding(.horizontal, 4)
         .onAppear {
-            if turnStartedAt == nil { turnStartedAt = .now }
+            if turnStartedAt == nil && !model.isLoadingHistory(for: sessionID) { turnStartedAt = .now }
         }
     }
 
@@ -2021,6 +2030,7 @@ struct ConversationView: View {
            ms > 0 {
             return Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
         }
+        if model.isLoadingHistory(for: sessionID) { return nil }
         return turnStartedAt
     }
 
@@ -2037,7 +2047,7 @@ struct ConversationView: View {
     /// meaningful between Harness steps, rather than collapsing to a generic
     /// waiting label before the next event arrives.
     private var liveTrailText: String {
-        liveTurnTrail ?? "等待响应…"
+        liveTurnTrail ?? (model.isLoadingHistory(for: sessionID) ? "正在同步当前进度…" : "等待响应…")
     }
 
     /// Queue bubble above the input card, pinned right. One queued prompt

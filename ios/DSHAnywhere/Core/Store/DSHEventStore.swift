@@ -41,6 +41,9 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var directoryListing: DSHDirectoryListing?
     public var usageBySession: [String: DSHSessionUsage] = [:]
     public var historyUsageBySession: [String: DSHHistoryUsage]?
+    public var pendingSessionHistory: [String: DSHPendingSessionHistory]?
+    public var retiredHistoryBatches: [String: [String]]?
+    public var historyFailures: [String: String]?
     public var permissionBySession: [String: DSHPermissionUpdate] = [:]
     public var metadataBySession: [String: DSHSessionMetadataUpdate] = [:]
     public var modelChangesBySession: [String: [DSHModelChangeNotice]] = [:]
@@ -104,6 +107,91 @@ public struct DSHHistoryUsage: Codable, Sendable, Equatable {
     public var receivedLive = false
 }
 
+/// A per-session baseline plus staged wire events. Historical content becomes
+/// visible at one commit; live events continue on the visible state meanwhile.
+public struct DSHPendingSessionHistory: Codable, Sendable, Equatable {
+    public var batchId: String
+    public var baseline: DSHHistoryContent
+    public var historical: [DSHEnvelope] = []
+    public var live: [DSHEnvelope] = []
+}
+
+public struct DSHHistoryContent: Codable, Sendable, Equatable {
+    var messages: [DSHChatMessage]?
+    var tools: [DSHToolActivity]?
+    var commands: [DSHCommandResult]?
+    var models: [DSHModelChangeNotice]?
+    var attachments: [DSHUploadedAttachment]?
+    var workflows: [DSHWorkflowRun]?
+    var execution: [DSHExecutionRecord]?
+    var todo: DSHTodoState?
+    var goal: DSHGoalState?
+    var plan: DSHPlanState?
+    var planProjection: DSHPlanProjection?
+    var usage: DSHSessionUsage?
+    var permission: DSHPermissionUpdate?
+    var metadata: DSHSessionMetadataUpdate?
+    var liveGoal: Bool
+    init(_ state: DSHStoreState, session: String) {
+        messages = state.messagesBySession[session]
+        tools = state.toolsBySession[session]
+        commands = state.commandResultsBySession[session]
+        models = state.modelChangesBySession[session]
+        attachments = state.attachmentsBySession[session]
+        workflows = state.workflowsBySession?[session]
+        execution = state.executionBySession?[session]
+        todo = state.todoBySession?[session]
+        goal = state.goalBySession?[session]
+        plan = state.planBySession?[session]
+        planProjection = state.planProjections?[session]
+        usage = state.usageBySession[session]
+        permission = state.permissionBySession[session]
+        metadata = state.metadataBySession[session]
+        liveGoal = state.liveGoalSessions?.contains(session) == true
+    }
+    func restore(into state: inout DSHStoreState, session: String) {
+        state.messagesBySession[session] = messages
+        state.toolsBySession[session] = tools
+        state.commandResultsBySession[session] = commands
+        state.modelChangesBySession[session] = models
+        state.attachmentsBySession[session] = attachments
+        if workflows != nil || state.workflowsBySession != nil {
+            if state.workflowsBySession == nil { state.workflowsBySession = [:] }
+            state.workflowsBySession?[session] = workflows
+        }
+        if execution != nil || state.executionBySession != nil {
+            if state.executionBySession == nil { state.executionBySession = [:] }
+            state.executionBySession?[session] = execution
+        }
+        if todo != nil || state.todoBySession != nil {
+            if state.todoBySession == nil { state.todoBySession = [:] }
+            state.todoBySession?[session] = todo
+        }
+        if goal != nil || state.goalBySession != nil {
+            if state.goalBySession == nil { state.goalBySession = [:] }
+            state.goalBySession?[session] = goal
+        }
+        if plan != nil || state.planBySession != nil {
+            if state.planBySession == nil { state.planBySession = [:] }
+            state.planBySession?[session] = plan
+        }
+        if planProjection != nil || state.planProjections != nil {
+            if state.planProjections == nil { state.planProjections = [:] }
+            state.planProjections?[session] = planProjection
+        }
+        state.usageBySession[session] = usage
+        state.permissionBySession[session] = permission
+        state.metadataBySession[session] = metadata
+        if liveGoal {
+            if state.liveGoalSessions == nil { state.liveGoalSessions = [] }
+            state.liveGoalSessions?.insert(session)
+        }
+        if let usage, let index = state.sessions.firstIndex(where: { $0.id == session }) {
+            state.sessions[index].usage = usage
+        }
+    }
+}
+
 /// Pure, deterministic event reducer.  Keeping this separate from the
 /// observable store makes all event ordering and duplicate handling testable.
 public struct DSHEventReducer: Sendable {
@@ -116,7 +204,12 @@ public struct DSHEventReducer: Sendable {
         switch event.kind {
         case .transportState(let value):
             state.transportState = value
-            if value != .connected { state.historyUsageBySession = nil }
+            if value != .connected {
+                for session in Array(state.pendingSessionHistory?.keys ?? Dictionary<String, DSHPendingSessionHistory>().keys) {
+                    abandonHistory(session: session, into: &state)
+                }
+                state.historyUsageBySession = nil
+            }
             if value != .connected {
                 state.liveGoalSessions = nil
                 for (id, _) in state.planProjections ?? [:] { state.planProjections?[id]?.available = false }
@@ -172,6 +265,39 @@ public struct DSHEventReducer: Sendable {
         guard event.sequence > state.lastSequence else { return false }
         state.lastSequence = event.sequence
 
+        if case .historyStarted(let batch) = event.kind {
+            if state.pendingSessionHistory?[batch.sessionId]?.batchId == batch.batchId { return true }
+            state.retiredHistoryBatches?[batch.sessionId]?.removeAll { $0 == batch.batchId }
+            if let old = state.pendingSessionHistory?[batch.sessionId], old.batchId != batch.batchId {
+                retireHistory(old.batchId, session: batch.sessionId, into: &state)
+            }
+            if state.pendingSessionHistory == nil { state.pendingSessionHistory = [:] }
+            let baseline = DSHHistoryContent(state, session: batch.sessionId)
+            state.pendingSessionHistory?[batch.sessionId] = DSHPendingSessionHistory(
+                batchId: batch.batchId, baseline: baseline)
+            state.historyFailures?.removeValue(forKey: batch.sessionId)
+            var carry = DSHHistoryCarryOver(batchId: batch.batchId)
+            carry.messages = state.messagesBySession[batch.sessionId] ?? []
+            carry.tools = state.toolsBySession[batch.sessionId] ?? []
+            carry.commandResults = state.commandResultsBySession[batch.sessionId] ?? []
+            carry.modelChanges = state.modelChangesBySession[batch.sessionId] ?? []
+            state.historyCarryOverBySession[batch.sessionId] = carry
+            return true
+        }
+        if case .historyCompleted(let batch) = event.kind {
+            completeHistory(sessionId: batch.sessionId, batchId: batch.batchId, into: &state)
+            return true
+        }
+        let contentSession = event.envelope.sessionId ?? event.envelope.payload.executionObject["sessionId"]?.executionString
+        if let batch = event.envelope.historyBatchId, let session = contentSession {
+            if state.retiredHistoryBatches?[session]?.contains(batch) == true { return true }
+            if let pending = state.pendingSessionHistory?[session] {
+                if pending.batchId == batch { state.pendingSessionHistory?[session]?.historical.append(event.envelope) }
+                return true
+            }
+        } else if let session = contentSession, state.pendingSessionHistory?[session] != nil {
+            state.pendingSessionHistory?[session]?.live.append(event.envelope)
+        }
         return apply(event, into: &state)
     }
 
@@ -727,6 +853,31 @@ public struct DSHEventReducer: Sendable {
     /// whatever is open, which is what the app-level timeout does when the
     /// closing bracket never arrives.
     public func completeHistory(sessionId: String, batchId: String?, into state: inout DSHStoreState) {
+        if let pending = state.pendingSessionHistory?[sessionId] {
+            guard let batchId else { abandonHistory(session: sessionId, into: &state); return }
+            guard pending.batchId == batchId else { return }
+            var built = DSHStoreState()
+            pending.baseline.restore(into: &built, session: sessionId)
+            // Build privately using the same reducer semantics, without
+            // rewinding the live transport sequence or triggering UI effects.
+            let marker = DSHEvent(envelope: DSHEnvelope(messageId: batchId, deviceId: "history", machineId: "history",
+                sessionId: sessionId, historyBatchId: batchId, sequence: 0, type: "history.started",
+                payload: .object(["sessionId": .string(sessionId), "batchId": .string(batchId)])))
+            _ = apply(marker, into: &built)
+            for envelope in pending.historical { _ = apply(DSHEvent(envelope: envelope), into: &built) }
+            // Apply live deltas exactly once before closing the carry so
+            // deduplication and live-priority projections keep their semantics.
+            for envelope in pending.live { _ = apply(DSHEvent(envelope: envelope), into: &built) }
+            completeHistory(sessionId: sessionId, batchId: batchId, into: &built)
+            DSHHistoryContent(built, session: sessionId).restore(into: &state, session: sessionId)
+            state.pendingSessionHistory?.removeValue(forKey: sessionId)
+            state.historyCarryOverBySession.removeValue(forKey: sessionId)
+            state.historyUsageBySession?.removeValue(forKey: sessionId)
+            state.historyFailures?.removeValue(forKey: sessionId)
+            retireHistory(batchId, session: sessionId, into: &state)
+            return
+        }
+
         if let pending = state.historyUsageBySession?[sessionId], batchId == nil || pending.batchId == batchId {
             state.historyUsageBySession?.removeValue(forKey: sessionId)
             if batchId != nil, !pending.receivedLive, let usage = pending.usage {
@@ -748,6 +899,22 @@ public struct DSHEventReducer: Sendable {
         appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
         appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
         appendMissingModelChanges(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
+    }
+
+    private func retireHistory(_ batch: String, session: String, into state: inout DSHStoreState) {
+        if state.retiredHistoryBatches == nil { state.retiredHistoryBatches = [:] }
+        let retired = Array(((state.retiredHistoryBatches?[session] ?? []) + [batch]).suffix(64))
+        state.retiredHistoryBatches?[session] = retired
+    }
+
+    public func abandonHistory(session: String, into state: inout DSHStoreState) {
+        if let pending = state.pendingSessionHistory?.removeValue(forKey: session) {
+            state.historyCarryOverBySession.removeValue(forKey: session)
+            state.historyUsageBySession?.removeValue(forKey: session)
+            retireHistory(pending.batchId, session: session, into: &state)
+            if state.historyFailures == nil { state.historyFailures = [:] }
+            state.historyFailures?[session] = "历史加载未完成，已保留当前内容，请重试。"
+        }
     }
 
     private func setUsage(_ usage: DSHSessionUsage, sessionID: String, into state: inout DSHStoreState) {

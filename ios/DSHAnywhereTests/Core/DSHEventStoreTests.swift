@@ -842,6 +842,42 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.decisionVersion?.epoch, "host-2")
     }
 
+    func testAtomicHistoryKeepsVisibleContentStableAndMergesLiveOnce() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var seq: Int64 = 0
+        func send(_ type: String, _ payload: [String: DSHJSONValue], batch: String? = nil) {
+            seq += 1
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "atomic-\(seq)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: batch, sequence: seq, type: type, payload: .object(payload))), into: &state)
+        }
+        let marker: [String: DSHJSONValue] = ["sessionId": .string("s"), "batchId": .string("batch")]
+        send("history.started", marker, batch: "batch")
+        for n in 1...200 {
+            send("user.message.accepted", ["id": .string("old-\(n)"), "role": .string("user"), "markdown": .string("历史问题 \(n)")], batch: "batch")
+            send("tool.completed", ["id": .string("tool-\(n)"), "name": .string("bash"), "status": .string("completed"), "detail": .string("old")], batch: "batch")
+            XCTAssertTrue(state.messagesBySession["s", default: []].isEmpty)
+            XCTAssertTrue(state.toolsBySession["s", default: []].isEmpty)
+        }
+        send("assistant.message.completed", ["id": .string("answer"), "role": .string("assistant"), "markdown": .string("hello")], batch: "batch")
+        send("assistant.message.delta", ["messageId": .string("answer"), "text": .string(" world")])
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 1, "Live output stays available while historical rows remain hidden")
+        send("tool.completed", ["id": .string("tool-200"), "name": .string("bash"), "status": .string("failed"), "detail": .string("live failure")])
+        send("history.completed", marker, batch: "batch")
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 201)
+        XCTAssertEqual(state.messagesBySession["s"]?.last?.markdown, "hello world", "Never apply live deltas twice")
+        XCTAssertEqual(state.toolsBySession["s"]?.last?.status, "failed")
+        XCTAssertNil(state.pendingSessionHistory?["s"])
+        let settled = state.messagesBySession["s"]
+        send("assistant.message.delta", ["messageId": .string("answer"), "text": .string("stale")], batch: "batch")
+        XCTAssertEqual(state.messagesBySession["s"], settled)
+        send("history.started", ["sessionId": .string("s"), "batchId": .string("abandoned")], batch: "abandoned")
+        send("user.message.accepted", ["id": .string("discard"), "role": .string("user"), "markdown": .string("incomplete")], batch: "abandoned")
+        reducer.abandonHistory(session: "s", into: &state)
+        XCTAssertEqual(state.messagesBySession["s"], settled)
+        XCTAssertNotNil(state.historyFailures?["s"])
+    }
+
     func testHistoricalUsageCommitsOnceAndProtectsLiveAndNewerBatches() throws {
         let reducer = DSHEventReducer()
         var state = DSHStoreState()
@@ -2429,7 +2465,10 @@ final class DSHEventStoreTests: XCTestCase {
         let retryCommand = await transport.lastCommand(ofType: "session.create")
         XCTAssertEqual(retryCommand?.requestId, requestID)
 
-        try await Task.sleep(for: .milliseconds(90))
+        for _ in 0..<200 {
+            if model.sessionCreationFailure(for: requestID)?.resultUnknown == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         XCTAssertTrue(model.sessionCreationFailure(for: requestID)?.resultUnknown == true)
         model.disconnect()
     }

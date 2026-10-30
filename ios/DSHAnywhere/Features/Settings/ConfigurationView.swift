@@ -61,7 +61,7 @@ struct DSHComputerConfigurationView: View {
                 }
                 ForEach(plugins.agentPresets ?? []) { preset in
                     Section("\(preset.name ?? preset.id)\(preset.isDefault ? " · 默认模式" : "")") {
-                        Text(preset.trust == "system" ? "系统预设" : "用户预设").font(.caption).foregroundStyle(.secondary)
+                        Text("模式预设").font(.caption).foregroundStyle(.secondary)
                         if let broken = preset.broken { Text(broken).foregroundStyle(.red).textSelection(.enabled) }
                         ForEach(Array(preset.rows.enumerated()).filter { matches($0.element.moduleName) }, id: \.offset) { _, row in
                             VStack(alignment: .leading, spacing: 4) {

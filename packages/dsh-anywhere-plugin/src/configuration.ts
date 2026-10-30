@@ -12,6 +12,10 @@ const NativeSettings = SettingsSnapshotSchema.strip().extend({ namespaces: Nativ
 const NativePlugins = PluginInventorySchema.strip().extend({
   entries: PluginInventorySchema.shape.entries.element.strip().array(),
   agentPresets: PluginInventorySchema.shape.agentPresets.unwrap().element.strip().extend({
+    // Harness 0.2 removed origin classification. Retain the legacy wire's
+    // least-privileged value for old decoders; it grants no authority. The
+    // mobile UI must not infer a preset's origin from this compatibility slot.
+    trust: PluginInventorySchema.shape.agentPresets.unwrap().element.shape.trust.optional().default('user'),
     rows: PluginInventorySchema.shape.agentPresets.unwrap().element.shape.rows.element.strip().array(),
   }).array().optional(),
 })

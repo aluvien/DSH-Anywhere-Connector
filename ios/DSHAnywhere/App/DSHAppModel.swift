@@ -921,15 +921,21 @@ final class DSHAppModel: ObservableObject {
     private var pendingModelCatalogRecovery = false
     private var pendingSessionOpenRecoveryIDs: Set<String> = []
     private var readOnlyRecoveryTask: Task<Void, Never>?
-    /// Force-merge tasks for history batches whose closing bracket never
-    /// arrives (bridge died mid-stream). Keyed by the session and batch so a
-    /// late callback from an older overlapping replay cannot cancel or clear
-    /// the newer batch's timer.
+    /// Idle watchdogs for historical batches and initial read requests.
+    /// Session/batch keys prevent an older replay from retiring a newer one.
     private var historyTimeoutTasks: [String: Task<Void, Never>] = [:]
+    private var historyLastProgressAt: [String: Date] = [:]
     /// History replay includes the stored terminal turn state. It must rebuild
     /// the transcript only; treating that state as a live completion would
     /// release a locally queued prompt while the user is merely opening an
     /// old session.
+    @Published private(set) var requestedHistorySessions: Set<String> = []
+    private var historyOpenRequests: [String: String] = [:]
+    func isLoadingHistory(for session: String) -> Bool {
+        requestedHistorySessions.contains(session) || state.pendingSessionHistory?[session] != nil
+    }
+    func historyLoadError(for session: String) -> String? { state.historyFailures?[session] }
+
     private var replayingHistoryBatches: [String: Set<String>] = [:]
     /// Already-notified request ids and failed sessions (see notifyForEvent).
     private var notifiedApprovalIDs: Set<String> = []
@@ -1744,7 +1750,13 @@ final class DSHAppModel: ObservableObject {
         sessionCreationRetryDeadlines.removeAll(keepingCapacity: false)
         for task in historyTimeoutTasks.values { task.cancel() }
         historyTimeoutTasks.removeAll(keepingCapacity: false)
+        historyLastProgressAt.removeAll()
+        for session in Array(state.pendingSessionHistory?.keys ?? Dictionary<String, DSHPendingSessionHistory>().keys) {
+            reducer.abandonHistory(session: session, into: &state)
+        }
         replayingHistoryBatches.removeAll(keepingCapacity: false)
+        requestedHistorySessions.removeAll()
+        historyOpenRequests.removeAll()
         lastOpenSessionAt.removeAll(keepingCapacity: false)
         pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingSessionCreationCommandsByRequestID.removeAll(keepingCapacity: false)
@@ -2479,6 +2491,9 @@ final class DSHAppModel: ObservableObject {
         if pendingSessionCreationRequestIDs.isEmpty {
             restoreSessionCreationTransactions(for: machineID)
         }
+        for session in Array(state.pendingSessionHistory?.keys ?? Dictionary<String, DSHPendingSessionHistory>().keys) {
+            reducer.abandonHistory(session: session, into: &state)
+        }
         let connectionGeneration = machineStateGeneration
         state.connectionState = .connecting
         state.transportState = .connecting
@@ -2847,8 +2862,23 @@ final class DSHAppModel: ObservableObject {
         let now = Date()
         if let last = lastOpenSessionAt[sessionID], now.timeIntervalSince(last) < 2 { return }
         lastOpenSessionAt[sessionID] = now
-        send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
-                                    sessionId: sessionID, streaming: true))
+        let command = DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
+                                    sessionId: sessionID, streaming: true)
+        requestedHistorySessions.insert(sessionID)
+        state.historyFailures?.removeValue(forKey: sessionID)
+        historyOpenRequests[command.requestId] = sessionID
+        let key = "request-" + sessionID
+        historyTimeoutTasks[key]?.cancel()
+        historyTimeoutTasks[key] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(75))
+            guard !Task.isCancelled, let self, self.requestedHistorySessions.contains(sessionID),
+                  self.state.pendingSessionHistory?[sessionID] == nil else { return }
+            self.requestedHistorySessions.remove(sessionID)
+            if self.state.historyFailures == nil { self.state.historyFailures = [:] }
+            self.state.historyFailures?[sessionID] = "电脑未返回完整历史，请重试。"
+            self.historyTimeoutTasks.removeValue(forKey: key)
+        }
+        send(command)
         requestCommands(for: sessionID)
         Task { [weak self] in try? await self?.loadFeedback(for: sessionID) }
     }
@@ -5230,7 +5260,14 @@ final class DSHAppModel: ObservableObject {
         for request in state.pendingApprovals where !remainingApprovals.contains(request.id) {
             UserDefaults.standard.removeObject(forKey: approvalDraftKey(request.id))
         }
-        invalidateTranscriptCaches(for: transcriptSessionIDs(affectedBy: acceptedEvents))
+        // Staged history cannot change visible transcript rows yet. Avoid
+        // repeatedly rebuilding their groups while the batch is still loading.
+        let visibleEvents = acceptedEvents.filter { event in
+            if case .historyCompleted = event.kind { return true }
+            if case .historyStarted = event.kind { return false }
+            return event.envelope.historyBatchId == nil
+        }
+        invalidateTranscriptCaches(for: transcriptSessionIDs(affectedBy: visibleEvents))
         // Do not compare the entire transcript here: that equality check would
         // walk every message/tool on every frame and cost more than the
         // notification we are trying to avoid. A batch always represents one
@@ -5386,10 +5423,9 @@ final class DSHAppModel: ObservableObject {
         ))
     }
 
-    /// Arms (or disarms) the force-merge fallback for one history batch. If
-    /// `history.completed` never arrives, the carry entry would linger; after
-    /// ten seconds it is merged back (normally a no-op, since rows are never
-    /// cleared for replays) and the entry is dropped.
+    /// Track replay provenance separately from live activity. An idle batch
+    /// is abandoned after 30 seconds without data; partial history is never
+    /// promoted to a successful visible snapshot.
     private func beginHistoryReplay(_ batch: DSHHistoryBatch) {
         replayingHistoryBatches[batch.sessionId, default: []].insert(batch.batchId)
     }
@@ -5410,38 +5446,63 @@ final class DSHAppModel: ObservableObject {
     }
 
     private func trackHistoryBatch(_ event: DSHEvent) {
+        if case .transportState(let connection) = event.kind, connection != .connected {
+            requestedHistorySessions.removeAll()
+            for task in historyTimeoutTasks.values { task.cancel() }
+            historyTimeoutTasks.removeAll()
+            historyLastProgressAt.removeAll()
+            replayingHistoryBatches.removeAll()
+            return
+        }
+        if case .protocolError = event.kind, let session = historyOpenRequests.removeValue(forKey: event.envelope.messageId) {
+            reducer.abandonHistory(session: session, into: &state)
+            requestedHistorySessions.remove(session)
+            if state.historyFailures == nil { state.historyFailures = [:] }
+            state.historyFailures?[session] = "读取电脑历史失败，请重试。"
+            return
+        }
         switch event.kind {
         case .historyStarted(let batch):
             beginHistoryReplay(batch)
-            let key = historyBatchKey(batch)
-            historyTimeoutTasks[key]?.cancel()
-            historyTimeoutTasks[key] = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(10))
-                guard !Task.isCancelled else { return }
+            historyTimeoutTasks.removeValue(forKey: "request-" + batch.sessionId)?.cancel()
+            armHistoryTimeout(batch)
+        case .historyCompleted(let batch):
+            historyTimeoutTasks.removeValue(forKey: historyBatchKey(batch))?.cancel()
+            historyLastProgressAt.removeValue(forKey: historyBatchKey(batch))
+            if state.pendingSessionHistory?[batch.sessionId] == nil {
+                requestedHistorySessions.remove(batch.sessionId)
+                historyOpenRequests = historyOpenRequests.filter { $0.value != batch.sessionId }
+            }
+        default:
+            if let session = event.envelope.sessionId, let batch = event.envelope.historyBatchId,
+               state.pendingSessionHistory?[session]?.batchId == batch {
+                armHistoryTimeout(DSHHistoryBatch(sessionId: session, batchId: batch))
+            }
+        }
+    }
+
+    private func armHistoryTimeout(_ batch: DSHHistoryBatch) {
+        let key = historyBatchKey(batch)
+        historyLastProgressAt[key] = .now
+        guard historyTimeoutTasks[key] == nil else { return }
+        historyTimeoutTasks[key] = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
                 guard let self else { return }
-                if self.state.historyCarryOverBySession[batch.sessionId] != nil {
-                    var next = self.state
-                    self.reducer.completeHistory(
-                        sessionId: batch.sessionId,
-                        batchId: batch.batchId,
-                        into: &next
-                    )
-                    self.invalidateTranscriptCaches(for: [batch.sessionId])
-                    self.state = next
+                let idle = Date().timeIntervalSince(self.historyLastProgressAt[key] ?? .now)
+                if idle < 30 {
+                    try? await Task.sleep(for: .seconds(30 - idle))
+                    continue
                 }
-                // Even when the reducer has already completed the carry (or
-                // this overlapping batch was not the carry owner's batch),
-                // the replay marker must be retired so queued prompts can
-                // settle after a missing history.completed bracket.
+                if self.state.pendingSessionHistory?[batch.sessionId]?.batchId == batch.batchId {
+                    self.reducer.abandonHistory(session: batch.sessionId, into: &self.state)
+                    self.invalidateTranscriptCaches(for: [batch.sessionId])
+                    self.requestedHistorySessions.remove(batch.sessionId)
+                }
                 self.endHistoryReplay(batch)
                 self.historyTimeoutTasks.removeValue(forKey: key)
+                self.historyLastProgressAt.removeValue(forKey: key)
+                return
             }
-        case .historyCompleted(let batch):
-            let key = historyBatchKey(batch)
-            historyTimeoutTasks[key]?.cancel()
-            historyTimeoutTasks.removeValue(forKey: key)
-        default:
-            break
         }
     }
 
@@ -5453,6 +5514,7 @@ final class DSHAppModel: ObservableObject {
     /// error next to the composer, and double-reporting would just overwrite it.
     private func surfaceProtocolError(_ event: DSHEvent) {
         guard case .protocolError(let error) = event.kind else { return }
+        if historyOpenRequests[event.envelope.messageId] != nil { return }
         if let decisionType = decisionRequestTypes[event.envelope.messageId] {
             // Older Connectors only included status in this fixed diagnostic.
             // Match the exact decision command, never unrelated HTTP conflicts.
