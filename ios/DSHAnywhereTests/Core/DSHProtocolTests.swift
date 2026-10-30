@@ -1682,6 +1682,44 @@ final class DSHConversationViewportTests: XCTestCase {
         XCTAssertEqual(dshNearestReasoningEffortIndex(full, to: "ultra"), 5)
     }
 
+    func testCompletedTaskSummaryAndNeutralTodoPreview() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        defer { window.isHidden = true }
+        for dark in [false, true] {
+            var state = DSHAppModel.preview().state
+            state.messagesBySession["preview-session"] = [
+                DSHChatMessage(id: "summary-user", role: .user, markdown: "检查长任务的工具调用和上下文记录", sequence: 1),
+                DSHChatMessage(id: "summary-answer", role: .assistant, markdown: "本轮执行已结束。\n\n工具调用、上下文裁剪和压缩记录已收进上方摘要，点击即可查看。失败记录保留提示，正文正常阅读。", sequence: 30),
+            ]
+            state.toolsBySession["preview-session"] = (2...9).map { n in
+                DSHToolActivity(id: "summary-tool-\(n)", name: "bash", status: n == 4 ? "failed" : "completed", sequence: Int64(n))
+            }
+            state.executionBySession = ["preview-session": [
+                DSHExecutionRecord(nativeSequence: 10, type: "compaction/prune", time: nil, data: [:], sequence: 10),
+                DSHExecutionRecord(nativeSequence: 11, type: "compaction/start", time: nil, data: [:], sequence: 11),
+                DSHExecutionRecord(nativeSequence: 12, type: "compaction/end", time: nil, data: [:], sequence: 12),
+            ]]
+            state.turnStateBySession["preview-session"] = "completed"
+            state.todoBySession = ["preview-session": try JSONDecoder().decode(DSHTodoState.self, from: Data(#"{"sessionId":"preview-session","todos":[{"content":"确认待办颜色","status":"completed"},{"content":"确认统计稳定","status":"in_progress"},{"content":"检查工具折叠","status":"pending"}]}"#.utf8))]
+            let model = DSHAppModel(transport: DSHPreviewTransport(), initialState: state, isPaired: true)
+            let sections = model.transcriptSections(for: "preview-session")
+            XCTAssertEqual(sections.count, 2, "Tools and compression must not render independent cards")
+            let host = UIHostingController(rootView: NavigationStack {
+                ConversationView(sessionID: "preview-session").environmentObject(model)
+            })
+            window.overrideUserInterfaceStyle = dark ? .dark : .light
+            window.rootViewController = host; window.makeKeyAndVisible()
+            try await Task.sleep(for: .milliseconds(800))
+            await settle()
+            let attachment = XCTAttachment(image: UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            })
+            attachment.name = "completed-summary-neutral-todo-\(dark ? "dark" : "light")"
+            attachment.lifetime = .keepAlways; add(attachment)
+        }
+    }
+
     func testFrostedConversationDockAndSingleLineGoalPreview() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
         let window = UIWindow(windowScene: scene)

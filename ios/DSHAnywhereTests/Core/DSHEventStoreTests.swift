@@ -842,6 +842,82 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.decisionVersion?.epoch, "host-2")
     }
 
+    func testHistoricalUsageCommitsOnceAndProtectsLiveAndNewerBatches() throws {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        var sequence: Int64 = 0
+        func send(_ type: String, batch: String? = nil, value: Int = 0, session: String = "s") throws {
+            sequence += 1
+            var payload: [String: DSHJSONValue] = ["sessionId": .string(session)]
+            if type == "usage.updated" {
+                let usage = DSHSessionUsage(rounds: value, steps: value * 10, totalTokens: Double(value * 1000),
+                    cacheHitPercent: Double(value) / 10, tokensPerSecond: Double(value))
+                payload["usage"] = try JSONDecoder().decode(DSHJSONValue.self, from: JSONEncoder().encode(usage))
+            } else { payload["batchId"] = .string(batch ?? "b") }
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "u\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: session, historyBatchId: batch, sequence: sequence, type: type, payload: .object(payload))), into: &state)
+        }
+        try send("history.started", batch: "b")
+        for value in 1...200 {
+            try send("usage.updated", batch: "b", value: value)
+            XCTAssertNil(state.usageBySession["s"])
+        }
+        try send("history.completed", batch: "b")
+        let final = try XCTUnwrap(state.usageBySession["s"])
+        XCTAssertEqual(final.rounds, 200); XCTAssertEqual(final.steps, 2000)
+        XCTAssertEqual(final.totalTokens, 200000); XCTAssertEqual(final.tokensPerSecond, 200)
+        XCTAssertEqual(final.cacheHitPercent, 20)
+        try send("history.started", batch: "old")
+        try send("usage.updated", batch: "old", value: 1)
+        XCTAssertEqual(state.usageBySession["s"], final)
+        try send("history.started", batch: "new")
+        try send("usage.updated", batch: "new", value: 201)
+        try send("history.completed", batch: "old")
+        XCTAssertEqual(state.usageBySession["s"], final)
+        try send("history.completed", batch: "new")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 201)
+        try send("history.started", batch: "live")
+        try send("usage.updated", value: 300)
+        try send("usage.updated", batch: "live", value: 202)
+        try send("history.completed", batch: "live")
+        try send("usage.updated", batch: "live", value: 203)
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("history.started", batch: "timeout")
+        try send("usage.updated", batch: "timeout", value: 2)
+        reducer.completeHistory(sessionId: "s", batchId: nil, into: &state)
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("history.started", batch: "empty")
+        try send("history.completed", batch: "empty")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        try send("usage.updated", value: 5, session: "other")
+        XCTAssertEqual(state.usageBySession["s"]?.rounds, 300)
+        XCTAssertEqual(state.usageBySession["other"]?.rounds, 5)
+    }
+
+    func testOrphanToolsAndCompactionFoldIntoTaskWithoutHidingAnswers() {
+        let user = DSHChatMessage(id: "u", role: .user, markdown: "start", sequence: 1)
+        let answer = DSHChatMessage(id: "a", role: .assistant, markdown: "final answer", sequence: 5)
+        let tool = DSHToolActivity(id: "t", name: "bash", status: "failed", sequence: 2)
+        let record = DSHExecutionRecord(nativeSequence: 3, type: "compaction/prune", time: nil, data: [:], sequence: 3)
+        let notice = DSHExecutionNotice(id: "prune", kind: "prune", records: [record], boundary: nil)
+        let entries: [DSHTranscriptEntry] = [.turn(.init(id: user.id, messages: [user])), .tool(tool),
+            .execution(notice), .turn(.init(id: answer.id, messages: [answer])),
+            .turn(.init(id: "next", messages: [.init(id: "next", role: .user, markdown: "next", sequence: 6)]))]
+        let sections = entries.groupedTurns().withTaskTimelines()
+        XCTAssertEqual(sections.count, 3)
+        guard case .turn(let block, _) = sections[1] else { return XCTFail("Expected collapsed task header") }
+        XCTAssertEqual(block.visibleMessages.map(\.markdown), ["final answer"])
+        XCTAssertEqual(block.taskTimeline?.tools.map(\.id), ["t"])
+        XCTAssertEqual(block.taskTimeline?.execution.map(\.id), ["prune"])
+        XCTAssertEqual(block.taskTimeline?.activities.map(\.id), ["tool-t", "execution-prune"])
+        let orphan = [DSHTranscriptEntry.tool(tool), .execution(notice)].groupedTurns().withTaskTimelines()
+        XCTAssertEqual(orphan.count, 1)
+        guard case .turn(let synthetic, _) = orphan[0] else { return XCTFail("Missing history-edge summary") }
+        XCTAssertTrue(synthetic.visibleMessages.isEmpty)
+        XCTAssertEqual(synthetic.taskTimeline?.tools.count, 1)
+        XCTAssertEqual(synthetic.taskTimeline?.execution.count, 1)
+    }
+
     func testHistoryTodoEditsPublishOnlyFinalStateAndKeepLiveUpdates() throws {
         let reducer = DSHEventReducer()
         var state = DSHStoreState()

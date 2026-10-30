@@ -40,6 +40,7 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var modeCatalog: DSHModeCatalog?
     public var directoryListing: DSHDirectoryListing?
     public var usageBySession: [String: DSHSessionUsage] = [:]
+    public var historyUsageBySession: [String: DSHHistoryUsage]?
     public var permissionBySession: [String: DSHPermissionUpdate] = [:]
     public var metadataBySession: [String: DSHSessionMetadataUpdate] = [:]
     public var modelChangesBySession: [String: [DSHModelChangeNotice]] = [:]
@@ -95,6 +96,14 @@ public struct DSHHistoryCarryOver: Codable, Sendable, Equatable {
     public init(batchId: String) { self.batchId = batchId }
 }
 
+/// A separate projection buffer lets overlapping transcript replays retain
+/// their existing carry behavior while statistics follow the newest batch.
+public struct DSHHistoryUsage: Codable, Sendable, Equatable {
+    public var batchId: String
+    public var usage: DSHSessionUsage?
+    public var receivedLive = false
+}
+
 /// Pure, deterministic event reducer.  Keeping this separate from the
 /// observable store makes all event ordering and duplicate handling testable.
 public struct DSHEventReducer: Sendable {
@@ -107,6 +116,7 @@ public struct DSHEventReducer: Sendable {
         switch event.kind {
         case .transportState(let value):
             state.transportState = value
+            if value != .connected { state.historyUsageBySession = nil }
             if value != .connected {
                 state.liveGoalSessions = nil
                 for (id, _) in state.planProjections ?? [:] { state.planProjections?[id]?.available = false }
@@ -402,10 +412,14 @@ public struct DSHEventReducer: Sendable {
         case .directoryListing(let listing):
             state.directoryListing = listing
         case .usageUpdated(let update):
-            state.usageBySession[update.sessionId] = update.usage
-            if let index = state.sessions.firstIndex(where: { $0.id == update.sessionId }) {
-                state.sessions[index].usage = update.usage
+            if let batchID = event.envelope.historyBatchId {
+                if state.historyUsageBySession?[update.sessionId]?.batchId == batchID {
+                    state.historyUsageBySession?[update.sessionId]?.usage = update.usage
+                }
+                break
             }
+            state.historyUsageBySession?[update.sessionId]?.receivedLive = true
+            setUsage(update.usage, sessionID: update.sessionId, into: &state)
         case .permissionUpdated(let update):
             // Historical replay carries the permission that was in effect
             // for an older turn. It is useful to the history renderer but
@@ -609,6 +623,8 @@ public struct DSHEventReducer: Sendable {
             state.protocolErrorsByRequestID[event.envelope.messageId] = error.message
             if error.code == "bridge-request-failed", error.retryable { state.bridgeReachable = false }
         case .historyStarted(let batch):
+            if state.historyUsageBySession == nil { state.historyUsageBySession = [:] }
+            state.historyUsageBySession?[batch.sessionId] = DSHHistoryUsage(batchId: batch.batchId)
             state.planBySession?.removeValue(forKey: batch.sessionId)
             if state.liveGoalSessions?.contains(batch.sessionId) != true { state.goalBySession?.removeValue(forKey: batch.sessionId) }
             // A replay rebuilds this session's transcript in stored order.
@@ -711,6 +727,12 @@ public struct DSHEventReducer: Sendable {
     /// whatever is open, which is what the app-level timeout does when the
     /// closing bracket never arrives.
     public func completeHistory(sessionId: String, batchId: String?, into state: inout DSHStoreState) {
+        if let pending = state.historyUsageBySession?[sessionId], batchId == nil || pending.batchId == batchId {
+            state.historyUsageBySession?.removeValue(forKey: sessionId)
+            if batchId != nil, !pending.receivedLive, let usage = pending.usage {
+                setUsage(usage, sessionID: sessionId, into: &state)
+            }
+        }
         guard let carry = state.historyCarryOverBySession[sessionId] else { return }
         if let batchId, carry.batchId != batchId { return }
         state.historyCarryOverBySession.removeValue(forKey: sessionId)
@@ -726,6 +748,13 @@ public struct DSHEventReducer: Sendable {
         appendMissing(carry.tools, to: &state.toolsBySession[sessionId, default: []])
         appendMissing(carry.commandResults, to: &state.commandResultsBySession[sessionId, default: []])
         appendMissingModelChanges(carry.modelChanges, to: &state.modelChangesBySession[sessionId, default: []])
+    }
+
+    private func setUsage(_ usage: DSHSessionUsage, sessionID: String, into state: inout DSHStoreState) {
+        state.usageBySession[sessionID] = usage
+        if let index = state.sessions.firstIndex(where: { $0.id == sessionID }) {
+            state.sessions[index].usage = usage
+        }
     }
 
     private func appendMissing<T: Identifiable>(_ values: [T], to store: inout [T]) where T.ID: Equatable {

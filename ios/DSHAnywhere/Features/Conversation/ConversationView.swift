@@ -1655,7 +1655,7 @@ struct ConversationView: View {
                             ForEach(todo.todos, id: \.content) { item in
                                 HStack(alignment: .top, spacing: 8) {
                                     Image(systemName: item.status == "completed" ? "checkmark.circle.fill" : item.status == "in_progress" ? "circle.dotted" : "circle")
-                                        .foregroundStyle(item.status == "completed" ? Color.green : Color.accentColor)
+                                        .foregroundStyle(item.status == "completed" ? Color.green : item.status == "in_progress" ? Color.accentColor : Color.secondary)
                                     Text(item.content)
                                         .foregroundStyle(item.status == "completed" ? .secondary : .primary)
                                         .textSelection(.enabled)
@@ -1671,7 +1671,9 @@ struct ConversationView: View {
                 } label: {
                     Label("待办 · \(todo.todos.filter { $0.status == "completed" }.count)/\(todo.todos.count) 已完成", systemImage: "checklist")
                         .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
                 }
+                .tint(.primary)
                 .padding(10)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
             }
@@ -4533,10 +4535,13 @@ private struct AssistantTurnView: View {
                     .padding(.top, 12)
             }
         }
+        .onChange(of: isTaskRunning) { wasRunning, running in
+            if wasRunning && !running { isExpanded = false }
+        }
     }
 
     private var isExpandable: Bool {
-        !text.isEmpty || !tools.isEmpty
+        !text.isEmpty || !tools.isEmpty || !(timeline?.execution.isEmpty ?? true)
     }
 
     /// Reference layout: timing text with the chevron tucked right behind
@@ -4578,8 +4583,12 @@ private struct AssistantTurnView: View {
                     .background(Color.secondary.opacity(0.08))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
-                ForEach(tools) { tool in
-                    ToolActivityCard(tool: tool, sessionID: sessionID, isLive: isTaskRunning)
+                ForEach(timeline?.activities ?? []) { activity in
+                    switch activity {
+                    case .tool(let tool): ToolActivityCard(tool: tool, sessionID: sessionID, isLive: isTaskRunning)
+                    case .execution(let notice): DSHExecutionNoticeCard(sessionID: sessionID, notice: notice)
+                    default: EmptyView()
+                    }
                 }
             }
             .padding(.bottom, 4)
@@ -4601,6 +4610,10 @@ private struct AssistantTurnView: View {
             }
             .font(.body)
             .foregroundStyle(.secondary)
+            if tools.contains(where: { $0.status == "failed" || $0.error != nil }) || (timeline?.execution.contains { $0.records.contains { $0.data["error"] != nil } } ?? false) {
+                Label("有失败记录", systemImage: "exclamationmark.circle.fill")
+                    .font(.caption).foregroundStyle(.red)
+            }
             if isExpandable {
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -4612,7 +4625,7 @@ private struct AssistantTurnView: View {
 
     private func timelineTitle(now: Date?) -> String {
         guard let duration = timeline?.duration(now: now) else {
-            return DSHLocalization.string("Thinking")
+            return isTaskRunning ? DSHLocalization.string("Thinking") : "执行记录 · \(tools.count) 次工具调用"
         }
         return (duration.estimated ? "≈ " : "") + turnDurationText(duration.seconds)
     }

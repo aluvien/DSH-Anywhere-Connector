@@ -1304,6 +1304,14 @@ public struct DSHTaskTimeline: Sendable, Equatable {
     public let startedAt: Int64?
     public let messages: [DSHChatMessage]
     public let tools: [DSHToolActivity]
+    public var execution: [DSHExecutionNotice] = []
+
+    public var activities: [DSHTranscriptEntry] {
+        (tools.map(DSHTranscriptEntry.tool) + execution.map(DSHTranscriptEntry.execution))
+            .enumerated().sorted {
+                $0.element.sequence == $1.element.sequence ? $0.offset < $1.offset : $0.element.sequence < $1.element.sequence
+            }.map(\.element)
+    }
 
     public var reasoning: String {
         messages.compactMap(\.reasoning).filter { !$0.isEmpty }.joined(separator: "\n\n")
@@ -1338,46 +1346,56 @@ public extension Array where Element == DSHTranscriptSection {
         var result = self
         var prompt: DSHChatMessage?
         var indices: [Int] = []
+        var orphanIndices: [Int] = []
+        var removed: Set<Int> = []
         func flush() {
-            guard !indices.isEmpty else { return }
-            let blocks = indices.compactMap { index -> DSHTranscriptBlock? in
-                if case .turn(let block, _) = result[index] { return block }
-                return nil
-            }
-            let messages = blocks.flatMap(\.messages)
-            let tools = indices.flatMap { index -> [DSHToolActivity] in
-                if case .turn(_, let tools) = result[index] { return tools }
+            guard !indices.isEmpty || !orphanIndices.isEmpty else { return }
+            let messages = indices.flatMap { index -> [DSHChatMessage] in
+                if case .turn(let block, _) = result[index] { return block.messages }
                 return []
             }
-            // A reasoning-only section can be hidden while streaming. Anchor
-            // to the first visible answer when there is one.
+            let allIndices = (indices + orphanIndices).sorted()
+            let tools = allIndices.flatMap { index -> [DSHToolActivity] in
+                switch result[index] {
+                case .turn(_, let tools): return tools
+                case .row(.tool(let tool)): return [tool]
+                default: return []
+                }
+            }
+            let execution = orphanIndices.compactMap { index -> DSHExecutionNotice? in
+                if case .row(.execution(let notice)) = result[index] { return notice }
+                return nil
+            }
             let headerIndex = indices.first { index in
                 if case .turn(let block, _) = result[index] { return !block.visibleMessages.isEmpty }
                 return false
-            } ?? indices[0]
-            if case .turn(var block, let ownTools) = result[headerIndex] {
-                block.taskTimeline = DSHTaskTimeline(promptID: prompt?.id,
-                    startedAt: prompt?.timestamp ?? messages.first?.timestamp,
-                    messages: messages, tools: tools)
-                result[headerIndex] = .turn(block: block, tools: ownTools)
+            } ?? indices.first ?? orphanIndices[0]
+            var block: DSHTranscriptBlock
+            var ownTools: [DSHToolActivity] = []
+            if case .turn(let existing, let existingTools) = result[headerIndex] {
+                block = existing; ownTools = existingTools
+            } else {
+                block = DSHTranscriptBlock(id: "activity-" + result[headerIndex].id, messages: [])
             }
-            indices = []
+            block.taskTimeline = DSHTaskTimeline(promptID: prompt?.id,
+                startedAt: prompt?.timestamp ?? messages.first?.timestamp,
+                messages: messages, tools: tools, execution: execution)
+            result[headerIndex] = .turn(block: block, tools: ownTools)
+            removed.formUnion(orphanIndices.filter { $0 != headerIndex })
+            indices = []; orphanIndices = []
         }
         for index in result.indices {
             switch result[index] {
-            case .row(.historyGap):
-                flush()
-                prompt = nil
+            case .row(.historyGap): flush(); prompt = nil
             case .row(.turn(let block)) where block.isUserTurn:
-                flush()
-                prompt = block.messages.first
-            case .turn(let block, _) where !block.isUserTurn:
-                indices.append(index)
+                flush(); prompt = block.messages.first
+            case .turn(let block, _) where !block.isUserTurn: indices.append(index)
+            case .row(.tool), .row(.execution): orphanIndices.append(index)
             default: break
             }
         }
         flush()
-        return result
+        return result.enumerated().filter { !removed.contains($0.offset) }.map(\.element)
     }
 }
 
