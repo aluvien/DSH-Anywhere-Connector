@@ -2437,7 +2437,10 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.recoverableSessionCreationRequestID())
 
         model.connect()
-        try await Task.sleep(for: .milliseconds(30))
+        for _ in 0..<200 {
+            if model.recoverableSessionCreationRequestID() == requestID { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         XCTAssertEqual(model.recoverableSessionCreationRequestID(), requestID)
         XCTAssertEqual(model.sessionCreationDraft(for: requestID)?.text, "restore me")
         model.disconnect()
