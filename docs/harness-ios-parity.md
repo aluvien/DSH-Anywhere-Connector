@@ -316,4 +316,13 @@ Build 131 发布记录：1.0 (131)，2026-10-30 19:05（本地时间）完成签
 - 缓存写入在后台合并，使用原子文件与文件保护，排除系统备份；单会话上限 50 MiB，总容量 150 MiB，超出后按最近使用时间淘汰。损坏缓存回退到电脑读取，不影响独立的待发送请求日志。
 - `session.open` 新增可选 `historyFingerprint`；`history.completed` 新增可选 `fingerprint`、`unchanged`。Bridge 对完整 Native 历史使用带版本盐的 SHA-256 核对，匹配时不重放历史行；有新增、改写或压缩时执行完整原子刷新。这里采用条件刷新，历史变化时仍会读取最近窗口，并非逐事件增量协议。
 - 缓存不恢复审批、提问、权限授权、连接状态或计时中的轮次；运行中的工具显示状态待核实。服务端运行态继续由实时连接确认。手动下拉刷新绕过指纹检查。
-- 第一次使用新版需要先完整读取以建立指纹，此后指纹随缓存保存。更新顺序为 Relay → Connector/Bridge → iOS；旧客户端不携带新增字段继续使用原路径。此处为源码实现，未发布新的 TestFlight 或部署新协议组件。
+- 第一次使用新版需要先完整读取以建立指纹，此后指纹随缓存保存。更新顺序为 Relay → Connector/Bridge → iOS；旧客户端不携带新增字段继续使用原路径。已于同日随 Build 132 更新 Relay、电脑组件并上传 TestFlight；上传回执见下一节。
+
+
+### Build 132 发布（2026-11-01）
+
+- 功能源码：`b785211da613ee525ef48e778fb5b835021d7ff5`。相关 iOS 测试 144 项通过；TypeScript 协议、Relay、Bridge、Connector 合计 299 项通过。
+- Ali-BJ Relay 已重建并验证新 `historyFingerprint` 协议；公网 `/health` 正常，容器 healthy。公开安装入口固定到上述提交，配对数据与配置保留。
+- 本机桌面组件已安装并正常重启 Harness / Connector；新动态端点写入于 `2026-11-01T13:50:14.869Z`。Bridge health 与 plugins/providers/settings 配置读取均返回 HTTP 200。
+- TestFlight：DSH Anywhere 1.0（Build 132），Apple 返回 `UPLOAD SUCCEEDED with no errors`。Delivery UUID：`564134d5-d61f-44ef-ad00-a36c5e842eb8`。
+- IPA：`artifacts/ios/export-build132-20261101-214858/DSHAnywhere.ipa`；上传日志：`/tmp/dsh-build132-release.log`。上传成功不等于 Apple 已处理完成，客户端可用状态需以 App Store Connect 为准。
