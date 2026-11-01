@@ -906,6 +906,48 @@ describe('native bridge mutations', () => {
     } finally { request.dispose(); appended.mockRestore() }
   })
 
+  it('validates an unchanged cached session without replaying its transcript', async () => {
+    const appended = vi.spyOn(ReplayBuffer.prototype, 'append')
+    let events = [{ seq: 7, type: 'user/message', data: {
+      id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text: 'cached' }],
+    } }]
+    const request = mount({
+      list: async () => ({ items: [{ sessionId: 's', title: 'Cached' }] }),
+      inspect: async () => ({ events }),
+    })
+    try {
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/s/open', { deviceId: 'phone' }))
+        .resolves.toMatchObject({ status: 202 })
+      const first = appended.mock.calls.map(([event]) => event)
+      const completion = first.find((event) => event.type === 'history.completed' && event.sessionId === 's')
+      const fingerprint = (completion?.payload as { fingerprint?: string } | undefined)?.fingerprint
+      expect(fingerprint).toMatch(/^[a-f0-9]{64}$/)
+
+      appended.mockClear()
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/s/open', {
+        deviceId: 'phone', historyFingerprint: fingerprint,
+      })).resolves.toMatchObject({ status: 202 })
+      const second = appended.mock.calls.map(([event]) => event)
+      expect(second).not.toContainEqual(expect.objectContaining({ type: 'history.started', sessionId: 's' }))
+      expect(second).not.toContainEqual(expect.objectContaining({ type: 'user.message.accepted', sessionId: 's' }))
+      expect(second).toContainEqual(expect.objectContaining({ type: 'history.completed', sessionId: 's',
+        payload: expect.objectContaining({ fingerprint, unchanged: true }) }))
+
+      // A durable rewrite (for example, Harness compaction) must invalidate
+      // the optimistic local copy and fall back to the normal atomic replay.
+      events = [...events, { seq: 8, type: 'assistant/message', data: {
+        message: { id: 'a', content: [{ type: 'text', text: 'new' }] },
+      } }]
+      appended.mockClear()
+      await expect(request('POST', '/dsh-anywhere/v1/sessions/s/open', {
+        deviceId: 'phone', historyFingerprint: fingerprint,
+      })).resolves.toMatchObject({ status: 202 })
+      expect(appended.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({
+        type: 'history.started', sessionId: 's',
+      }))
+    } finally { request.dispose(); appended.mockRestore() }
+  })
+
   it('forks the native log at the exact boundary once across retries', async () => {
     let calls = 0
     const request = mount({ fork: async (value) => {

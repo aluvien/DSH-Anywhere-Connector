@@ -1199,7 +1199,7 @@ struct ConversationView: View {
         if let loadError = model.historyLoadError(for: sessionID) {
             HStack {
                 Text(loadError).font(.caption).foregroundStyle(.secondary)
-                Button("重试") { model.openSession(sessionID) }
+                Button("重试") { model.openSession(sessionID, forceRefresh: true) }
             }
         }
         if let historyError { Text(historyError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
@@ -1313,7 +1313,7 @@ struct ConversationView: View {
             // or replaying the whole event stream.
             model.refreshSessions(includeArchived: true)
             model.sendModelCatalog()
-            model.openSession(sessionID)
+            model.openSession(sessionID, forceRefresh: true)
         }
         // Dragging the transcript puts the keyboard away with the finger
         // following it (`.interactively` is the only system-supported

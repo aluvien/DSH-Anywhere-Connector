@@ -308,3 +308,12 @@ Build 131 发布记录：1.0 (131)，2026-10-30 19:05（本地时间）完成签
 - 从已安装官方桌面包提取 rc.5 运行时，在独立 DSH_HOME、loopback 测试端口验证 Bridge、sessions、workspaces、modes、plugins/providers/settings 全部返回 200。完整 pnpm build/check 通过，298 项 TypeScript 测试通过。测试进程已停止。
 - 已安装到本机并正常重启 Harness，生成新的动态端口，Connector 日志确认 Local DSH bridge connected。生产本机上述 7 项读取全部 HTTP 200；脱敏证据 `production-rc5-recovery-20261101.json`。原有配对继续使用，用户无需重新配对。
 - App 增加有界的被动目录请求关联：session.list、workspace/mode/model.catalog、decisions.list 的可重试 Bridge 失败由现有离线状态展示，不再叠加通用全局弹窗。明确操作失败、非暂时性的升级/权限错误仍可见，机器切换时清理请求关联。2 项模拟器定向测试通过（`/tmp/dsh-offline-catalogs.xcresult`）。此 App 修复尚未上传新的 TestFlight；Build 131 不包含它，电脑连接恢复已即时生效。
+
+
+### 2026-11-01：本机历史缓存与条件核对
+
+- 手机按 Relay 地址、电脑 ID、会话 ID 隔离持久保存正文、思考、工具、目标、待办、计划、统计及已读历史范围；App 重启后先从磁盘恢复，电脑离线仍可阅读已缓存会话。
+- 缓存写入在后台合并，使用原子文件与文件保护，排除系统备份；单会话上限 50 MiB，总容量 150 MiB，超出后按最近使用时间淘汰。损坏缓存回退到电脑读取，不影响独立的待发送请求日志。
+- `session.open` 新增可选 `historyFingerprint`；`history.completed` 新增可选 `fingerprint`、`unchanged`。Bridge 对完整 Native 历史使用带版本盐的 SHA-256 核对，匹配时不重放历史行；有新增、改写或压缩时执行完整原子刷新。这里采用条件刷新，历史变化时仍会读取最近窗口，并非逐事件增量协议。
+- 缓存不恢复审批、提问、权限授权、连接状态或计时中的轮次；运行中的工具显示状态待核实。服务端运行态继续由实时连接确认。手动下拉刷新绕过指纹检查。
+- 第一次使用新版需要先完整读取以建立指纹，此后指纹随缓存保存。更新顺序为 Relay → Connector/Bridge → iOS；旧客户端不携带新增字段继续使用原路径。此处为源码实现，未发布新的 TestFlight 或部署新协议组件。

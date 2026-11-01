@@ -1878,7 +1878,8 @@ export function bridgeRequestFor(command: CommandEnvelope): BridgeRequest {
         path: `/sessions/${encodeURIComponent(requireSessionId(command))}/open`,
         body: { deviceId: command.deviceId,
           ...(command.payload.parentSessionId === undefined ? {} : { parentSessionId: command.payload.parentSessionId }),
-          ...(command.payload.subagentMode === undefined ? {} : { subagentMode: command.payload.subagentMode }) },
+          ...(command.payload.subagentMode === undefined ? {} : { subagentMode: command.payload.subagentMode }),
+          ...(command.payload.historyFingerprint === undefined ? {} : { historyFingerprint: command.payload.historyFingerprint }) },
       };
     case "session.fork":
       return { method: "POST", path: `/sessions/${encodeURIComponent(requireSessionId(command))}/fork`,

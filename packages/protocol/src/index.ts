@@ -551,6 +551,10 @@ export type AssistantReasoningPayload = z.infer<typeof AssistantReasoningPayload
 export const HistoryBatchPayloadSchema = StrictObject({
   sessionId: IdentifierSchema,
   batchId: IdentifierSchema,
+  /** A durable content fingerprint for the inspected Harness session. */
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  /** The caller supplied this fingerprint and no transcript rows were resent. */
+  unchanged: z.boolean().optional(),
 });
 export type HistoryBatchPayload = z.infer<typeof HistoryBatchPayloadSchema>;
 
@@ -810,6 +814,8 @@ export const SessionOpenPayloadSchema = StrictObject({
   streaming: z.boolean().optional(),
   parentSessionId: IdentifierSchema.optional(),
   subagentMode: z.enum(["one-shot", "continuable"]).optional(),
+  /** Last durable history fingerprint held by this client, if supported. */
+  historyFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 export const SessionForkPayloadSchema = StrictObject({ atSeq: z.number().int().nonnegative().optional() });
 export const ConnectionResumePayloadSchema = StrictObject({

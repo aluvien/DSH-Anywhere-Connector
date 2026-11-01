@@ -3000,6 +3000,11 @@ async function handleHttp(
   if (req.method === 'POST' && openMatch !== null) {
     const sessionId = decodeURIComponent(openMatch[1]!)
     const body = objectOf(await readJson(req))
+    const requestedFingerprint = body.historyFingerprint
+    if (requestedFingerprint !== undefined &&
+        (typeof requestedFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(requestedFingerprint))) {
+      throw new HttpError(400, 'historyFingerprint must be a lowercase SHA-256 hex digest')
+    }
     let summary
     if (typeof body.parentSessionId === 'string') {
       const catalog = await subagentCatalog(ctx, body.parentSessionId)
@@ -3012,7 +3017,7 @@ async function handleHttp(
     }
     if (summary === undefined) throw new HttpError(404, 'session not found')
     const recipient = historyRecipient(device.id, body.deviceId)
-    await publishSessionHistory(ctx, summary, recipient, publish)
+    await publishSessionHistory(ctx, summary, recipient, publish, undefined, requestedFingerprint)
     controlSnapshots.get(ctx)?.(sessionId, recipient)
     json(res, 202, { accepted: true, sessionId })
     return
@@ -4270,15 +4275,33 @@ export function historyRecipient(authenticatedDeviceId: string, requestedDeviceI
     ? requestedDeviceId : authenticatedDeviceId
 }
 
+/**
+ * The inspection event stream is the durable source for an opened transcript.
+ * Sort object keys before hashing so equivalent Host records do not trigger a
+ * retransmission just because an implementation changed property insertion
+ * order.  The version salt permits a deliberate cache reset if this durable
+ * representation ever changes.
+ */
+function durableHistoryFingerprint(events: readonly unknown[]): string {
+  const canonical = JSON.stringify(events, (_key, value: unknown) => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)))
+  })
+  return createHash('sha256').update('dsh-anywhere-history-v1\0').update(canonical).digest('hex')
+}
+
 async function publishSessionHistory(
   ctx: NativeContext,
   session: ReturnType<typeof normalizeSessionSummary>,
   deviceId: string,
   publish: (event: NativeEventInput, recipients?: Iterable<WebSocket>) => void,
   recipients?: Iterable<WebSocket>,
+  historyFingerprint?: string,
 ): Promise<number> {
   const inspection = await ctx.sessionController.inspect(session.id, AbortSignal.timeout(60_000))
   const allEvents = inspection.events
+  const fingerprint = durableHistoryFingerprint(allEvents)
+  const unchanged = historyFingerprint === fingerprint
   const recentCount = Math.min(HISTORY_EVENT_LIMIT, allEvents.length)
   const recentStart = Math.max(0, allEvents.length - recentCount)
   const historyToolNames = new Map<string, string>()
@@ -4289,6 +4312,7 @@ async function publishSessionHistory(
   let published = 0
   let publishedUsage = false
 
+  if (!unchanged) {
   publish({ deviceId, sessionId: session.id, type: 'history.started',
     historyBatchId: batchId,
     payload: { sessionId: session.id, batchId } }, recipients)
@@ -4357,7 +4381,14 @@ async function publishSessionHistory(
   }
   publish({ deviceId, sessionId: session.id, type: 'history.completed',
     historyBatchId: batchId,
-    payload: { sessionId: session.id, batchId } }, recipients)
+    payload: { sessionId: session.id, batchId, fingerprint } }, recipients)
+  } else {
+    // No start marker means iOS leaves its cached transcript untouched. The
+    // completion is still a correlated, durable validation receipt.
+    publish({ deviceId, sessionId: session.id, type: 'history.completed',
+      historyBatchId: batchId,
+      payload: { sessionId: session.id, batchId, fingerprint, unchanged: true } }, recipients)
+  }
   const window = historyWindow(session.id, allEvents, recentStart)
   if (window !== undefined) publish({ deviceId, sessionId: session.id, type: 'history.window', payload: window }, recipients)
   for (const payload of workflowRecords.get(ctx)?.seed(session.id, allEvents) ?? []) {

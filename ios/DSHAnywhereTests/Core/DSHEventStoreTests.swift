@@ -842,6 +842,24 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertEqual(state.decisionVersion?.epoch, "host-2")
     }
 
+    func testRewrittenHistoryReplacesDiskCacheButKeepsNewLiveOutput() {
+        let reducer = DSHEventReducer()
+        var state = DSHStoreState()
+        state.messagesBySession["s"] = [.init(id: "removed", role: .assistant, markdown: "Old cached text")]
+        state.restoredHistoryContent = ["s": DSHHistoryContent(state, session: "s")]
+        state.messagesBySession["s"]?.append(.init(id: "live-before-start", role: .assistant, markdown: "New live text"))
+        func send(_ type: String, _ payload: [String: DSHJSONValue], sequence: Int64, batch: String? = nil) {
+            reducer.reduce(DSHEvent(envelope: DSHEnvelope(messageId: "replace-\(sequence)", deviceId: "d", machineId: "m",
+                sessionId: "s", historyBatchId: batch, sequence: sequence, type: type, payload: .object(payload))), into: &state)
+        }
+        let marker: [String: DSHJSONValue] = ["sessionId": .string("s"), "batchId": .string("b")]
+        send("history.started", marker, sequence: 1, batch: "b")
+        send("assistant.message.completed", ["id": .string("replacement"), "role": .string("assistant"), "markdown": .string("New authoritative text")], sequence: 2, batch: "b")
+        XCTAssertEqual(state.messagesBySession["s"]?.count, 2, "Cache remains readable until commit")
+        send("history.completed", marker, sequence: 3, batch: "b")
+        XCTAssertEqual(Set(state.messagesBySession["s", default: []].map(\.id)), ["replacement", "live-before-start"])
+    }
+
     func testAtomicHistoryKeepsVisibleContentStableAndMergesLiveOnce() throws {
         let reducer = DSHEventReducer()
         var state = DSHStoreState()
@@ -3381,6 +3399,46 @@ final class DSHEventStoreTests: XCTestCase {
     /// DSHAppModel deliberately reconciles pairing/profile state while its
     /// pending transaction ledger loads. These transport tests need a real
     /// matching active profile so that guard is exercised instead of bypassed.
+    @MainActor
+    func testCachedHistorySurvivesNewModelOfflineAndValidatesWithoutReplay() async throws {
+        let restoreProfile = installCorrelationTestProfile(); defer { restoreProfile() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var original = DSHStoreState()
+        original.sessions = [.init(id: "cached", title: "Long task", running: true)]
+        original.messagesBySession["cached"] = [.init(id: "old", role: .assistant, markdown: "Already on phone")]
+        let fingerprint = String(repeating: "a", count: 64)
+        let disk = DSHHistoryCache(directory: directory)
+        try await disk.save(.init(state: original, session: "cached", fingerprint: fingerprint), scope: "https://example.test|machine")
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, isPaired: true, transactionDirectory: directory)
+        await model.preparePromptPersistence()
+        model.disconnect()
+        try await Task.sleep(for: .milliseconds(150))
+        model.openSession("cached")
+        for _ in 0..<100 where model.state.messagesBySession["cached"] == nil { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(model.state.messagesBySession["cached"]?.first?.markdown, "Already on phone")
+        XCTAssertFalse(model.isLoadingHistory(for: "cached"))
+        let offlineRequest = await transport.lastCommand(ofType: "session.open")
+        XCTAssertNil(offlineRequest)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(150))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        try await Task.sleep(for: .milliseconds(100))
+        model.openSession("cached", forceRefresh: true)
+        for _ in 0..<100 { if await transport.lastCommand(ofType: "session.open") != nil { break }; try await Task.sleep(for: .milliseconds(20)) }
+        await transport.emit(event(type: "history.completed", messageID: "validated", sequence: 2,
+            payload: .object(["sessionId": .string("cached"), "batchId": .string("check"), "fingerprint": .string(fingerprint), "unchanged": .bool(true)])))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(model.isLoadingHistory(for: "cached"))
+        XCTAssertEqual(model.state.messagesBySession["cached"]?.map(\.id), ["old"])
+        try await Task.sleep(for: .milliseconds(2100))
+        model.openSession("cached")
+        try await Task.sleep(for: .milliseconds(150))
+        let request = await transport.lastCommand(ofType: "session.open")
+        XCTAssertEqual(request?.payload.executionObject["historyFingerprint"], .string(fingerprint))
+    }
+
     @MainActor
     private func makeModel(transport: any DSHAppTransport, initialState: DSHStoreState = .init(),
                            isPaired: Bool? = nil, transactionDirectory: URL? = nil) -> DSHAppModel {

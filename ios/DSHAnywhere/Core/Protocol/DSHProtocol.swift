@@ -264,10 +264,12 @@ public struct DSHCommand: Codable, Sendable, Equatable {
     /// history as ordinary transcript events over the existing socket.
     public static func openSession(deviceId: String, machineId: String,
                                    sessionId: String, streaming: Bool = false,
+                                   historyFingerprint: String? = nil,
                                    parentSessionId: String? = nil, subagentMode: String? = nil,
                                    requestId: String = UUID().uuidString) -> DSHCommand {
         var payload: [String: DSHJSONValue] = ["sessionId": .string(sessionId)]
         if streaming { payload["streaming"] = .bool(true) }
+        if let historyFingerprint { payload["historyFingerprint"] = .string(historyFingerprint) }
         if let parentSessionId { payload["parentSessionId"] = .string(parentSessionId) }
         if let subagentMode { payload["subagentMode"] = .string(subagentMode) }
         return DSHCommand(requestId: requestId, deviceId: deviceId, machineId: machineId,
@@ -2082,10 +2084,14 @@ public struct DSHProtocolError: Codable, Sendable, Equatable {
 public struct DSHHistoryBatch: Codable, Sendable, Equatable {
     public let sessionId: String
     public let batchId: String
+    public var fingerprint: String?
+    public var unchanged: Bool?
 
-    public init(sessionId: String, batchId: String) {
+    public init(sessionId: String, batchId: String, fingerprint: String? = nil, unchanged: Bool? = nil) {
         self.sessionId = sessionId
         self.batchId = batchId
+        self.fingerprint = fingerprint
+        self.unchanged = unchanged
     }
 }
 

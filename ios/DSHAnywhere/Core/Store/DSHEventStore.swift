@@ -41,6 +41,7 @@ public struct DSHStoreState: Codable, Sendable, Equatable {
     public var directoryListing: DSHDirectoryListing?
     public var usageBySession: [String: DSHSessionUsage] = [:]
     public var historyUsageBySession: [String: DSHHistoryUsage]?
+    public var restoredHistoryContent: [String: DSHHistoryContent]?
     public var pendingSessionHistory: [String: DSHPendingSessionHistory]?
     public var retiredHistoryBatches: [String: [String]]?
     public var historyFailures: [String: String]?
@@ -857,7 +858,20 @@ public struct DSHEventReducer: Sendable {
             guard let batchId else { abandonHistory(session: sessionId, into: &state); return }
             guard pending.batchId == batchId else { return }
             var built = DSHStoreState()
-            pending.baseline.restore(into: &built, session: sessionId)
+            if let cached = state.restoredHistoryContent?.removeValue(forKey: sessionId) {
+                // Discard the old disk snapshot on authoritative replacement,
+                // but carry output received live since that snapshot was read.
+                let cachedMessages = Set((cached.messages ?? []).map(\.id))
+                let cachedTools = Set((cached.tools ?? []).map(\.id))
+                let cachedCommands = Set((cached.commands ?? []).map(\.id))
+                let cachedModels = Set((cached.models ?? []).map(\.id))
+                built.messagesBySession[sessionId] = pending.baseline.messages?.filter { !cachedMessages.contains($0.id) }
+                built.toolsBySession[sessionId] = pending.baseline.tools?.filter { !cachedTools.contains($0.id) }
+                built.commandResultsBySession[sessionId] = pending.baseline.commands?.filter { !cachedCommands.contains($0.id) }
+                built.modelChangesBySession[sessionId] = pending.baseline.models?.filter { !cachedModels.contains($0.id) }
+            } else {
+                pending.baseline.restore(into: &built, session: sessionId)
+            }
             // Build privately using the same reducer semantics, without
             // rewinding the live transport sequence or triggering UI effects.
             let marker = DSHEvent(envelope: DSHEnvelope(messageId: batchId, deviceId: "history", machineId: "history",

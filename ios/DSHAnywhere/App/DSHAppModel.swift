@@ -887,6 +887,15 @@ final class DSHAppModel: ObservableObject {
     private var fileLinksBySession: [String: [String: (markdown: String, references: [DSHFileReference])]] = [:]
     /// Last `openSession` per session, to collapse duplicate replays.
     private var lastOpenSessionAt: [String: Date] = [:]
+    private lazy var historyCache = DSHHistoryCache(directory: transactionDirectory)
+    private var historyFingerprints: [String: String] = [:]
+    private var cacheRestoreTasks: [String: Task<Void, Never>] = [:]
+    private var cacheSaveTask: Task<Void, Never>?
+    private var dirtyCachedSessions: Set<String> = []
+    private var historyCacheScope: String {
+        (activeMachine?.relayBaseURL.absoluteString ?? "") + "|" + machineID
+    }
+
     /// The visible screen, unlike `lastOpenSessionAt`, is cleared when the
     /// user returns home. Replay recovery must not reopen a stale transcript
     /// behind the session list.
@@ -1760,6 +1769,12 @@ final class DSHAppModel: ObservableObject {
         requestedHistorySessions.removeAll()
         historyOpenRequests.removeAll()
         lastOpenSessionAt.removeAll(keepingCapacity: false)
+        for task in cacheRestoreTasks.values { task.cancel() }
+        cacheRestoreTasks.removeAll()
+        cacheSaveTask?.cancel()
+        cacheSaveTask = nil
+        dirtyCachedSessions.removeAll()
+        historyFingerprints.removeAll()
         pendingSessionCreationRequestIDs.removeAll(keepingCapacity: false)
         pendingSessionCreationCommandsByRequestID.removeAll(keepingCapacity: false)
         for task in sessionCreationTimeoutTasks.values { task.cancel() }
@@ -2379,6 +2394,8 @@ final class DSHAppModel: ObservableObject {
             }
             do {
                 try await self.transport.removeMachine(machine.machineId)
+                let scope = machine.relayBaseURL.absoluteString + "|" + machine.machineId
+                try? await self.historyCache.remove(scope: scope)
             } catch {
                 self.removedMachineIDs.remove(machine.machineId)
                 guard await self.persistRemovedMachineFence() else { return }
@@ -2504,6 +2521,13 @@ final class DSHAppModel: ObservableObject {
         state.bridgeReachable = nil
         eventTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            let scope = self.historyCacheScope
+            let summaries = await self.historyCache.summaries(scope: scope)
+            guard !Task.isCancelled, self.machineStateGeneration == connectionGeneration else { return }
+            if self.state.sessions.isEmpty, !self.state.hasLoadedSessions, !summaries.isEmpty {
+                self.state.sessions = summaries
+                self.state.hasLoadedSessions = true
+            }
             await self.transport.setIncludeArchived(self.showArchivedSessions)
             let stream = await transport.connect()
             guard self.machineStateGeneration == connectionGeneration else { return }
@@ -2580,6 +2604,7 @@ final class DSHAppModel: ObservableObject {
         eventFlushTask?.cancel()
         eventFlushTask = nil
         let forgottenMachineID = activeMachine?.machineId ?? machineID
+        let forgottenCacheScope = historyCacheScope
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard await self.suspendSessionCreationTransactions(for: forgottenMachineID) else {
@@ -2593,7 +2618,10 @@ final class DSHAppModel: ObservableObject {
                 return
             }
             self.resetTransientRequestState()
-            do { try await self.transport.forgetPairing() }
+            do {
+                try await self.transport.forgetPairing()
+                try? await self.historyCache.remove(scope: forgottenCacheScope)
+            }
             catch {
                 self.removedMachineIDs.remove(forgottenMachineID)
                 guard await self.persistRemovedMachineFence() else { return }
@@ -2860,12 +2888,44 @@ final class DSHAppModel: ObservableObject {
     /// Replays less than two seconds apart are the same user gesture (appear
     /// plus pull-to-refresh): the second stream would only interleave a
     /// duplicate of the first, so it is skipped.
-    func openSession(_ sessionID: String) {
+    func openSession(_ sessionID: String, forceRefresh: Bool = false) {
         let now = Date()
-        if let last = lastOpenSessionAt[sessionID], now.timeIntervalSince(last) < 2 { return }
+        if !forceRefresh, let last = lastOpenSessionAt[sessionID], now.timeIntervalSince(last) < 2 { return }
+        guard cacheRestoreTasks[sessionID] == nil else { return }
         lastOpenSessionAt[sessionID] = now
+        let scope = historyCacheScope, generation = machineStateGeneration
+        cacheRestoreTasks[sessionID] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let record = await self.historyCache.load(scope: scope, session: sessionID)
+            guard !Task.isCancelled, self.machineStateGeneration == generation, self.historyCacheScope == scope else { return }
+            self.cacheRestoreTasks.removeValue(forKey: sessionID)
+            if self.state.messagesBySession[sessionID] == nil,
+               self.state.toolsBySession[sessionID] == nil,
+               self.state.pendingSessionHistory?[sessionID] == nil, let record {
+                let summary = self.state.sessions.first(where: { $0.id == sessionID })
+                let turn = self.state.turnStateBySession[sessionID]
+                record.restore(into: &self.state)
+                if let summary, let index = self.state.sessions.firstIndex(where: { $0.id == sessionID }) { self.state.sessions[index] = summary }
+                if let turn { self.state.turnStateBySession[sessionID] = turn }
+                if self.state.restoredHistoryContent == nil { self.state.restoredHistoryContent = [:] }
+                self.state.restoredHistoryContent?[sessionID] = DSHHistoryContent(self.state, session: sessionID)
+                self.invalidateTranscriptCaches(for: [sessionID])
+                if let fingerprint = record.fingerprint { self.historyFingerprints[sessionID] = fingerprint }
+            }
+            // Offline browsing never creates a request that can time out.
+            guard self.state.confirmedMachinePresence != false, self.state.bridgeReachable != false else { return }
+            switch self.state.connectionState {
+            case .disconnected, .failed: return
+            default: break
+            }
+            self.requestSessionHistory(sessionID, forceRefresh: forceRefresh)
+        }
+    }
+
+    private func requestSessionHistory(_ sessionID: String, forceRefresh: Bool) {
         let command = DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
-                                    sessionId: sessionID, streaming: true)
+                                    sessionId: sessionID, streaming: true,
+                                    historyFingerprint: forceRefresh ? nil : historyFingerprints[sessionID])
         requestedHistorySessions.insert(sessionID)
         state.historyFailures?.removeValue(forKey: sessionID)
         historyOpenRequests[command.requestId] = sessionID
@@ -5279,6 +5339,12 @@ final class DSHAppModel: ObservableObject {
         // notification we are trying to avoid. A batch always represents one
         // transport tick, so one assignment is the bounded publication point.
         state = next
+        for event in acceptedEvents {
+            if case .historyCompleted(let batch) = event.kind, let fingerprint = batch.fingerprint {
+                historyFingerprints[batch.sessionId] = fingerprint
+            }
+        }
+        scheduleHistoryCacheSave(transcriptSessionIDs(affectedBy: visibleEvents))
 
         // Walk history markers in the same order as their accepted events.
         // Registering every marker up front would let a later history.started
@@ -5339,6 +5405,24 @@ final class DSHAppModel: ObservableObject {
         // the whole batch has contributed its readiness state.
         performReplayResynchronizationIfReady()
         performPendingReadOnlyRecoveryIfReady()
+    }
+
+    private func scheduleHistoryCacheSave(_ sessions: Set<String>) {
+        dirtyCachedSessions.formUnion(sessions)
+        guard cacheSaveTask == nil, !machineID.isEmpty else { return }
+        let scope = historyCacheScope, generation = machineStateGeneration
+        cacheSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self, self.machineStateGeneration == generation else { return }
+            let sessions = self.dirtyCachedSessions
+            self.dirtyCachedSessions.removeAll()
+            self.cacheSaveTask = nil
+            for session in sessions where self.state.pendingSessionHistory?[session] == nil {
+                guard self.state.messagesBySession[session] != nil || self.state.toolsBySession[session] != nil else { continue }
+                let record = DSHHistoryCacheRecord(state: self.state, session: session, fingerprint: self.historyFingerprints[session])
+                try? await self.historyCache.save(record, scope: scope)
+            }
+        }
     }
 
     private func observeReadOnlyRecoveryReadiness(_ event: DSHEvent) {
@@ -5473,6 +5557,7 @@ final class DSHAppModel: ObservableObject {
             historyTimeoutTasks.removeValue(forKey: "request-" + batch.sessionId)?.cancel()
             armHistoryTimeout(batch)
         case .historyCompleted(let batch):
+            historyTimeoutTasks.removeValue(forKey: "request-" + batch.sessionId)?.cancel()
             historyTimeoutTasks.removeValue(forKey: historyBatchKey(batch))?.cancel()
             historyLastProgressAt.removeValue(forKey: historyBatchKey(batch))
             if state.pendingSessionHistory?[batch.sessionId] == nil {
