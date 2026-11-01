@@ -1307,6 +1307,40 @@ final class DSHEventStoreTests: XCTestCase {
         model.disconnect()
     }
     @MainActor
+    func testUnavailableBridgeCatalogsUseHomeStatusWithoutHidingActionErrors() async throws {
+        let restore = installCorrelationTestProfile(); defer { restore() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        _ = await model.preparePromptPersistence(expectedMachineGeneration: model.currentMachineGeneration, expectedMachineID: model.machineID)
+        model.connect(); defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(50))
+        await transport.emit(event(type: "connection.ready", messageID: "ready", sequence: 1, payload: .object([:])))
+        model.refreshSessions(); model.requestWorkspaces(); model.requestModes(); model.sendModelCatalog()
+        var sequence: Int64 = 2
+        for type in ["session.list", "workspace.catalog", "mode.catalog", "model.catalog", "decisions.list"] {
+            let captured = try await transport.waitForCommand(ofType: type)
+            let command = try XCTUnwrap(captured)
+            await transport.emit(event(type: "protocol.error", messageID: command.requestId, sequence: sequence,
+                payload: .object(["code": .string("bridge-request-failed"), "message": .string("Local DSH bridge request failed"), "retryable": .bool(true)])))
+            sequence += 1
+        }
+        for _ in 0..<100 { if model.state.lastSequence == sequence - 1 { break }; try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.state.bridgeReachable, false)
+        XCTAssertEqual(model.deviceStatus, .error)
+        await transport.emit(event(type: "protocol.error", messageID: "explicit-action", sequence: sequence,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("Explicit action must remain visible"), "retryable": .bool(true)])))
+        sequence += 1
+        for _ in 0..<100 { if model.errorMessage != nil { break }; try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(model.errorMessage, "Explicit action must remain visible")
+        let catalog = try await transport.waitForCommand(ofType: "mode.catalog")
+        await transport.emit(event(type: "protocol.error", messageID: try XCTUnwrap(catalog).requestId, sequence: sequence,
+            payload: .object(["code": .string("bridge-request-failed"), "message": .string("Upgrade required"), "retryable": .bool(false)])))
+        for _ in 0..<100 { if model.errorMessage == "Upgrade required" { break }; try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(model.errorMessage, "Upgrade required", "Non-transient compatibility errors remain visible")
+    }
+
+    @MainActor
     func testPassiveCommandCatalogFailureDoesNotInterruptConversation() async throws {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }

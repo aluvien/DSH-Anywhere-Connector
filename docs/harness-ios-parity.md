@@ -299,3 +299,12 @@ Build 130 发布记录：1.0 (130)，2026-10-30 17:07（本地时间）完成签
 - pnpm build/check 通过，298 项 TypeScript 测试通过。最终完整 iOS 回归 249 项通过、2 项条件跳过、0 失败（`/tmp/dsh-atomic-history-final.xcresult`）。慢速视觉测试在实际接收通道就绪后逐批重放，逐次断言正文和活动说明保持稳定；浅深色加载前/中/完成截图已检查，实际录像 `atomic-history-light-dark.mp4` 已逐帧核对完成时一次出现正文。另修正旧会话创建超时测试最终断言的固定短等待，保持原有严格计时窗口断言。已随 Build 131 上传。
 
 Build 131 发布记录：1.0 (131)，2026-10-30 19:05（本地时间）完成签名归档、IPA 导出和上传；Apple 返回 `UPLOAD SUCCEEDED with no errors`，接收编号 `9e461c67-4f11-4b99-8297-7c8309fb2437`。首次状态查询尚未列出构建，等待 Apple 处理。源码及本机组件修复均已推送，生产本机配置三项读取已实际返回 200。
+
+
+### Harness 升级 rc.5 后恢复连接（2026-11-01）
+
+- 本机 Harness 升至 0.2.1-rc.5 后，旧 dsh-anywhere 0.1.0 的 Native peer 仍锁定 0.1.5-rc.2，原有 rc.3 专项兼容确认不适用。原生插件页明确显示“不兼容 / 异常”，因此 Bridge 未加载，端口描述符仍是 10 月 30 日的旧监听地址，Connector ECONNREFUSED，手机显示 Mac 无法访问。
+- 组件版本更新为 0.1.1，Native peer 范围声明为 `^0.1.5-rc.2 || ^0.2.1-rc.3`。通过 rc.5 官方 evaluatePluginCompatibility 检查：0.1.5-rc.2、0.2.1-rc.3、0.2.1-rc.5 匹配，0.3.0 仍被拒绝；没有新增兼容豁免或关闭原生校验。
+- 从已安装官方桌面包提取 rc.5 运行时，在独立 DSH_HOME、loopback 测试端口验证 Bridge、sessions、workspaces、modes、plugins/providers/settings 全部返回 200。完整 pnpm build/check 通过，298 项 TypeScript 测试通过。测试进程已停止。
+- 已安装到本机并正常重启 Harness，生成新的动态端口，Connector 日志确认 Local DSH bridge connected。生产本机上述 7 项读取全部 HTTP 200；脱敏证据 `production-rc5-recovery-20261101.json`。原有配对继续使用，用户无需重新配对。
+- App 增加有界的被动目录请求关联：session.list、workspace/mode/model.catalog、decisions.list 的可重试 Bridge 失败由现有离线状态展示，不再叠加通用全局弹窗。明确操作失败、非暂时性的升级/权限错误仍可见，机器切换时清理请求关联。2 项模拟器定向测试通过（`/tmp/dsh-offline-catalogs.xcresult`）。此 App 修复尚未上传新的 TestFlight；Build 131 不包含它，电脑连接恢复已即时生效。

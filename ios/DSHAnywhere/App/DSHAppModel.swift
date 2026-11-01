@@ -868,6 +868,7 @@ final class DSHAppModel: ObservableObject {
     /// child-folder listing.
     private var pendingDirectoryRequestID: String?
     private var requestedCatalogsForConnection = false
+    private var passiveCatalogRequestIDs: [String] = []
     private var requestedDecisionsForConnection = false
     /// Attachments selected in the shared new-session composer stay local until
     /// the session exists. They are uploaded and sent as one initial prompt
@@ -1738,6 +1739,7 @@ final class DSHAppModel: ObservableObject {
         cancelledStagedPromptIDs.removeAll(keepingCapacity: false)
         sendAttemptGenerations.removeAll(keepingCapacity: false)
         uploadWaitRequestIDs.removeAll(keepingCapacity: false)
+        passiveCatalogRequestIDs.removeAll(keepingCapacity: false)
         decisionRequestTypes.removeAll(keepingCapacity: false)
         fileLinksBySession.removeAll(keepingCapacity: false)
         failedSendsByRequestID.removeAll(keepingCapacity: false)
@@ -4975,6 +4977,10 @@ final class DSHAppModel: ObservableObject {
             errorMessage = "当前 Mac 配对事务尚未完成，请重新配对后再试。"
             return
         }
+        if ["session.list", "workspace.catalog", "mode.catalog", "model.catalog", "decisions.list"].contains(command.type) {
+            passiveCatalogRequestIDs.append(command.requestId)
+            passiveCatalogRequestIDs = Array(passiveCatalogRequestIDs.suffix(256))
+        }
         let attempt = command.type == "prompt.send" ? sendAttemptGenerations[command.requestId] : nil
         let promptDeadline = pendingSendsByRequestID[command.requestId]?.dedupeExpiresAt
         let machineGeneration = self.machineStateGeneration
@@ -5533,6 +5539,10 @@ final class DSHAppModel: ObservableObject {
         // Catalog discovery is a passive read performed while opening a chat.
         // Keep the existing suggestions when it fails; do not interrupt reading.
         guard !commandCatalogRequestIDs.values.contains(event.envelope.messageId) else { return }
+        // Home already shows the unavailable Mac state. A passive catalog
+        // retry must not stack a generic alert on top of that same condition.
+        if passiveCatalogRequestIDs.contains(event.envelope.messageId),
+           error.code == "bridge-request-failed", error.retryable { return }
         if isReplayResynchronizationNotice(error) {
             scheduleReplayResynchronization(for: event)
             return
