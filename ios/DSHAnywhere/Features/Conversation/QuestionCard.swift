@@ -1,16 +1,40 @@
 import SwiftUI
 
+struct DSHQuestionDraft: Codable, Equatable {
+    let questions: [DSHQuestion]
+    var selections: [String: Set<String>]
+    var custom: [String: String]
+    var skipped: Set<String>
+}
+
 /// Renders an `ask_user_question` request so it can actually be answered from
 /// the phone. The model's tool call stays parked on the Mac until every
 /// question in the request has an answer, so the card submits one complete
 /// payload rather than a partial one.
 struct QuestionCard: View {
     let request: DSHQuestionRequest
-    let onAnswer: ([DSHQuestionAnswer]) -> Void
+    var savedDraft: DSHQuestionDraft? = nil
+    var onDraftChange: ((DSHQuestionDraft) -> Void)? = nil
+    var onCancel: (() async throws -> Void)? = nil
+    let onAnswer: ([DSHQuestionAnswer]) async throws -> Void
 
     @State private var selections: [String: Set<String>] = [:]
     @State private var custom: [String: String] = [:]
+    @State private var skipped: Set<String> = []
     @State private var isSubmitting = false
+    @State private var showPlan = false
+    @State private var cancellationError: String?
+    @State private var restoredDraft = false
+    @State private var expired = false
+
+    private var planReview: DSHQuestion? {
+        guard request.questions.count == 1, let question = request.questions.first,
+              question.intent?.kind == "plan-review", question.multiSelect != true,
+              let detail = question.detail, !detail.isEmpty,
+              let options = question.options, options.count == 2,
+              options.contains(where: { $0.label == question.intent?.approve }) else { return nil }
+        return question
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -18,15 +42,38 @@ struct QuestionCard: View {
                 .font(.headline)
                 .foregroundStyle(Color.accentColor)
 
+            if planReview != nil {
+                Button("全屏阅读计划") { showPlan = true }
+                    .buttonStyle(.bordered)
+            }
+
             ForEach(request.questions) { question in
                 questionBody(question)
             }
+            .disabled(isSubmitting || expired)
+            if expired { Text("问题已过期，请等待电脑同步最新状态。 ").font(.caption).foregroundStyle(.secondary) }
 
             HStack {
+                if let onCancel {
+                    Button(planReview == nil ? "取消提问" : "继续讨论") {
+                        guard !isSubmitting else { return }
+                        isSubmitting = true
+                        cancellationError = nil
+                        Task { @MainActor in
+                            defer { isSubmitting = false }
+                            do { try await onCancel() }
+                            catch { cancellationError = error.localizedDescription }
+                        }
+                    }
+                    .disabled(isSubmitting || expired)
+                }
                 Spacer()
                 Button("Send answer") { submitCompleteAnswers() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isSubmitting || !isComplete)
+                    .disabled(isSubmitting || expired || !isComplete)
+            }
+            if let cancellationError {
+                Text(cancellationError).font(.caption).foregroundStyle(.red)
             }
         }
         .padding()
@@ -38,6 +85,42 @@ struct QuestionCard: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .accessibilityElement(children: .contain)
+        .onAppear {
+            guard !restoredDraft else { return }
+            restoredDraft = true
+            if let savedDraft, savedDraft.questions == request.questions {
+                selections = savedDraft.selections
+                custom = savedDraft.custom
+                skipped = savedDraft.skipped
+            }
+        }
+        .onChange(of: selections) { _, _ in persistDraft() }
+        .onChange(of: custom) { _, _ in persistDraft() }
+        .onChange(of: skipped) { _, _ in persistDraft() }
+        .task(id: request.expiresAt) {
+            guard let expiresAt = request.expiresAt else { return }
+            let delay = Double(expiresAt) / 1_000 - Date().timeIntervalSince1970
+            if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+            guard !Task.isCancelled else { return }
+            expired = true
+        }
+        .sheet(isPresented: $showPlan) {
+            NavigationStack {
+                ScrollView {
+                    MarkdownBlockText(text: planReview?.detail ?? "")
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
+                .navigationTitle("计划审阅")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { showPlan = false }
+                    }
+                }
+            }
+        }
     }
 
     private var title: String {
@@ -63,9 +146,7 @@ struct QuestionCard: View {
 
             if let detail = question.detail, !detail.isEmpty {
                 ScrollView {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    MarkdownBlockText(text: detail)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -84,10 +165,23 @@ struct QuestionCard: View {
             }
 
             TextField(options.isEmpty ? "Type your answer" : "Other answer",
-                      text: customBinding(question.id))
+                      text: customBinding(question.id, isMulti: isMulti))
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
                 .onSubmit { submitCompleteAnswers() }
+            if planReview == nil {
+              Button(skipped.contains(question.id) ? "取消跳过" : "跳过此问题") {
+                if skipped.contains(question.id) {
+                    skipped.remove(question.id)
+                } else {
+                    selections[question.id] = []
+                    custom[question.id] = ""
+                    skipped.insert(question.id)
+                }
+            }
+            .font(.caption)
+            .disabled(isSubmitting)
+            }
         }
     }
 
@@ -96,6 +190,7 @@ struct QuestionCard: View {
         let isSelected = selections[question.id]?.contains(option.label) == true
         return Button {
             guard !isSubmitting else { return }
+            skipped.remove(question.id)
             if isMulti {
                 var current = selections[question.id] ?? []
                 if current.contains(option.label) { current.remove(option.label) }
@@ -113,7 +208,9 @@ struct QuestionCard: View {
                 Image(systemName: symbol(isSelected: isSelected, isMulti: isMulti))
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(option.label)
+                    Text(planReview?.id == question.id
+                         ? (option.label == question.intent?.approve ? "批准计划并执行" : option.label)
+                         : option.label)
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.primary)
                         .multilineTextAlignment(.leading)
@@ -143,14 +240,21 @@ struct QuestionCard: View {
         return isSelected ? "largecircle.fill.circle" : "circle"
     }
 
-    private func customBinding(_ questionID: String) -> Binding<String> {
+    private func customBinding(_ questionID: String, isMulti: Bool) -> Binding<String> {
         Binding(
             get: { custom[questionID] ?? "" },
-            set: { custom[questionID] = $0 }
+            set: {
+                custom[questionID] = $0
+                if !$0.isEmpty {
+                    skipped.remove(questionID)
+                    if !isMulti { selections[questionID] = [] }
+                }
+            }
         )
     }
 
     private func hasAnswer(_ question: DSHQuestion) -> Bool {
+        if skipped.contains(question.id) { return true }
         if selections[question.id]?.isEmpty == false { return true }
         return !(custom[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -160,16 +264,27 @@ struct QuestionCard: View {
     }
 
     private func submitCompleteAnswers() {
-        guard !isSubmitting, isComplete else { return }
+        guard !isSubmitting, !expired, isComplete else { return }
         isSubmitting = true
-        onAnswer(request.questions.map { question in
+        cancellationError = nil
+        persistDraft()
+        let answers = request.questions.map { question in
             let text = (custom[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return DSHQuestionAnswer(
                 id: question.id,
                 selected: Array(selections[question.id] ?? []).sorted(),
                 custom: text.isEmpty ? nil : text
             )
-        })
+        }
+        Task { @MainActor in
+            defer { isSubmitting = false }
+            do { try await onAnswer(answers) }
+            catch { cancellationError = error.localizedDescription }
+        }
+    }
+
+    private func persistDraft() {
+        onDraftChange?(DSHQuestionDraft(questions: request.questions, selections: selections, custom: custom, skipped: skipped))
     }
 }
 

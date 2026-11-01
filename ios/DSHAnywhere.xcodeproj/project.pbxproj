@@ -7,6 +7,18 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        B00000000000000000000047 /* Features/Settings/ModelDiscoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000047; };
+        B00000000000000000000046 /* Features/Settings/ConfigurationField.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000046; };
+        B00000000000000000000045 /* Features/Settings/ConfigurationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000045; };
+        B00000000000000000000044 /* Core/Protocol/DSHConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000044; };
+        B00000000000000000000043 /* Features/Conversation/ScheduleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000043; };
+        B00000000000000000000042 /* Core/Protocol/DSHSchedule.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000042; };
+        B00000000000000000000041 /* Features/Conversation/HistorySearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000041; };
+        B00000000000000000000040 /* Core/Protocol/DSHHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000040; };
+        B00000000000000000000039 /* Features/Conversation/SubagentMedia.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000039; };
+        B00000000000000000000038 /* Features/Conversation/ReferencePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000038; };
+        B00000000000000000000037 /* Features/Conversation/FeedbackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000037; };
+        B00000000000000000000036 /* Core/Protocol/DSHToolResult.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000036 /* Core/Protocol/DSHToolResult.swift */; };
 		B00000000000000000000001 /* Core/Protocol/DSHProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */; };
 		B00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift */; };
 		B00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */; };
@@ -21,6 +33,10 @@
 		B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000B /* Features/Conversation/ConversationView.swift */; };
 		B00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */; };
 		B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */; };
+		B00000000000000000000032 /* Features/Conversation/WorkflowRunCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000032 /* Features/Conversation/WorkflowRunCard.swift */; };
+		B00000000000000000000033 /* Features/Conversation/RemoteFilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000033 /* Features/Conversation/RemoteFilesView.swift */; };
+		B00000000000000000000034 /* Core/Protocol/DSHExecution.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000034 /* Core/Protocol/DSHExecution.swift */; };
+		B00000000000000000000035 /* Features/Conversation/ExecutionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000035 /* Features/Conversation/ExecutionView.swift */; };
 		B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */; };
 		B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */; };
 		B00000000000000000000010 /* Features/Settings/SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000010 /* Features/Settings/SettingsView.swift */; };
@@ -31,6 +47,8 @@
 		B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000102 /* Core/DSHEventStoreTests.swift */; };
 		B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift */; };
 		B00000000000000000000104 /* Core/DSHProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000104 /* Core/DSHProfileStoreTests.swift */; };
+		B00000000000000000000090 /* Core/Store/DSHHistoryCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000090; };
+		B00000000000000000000091 /* ../DSHAnywhereTests/Core/DSHHistoryCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000091; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +62,18 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+        F00000000000000000000047 /* Features/Settings/ModelDiscoveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/ModelDiscoveryView.swift; sourceTree = "<group>"; };
+        F00000000000000000000046 /* Features/Settings/ConfigurationField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/ConfigurationField.swift; sourceTree = "<group>"; };
+        F00000000000000000000045 /* Features/Settings/ConfigurationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/ConfigurationView.swift; sourceTree = "<group>"; };
+        F00000000000000000000044 /* Core/Protocol/DSHConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHConfiguration.swift; sourceTree = "<group>"; };
+        F00000000000000000000043 /* Features/Conversation/ScheduleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ScheduleView.swift; sourceTree = "<group>"; };
+        F00000000000000000000042 /* Core/Protocol/DSHSchedule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHSchedule.swift; sourceTree = "<group>"; };
+        F00000000000000000000041 /* Features/Conversation/HistorySearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/HistorySearchView.swift; sourceTree = "<group>"; };
+        F00000000000000000000040 /* Core/Protocol/DSHHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHHistory.swift; sourceTree = "<group>"; };
+        F00000000000000000000039 /* Features/Conversation/SubagentMedia.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/SubagentMedia.swift; sourceTree = "<group>"; };
+        F00000000000000000000038 /* Features/Conversation/ReferencePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ReferencePicker.swift; sourceTree = "<group>"; };
+        F00000000000000000000037 /* Features/Conversation/FeedbackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/FeedbackView.swift; sourceTree = "<group>"; };
+        F00000000000000000000036 /* Core/Protocol/DSHToolResult.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHToolResult.swift; sourceTree = "<group>"; };
 		F00000000000000000000001 /* Core/Protocol/DSHProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHProtocol.swift; sourceTree = "<group>"; };
 		F00000000000000000000030 /* Core/Protocol/DSHMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHMarkdown.swift; sourceTree = "<group>"; };
 		F00000000000000000000002 /* Core/Security/DSHKeychainTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Security/DSHKeychainTokenStore.swift; sourceTree = "<group>"; };
@@ -58,6 +88,10 @@
 		F0000000000000000000000B /* Features/Conversation/ConversationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ConversationView.swift; sourceTree = "<group>"; };
 		F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Shared/DSHRemoteGlyphs.swift; sourceTree = "<group>"; };
 		F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ToolActivityCard.swift; sourceTree = "<group>"; };
+		F00000000000000000000032 /* Features/Conversation/WorkflowRunCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/WorkflowRunCard.swift; sourceTree = "<group>"; };
+		F00000000000000000000033 /* Features/Conversation/RemoteFilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/RemoteFilesView.swift; sourceTree = "<group>"; };
+		F00000000000000000000034 /* Core/Protocol/DSHExecution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/Protocol/DSHExecution.swift; sourceTree = "<group>"; };
+		F00000000000000000000035 /* Features/Conversation/ExecutionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ExecutionView.swift; sourceTree = "<group>"; };
 		F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/ApprovalCard.swift; sourceTree = "<group>"; };
 		F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Conversation/QuestionCard.swift; sourceTree = "<group>"; };
 		F00000000000000000000010 /* Features/Settings/SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/Settings/SettingsView.swift; sourceTree = "<group>"; };
@@ -70,6 +104,8 @@
 		F00000000000000000000104 /* Core/DSHProfileStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/DSHProfileStoreTests.swift; sourceTree = "<group>"; };
 		F00000000000000000000201 /* DSHAnywhere.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DSHAnywhere.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F00000000000000000000202 /* DSHAnywhereTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DSHAnywhereTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F00000000000000000000090 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/Store/DSHHistoryCache.swift"; sourceTree = "<group>"; };
+		F00000000000000000000091 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../DSHAnywhereTests/Core/DSHHistoryCacheTests.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -108,6 +144,8 @@
 				F00000000000000000000003 /* Core/Networking/DSHAPIClient.swift */,
 				F00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift */,
 				F00000000000000000000005 /* Core/Store/DSHEventStore.swift */,
+				F00000000000000000000091,
+				F00000000000000000000090,
 				F00000000000000000000006 /* App/DSHAppTransport.swift */,
 				F00000000000000000000007 /* App/DSHAppModel.swift */,
 				F00000000000000000000008 /* App/DSHAnywhereApp.swift */,
@@ -116,6 +154,22 @@
 				F0000000000000000000000B /* Features/Conversation/ConversationView.swift */,
 				F00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift */,
 				F0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift */,
+				F00000000000000000000032 /* Features/Conversation/WorkflowRunCard.swift */,
+				F00000000000000000000033 /* Features/Conversation/RemoteFilesView.swift */,
+				F00000000000000000000034 /* Core/Protocol/DSHExecution.swift */,
+				F00000000000000000000035 /* Features/Conversation/ExecutionView.swift */,
+                F00000000000000000000036 /* Core/Protocol/DSHToolResult.swift */,
+                F00000000000000000000037 /* Features/Conversation/FeedbackView.swift */,
+                F00000000000000000000038 /* Features/Conversation/ReferencePicker.swift */,
+                F00000000000000000000039 /* Features/Conversation/SubagentMedia.swift */,
+                F00000000000000000000040 /* Core/Protocol/DSHHistory.swift */,
+                F00000000000000000000041 /* Features/Conversation/HistorySearchView.swift */,
+                F00000000000000000000043 /* Features/Conversation/ScheduleView.swift */,
+                F00000000000000000000047 /* Features/Settings/ModelDiscoveryView.swift */,
+                F00000000000000000000046 /* Features/Settings/ConfigurationField.swift */,
+                F00000000000000000000045 /* Features/Settings/ConfigurationView.swift */,
+                F00000000000000000000044 /* Core/Protocol/DSHConfiguration.swift */,
+                F00000000000000000000042 /* Core/Protocol/DSHSchedule.swift */,
 				F0000000000000000000000D /* Features/Conversation/ApprovalCard.swift */,
 				F0000000000000000000000F /* Features/Conversation/QuestionCard.swift */,
 				F00000000000000000000010 /* Features/Settings/SettingsView.swift */,
@@ -252,6 +306,7 @@
 				B00000000000000000000003 /* Core/Networking/DSHAPIClient.swift in Sources */,
 				B00000000000000000000004 /* Core/Networking/DSHWebSocketConnection.swift in Sources */,
 				B00000000000000000000005 /* Core/Store/DSHEventStore.swift in Sources */,
+				B00000000000000000000090,
 				B00000000000000000000006 /* App/DSHAppTransport.swift in Sources */,
 				B00000000000000000000007 /* App/DSHAppModel.swift in Sources */,
 				B00000000000000000000008 /* App/DSHAnywhereApp.swift in Sources */,
@@ -260,6 +315,22 @@
 				B0000000000000000000000B /* Features/Conversation/ConversationView.swift in Sources */,
 				B00000000000000000000031 /* Features/Shared/DSHRemoteGlyphs.swift in Sources */,
 				B0000000000000000000000C /* Features/Conversation/ToolActivityCard.swift in Sources */,
+				B00000000000000000000032 /* Features/Conversation/WorkflowRunCard.swift in Sources */,
+				B00000000000000000000033 /* Features/Conversation/RemoteFilesView.swift in Sources */,
+				B00000000000000000000034 /* Core/Protocol/DSHExecution.swift in Sources */,
+				B00000000000000000000035 /* Features/Conversation/ExecutionView.swift in Sources */,
+                B00000000000000000000036 /* Core/Protocol/DSHToolResult.swift in Sources */,
+                B00000000000000000000037 /* Features/Conversation/FeedbackView.swift in Sources */,
+                B00000000000000000000038 /* Features/Conversation/ReferencePicker.swift in Sources */,
+                B00000000000000000000039 /* Features/Conversation/SubagentMedia.swift in Sources */,
+                B00000000000000000000040 /* Core/Protocol/DSHHistory.swift in Sources */,
+                B00000000000000000000041 /* Features/Conversation/HistorySearchView.swift in Sources */,
+                B00000000000000000000043 /* Features/Conversation/ScheduleView.swift in Sources */,
+                B00000000000000000000047 /* Features/Settings/ModelDiscoveryView.swift in Sources */,
+                B00000000000000000000046 /* Features/Settings/ConfigurationField.swift in Sources */,
+                B00000000000000000000045 /* Features/Settings/ConfigurationView.swift in Sources */,
+                B00000000000000000000044 /* Core/Protocol/DSHConfiguration.swift in Sources */,
+                B00000000000000000000042 /* Core/Protocol/DSHSchedule.swift in Sources */,
 				B0000000000000000000000D /* Features/Conversation/ApprovalCard.swift in Sources */,
 				B0000000000000000000000F /* Features/Conversation/QuestionCard.swift in Sources */,
 				B00000000000000000000010 /* Features/Settings/SettingsView.swift in Sources */,
@@ -271,6 +342,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B00000000000000000000091,
 				B00000000000000000000101 /* Core/DSHProtocolTests.swift in Sources */,
 				B00000000000000000000102 /* Core/DSHEventStoreTests.swift in Sources */,
 				B00000000000000000000103 /* Core/DSHWebSocketConnectionTests.swift in Sources */,
@@ -317,7 +389,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 132;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
@@ -342,7 +414,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 132;
 				DEVELOPMENT_TEAM = DR2TNGTRAJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DSH Anywhere";
