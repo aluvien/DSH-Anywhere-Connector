@@ -3200,7 +3200,6 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
-    @MainActor
     func testInterruptedVisibleHistoryBatchReopensWithoutReplayGapNotice() async throws {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }
@@ -3239,6 +3238,7 @@ final class DSHEventStoreTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    @MainActor
     func testReadOnlyNotConnectedWaitsForNewReadinessWithoutRetryLoop() async {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }
