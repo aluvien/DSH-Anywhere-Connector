@@ -42,6 +42,9 @@ importers:
 
   packages/dsh-anywhere-plugin:
     dependencies:
+      '@dsh-anywhere/connector':
+        specifier: workspace:*
+        version: link:../connector
       '@dsh-anywhere/protocol':
         specifier: workspace:*
         version: link:../protocol

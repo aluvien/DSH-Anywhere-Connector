@@ -935,6 +935,7 @@ struct ConversationView: View {
     @Environment(\.dismiss) private var dismiss
     let sessionID: String
     var initialLocation: DSHSearchHit? = nil
+    var onBack: (() -> Void)? = nil
     @State private var showHistorySearch = false
     @State private var showSchedules = false
     @State private var locationRequest: DSHSearchHit?
@@ -1438,7 +1439,9 @@ struct ConversationView: View {
     /// left and a compact edit/menu capsule on the right.
     private var happyConversationHeader: some View {
         HStack(spacing: 10) {
-            Button { dismiss() } label: {
+            Button {
+                if let onBack { onBack() } else { dismiss() }
+            } label: {
                 if #available(iOS 26, *) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 20, weight: .medium))

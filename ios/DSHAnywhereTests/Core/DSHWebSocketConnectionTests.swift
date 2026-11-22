@@ -160,6 +160,60 @@ final class DSHWebSocketConnectionTests: XCTestCase {
         await connection.disconnect()
     }
 
+    func testConnectivityProbeKeepsSocketWithPong() async throws {
+        let socket = RecordingWebSocketTask()
+        socket.probeResponse = true
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                               bearerToken: "secret", deviceId: "device", machineId: "machine")
+        let connection = DSHWebSocketConnection(configuration: config, taskFactory: { _ in socket })
+        let stream = await connection.connect()
+        var events = stream.makeAsyncIterator()
+        _ = try await events.next()
+        _ = try await events.next()
+
+        await connection.recheckConnectivity(networkAvailable: false)
+        XCTAssertEqual(socket.probeCount, 0)
+        await connection.recheckConnectivity(networkAvailable: true)
+        await connection.recheckConnectivity(networkAvailable: true)
+        XCTAssertEqual(socket.probeCount, 1)
+        let state = await connection.state
+        XCTAssertEqual(state, .connected)
+        XCTAssertEqual(socket.resumeCount, 1)
+        await connection.disconnect()
+        await connection.recheckConnectivity(networkAvailable: true)
+        XCTAssertEqual(socket.probeCount, 1)
+    }
+
+    func testMissingPongReconnectsAndNetworkChangeWakesBackoff() async throws {
+        let first = RecordingWebSocketTask()
+        let second = RecordingWebSocketTask()
+        let config = DSHWebSocketConfiguration(url: URL(string: "wss://example.test/socket")!,
+                                               bearerToken: "secret", deviceId: "device", machineId: "machine",
+                                               backoff: .init(initialNanoseconds: 30_000_000_000))
+        let connection = DSHWebSocketConnection(configuration: config, lastSequence: 42,
+                                                 probeDeadline: .milliseconds(50),
+                                                 taskFactory: { _ in first.resumeCount == 0 ? first : second })
+        let stream = await connection.connect()
+        var events = stream.makeAsyncIterator()
+        _ = try await events.next()
+        _ = try await events.next()
+
+        await connection.recheckConnectivity(networkAvailable: true)
+        let reconnecting = try await events.next()
+        guard let reconnecting, case .transportState(.reconnecting(attempt: 1)) = reconnecting.kind else {
+            XCTFail("The socket should enter its retry wait after the probe times out.")
+            return
+        }
+        await connection.recheckConnectivity(networkAvailable: true)
+        for _ in 0..<200 where second.sentCommands.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(first.probeCount, 1)
+        XCTAssertEqual(second.resumeCount, 1)
+        XCTAssertEqual(second.sentCommands.first?.payload.executionObject["lastSequence"], .number(42))
+        await connection.disconnect()
+    }
+
     func testMachinePresenceIsForwardedToTheUIStream() async throws {
         let presence = DSHRelayPresenceMessage(type: "relay.presence", machineId: "machine",
                                                role: .machine, online: false,
@@ -299,6 +353,10 @@ final class DSHWebSocketConnectionTests: XCTestCase {
 private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Sendable {
     private let lock = NSLock()
     private var recordedResumeCount = 0
+    private var recordedProbeCount = 0
+    private var cancelled = false
+    var probeResponse: Bool?
+    var probeCount: Int { lock.withLock { recordedProbeCount } }
     private var recordedCommands: [DSHCommand] = []
     var resumeCount: Int { lock.withLock { recordedResumeCount } }
     var sentCommands: [DSHCommand] { lock.withLock { recordedCommands } }
@@ -314,8 +372,17 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
     }
 
     func resume() { lock.withLock { recordedResumeCount += 1 } }
+    func probe(_ completion: @escaping @Sendable (Bool) -> Void) {
+        let response = lock.withLock {
+            recordedProbeCount += 1
+            return probeResponse
+        }
+        if let response { completion(response) }
+    }
+
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let pending = lock.withLock {
+            cancelled = true
             let pending = receiveContinuation; receiveContinuation = nil; return pending
         }
         pending?.resume(throwing: DSHWebSocketError.closed)
@@ -332,6 +399,7 @@ private final class RecordingWebSocketTask: DSHWebSocketTasking, @unchecked Send
     func receive() async throws -> URLSessionWebSocketTask.Message {
         try await withCheckedThrowingContinuation { continuation in
             lock.withLock {
+                if cancelled { continuation.resume(throwing: DSHWebSocketError.closed); return }
                 if let receiveError { continuation.resume(throwing: receiveError); return }
                 if !sentReady {
                     sentReady = true

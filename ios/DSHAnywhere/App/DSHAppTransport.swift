@@ -13,6 +13,7 @@ protocol DSHAppTransport: Sendable {
     /// preview/test transports inherit the ordinary send behavior.
     func send(_ command: DSHCommand, notAfter: Date?) async throws
     func disconnect() async
+    func recheckConnectivity(networkAvailable: Bool) async
     func forgetPairing() async throws
     /// Chooses which paired Mac subsequent connections target.
     func setActiveMachine(_ machineId: String) async
@@ -43,6 +44,8 @@ protocol DSHAppTransport: Sendable {
 }
 
 extension DSHAppTransport {
+    func recheckConnectivity(networkAvailable: Bool) async {}
+
     func send(_ command: DSHCommand, notAfter: Date?) async throws {
         try await send(command)
     }
@@ -310,6 +313,10 @@ actor DSHRemoteTransport: DSHAppTransport {
         machineSelectionGeneration &+= 1
         pendingMachineSelectionID = nil
         await disconnectConnection()
+    }
+
+    func recheckConnectivity(networkAvailable: Bool) async {
+        await connection?.recheckConnectivity(networkAvailable: networkAvailable)
     }
 
     private func disconnectConnection() async {

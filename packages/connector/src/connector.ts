@@ -244,6 +244,10 @@ export class DSHAnywhereConnector {
     return this.state;
   }
 
+  get bridgeConnected(): boolean {
+    return this.relayVerified && this.bridge !== undefined && this.bridgeReady;
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;

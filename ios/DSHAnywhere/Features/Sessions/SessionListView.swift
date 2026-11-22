@@ -1191,7 +1191,9 @@ struct DSHHomeBottomBar: View {
 /// header, and native controls for search and starting work.
 struct DSHRemoteHomeView: View {
     @EnvironmentObject private var model: DSHAppModel
+    private let openConversation: ((String, DSHSearchHit?) -> Void)?
     @State private var navigationPath: [String] = []
+    @State private var historyLocation: DSHSearchHit?
     @State private var showSettings = false
     @State private var showSearch = false
     @State private var searchText = ""
@@ -1211,6 +1213,10 @@ struct DSHRemoteHomeView: View {
     @State private var showRenameWorkspace = false
     @State private var pendingWorkspaceDeletion: DSHSessionGroup?
     @State private var showDeleteWorkspaceConfirmation = false
+
+    init(openConversation: ((String, DSHSearchHit?) -> Void)? = nil) {
+        self.openConversation = openConversation
+    }
 
     private var groupedSessions: [DSHSessionGroup] {
         let sessionGroups = model.sessions
@@ -1299,7 +1305,7 @@ struct DSHRemoteHomeView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        DSHHistorySearchResults(query: searchText).padding(.horizontal, 12)
+                        DSHHistorySearchResults(query: searchText, onSelect: openHistoryResult).padding(.horizontal, 12)
                     }
                     if isLoadingTasks {
                         remoteLoadingState
@@ -1320,7 +1326,7 @@ struct DSHRemoteHomeView: View {
                             remoteEmptyState
                         } else {
                             ForEach(displayedFlatSessions) { session in
-                                NavigationLink(value: session.id) {
+                                Button { showConversation(session.id) } label: {
                                     DSHRemoteTaskRow(session: session, showWorkspaceName: true, flatStyle: true)
                                         .environmentObject(model)
                                 }
@@ -1364,7 +1370,7 @@ struct DSHRemoteHomeView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: String.self) { id in
-                ConversationView(sessionID: id)
+                ConversationView(sessionID: id, initialLocation: historyLocation?.sessionId == id ? historyLocation : nil)
             }
             .transaction { transaction in
                 // A task snapshot can contain hundreds of changed sessions
@@ -1407,10 +1413,8 @@ struct DSHRemoteHomeView: View {
                 Text("将删除项目“\(group.title)”并归档其中的 \(group.sessions.count) 个会话。项目目录和历史记录仍保留在 Mac 上。")
             }
             .onChange(of: model.selectedSessionID) { _, sessionID in
-                guard let sessionID else { return }
-                if navigationPath.last != sessionID {
-                    navigationPath.append(sessionID)
-                }
+                guard openConversation == nil, let sessionID else { return }
+                showConversation(sessionID)
                 model.selectedSessionID = nil
             }
             .task {
@@ -1520,6 +1524,19 @@ struct DSHRemoteHomeView: View {
     }
 
     @ViewBuilder
+    private func showConversation(_ sessionID: String, location: DSHSearchHit? = nil) {
+        if let openConversation {
+            openConversation(sessionID, location)
+        } else if navigationPath.last != sessionID {
+            historyLocation = location
+            navigationPath.append(sessionID)
+        }
+    }
+
+    private func openHistoryResult(_ hit: DSHSearchHit) {
+        showConversation(hit.sessionId, location: hit)
+    }
+
     private func remoteProjectSection(_ group: DSHSessionGroup) -> some View {
         let expanded = !model.isGroupCollapsed(group.id)
 
@@ -1572,7 +1589,7 @@ struct DSHRemoteHomeView: View {
 
             if expanded {
                 ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
-                    NavigationLink(value: session.id) {
+                    Button { showConversation(session.id) } label: {
                         DSHRemoteTaskRow(session: session,
                                          showWorkspaceName: false,
                                          flatStyle: false,
@@ -1637,7 +1654,7 @@ struct DSHRemoteHomeView: View {
                     .padding(.vertical, 8)
             } else {
                 ForEach(archivedSessions) { session in
-                    NavigationLink(value: session.id) {
+                    Button { showConversation(session.id) } label: {
                         DSHRemoteTaskRow(session: session,
                                          showWorkspaceName: true,
                                          flatStyle: true)

@@ -43,6 +43,7 @@
     "ws": "^8.18.3"
   },
   "dependencies": {
+    "@dsh-anywhere/connector": "workspace:*",
     "@dsh-anywhere/protocol": "workspace:*",
     "qrcode-generator": "^2.0.4",
     "ws": "^8.18.3"

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 public enum DSHConnectionState: Sendable, Equatable, Codable {
     case disconnected
@@ -72,6 +73,7 @@ public protocol DSHWebSocketTasking: AnyObject, Sendable {
     var responseStatusCode: Int? { get }
     var closeCodeRawValue: Int? { get }
     func resume()
+    func probe(_ completion: @escaping @Sendable (Bool) -> Void)
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
@@ -85,6 +87,10 @@ public extension DSHWebSocketTasking {
 extension URLSessionWebSocketTask: DSHWebSocketTasking {
     public var responseStatusCode: Int? { (response as? HTTPURLResponse)?.statusCode }
     public var closeCodeRawValue: Int? { closeCode.rawValue }
+
+    public func probe(_ completion: @escaping @Sendable (Bool) -> Void) {
+        sendPing { error in completion(error == nil) }
+    }
 
     public func send(_ message: URLSessionWebSocketTask.Message) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -158,6 +164,7 @@ public struct DSHWebSocketConfiguration: Sendable, Equatable {
 /// machine become `DSHEvent`s; Relay control traffic never reaches the store.
 public actor DSHWebSocketConnection {
     public typealias TaskFactory = @Sendable (URLRequest) -> any DSHWebSocketTasking
+    private static let logger = Logger(subsystem: "me.aluvien.DSHAnywhere", category: "RelayRecovery")
     private static let maxBufferedEvents = 512
     private static let unsolicitedSessionSnapshotPrefix = "snapshot-push-"
     /// These errors describe one malformed or unauthorized payload. They do
@@ -173,8 +180,15 @@ public actor DSHWebSocketConnection {
     private let makeTask: TaskFactory
     private var socket: (any DSHWebSocketTasking)?
     private var runner: Task<Void, Never>?
+    private var retryWait: Task<Void, Never>?
+    private var probeTimeout: Task<Void, Never>?
+    private var probeID: UUID?
+    private var lastProbeAt: ContinuousClock.Instant?
+    private let probeDeadline: Duration
     private var continuation: AsyncThrowingStream<DSHEvent, Error>.Continuation?
     private var activeStream: AsyncThrowingStream<DSHEvent, Error>?
+    private var streamID: UUID?
+    private var awaitingFirstLiveEvent = false
     private var stopped = false
     private var streamBufferOverflowed = false
     private var includeArchivedSessions = false
@@ -203,10 +217,12 @@ public actor DSHWebSocketConnection {
 
     public init(configuration: DSHWebSocketConfiguration,
                 lastSequence: Int64 = 0,
+                probeDeadline: Duration = .seconds(5),
                 taskFactory: @escaping TaskFactory = { URLSession.shared.webSocketTask(with: $0) }) {
         self.configuration = configuration
         self._lastSequence = lastSequence
         self.makeTask = taskFactory
+        self.probeDeadline = probeDeadline
     }
 
     public var state: DSHConnectionState { _state }
@@ -224,22 +240,63 @@ public actor DSHWebSocketConnection {
         if let activeStream { return activeStream }
         stopped = false
         streamBufferOverflowed = false
+        let id = UUID()
+        streamID = id
         let stream = AsyncThrowingStream<DSHEvent, Error>(bufferingPolicy: .bufferingOldest(Self.maxBufferedEvents)) { continuation in
             self.continuation = continuation
             continuation.onTermination = { [weak self] _ in
-                Task { await self?.streamDidTerminate() }
+                Task { await self?.streamDidTerminate(id) }
             }
         }
         activeStream = stream
-        runner = Task { [weak self] in await self?.run() }
+        runner = Task { [weak self] in await self?.run(streamID: id) }
         return stream
+    }
+
+    /// Recheck the current Relay socket or wake a backoff after connectivity returns.
+    public func recheckConnectivity(networkAvailable: Bool) {
+        guard !stopped, runner != nil, networkAvailable else { return }
+        if let retryWait {
+            Self.logger.info("Connectivity signal woke Relay retry")
+            retryWait.cancel()
+            return
+        }
+        guard _state == .connected, let task = socket, probeID == nil else { return }
+        let now = ContinuousClock.now
+        if let lastProbeAt, now - lastProbeAt < .seconds(1) { return }
+        lastProbeAt = now
+        Self.logger.info("Connectivity signal started Relay probe")
+        let id = UUID()
+        probeID = id
+        let deadline = probeDeadline
+        probeTimeout = Task { [weak self] in
+            do { try await Task.sleep(for: deadline) } catch { return }
+            await self?.finishProbe(id, healthy: false)
+        }
+        task.probe { [weak self] healthy in
+            Task { await self?.finishProbe(id, healthy: healthy) }
+        }
+    }
+
+    private func finishProbe(_ id: UUID, healthy: Bool) {
+        guard probeID == id else { return }
+        clearProbe()
+        Self.logger.info("Relay probe finished, healthy: \(healthy, privacy: .public)")
+        if !healthy { socket?.cancel(with: .goingAway, reason: nil) }
+    }
+
+    private func clearProbe() {
+        probeID = nil
+        probeTimeout?.cancel()
+        probeTimeout = nil
     }
 
     public func disconnect() {
         disconnect(preserveFailure: false)
     }
 
-    private func streamDidTerminate() {
+    private func streamDidTerminate(_ id: UUID) {
+        guard streamID == id else { return }
         let preserveFailure: Bool
         if case .failed = _state { preserveFailure = true }
         else { preserveFailure = false }
@@ -248,9 +305,15 @@ public actor DSHWebSocketConnection {
 
     private func disconnect(preserveFailure: Bool) {
         stopped = true
+        streamID = nil
+        awaitingFirstLiveEvent = false
         streamBufferOverflowed = false
         runner?.cancel()
         runner = nil
+        retryWait?.cancel()
+        retryWait = nil
+        clearProbe()
+        lastProbeAt = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         if !preserveFailure {
@@ -307,9 +370,9 @@ public actor DSHWebSocketConnection {
         }
     }
 
-    private func run() async {
+    private func run(streamID id: UUID) async {
         var attempt = 0
-        while !stopped && !Task.isCancelled {
+        while streamID == id && !stopped && !Task.isCancelled {
             _state = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
             yieldControl(type: "transport.state", value: _state)
             var activeTask: (any DSHWebSocketTasking)?
@@ -334,24 +397,33 @@ public actor DSHWebSocketConnection {
                     task.cancel(with: .goingAway, reason: nil)
                     if let current = socket,
                        (current as AnyObject) === (task as AnyObject) {
+                        clearProbe()
+                        lastProbeAt = nil
                         socket = nil
                     }
                 }
+                awaitingFirstLiveEvent = false
+                let startedAt = ContinuousClock.now
                 task.resume()
                 var didReceiveReady = false
                 while !stopped && !Task.isCancelled {
                     if streamBufferOverflowed { throw DSHWebSocketError.eventBufferOverflow }
                     let message = try await task.receive()
-                    if try await consume(message, over: task) { didReceiveReady = true; attempt = 0 }
+                    guard streamID == id, !stopped, !Task.isCancelled else { return }
+                    if try await consume(message, over: task) {
+                        didReceiveReady = true
+                        attempt = 0
+                        let elapsed = (ContinuousClock.now - startedAt).components
+                        let milliseconds = elapsed.seconds * 1_000 + elapsed.attoseconds / 1_000_000_000_000_000
+                        Self.logger.info("Relay ready in \(milliseconds, privacy: .public) ms")
+                    }
                 }
                 if didReceiveReady { attempt = max(attempt, 1) }
-            } catch is CancellationError {
-                break
             } catch {
                 let classifiedError = classifyTransportError(error, task: activeTask,
                                                              responseStatusCode: responseStatusCode,
                                                              closeCodeRawValue: closeCodeRawValue)
-                guard !stopped && !Task.isCancelled else { break }
+                guard streamID == id && !stopped && !Task.isCancelled else { return }
                 if let socketError = classifiedError as? DSHWebSocketError,
                    case .eventBufferOverflow = socketError {
                     streamBufferOverflowed = false
@@ -374,11 +446,18 @@ public actor DSHWebSocketConnection {
                 _state = .reconnecting(attempt: attempt)
                 yieldControl(type: "transport.state", value: _state)
                 let delay = configuration.backoff.delayNanoseconds(for: attempt)
-                do { try await Task.sleep(nanoseconds: delay) }
-                catch { break }
+                let wait = Task<Void, Never> { try? await Task.sleep(nanoseconds: delay) }
+                retryWait = wait
+                await withTaskCancellationHandler {
+                    await wait.value
+                } onCancel: {
+                    wait.cancel()
+                }
+                guard streamID == id, !Task.isCancelled else { return }
+                retryWait = nil
             }
         }
-        if !stopped {
+        if streamID == id && !stopped {
             _state = .failed(DSHWebSocketError.closed.localizedDescription)
             yieldControl(type: "transport.state", value: _state)
         }
@@ -442,6 +521,7 @@ public actor DSHWebSocketConnection {
             try await sendRelay(.resume(deviceId: configuration.deviceId, machineId: configuration.machineId,
                                         lastSequence: _lastSequence,
                                         includeArchived: includeArchivedSessions), over: task)
+            guard let socket, socket === task, !stopped, !Task.isCancelled else { return false }
             // A Relay handshake is the only readiness signal guaranteed on
             // every connection. Request the authoritative session list here,
             // rather than relying on SwiftUI onAppear or on a replayed local
@@ -461,11 +541,14 @@ public actor DSHWebSocketConnection {
             // concurrent user command can install a newer list generation
             // while this handshake is still recording its own request, and
             // the later handshake request would incorrectly supersede it.
+            guard self.socket === task, !stopped, !Task.isCancelled else { return false }
             _state = .connected
+            awaitingFirstLiveEvent = true
             yieldControl(type: "transport.state", value: _state)
             return true
         case .presence(let presence):
             if presence.machineId == configuration.machineId, presence.role == .machine {
+                Self.logger.info("Relay reports computer online: \(presence.online, privacy: .public)")
                 yieldControl(type: "machine.presence", value: presence.online)
             }
             return false
@@ -550,6 +633,10 @@ public actor DSHWebSocketConnection {
                 // a dropped event unrecoverable on the next connection.
                 if establishesEpoch { _lastSequence = 0 }
                 if event.sequence > _lastSequence { _lastSequence = event.sequence }
+                if awaitingFirstLiveEvent, event.envelope.sessionId != nil {
+                    awaitingFirstLiveEvent = false
+                    Self.logger.info("First session event accepted after Relay handshake")
+                }
             case .dropped:
                 // Keep the previous cursor and reconnect. Connector replay
                 // will then resend the first event that did not fit.
@@ -575,7 +662,7 @@ public actor DSHWebSocketConnection {
                            notAfter: Date? = nil) async throws {
         let payload = try DSHRelayPayloadMessage.wrapping(machineId: configuration.machineId,
                                                            sender: .device, body: command)
-        var encoder = JSONEncoder()
+        let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         let data = try encoder.encode(payload)
         // Check the bytes that will actually cross the socket. In particular,

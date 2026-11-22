@@ -3200,6 +3200,45 @@ final class DSHEventStoreTests: XCTestCase {
     }
 
     @MainActor
+    @MainActor
+    func testInterruptedVisibleHistoryBatchReopensWithoutReplayGapNotice() async throws {
+        let restoreProfile = installCorrelationTestProfile()
+        defer { restoreProfile() }
+        let transport = CorrelationTransport()
+        let model = makeModel(transport: transport, initialState: .init(), isPaired: true)
+        model.connect()
+        defer { model.disconnect() }
+        try await Task.sleep(for: .milliseconds(60))
+        await transport.emit(event(type: "transport.state", messageID: "first-ready", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "first-presence", sequence: 0,
+                                   payload: .bool(true)))
+        model.setConversationVisible("interrupted-session", visible: true)
+        model.openSession("interrupted-session")
+        for _ in 0..<100 {
+            if await transport.commandCount(ofType: "session.open") == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let firstOpenCount = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(firstOpenCount, 1)
+        await transport.emit(event(type: "history.started", messageID: "history-start", sequence: 1,
+                                   payload: .object(["sessionId": .string("interrupted-session"),
+                                                     "batchId": .string("old-batch")])))
+        await transport.emit(event(type: "transport.state", messageID: "reconnecting", sequence: 0,
+                                   payload: .object(["state": .string("reconnecting"), "attempt": .number(1)])))
+        await transport.emit(event(type: "transport.state", messageID: "second-ready", sequence: 0,
+                                   payload: .object(["state": .string("connected")])))
+        await transport.emit(event(type: "machine.presence", messageID: "second-presence", sequence: 0,
+                                   payload: .bool(true)))
+        for _ in 0..<100 {
+            if await transport.commandCount(ofType: "session.open") >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let finalOpenCount = await transport.commandCount(ofType: "session.open")
+        XCTAssertEqual(finalOpenCount, 2)
+        XCTAssertNil(model.errorMessage)
+    }
+
     func testReadOnlyNotConnectedWaitsForNewReadinessWithoutRetryLoop() async {
         let restoreProfile = installCorrelationTestProfile()
         defer { restoreProfile() }

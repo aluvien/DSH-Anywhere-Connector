@@ -60,6 +60,7 @@ import { historyWindow, projectHistoryPage } from './history.js'
 import { ScheduleControlMirror } from './schedules.js'
 import { observeConfigurationChanges, discoverConfigurationModels, readConfiguration, updateConfiguration, configurationFailure } from './configuration.js'
 import { publishBridgeEndpoint, registeredBridgeToken } from './desktop.js'
+import { PluginRemoteSetup, resolvePluginRegistration } from './remote-setup.js'
 import { PairingAuthority } from './auth.js'
 import { HttpError, json, readJson, RetryableHttpError } from './http.js'
 import { PendingApprovals, type ApprovalDecision } from './pending-approvals.js'
@@ -307,6 +308,8 @@ export interface Config {
    * a copy served over the network.
    */
   readonly connectorConfigPath?: string
+  readonly managedConnector?: boolean
+  readonly managedRelay?: string
 }
 
 export const CONNECTOR_DEVICE_ID = 'dsh-anywhere-connector'
@@ -2070,7 +2073,9 @@ export function apply(baseCtx: Context, config: Config = {}): void {
   const ctx = baseCtx as NativeContext
   const prefix = config.routePrefix ?? '/dsh-anywhere/v1'
   const machineId = `machine_${hostname()}`
-  const configPath = config.connectorConfigPath ?? defaultConnectorConfigPath()
+  const legacyPath = config.connectorConfigPath ?? defaultConnectorConfigPath()
+  const registration = config.managedConnector ? resolvePluginRegistration(legacyPath) : undefined
+  const configPath = registration?.configPath ?? legacyPath
   const connectorToken = config.connectorToken ?? process.env.DSH_ANYWHERE_CONNECTOR_TOKEN
     ?? registeredBridgeToken(configPath)
   if (connectorToken !== undefined && connectorToken.length > 0 && connectorToken.length < 32) {
@@ -2090,6 +2095,17 @@ export function apply(baseCtx: Context, config: Config = {}): void {
       name: CONNECTOR_DEVICE_NAME,
       token: connectorToken,
     })
+  }
+  const remoteSetup = registration && new PluginRemoteSetup({
+    ...registration, host: ctx.webServer, prefix,
+    ...(config.managedRelay === undefined ? {} : { relay: config.managedRelay }),
+    trustBridge: token => {
+      pairing.registerTrustedDevice({ id: CONNECTOR_DEVICE_ID, name: CONNECTOR_DEVICE_NAME, token })
+    },
+    warn: message => ctx.logger.warn(message),
+  })
+  if (remoteSetup) {
+    ctx.effect(() => () => remoteSetup.stop(), 'dsh-anywhere: managed connection')
   }
   const pairingRateLimiter = new PairingRateLimiter(
     config.pairingRateLimitMaxAttempts ?? 5,
@@ -2210,12 +2226,16 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     kind: 'prefix',
     path: prefix,
     handler: async (req, res) => {
+      if (remoteSetup && new URL(req.url ?? '/', 'http://localhost').pathname === prefix + '/setup') {
+        await handleRemoteSetup(req, res, remoteSetup)
+        return
+      }
       const serve = async (target: ServerResponse): Promise<void> => {
         try {
           await handleHttp(
             ctx, req, target, prefix, pairing, pairingRateLimiter, approvals, machineId, metadata, publish,
             idempotentResponses,
-            config.connectorConfigPath ?? defaultConnectorConfigPath(),
+            configPath,
             questions,
             relayDevices,
             relayDeviceLeases,
@@ -2725,6 +2745,7 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     }
   }) as never, { global: true, prepend: true })
 
+  remoteSetup?.resume()
   ctx.effect(() => () => {
     route()
     upgrade()
@@ -2734,6 +2755,48 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     wss.close()
   }, 'dsh-anywhere: routes and sockets')
 
+}
+
+async function handleRemoteSetup(req: IncomingMessage, res: ServerResponse, setup: PluginRemoteSetup): Promise<void> {
+  // This route carries a pairing credential and can register a machine.
+  // Require a first-party fetch with a custom header; send no CORS grant.
+  const fetchSite = header(req, 'sec-fetch-site')
+  const origin = header(req, 'origin')
+  const localOrigin = origin === undefined || origin === 'dsh-app://app' ||
+    origin === `http://${header(req, 'host')}` || origin === `https://${header(req, 'host')}`
+  if (!isLoopbackRequest(req) || header(req, 'x-dsh-anywhere-setup') !== '1' ||
+      !localOrigin || (fetchSite !== undefined && fetchSite !== 'same-origin' && fetchSite !== 'none')) {
+    json(res, 404, { error: 'not found' })
+    return
+  }
+  try {
+    if (req.method === 'GET') {
+      json(res, 200, { state: setup.state })
+      return
+    }
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'Method not allowed.' })
+      return
+    }
+    const action = objectOf(await readJson(req, 1024)).action
+    if (action === 'enable') {
+      await setup.enable()
+      json(res, 200, { state: setup.state })
+      return
+    }
+    if (action === 'pair') {
+      const { link, expiresAt } = await setup.pairingCode()
+      const code = qrCodeFactoryOf()(0, 'M')
+      code.addData(link)
+      code.make()
+      const svg = code.createSvgTag({ cellSize: 4, margin: 4, scalable: true })
+      json(res, 200, { state: setup.state, expiresAt, qrImage: `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}` })
+      return
+    }
+    json(res, 400, { error: 'Unknown setup action.' })
+  } catch {
+    json(res, 503, { error: 'Remote setup could not complete. Check the Harness and Relay connection and retry.' })
+  }
 }
 
 async function handleHttp(

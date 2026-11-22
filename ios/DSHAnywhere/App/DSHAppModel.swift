@@ -2505,6 +2505,11 @@ final class DSHAppModel: ObservableObject {
               !machineID.isEmpty, !removedMachineIDs.contains(machineID) else { return }
         if suspendingTransactions {
             reconnectAfterSuspension = true
+    func recheckConnectivity(networkAvailable: Bool) async {
+        guard eventTask != nil, isPaired, !suspendingTransactions else { return }
+        await transport.recheckConnectivity(networkAvailable: networkAvailable)
+    }
+
             return
         }
         if pendingSessionCreationRequestIDs.isEmpty {
@@ -5110,15 +5115,7 @@ final class DSHAppModel: ObservableObject {
               (error as? DSHWebSocketError) == .notConnected,
               ["session.list", "workspace.catalog", "mode.catalog", "model.catalog", "session.open"]
                 .contains(command.type) else { return false }
-        if pendingReadOnlyRecoveryGeneration != machineGeneration {
-            pendingReadOnlyRecoveryGeneration = machineGeneration
-            requiredReadOnlyRecoveryReadinessRevision = readinessAtAttempt + 1
-            pendingSessionListRecovery = false
-            pendingWorkspaceCatalogRecovery = false
-            pendingModeCatalogRecovery = false
-            pendingModelCatalogRecovery = false
-            pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
-        }
+        prepareReadOnlyRecovery(for: machineGeneration, readinessAtAttempt: readinessAtAttempt)
         switch command.type {
         case "session.list": pendingSessionListRecovery = true
         case "workspace.catalog": pendingWorkspaceCatalogRecovery = true
@@ -5142,6 +5139,17 @@ final class DSHAppModel: ObservableObject {
             await Task.yield()
             guard let self, !Task.isCancelled else { return }
             self.readOnlyRecoveryTask = nil
+    private func prepareReadOnlyRecovery(for generation: Int, readinessAtAttempt: Int) {
+        guard pendingReadOnlyRecoveryGeneration != generation else { return }
+        pendingReadOnlyRecoveryGeneration = generation
+        requiredReadOnlyRecoveryReadinessRevision = readinessAtAttempt + 1
+        pendingSessionListRecovery = false
+        pendingWorkspaceCatalogRecovery = false
+        pendingModeCatalogRecovery = false
+        pendingModelCatalogRecovery = false
+        pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
+    }
+
             self.performPendingReadOnlyRecoveryIfReady()
         }
     }
@@ -5179,8 +5187,7 @@ final class DSHAppModel: ObservableObject {
         if wantsModes { requestModes() }
         if wantsModels { sendModelCatalog() }
         for sessionID in sessionIDs {
-            send(DSHCommand.openSession(deviceId: deviceID, machineId: machineID,
-                                        sessionId: sessionID, streaming: true))
+            requestSessionHistory(sessionID, forceRefresh: false)
         }
     }
 
@@ -5544,7 +5551,16 @@ final class DSHAppModel: ObservableObject {
             replayingHistoryBatches.removeAll()
             return
         }
+            if case .reconnecting = connection, let sessionID = visibleConversationSessionID,
+               requestedHistorySessions.contains(sessionID) || isReplayingHistory(sessionID: sessionID) {
+                // The reducer retires partial history batches on disconnect.
+                // Resume may replay only the rest of that retired batch.
+                prepareReadOnlyRecovery(for: machineStateGeneration,
+                                        readinessAtAttempt: readOnlyRecoveryReadinessRevision)
+                pendingSessionOpenRecoveryIDs.insert(sessionID)
+            }
         if case .protocolError = event.kind, let session = historyOpenRequests.removeValue(forKey: event.envelope.messageId) {
+            historyOpenRequests.removeAll()
             reducer.abandonHistory(session: session, into: &state)
             requestedHistorySessions.remove(session)
             if state.historyFailures == nil { state.historyFailures = [:] }
