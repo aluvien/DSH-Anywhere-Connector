@@ -940,6 +940,7 @@ struct ConversationView: View {
     @State private var showSchedules = false
     @State private var locationRequest: DSHSearchHit?
     @State private var locationRevision = UUID()
+    @State private var hasPositionedTranscript = false
     @State private var historyLoading = false
     @State private var historyError: String?
     @State private var focusedHistory: DSHHistoryFocus?
@@ -1347,8 +1348,17 @@ struct ConversationView: View {
                 scrollCoordinator.followingChanged = { following in
                     withAnimation(.easeInOut(duration: 0.25)) { isFollowingLatest = following }
                 }
-                if initialLocation == nil { scrollCoordinator.schedulePin() }
-                else { scrollCoordinator.pauseFollowing(); isFollowingLatest = false; locationRequest = initialLocation; locationRevision = UUID() }
+                if !hasPositionedTranscript {
+                    hasPositionedTranscript = true
+                    if let initialLocation {
+                        scrollCoordinator.pauseFollowing()
+                        isFollowingLatest = false
+                        locationRequest = initialLocation
+                        locationRevision = UUID()
+                    } else {
+                        scrollCoordinator.schedulePin()
+                    }
+                }
             }
             .onDisappear {
                 model.setConversationVisible(sessionID, visible: false)

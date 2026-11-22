@@ -2226,9 +2226,16 @@ export function apply(baseCtx: Context, config: Config = {}): void {
     kind: 'prefix',
     path: prefix,
     handler: async (req, res) => {
-      if (remoteSetup && new URL(req.url ?? '/', 'http://localhost').pathname === prefix + '/setup') {
-        await handleRemoteSetup(req, res, remoteSetup)
-        return
+      if (remoteSetup && registration) {
+        const path = new URL(req.url ?? '/', 'http://localhost').pathname
+        if (path === prefix + '/setup') {
+          await handleRemoteSetup(req, res, remoteSetup)
+          return
+        }
+        if (!registration.external && path === prefix + '/pairing') {
+          json(res, 404, { error: 'Use the DSH Anywhere plugin settings to create a one-time code.' })
+          return
+        }
       }
       const serve = async (target: ServerResponse): Promise<void> => {
         try {

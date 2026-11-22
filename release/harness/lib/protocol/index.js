@@ -1,0 +1,1058 @@
+import { z } from "zod";
+/** The wire format is intentionally pinned. Bump this only with a migration plan. */
+export const PROTOCOL_VERSION = 1;
+/** Matched capability floor for the Harness parity release. */
+export const SCHEMA_REVISION = 12;
+export function supportsSchemaRevision(value, minimum = SCHEMA_REVISION) {
+    const revision = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+    return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= minimum;
+}
+/** Product limit for one original attachment before base64 transport encoding. */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+/** Exact maximum length of a padded base64 encoding of MAX_ATTACHMENT_BYTES. */
+export const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4;
+/** Maximum JSON body accepted by the Relay for one prompt command. */
+export const MAX_PROMPT_BODY_BYTES = 16 * 1024 * 1024;
+/**
+ * Inline image data is an exceptional compatibility path; iOS uses receipt
+ * uploads for normal attachments.  Keep the aggregate encoded image data
+ * below the prompt body budget so a schema-valid command is also accepted by
+ * the Bridge HTTP parser and Relay frame limit.
+ */
+export const MAX_PROMPT_INLINE_DATA_CHARS = 8 * 1024 * 1024;
+const IdentifierSchema = z.string().min(1).max(256);
+const TimestampSchema = z.number().int().nonnegative();
+export const SequenceSchema = z.number().int().positive();
+const StrictObject = (shape) => z.object(shape).strict();
+export const SessionStatusSchema = z.enum([
+    "idle",
+    "running",
+    "waiting_approval",
+    "error",
+    "closed",
+]);
+export const SessionSummarySchema = StrictObject({
+    id: IdentifierSchema,
+    title: z.string().min(1).max(512),
+    updatedAt: TimestampSchema,
+    cwd: z.string().min(1).optional(),
+    workspaceId: IdentifierSchema.optional(),
+    workspaceName: z.string().min(1).max(512).optional(),
+    archived: z.boolean().optional(),
+    running: z.boolean().optional(),
+    blank: z.boolean().optional(),
+    parentSessionId: IdentifierSchema.optional(),
+    /** Harness agent preset/mode used when the session was created. */
+    agentPreset: z.string().min(1).max(256).optional(),
+    mode: z.string().min(1).max(256).optional(),
+    branch: z.string().min(1).max(512).optional(),
+    provider: z.string().min(1).max(256).optional(),
+    model: z.string().min(1).max(512).optional(),
+    reasoningEffort: z.string().min(1).max(256).optional(),
+    permissionMode: z.enum(["ask", "never", "read-only", "workspace-write", "danger-full-access"]).optional(),
+    /** Correlates a session snapshot with a detached create request. */
+    createRequestId: IdentifierSchema.optional(),
+    usage: z.lazy(() => SessionUsageSchema).optional(),
+});
+export const SessionUsageSchema = StrictObject({
+    rounds: z.number().int().nonnegative().optional(),
+    steps: z.number().int().nonnegative().optional(),
+    inputTokens: z.number().nonnegative().optional(),
+    outputTokens: z.number().nonnegative().optional(),
+    totalTokens: z.number().nonnegative().optional(),
+    cacheReadTokens: z.number().nonnegative().optional(),
+    cacheWriteTokens: z.number().nonnegative().optional(),
+    cacheHitPercent: z.number().min(0).max(100).optional(),
+    tokensPerSecond: z.number().nonnegative().optional(),
+    contextUsed: z.number().nonnegative().optional(),
+    contextWindow: z.number().positive().optional(),
+});
+export const ModelSelectionSchema = StrictObject({
+    provider: z.string().min(1).max(256),
+    model: z.string().min(1).max(512),
+    reasoningEffort: z.string().min(1).max(256).optional(),
+});
+export const ModelReasoningEffortSchema = StrictObject({
+    id: IdentifierSchema,
+    name: z.string().min(1).max(256),
+    description: z.string().max(2_000).optional(),
+});
+export const ModelCatalogModelSchema = StrictObject({
+    id: IdentifierSchema,
+    name: z.string().min(1).max(512),
+    description: z.string().max(2_000).optional(),
+    reasoning: StrictObject({
+        efforts: z.array(ModelReasoningEffortSchema).max(100),
+        defaultEffort: IdentifierSchema.optional(),
+    }).optional(),
+});
+export const ModelCatalogGroupSchema = StrictObject({
+    id: IdentifierSchema,
+    name: z.string().min(1).max(512),
+    models: z.array(ModelCatalogModelSchema).max(500),
+});
+export const ModelCatalogPayloadSchema = StrictObject({
+    default: ModelSelectionSchema,
+    routableProviders: z.array(IdentifierSchema).max(100),
+    groups: z.array(ModelCatalogGroupSchema).max(100),
+    failures: z.array(StrictObject({
+        id: IdentifierSchema,
+        name: z.string().min(1).max(512),
+        message: z.string().max(4_000),
+    })).max(100),
+});
+const EnvelopeFields = {
+    version: z.literal(PROTOCOL_VERSION),
+    messageId: IdentifierSchema,
+    machineId: IdentifierSchema,
+    deviceId: IdentifierSchema,
+    sessionId: IdentifierSchema.optional(),
+    /** Identifies events emitted as part of one history replay batch. */
+    historyBatchId: IdentifierSchema.optional(),
+    sequence: SequenceSchema,
+    timestamp: TimestampSchema,
+};
+const EventEnvelope = (type, payload) => StrictObject({ ...EnvelopeFields, type: z.literal(type), payload });
+export const ConnectionReadyPayloadSchema = StrictObject({
+    machineId: IdentifierSchema,
+    deviceId: IdentifierSchema,
+    serverTime: TimestampSchema,
+    capabilities: z.array(IdentifierSchema).max(100),
+    resumedFrom: SequenceSchema.optional(),
+    /** A new value identifies a Bridge process/replay epoch. */
+    bridgeEpoch: IdentifierSchema.optional(),
+    /** Identifies the current Bridge WebSocket, not a replayed handshake. */
+    bridgeConnectionId: IdentifierSchema.optional(),
+    /** True when the requested cursor predates the retained Bridge buffer. */
+    replayTruncated: z.boolean().optional(),
+});
+export const SessionSnapshotPayloadSchema = z.array(SessionSummarySchema);
+export const SessionCreatedPayloadSchema = SessionSummarySchema;
+/** A durable Harness workspace. The registry is authoritative even while it
+ * has no sessions, so callers must not infer this list from session rows. */
+export const WorkspaceSchema = StrictObject({
+    id: IdentifierSchema,
+    title: z.string().min(1).max(512),
+    path: z.string().min(1).max(8_192),
+});
+export const WorkspaceCatalogPayloadSchema = StrictObject({
+    workspaces: z.array(WorkspaceSchema).max(10_000),
+});
+/** A mode is a native Harness agent preset, never a client-maintained list. */
+export const ModeCatalogPayloadSchema = StrictObject({
+    defaultMode: IdentifierSchema.optional(),
+    modes: z.array(StrictObject({
+        id: IdentifierSchema,
+        name: z.string().min(1).max(512),
+        description: z.string().max(4_000).optional(),
+    })).max(1_000),
+});
+/** One browsable level of the host filesystem. The client must use supplied
+ * absolute paths rather than assembling them itself. */
+export const DirectoryListPayloadSchema = StrictObject({
+    path: z.string().min(1).max(8_192),
+    parentPath: z.string().min(1).max(8_192).optional(),
+    directories: z.array(StrictObject({
+        name: z.string().min(1).max(512),
+        path: z.string().min(1).max(8_192),
+    })).max(1_000),
+});
+/** Read-only Host filesystem requests. Paths are interpreted by workspaceFiles,
+ * never by the Connector or the phone's filesystem. */
+export const MAX_FILE_CHUNK_BYTES = 192 * 1024;
+const WorkspacePathSchema = z.string().max(8_192).refine((value) => !value.includes("\0"), "invalid path");
+export const WorkspaceFilesCommandSchema = StrictObject({ path: WorkspacePathSchema });
+export const WorkspaceBytesCommandSchema = StrictObject({
+    path: WorkspacePathSchema.refine((value) => value.length > 0),
+    offset: z.number().int().safe().nonnegative(),
+    length: z.number().int().positive().max(MAX_FILE_CHUNK_BYTES),
+    version: z.string().min(1).max(2_048).optional(),
+});
+export const WorkspaceFilesPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, path: WorkspacePathSchema, truncated: z.boolean(),
+    entries: z.array(StrictObject({ name: z.string().min(1).max(1_024).refine((name) => !/[\u0000/\\]/.test(name)),
+        type: z.enum(["file", "directory", "other"]), size: z.number().int().safe().nonnegative().optional() })).max(10_000),
+});
+export const WorkspaceBytesPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, absolutePath: WorkspacePathSchema.refine((value) => value.length > 0),
+    version: z.string().min(1).max(2_048), bytes: z.number().int().safe().nonnegative().optional(),
+    offset: z.number().int().safe().nonnegative(), data: z.string().max(Math.ceil(MAX_FILE_CHUNK_BYTES / 3) * 4), eof: z.boolean(),
+});
+export const ChatRoleSchema = z.enum(["user", "assistant", "system"]);
+/** Attachment metadata carried with a message event. Phone-uploaded files
+ * resolve locally by receiptId; anything else (web uploads, Mac-side files,
+ * model-returned images) carries an embedded `thumbnail` data URL instead,
+ * because the phone has no byte path to those. Thumbnails are bridge-capped
+ * small (see THUMBNAIL_MAX_BYTES); full bytes stay on the Mac. */
+export const ChatAttachmentSchema = StrictObject({
+    id: IdentifierSchema,
+    name: z.string().min(1).max(512),
+    mediaType: z.string().min(1).max(256).optional(),
+    receiptId: IdentifierSchema.optional(),
+    thumbnail: z.string().min(1).max(400_000).optional(),
+    /** Host-owned attachment location; reads still pass through workspaceFiles. */
+    hostPath: z.string().min(1).max(8_192).optional(),
+});
+export const AssistantMessageDeltaPayloadSchema = StrictObject({
+    messageId: IdentifierSchema,
+    text: z.string(),
+});
+/** A transient live-stream bubble that did not produce a durable assistant
+ * message (for example a cancelled or retried attempt). */
+export const AssistantMessageDiscardedPayloadSchema = StrictObject({
+    messageId: IdentifierSchema,
+});
+export const ChatMessagePayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    role: ChatRoleSchema,
+    markdown: z.string(),
+    attachments: z.array(ChatAttachmentSchema).max(16).optional(),
+    usage: z.lazy(() => SessionUsageSchema).optional(),
+    provider: z.string().min(1).max(256).optional(),
+    model: z.string().min(1).max(512).optional(),
+    reasoningEffort: z.string().min(1).max(256).optional(),
+    contextWindow: z.number().positive().optional(),
+    /** Transient live-stream id which this durable message replaces. */
+    replacesMessageId: IdentifierSchema.optional(),
+    interrupted: z.boolean().optional(),
+    nativeSequence: z.number().int().nonnegative().optional(),
+});
+export const ToolStartedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    name: IdentifierSchema,
+    status: z.string().min(1),
+    detail: z.string().optional(),
+    nativeSequence: z.number().int().safe().nonnegative().optional(),
+    rootCallId: IdentifierSchema.optional(),
+    parentCallId: IdentifierSchema.optional(),
+    startedAt: z.number().finite().optional(),
+});
+export const ToolResultStatusSchema = z.enum(["succeeded", "failed", "cancelled"]);
+export const ToolCompletedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    name: IdentifierSchema,
+    status: z.string().min(1),
+    detail: z.string().optional(),
+    nativeSequence: z.number().int().safe().nonnegative().optional(),
+    rootCallId: IdentifierSchema.optional(),
+    parentCallId: IdentifierSchema.optional(),
+    arguments: z.string().optional(),
+    startedAt: z.number().finite().optional(),
+    finishedAt: z.number().finite().optional(),
+    resultMeta: z.unknown().optional(),
+    resultContent: z.array(z.unknown()).optional(),
+    error: z.unknown().optional(),
+    attachments: z.array(ChatAttachmentSchema).optional(),
+});
+export const ExecutionRecordSchema = StrictObject({
+    nativeSequence: z.number().int().safe().nonnegative(),
+    type: z.enum(["turn/start", "turn/end", "step/start", "step/end", "request/header", "request/context",
+        "assistant/message", "assistant/attempt", "tool/call", "tool/result", "tool/ptc-dispatch-start", "tool/ptc-dispatch", "llm/retry", "llm/retry-started",
+        "compaction/start", "compaction/summary", "compaction/end", "compaction/prune", "compaction/checkpoint"]),
+    time: TimestampSchema.optional(),
+    data: z.record(z.string(), z.unknown()),
+});
+export const FeedbackCategorySchema = z.enum(["task-result", "instruction-following", "product-interaction", "service-stability", "resource-cost", "security-privacy-permission", "other"]);
+export const FeedbackItemSchema = StrictObject({ messageId: IdentifierSchema, rating: z.enum(["positive", "negative"]),
+    note: z.string().optional(), category: FeedbackCategorySchema.optional(), version: z.string().min(1),
+    createdAt: z.number().finite(), updatedAt: z.number().finite() });
+export const FeedbackStateSchema = StrictObject({ sessionId: IdentifierSchema, items: z.array(FeedbackItemSchema), nativeSequence: z.number().int().safe().min(-1) });
+export const FeedbackChangedSchema = StrictObject({ sessionId: IdentifierSchema, messageId: IdentifierSchema,
+    item: FeedbackItemSchema.nullable(), nativeSequence: z.number().int().safe().nonnegative() });
+export const FeedbackUpdateSchema = z.discriminatedUnion("action", [
+    StrictObject({ action: z.literal("put"), messageId: IdentifierSchema, rating: z.enum(["positive", "negative"]),
+        note: z.string().min(1).max(100_000).optional(), category: FeedbackCategorySchema.optional(), ifVersion: z.string().min(1).nullable() }),
+    StrictObject({ action: z.literal("delete"), messageId: IdentifierSchema, ifVersion: z.string().min(1) }),
+]);
+export const FeedbackUpdatedSchema = StrictObject({ sessionId: IdentifierSchema, messageId: IdentifierSchema,
+    requestId: IdentifierSchema, item: FeedbackItemSchema.nullable() });
+export const ReferenceListSchema = StrictObject({ kind: z.enum(["file", "session"]), query: z.string().max(8192) });
+export const ReferenceCandidatesSchema = StrictObject({ sessionId: IdentifierSchema, kind: z.enum(["file", "session"]), query: z.string(),
+    items: z.array(StrictObject({ id: z.string().min(1), label: z.string(), kind: z.enum(["file", "directory", "session"]),
+        insertion: z.string(), path: z.string().optional(), sourceSessionId: z.string().optional(), detail: z.string().optional(), sameWorkspace: z.boolean().optional() })) });
+export const SearchQuerySchema = z.string().min(1).max(500).refine((value) => value.trim().length > 0 && !value.includes("\0"));
+export const SearchCommandSchema = StrictObject({ query: SearchQuerySchema, cursor: z.string().min(1).max(16_384).optional(),
+    parentSessionId: IdentifierSchema.optional(), subagentMode: z.enum(["one-shot", "continuable"]).optional(),
+}).refine((value) => (value.parentSessionId === undefined) === (value.subagentMode === undefined), "child search requires parent and mode");
+export const SearchHitSchema = StrictObject({ sessionId: IdentifierSchema, nativeSequence: z.number().int().safe().nonnegative().optional(),
+    time: TimestampSchema.optional(), type: z.string().optional(), surface: z.enum(["current", "shadowed", "log-only"]).optional(),
+    snippet: z.string(), session: SessionSummarySchema.optional() });
+export const SearchResultsSchema = StrictObject({ query: z.string(), scopeSessionId: IdentifierSchema.optional(),
+    items: z.array(SearchHitSchema), hasMore: z.boolean(), nextCursor: z.string().optional(), bounded: z.boolean().optional() });
+export const HistoryWindowSchema = StrictObject({ sessionId: IdentifierSchema, throughSeq: z.number().int().safe().min(-1),
+    fromSeq: z.number().int().safe().nonnegative(), toSeq: z.number().int().safe().min(-1), hasMore: z.boolean() });
+export const HistoryReadCommandSchema = StrictObject({ throughSeq: z.number().int().safe().min(-1).optional(),
+    beforeSeq: z.number().int().safe().nonnegative().optional(), atSeq: z.number().int().safe().nonnegative().optional(),
+    parentSessionId: IdentifierSchema.optional(), subagentMode: z.enum(["one-shot", "continuable"]).optional(),
+}).refine((value) => (value.parentSessionId === undefined) === (value.subagentMode === undefined), "child history requires parent and mode");
+export const HistoryRowSchema = StrictObject({ nativeSequence: z.number().int().safe().nonnegative(), time: TimestampSchema.optional(),
+    type: z.enum(["user.message.accepted", "assistant.message.completed", "assistant.reasoning", "tool.started", "tool.completed", "command.result", "session.model.changed", "execution.recorded", "workflow.changed"]),
+    payload: z.record(z.string(), z.unknown()) });
+export const HistoryFocusSchema = StrictObject({ nativeSequence: z.number().int().safe().nonnegative(), time: TimestampSchema.optional(),
+    type: z.string(), data: z.record(z.string(), z.unknown()) });
+export const HistoryPageSchema = HistoryWindowSchema.extend({ rows: z.array(HistoryRowSchema), focus: HistoryFocusSchema.optional() });
+export const ScheduleRecordSchema = z.discriminatedUnion("kind", [
+    StrictObject({ id: IdentifierSchema, kind: z.literal("after"), prompt: z.string().min(1), afterSeconds: z.number().int().safe().positive(), scheduledAt: z.string().datetime() }),
+    StrictObject({ id: IdentifierSchema, kind: z.literal("at"), prompt: z.string().min(1), scheduledAt: z.string().datetime() }),
+    StrictObject({ id: IdentifierSchema, kind: z.literal("every"), prompt: z.string().min(1), everySeconds: z.number().int().safe().min(300), scheduledAt: z.string().datetime() }),
+]);
+export const ScheduleProjectionSchema = StrictObject({ sessionId: IdentifierSchema, epoch: IdentifierSchema,
+    seq: z.number().int().safe().min(-1), available: z.boolean(), supported: z.boolean(), items: z.array(ScheduleRecordSchema) });
+export const ScheduleGetSchema = StrictObject({ parentSessionId: IdentifierSchema.optional(), subagentMode: z.enum(["one-shot", "continuable"]).optional() })
+    .refine((value) => (value.parentSessionId === undefined) === (value.subagentMode === undefined), "child schedule requires parent and mode");
+export const SettingsNamespaceSchema = StrictObject({ ns: z.string().min(1), schema: z.json(), value: z.json(), base: z.json().optional(), user: z.json().optional(),
+    applies: z.enum(["live", "restart"]), secrets: z.array(StrictObject({ path: z.array(z.string()), set: z.boolean() })), revision: z.number().int().safe().nonnegative() });
+export const SettingsSnapshotSchema = StrictObject({ writable: z.boolean(), hasDocument: z.boolean(), namespaces: z.array(SettingsNamespaceSchema) });
+export const PluginInventorySchema = StrictObject({ entries: z.array(StrictObject({ entryId: z.string(), moduleName: z.string(), enabled: z.boolean(), fiberPhase: z.string().nullable() })),
+    agentPresets: z.array(StrictObject({ id: z.string(), trust: z.enum(["system", "user"]), name: z.string().optional(), isDefault: z.boolean(), broken: z.string().optional(),
+        rows: z.array(StrictObject({ entryId: z.string().nullable(), moduleName: z.string(), enabled: z.union([z.boolean(), z.literal("conditional")]), condition: z.string().optional(), fiberPhase: z.string().nullable() })) })).optional() });
+export const ConfigurableProviderSchema = StrictObject({ provider: z.string(), displayName: z.string(), settingsNs: z.string(), settingsPath: z.array(z.string()), declared: z.boolean().optional(), error: z.string().optional() });
+export const ProviderDirectorySchema = StrictObject({ registered: z.array(StrictObject({ id: z.string(), name: z.string() })), configurable: z.array(ConfigurableProviderSchema) });
+const CredentialRefSchema = z.string().min(1).max(256).regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
+export const CredentialInfoSchema = StrictObject({ configured: z.boolean(), source: z.string().optional(), writable: z.boolean() });
+export const ConfigurationReadSchema = z.discriminatedUnion("section", [
+    StrictObject({ section: z.literal("settings") }), StrictObject({ section: z.literal("plugins") }), StrictObject({ section: z.literal("providers") }),
+    StrictObject({ section: z.literal("credentials"), refs: z.array(CredentialRefSchema).max(64) }),
+]);
+export const ConfigurationResultSchema = z.discriminatedUnion("section", [
+    StrictObject({ section: z.literal("settings"), value: SettingsSnapshotSchema }), StrictObject({ section: z.literal("plugins"), value: PluginInventorySchema }),
+    StrictObject({ section: z.literal("providers"), value: ProviderDirectorySchema }), StrictObject({ section: z.literal("credentials"), value: z.record(z.string(), CredentialInfoSchema) }),
+]);
+export const SettingsPathOperationSchema = z.discriminatedUnion("op", [
+    StrictObject({ op: z.literal("set"), path: z.array(z.string().max(512)).max(64), value: z.json() }),
+    StrictObject({ op: z.literal("unset"), path: z.array(z.string().max(512)).max(64) }),
+]);
+export const ConfigurationUpdateSchema = z.discriminatedUnion("kind", [
+    StrictObject({ kind: z.literal("settings"), ns: z.string().min(1).max(256), expectedRevision: z.number().int().safe().nonnegative(), ops: z.array(SettingsPathOperationSchema).min(1).max(256) }),
+    StrictObject({ kind: z.literal("credential"), action: z.enum(["set", "unset"]), ref: CredentialRefSchema, value: z.string().min(1).max(65_536).optional() })
+        .refine((value) => value.action === "set" ? value.value !== undefined : value.value === undefined, "credential set requires a value; unset forbids one"),
+]);
+export const ConfigurationUpdatedSchema = z.discriminatedUnion("kind", [
+    StrictObject({ kind: z.literal("settings"), requestId: IdentifierSchema, namespace: SettingsNamespaceSchema }),
+    StrictObject({ kind: z.literal("credential"), requestId: IdentifierSchema, ref: CredentialRefSchema }),
+]);
+export const ConfigurationInvalidatedSchema = z.discriminatedUnion("section", [
+    StrictObject({ section: z.literal("settings"), ns: z.string().min(1) }),
+    StrictObject({ section: z.literal("credentials"), ref: CredentialRefSchema.optional() }),
+    StrictObject({ section: z.literal("providers") }), StrictObject({ section: z.literal("plugins") }),
+]);
+export const ConfigurationDiscoverySchema = StrictObject({ settingsNs: z.string().min(1).max(256), request: StrictObject({
+        provider: z.string().min(1).max(256).optional(), baseURL: z.string().min(1).max(8192).optional(),
+        api: z.string().min(1).max(256).optional(), apiKey: z.string().min(1).max(65_536).optional(),
+    }) });
+export const ConfigurationModelsSchema = StrictObject({ settingsNs: z.string().min(1), models: z.array(StrictObject({
+        id: z.string().min(1), name: z.string().optional(), contextWindow: z.number().finite().optional(), maxTokens: z.number().finite().optional(),
+    })) });
+export const ExecutionRecordedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, record: ExecutionRecordSchema, inTranscript: z.boolean().optional(),
+});
+export const ExecutionListCommandSchema = StrictObject({
+    beforeSeq: z.number().int().safe().nonnegative().optional(), limit: z.number().int().positive().max(200).optional(),
+    parentSessionId: IdentifierSchema.optional(), subagentMode: z.enum(["one-shot", "continuable"]).optional(),
+}).refine((value) => (value.parentSessionId === undefined) === (value.subagentMode === undefined), "child execution address requires parent and mode");
+export const ExecutionLifecycleSchema = StrictObject({ createdAt: TimestampSchema, inheritedEventCount: z.number().int().safe().nonnegative(),
+    throughSeq: z.number().int().safe().min(-1), ownEventCount: z.number().int().safe().nonnegative(),
+    turnsStarted: z.number().int().safe().nonnegative(), turnsEnded: z.number().int().safe().nonnegative(),
+    measuredTurns: z.number().int().safe().nonnegative(), endedTurnMilliseconds: z.number().finite().nonnegative(), timingIncomplete: z.boolean(),
+    assistantMessages: z.number().int().safe().nonnegative(), toolCalls: z.number().int().safe().nonnegative(),
+    lastActivityAt: TimestampSchema.optional(), lastEndKind: z.enum(["completed", "aborted", "error", "max-tokens", "interrupted", "unknown"]).optional(),
+    openTurn: StrictObject({ turn: z.number().int().safe().nonnegative(), startedAt: TimestampSchema.optional() }).optional(),
+});
+export const ExecutionPagePayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, records: z.array(ExecutionRecordSchema).max(200), hasMore: z.boolean(),
+    beforeSeq: z.number().int().safe().nonnegative().optional(),
+    lifecycle: ExecutionLifecycleSchema.optional(),
+});
+export const ApprovalDecisionSchema = z.enum(["allow-once", "rejected", "expired"]);
+export const DecisionVersionSchema = StrictObject({ epoch: IdentifierSchema, revision: z.number().int().nonnegative() });
+export const ApprovalRequestedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    sessionId: IdentifierSchema,
+    toolName: IdentifierSchema,
+    reason: z.string().min(1).max(4_000),
+    expiresAt: TimestampSchema.optional(),
+    stateVersion: DecisionVersionSchema.optional(),
+});
+export const ApprovalResolvedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    allowed: z.boolean(),
+    stateVersion: DecisionVersionSchema.optional(),
+});
+export const TurnStateSchema = z.enum([
+    "queued",
+    "running",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "cancelled",
+]);
+export const TurnStateChangedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    state: z.string().min(1),
+});
+export const ProtocolErrorPayloadSchema = StrictObject({
+    httpStatus: z.number().int().min(100).max(599).optional(),
+    code: IdentifierSchema,
+    message: z.string().min(1).max(4_000),
+    retryable: z.boolean(),
+});
+export const UsageUpdatedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    usage: SessionUsageSchema,
+});
+export const PermissionUpdatedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    mode: z.enum(["ask", "never", "read-only", "workspace-write", "danger-full-access"]),
+    approvalPolicy: z.enum(["ask", "never"]).optional(),
+});
+export const SessionMetadataUpdatedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    provider: z.string().min(1).max(256).optional(),
+    model: z.string().min(1).max(512).optional(),
+    reasoningEffort: z.string().min(1).max(256).optional(),
+    contextWindow: z.number().positive().optional(),
+});
+/**
+ * A model selection is a visible transcript event when it changes in the
+ * middle of a session. Keeping the old and new values together lets clients
+ * render a compact inline notice while still offering the full provider/model
+ * names on demand.
+ */
+export const SessionModelChangedPayloadSchema = StrictObject({
+    nativeSequence: z.number().int().safe().nonnegative().optional(),
+    sessionId: IdentifierSchema,
+    previous: ModelSelectionSchema.optional(),
+    current: ModelSelectionSchema,
+});
+export const CommandResultPayloadSchema = StrictObject({
+    nativeSequence: z.number().int().safe().nonnegative().optional(),
+    sessionId: IdentifierSchema,
+    requestId: IdentifierSchema,
+    matched: z.boolean(),
+    commandId: IdentifierSchema.optional(),
+    kind: z.enum(["success", "error"]).optional(),
+    text: z.string().max(100_000).optional(),
+});
+export const AttachmentUploadedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    requestId: IdentifierSchema,
+    receiptId: IdentifierSchema,
+    name: z.string().min(1).max(512),
+    mediaType: z.string().min(1).max(256).optional(),
+    size: z.number().int().nonnegative().optional(),
+});
+/** A prompt was accepted by the local Harness.  This is deliberately separate
+ * from the durable `user.message.accepted` transcript event: the latter may be
+ * broadcast or arrive from history, while this request receipt is targeted and
+ * safe to replay when the original acknowledgement was lost. */
+export const PromptAcceptedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    requestId: IdentifierSchema,
+});
+/**
+ * Model reasoning is deliberately kept out of the answer markdown: the phone
+ * transcript stays readable, and a client that wants the chain-of-thought can
+ * collapse it behind a disclosure instead of mixing it into the reply.
+ */
+export const AssistantReasoningPayloadSchema = StrictObject({
+    messageId: IdentifierSchema,
+    text: z.string().min(1).max(200_000),
+});
+/**
+ * Brackets for one history replay batch of a single session. The bridge
+ * publishes `history.started`, then the replayed transcript events in stored
+ * order, then `history.completed` with the same batch id. Clients atomically
+ * replace the session transcript on completion, so a replay can never
+ * interleave with (or renumber) live output. `batchId` pairs one completion
+ * with its start when two replays of the same session overlap.
+ */
+export const HistoryBatchPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    batchId: IdentifierSchema,
+    /** A durable content fingerprint for the inspected Harness session. */
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    /** The caller supplied this fingerprint and no transcript rows were resent. */
+    unchanged: z.boolean().optional(),
+});
+/** One selectable answer offered for a user question. */
+export const AskUserQuestionOptionSchema = StrictObject({
+    label: z.string().min(1).max(512),
+    description: z.string().max(2_000).optional(),
+});
+export const AskUserQuestionItemSchema = StrictObject({
+    id: IdentifierSchema,
+    question: z.string().min(1).max(4_000),
+    header: z.string().max(512).optional(),
+    /** Supporting detail (a plan under review, for example), kept out of labels. */
+    detail: z.string().max(200_000).optional(),
+    intent: StrictObject({
+        kind: z.literal("plan-review"),
+        approve: z.string().min(1).max(512),
+    }).optional(),
+    options: z.array(AskUserQuestionOptionSchema).max(32).optional(),
+    multiSelect: z.boolean().optional(),
+});
+export const QuestionAskedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    sessionId: IdentifierSchema,
+    questions: z.array(AskUserQuestionItemSchema).min(1).max(16),
+    expiresAt: TimestampSchema.optional(),
+    stateVersion: DecisionVersionSchema.optional(),
+});
+export const QuestionResolvedPayloadSchema = StrictObject({
+    id: IdentifierSchema,
+    sessionId: IdentifierSchema,
+    stateVersion: DecisionVersionSchema.optional(),
+});
+export const DecisionsSnapshotPayloadSchema = StrictObject({
+    stateVersion: DecisionVersionSchema,
+    approvals: z.array(ApprovalRequestedPayloadSchema), questions: z.array(QuestionAskedPayloadSchema),
+});
+export const PlanChangedPayloadSchema = StrictObject({ sessionId: IdentifierSchema, active: z.boolean() });
+export const PlanProjectionPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, active: z.boolean(), pending: z.boolean(), available: z.boolean(),
+    supported: z.boolean(), epoch: IdentifierSchema, seq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+export const GoalRefSchema = StrictObject({ id: IdentifierSchema, revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) });
+export const GoalUpdatePayloadSchema = z.discriminatedUnion("action", [
+    StrictObject({ action: z.literal("create"), objective: z.string().min(1).max(100_000).refine((value) => value.trim().length > 0),
+        maxGoalRounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional() }),
+    StrictObject({ action: z.enum(["pause", "resume", "complete", "clear"]), ref: GoalRefSchema }),
+    StrictObject({ action: z.literal("edit"), ref: GoalRefSchema,
+        objective: z.string().min(1).max(100_000).refine((value) => value.trim().length > 0).optional(),
+        maxGoalRounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    }).refine((value) => value.objective !== undefined || value.maxGoalRounds !== undefined),
+]);
+export const GoalUpdatedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, requestId: IdentifierSchema, action: z.enum(["create", "edit", "pause", "resume", "complete", "clear"]),
+    ref: GoalRefSchema,
+});
+export const TodoChangedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    todos: z.array(StrictObject({ content: z.string().min(1),
+        status: z.enum(["pending", "in_progress", "completed"]) })),
+});
+export const WorkflowRunSchema = StrictObject({
+    id: IdentifierSchema, name: z.string(),
+    status: z.enum(["running", "completed", "failed", "cancelled", "interrupted"]),
+    nativeSequence: z.number().int().nonnegative().optional(),
+    updatedNativeSequence: z.number().int().nonnegative().optional(),
+    startedAt: TimestampSchema.optional(), finishedAt: TimestampSchema.optional(),
+    members: z.array(StrictObject({ seq: z.number().int().positive(), label: z.string(),
+        phase: z.string().optional(), childId: IdentifierSchema,
+        status: z.enum(["running", "completed", "failed", "cancelled", "interrupted"]),
+    })),
+});
+export const WorkflowChangedPayloadSchema = StrictObject({ sessionId: IdentifierSchema, run: WorkflowRunSchema, inTranscript: z.boolean().optional() });
+export const JobsChangedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    available: z.boolean(),
+    jobs: z.array(StrictObject({
+        id: IdentifierSchema, kind: z.string(), label: z.string(),
+        status: z.enum(["running", "stopping", "completed", "killed", "failed"]),
+        detail: z.string().optional(), startedAt: TimestampSchema, finishedAt: TimestampSchema.optional(),
+    })),
+});
+export const QueueChangedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema, available: z.boolean(),
+    items: z.array(StrictObject({ id: IdentifierSchema,
+        placement: z.enum(["queued", "steering", "context"]), rpcId: IdentifierSchema.optional(),
+        message: StrictObject({ id: IdentifierSchema, content: z.array(z.unknown()) }),
+        attachments: z.array(ChatAttachmentSchema).optional(),
+    })),
+});
+export const QueueUpdatePayloadSchema = z.discriminatedUnion("action", [
+    StrictObject({ itemId: IdentifierSchema, action: z.literal("edit"), text: z.string().min(1).max(100_000).refine((text) => text.trim().length > 0) }),
+    StrictObject({ itemId: IdentifierSchema, action: z.literal("remove") }),
+    StrictObject({ itemId: IdentifierSchema, action: z.literal("steer") }),
+]);
+export const SubagentCatalogPayloadSchema = StrictObject({
+    parentSessionId: IdentifierSchema, parentAvailable: z.boolean(), supported: z.boolean().optional(),
+    entries: z.array(z.discriminatedUnion("kind", [
+        StrictObject({ kind: z.literal("child"), id: IdentifierSchema,
+            activity: z.enum(["running", "inactive"]), hasChildren: z.boolean(),
+            mode: z.enum(["one-shot", "continuable"]), label: z.string().optional() }),
+        StrictObject({ kind: z.literal("diagnostic"), id: IdentifierSchema, reason: z.enum(["corrupt", "unsupported", "unavailable"]) }),
+    ])),
+});
+export const SubagentPromptPayloadSchema = StrictObject({
+    parentSessionId: IdentifierSchema, mode: z.literal("continuable"),
+    delivery: z.enum(["queue", "steer"]),
+    text: z.string().max(100_000),
+    images: z.array(StrictObject({ type: z.literal("image"), mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+        data: z.string().min(1).max(MAX_PROMPT_INLINE_DATA_CHARS), name: z.string().min(1).max(512).optional() })).max(16).optional(),
+    clientTimeZone: z.string().min(1).max(128).optional(),
+}).superRefine((value, context) => {
+    if (value.text.trim().length === 0 && !value.images?.length)
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "subagent prompt requires text or images" });
+    if ((value.images ?? []).reduce((total, image) => total + image.data.length, 0) > MAX_PROMPT_INLINE_DATA_CHARS)
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "subagent images exceed aggregate inline budget" });
+});
+export const SubagentInterruptPayloadSchema = StrictObject({
+    parentSessionId: IdentifierSchema, mode: z.literal("continuable"),
+});
+export const SubagentReceiptPayloadSchema = StrictObject({
+    parentSessionId: IdentifierSchema, childSessionId: IdentifierSchema, requestId: IdentifierSchema,
+    action: z.enum(["prompt", "interrupt"]), messageId: IdentifierSchema.optional(),
+});
+export const CommandCatalogPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    supported: z.boolean().optional(),
+    commands: z.array(StrictObject({ name: IdentifierSchema, description: z.string(),
+        input: StrictObject({ hint: z.string(), attachments: z.boolean().optional() }).optional() })),
+    skills: z.array(StrictObject({ name: IdentifierSchema, description: z.string(),
+        whenToUse: z.string().optional(), modelInvocable: z.boolean() })).optional(),
+});
+export const GoalChangedPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    goal: StrictObject({
+        id: IdentifierSchema, revision: z.number().int().positive(),
+        objective: z.string(), phase: z.enum(["active", "paused", "blocked", "complete"]),
+        maxGoalRounds: z.number().int().nonnegative(),
+        blockedReason: StrictObject({ code: z.string(), message: z.string() }).optional(),
+    }).nullable(),
+    roundsStarted: z.number().int().nonnegative(),
+    activation: z.enum(["armed", "disarmed"]).optional(),
+});
+export const EventEnvelopeSchema = z.discriminatedUnion("type", [
+    EventEnvelope("decisions.snapshot", DecisionsSnapshotPayloadSchema),
+    EventEnvelope("plan.changed", PlanChangedPayloadSchema),
+    EventEnvelope("plan.projection", PlanProjectionPayloadSchema),
+    EventEnvelope("todo.changed", TodoChangedPayloadSchema),
+    EventEnvelope("workflow.changed", WorkflowChangedPayloadSchema),
+    EventEnvelope("execution.recorded", ExecutionRecordedPayloadSchema),
+    EventEnvelope("execution.page", ExecutionPagePayloadSchema),
+    EventEnvelope("jobs.changed", JobsChangedPayloadSchema),
+    EventEnvelope("queue.changed", QueueChangedPayloadSchema),
+    EventEnvelope("queue.updated", StrictObject({ sessionId: IdentifierSchema, itemId: IdentifierSchema, requestId: IdentifierSchema })),
+    EventEnvelope("subagent.catalog", SubagentCatalogPayloadSchema),
+    EventEnvelope("subagent.catalog.invalidated", StrictObject({ parentSessionId: IdentifierSchema })),
+    EventEnvelope("subagent.receipt", SubagentReceiptPayloadSchema),
+    EventEnvelope("command.catalog", CommandCatalogPayloadSchema),
+    EventEnvelope("command.catalog.invalidated", StrictObject({ sessionId: IdentifierSchema.optional() })),
+    EventEnvelope("session.forked", StrictObject({ sessionId: IdentifierSchema, parentSessionId: IdentifierSchema, requestId: IdentifierSchema })),
+    EventEnvelope("goal.changed", GoalChangedPayloadSchema),
+    EventEnvelope("goal.state", GoalChangedPayloadSchema),
+    EventEnvelope("goal.updated", GoalUpdatedPayloadSchema),
+    EventEnvelope("feedback.state", FeedbackStateSchema),
+    EventEnvelope("feedback.changed", FeedbackChangedSchema),
+    EventEnvelope("feedback.updated", FeedbackUpdatedSchema),
+    EventEnvelope("reference.candidates", ReferenceCandidatesSchema),
+    EventEnvelope("search.results", SearchResultsSchema),
+    EventEnvelope("history.window", HistoryWindowSchema),
+    EventEnvelope("history.page", HistoryPageSchema),
+    EventEnvelope("schedule.projection", ScheduleProjectionSchema),
+    EventEnvelope("configuration.result", ConfigurationResultSchema),
+    EventEnvelope("configuration.updated", ConfigurationUpdatedSchema),
+    EventEnvelope("configuration.invalidated", ConfigurationInvalidatedSchema),
+    EventEnvelope("configuration.models", ConfigurationModelsSchema),
+    EventEnvelope("goal.activation", StrictObject({ sessionId: IdentifierSchema, id: IdentifierSchema,
+        revision: z.number().int().positive(), activation: z.enum(["armed", "disarmed"]) })),
+    EventEnvelope("goal.round", StrictObject({ sessionId: IdentifierSchema, id: IdentifierSchema,
+        round: z.number().int().positive() })),
+    EventEnvelope("connection.ready", ConnectionReadyPayloadSchema),
+    EventEnvelope("session.snapshot", SessionSnapshotPayloadSchema),
+    EventEnvelope("session.created", SessionCreatedPayloadSchema),
+    EventEnvelope("workspace.catalog", WorkspaceCatalogPayloadSchema),
+    EventEnvelope("workspace.created", WorkspaceSchema),
+    EventEnvelope("mode.catalog", ModeCatalogPayloadSchema),
+    EventEnvelope("directory.list", DirectoryListPayloadSchema),
+    EventEnvelope("workspace.files", WorkspaceFilesPayloadSchema),
+    EventEnvelope("workspace.bytes", WorkspaceBytesPayloadSchema),
+    EventEnvelope("user.message.accepted", ChatMessagePayloadSchema),
+    EventEnvelope("assistant.message.delta", AssistantMessageDeltaPayloadSchema),
+    EventEnvelope("assistant.message.discarded", AssistantMessageDiscardedPayloadSchema),
+    EventEnvelope("assistant.message.completed", ChatMessagePayloadSchema),
+    EventEnvelope("tool.started", ToolStartedPayloadSchema),
+    EventEnvelope("tool.completed", ToolCompletedPayloadSchema),
+    EventEnvelope("approval.requested", ApprovalRequestedPayloadSchema),
+    EventEnvelope("approval.resolved", ApprovalResolvedPayloadSchema),
+    EventEnvelope("turn.state.changed", TurnStateChangedPayloadSchema),
+    EventEnvelope("model.catalog", ModelCatalogPayloadSchema),
+    EventEnvelope("usage.updated", UsageUpdatedPayloadSchema),
+    EventEnvelope("permission.updated", PermissionUpdatedPayloadSchema),
+    EventEnvelope("session.metadata.updated", SessionMetadataUpdatedPayloadSchema),
+    EventEnvelope("session.model.changed", SessionModelChangedPayloadSchema),
+    EventEnvelope("command.result", CommandResultPayloadSchema),
+    EventEnvelope("attachment.uploaded", AttachmentUploadedPayloadSchema),
+    EventEnvelope("prompt.accepted", PromptAcceptedPayloadSchema),
+    EventEnvelope("assistant.reasoning", AssistantReasoningPayloadSchema),
+    EventEnvelope("history.started", HistoryBatchPayloadSchema),
+    EventEnvelope("history.completed", HistoryBatchPayloadSchema),
+    EventEnvelope("question.asked", QuestionAskedPayloadSchema),
+    EventEnvelope("question.resolved", QuestionResolvedPayloadSchema),
+    EventEnvelope("protocol.error", ProtocolErrorPayloadSchema),
+]);
+const CommandFields = {
+    version: z.literal(PROTOCOL_VERSION),
+    requestId: IdentifierSchema,
+    machineId: IdentifierSchema,
+    deviceId: IdentifierSchema,
+    sessionId: IdentifierSchema.optional(),
+    timestamp: TimestampSchema,
+};
+const CommandEnvelope = (type, payload) => StrictObject({ ...CommandFields, type: z.literal(type), payload });
+// Keep an index signature here for source-compatible callers that construct a
+// command union by hand (older clients send an empty object). The bridge still
+// reads only the declared `includeArchived` field.
+export const SessionListPayloadSchema = z.object({
+    includeArchived: z.boolean().optional(),
+}).catchall(z.unknown());
+export const SessionCreatePayloadSchema = StrictObject({
+    title: z.string().min(1).max(512).optional(),
+    workingDirectory: z.string().min(1).optional(),
+    workspaceId: IdentifierSchema.optional(),
+    agentPreset: z.string().min(1).max(256).optional(),
+    model: ModelSelectionSchema.optional(),
+    branch: z.string().min(1).max(512).optional(),
+    permissionMode: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+    initialPrompt: z.string().max(100_000).optional(),
+});
+export const SessionOpenPayloadSchema = StrictObject({
+    sessionId: IdentifierSchema,
+    /** Opt in to transient assistant-stream events for this session only. */
+    streaming: z.boolean().optional(),
+    parentSessionId: IdentifierSchema.optional(),
+    subagentMode: z.enum(["one-shot", "continuable"]).optional(),
+    /** Last durable history fingerprint held by this client, if supported. */
+    historyFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+});
+export const SessionForkPayloadSchema = StrictObject({ atSeq: z.number().int().nonnegative().optional() });
+export const ConnectionResumePayloadSchema = StrictObject({
+    lastSequence: z.number().int().nonnegative(),
+    includeArchived: z.boolean().optional(),
+});
+/**
+ * A reference to a file that was already uploaded. The Harness resolves these
+ * receipt ids out of the prompt content and binds them to the message, which is
+ * why they must travel inside `content` rather than beside it.
+ */
+export const PromptFilePartSchema = StrictObject({
+    type: z.literal("file"),
+    receiptId: IdentifierSchema,
+});
+export const PromptSendPayloadSchema = StrictObject({
+    text: z.string().max(100_000).optional(),
+    /**
+     * Files to attach. Declared here because this object is strict: while it was
+     * undeclared, a prompt carrying an attachment was rejected whole by the Relay
+     * — taking the typed text with it, so the file arrived and the message did not.
+     */
+    attachments: z.array(PromptFilePartSchema).max(16).optional(),
+    content: z.array(z.union([
+        PromptFilePartSchema,
+        StrictObject({ type: z.literal("text"), text: z.string().max(100_000) }),
+        StrictObject({
+            type: z.literal("image"),
+            mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+            data: z.string().min(1).max(MAX_PROMPT_INLINE_DATA_CHARS),
+            name: z.string().min(1).max(512).optional(),
+        }),
+        StrictObject({ type: z.literal("file"), receiptId: IdentifierSchema }),
+    ])).max(64).optional(),
+    mode: z.enum(["queue", "steer"]).optional(),
+    clientTimeZone: z.string().max(128).optional(),
+}).superRefine((value, context) => {
+    const hasText = typeof value.text === "string" && value.text.trim().length > 0;
+    const hasContent = value.content?.some((part) => part.type !== "text" || part.text.trim().length > 0) ?? false;
+    const hasAttachments = (value.attachments?.length ?? 0) > 0;
+    if (!hasText && !hasContent && !hasAttachments) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "prompt requires text or an attachment" });
+    }
+    const contentAttachments = value.content?.filter((part) => part.type === "file" || part.type === "image").length ?? 0;
+    const totalAttachments = contentAttachments + (value.attachments?.length ?? 0);
+    if (totalAttachments > 16) {
+        context.addIssue({
+            code: z.ZodIssueCode.too_big,
+            origin: "array",
+            maximum: 16,
+            type: "array",
+            inclusive: true,
+            path: ["content"],
+            message: "a prompt may contain at most 16 file or image attachments",
+        });
+    }
+    const inlineImageDataChars = value.content?.reduce((total, part) => part.type === "image" ? total + part.data.length : total, 0) ?? 0;
+    if (inlineImageDataChars > MAX_PROMPT_INLINE_DATA_CHARS) {
+        context.addIssue({
+            code: z.ZodIssueCode.too_big,
+            maximum: MAX_PROMPT_INLINE_DATA_CHARS,
+            origin: "string",
+            inclusive: true,
+            path: ["content"],
+            message: "inline image data exceeds the prompt body budget",
+        });
+    }
+    // Keep the shared schema and the Bridge's bounded JSON reader in agreement
+    // even when many text parts and inline images are combined.  Leave room for
+    // the surrounding command/envelope fields carried by Relay.
+    const encodedPromptBytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    if (encodedPromptBytes > MAX_PROMPT_BODY_BYTES - 64 * 1024) {
+        context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [],
+            message: "prompt body exceeds the transport budget",
+        });
+    }
+});
+export const TurnCancelPayloadSchema = StrictObject({});
+export const ApprovalDecidePayloadSchema = StrictObject({
+    approvalId: IdentifierSchema,
+    allow: z.boolean(),
+});
+export const DeviceRevokePayloadSchema = StrictObject({ targetDeviceId: IdentifierSchema });
+export const SessionArchivePayloadSchema = StrictObject({ archived: z.boolean() });
+export const SessionModelPayloadSchema = ModelSelectionSchema;
+/** Workspace mutations are kept separate from session commands so a project
+ * menu action can update the durable Harness registry instead of only changing
+ * a local iPhone alias. */
+export const WorkspaceRenamePayloadSchema = StrictObject({
+    workspaceId: IdentifierSchema,
+    title: z.string().min(1).max(512),
+});
+export const WorkspaceDeletePayloadSchema = StrictObject({
+    workspaceId: IdentifierSchema,
+});
+export const WorkspaceCreatePayloadSchema = StrictObject({
+    path: z.string().min(1).max(8_192),
+    title: z.string().min(1).max(512).optional(),
+});
+export const WorkspaceCatalogCommandPayloadSchema = StrictObject({});
+export const DirectoryListCommandPayloadSchema = StrictObject({
+    path: z.string().min(1).max(8_192).optional(),
+});
+export const ModeCatalogCommandPayloadSchema = StrictObject({});
+export const SessionRenamePayloadSchema = StrictObject({
+    title: z.string().min(1).max(512),
+});
+export const CommandExecutePayloadSchema = StrictObject({
+    line: z.string().min(1).max(20_000),
+    attachments: PromptSendPayloadSchema.shape.content.optional(),
+});
+export const PermissionSetPayloadSchema = StrictObject({
+    mode: z.enum(["ask", "never", "read-only", "workspace-write", "danger-full-access"]),
+});
+export const AttachmentUploadPayloadSchema = StrictObject({
+    name: z.string().min(1).max(512),
+    data: z.string().min(1).max(MAX_ATTACHMENT_BASE64_CHARS),
+});
+/** One answered question. `selected` carries option labels verbatim. */
+export const QuestionAnswerItemSchema = StrictObject({
+    id: IdentifierSchema,
+    selected: z.array(z.string().min(1).max(512)).max(32),
+    custom: z.string().max(4_000).optional(),
+});
+export const QuestionAnswerPayloadSchema = StrictObject({
+    questionId: IdentifierSchema,
+    answers: z.array(QuestionAnswerItemSchema).min(1).max(16),
+});
+export const CommandEnvelopeSchema = z.discriminatedUnion("type", [
+    CommandEnvelope("decisions.list", StrictObject({})),
+    CommandEnvelope("execution.list", ExecutionListCommandSchema),
+    CommandEnvelope("connection.resume", ConnectionResumePayloadSchema),
+    CommandEnvelope("session.list", SessionListPayloadSchema),
+    CommandEnvelope("session.create", SessionCreatePayloadSchema),
+    CommandEnvelope("session.open", SessionOpenPayloadSchema),
+    CommandEnvelope("session.fork", SessionForkPayloadSchema),
+    CommandEnvelope("queue.update", QueueUpdatePayloadSchema),
+    CommandEnvelope("goal.get", StrictObject({})),
+    CommandEnvelope("goal.update", GoalUpdatePayloadSchema),
+    CommandEnvelope("feedback.list", StrictObject({})),
+    CommandEnvelope("feedback.update", FeedbackUpdateSchema),
+    CommandEnvelope("reference.list", ReferenceListSchema),
+    CommandEnvelope("session.search", SearchCommandSchema),
+    CommandEnvelope("conversation.search", SearchCommandSchema),
+    CommandEnvelope("history.read", HistoryReadCommandSchema),
+    CommandEnvelope("schedule.get", ScheduleGetSchema),
+    CommandEnvelope("configuration.read", ConfigurationReadSchema),
+    CommandEnvelope("configuration.update", ConfigurationUpdateSchema),
+    CommandEnvelope("configuration.discover", ConfigurationDiscoverySchema),
+    CommandEnvelope("subagent.catalog", StrictObject({})),
+    CommandEnvelope("subagent.prompt", SubagentPromptPayloadSchema),
+    CommandEnvelope("subagent.interrupt", SubagentInterruptPayloadSchema),
+    CommandEnvelope("command.catalog", StrictObject({})),
+    CommandEnvelope("prompt.send", PromptSendPayloadSchema),
+    CommandEnvelope("turn.cancel", TurnCancelPayloadSchema),
+    CommandEnvelope("approval.decide", ApprovalDecidePayloadSchema),
+    CommandEnvelope("session.archive", SessionArchivePayloadSchema),
+    CommandEnvelope("session.model", SessionModelPayloadSchema),
+    CommandEnvelope("workspace.rename", WorkspaceRenamePayloadSchema),
+    CommandEnvelope("workspace.delete", WorkspaceDeletePayloadSchema),
+    CommandEnvelope("workspace.create", WorkspaceCreatePayloadSchema),
+    CommandEnvelope("workspace.catalog", WorkspaceCatalogCommandPayloadSchema),
+    CommandEnvelope("directory.list", DirectoryListCommandPayloadSchema),
+    CommandEnvelope("workspace.files", WorkspaceFilesCommandSchema),
+    CommandEnvelope("workspace.bytes", WorkspaceBytesCommandSchema),
+    CommandEnvelope("mode.catalog", ModeCatalogCommandPayloadSchema),
+    CommandEnvelope("session.rename", SessionRenamePayloadSchema),
+    CommandEnvelope("model.catalog", StrictObject({})),
+    CommandEnvelope("command.execute", CommandExecutePayloadSchema),
+    CommandEnvelope("permission.set", PermissionSetPayloadSchema),
+    CommandEnvelope("attachment.upload", AttachmentUploadPayloadSchema),
+    CommandEnvelope("question.answer", QuestionAnswerPayloadSchema),
+    CommandEnvelope("question.cancel", StrictObject({ questionId: IdentifierSchema })),
+    CommandEnvelope("device.revoke", DeviceRevokePayloadSchema),
+]);
+export const PairingRequestSchema = StrictObject({
+    version: z.literal(PROTOCOL_VERSION),
+    type: z.literal("pairing.request"),
+    requestId: IdentifierSchema,
+    deviceName: z.string().min(1).max(256),
+    pairingCode: z.string().regex(/^\d{6}$/, "pairing code must be six digits"),
+    timestamp: TimestampSchema,
+});
+export const PairingResponseSchema = StrictObject({
+    version: z.literal(PROTOCOL_VERSION),
+    type: z.literal("pairing.response"),
+    requestId: IdentifierSchema,
+    machineId: IdentifierSchema,
+    deviceId: IdentifierSchema,
+    status: z.enum(["accepted", "rejected"]),
+    deviceToken: z.string().min(1).max(16_384).optional(),
+    expiresAt: TimestampSchema.optional(),
+    error: z.string().max(4_000).optional(),
+}).superRefine((value, context) => {
+    if (value.status === "accepted" && !value.deviceToken) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "accepted pairing responses require a token" });
+    }
+    if (value.status === "rejected" && !value.error) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["error"], message: "rejected pairing responses require an error" });
+    }
+});
+export const WireMessageSchema = z.union([
+    EventEnvelopeSchema,
+    CommandEnvelopeSchema,
+    PairingRequestSchema,
+    PairingResponseSchema,
+]);
+/**
+ * Messages carried by the public Relay.  Unlike WireMessage, these envelopes
+ * are deliberately small: the Relay authenticates the sender and only routes
+ * a WireMessage to peers which belong to the same machine.
+ */
+export const RelayRoleSchema = z.enum(["machine", "device"]);
+export const RelayReadyMessageSchema = StrictObject({
+    type: z.literal("relay.ready"),
+    /** Included only when the client explicitly requests schema negotiation. */
+    schemaRevision: z.number().int().safe().nonnegative().optional(),
+    machineId: IdentifierSchema,
+    role: RelayRoleSchema,
+    connectionId: IdentifierSchema,
+    serverTime: TimestampSchema,
+    /** Monotonic lease generation for a machine connection. Older relays omit it. */
+    leaseGeneration: z.number().int().positive().optional(),
+    /** Changes when the Relay process is restarted, resetting generations. */
+    relayEpoch: IdentifierSchema.optional(),
+});
+export const RelayPresenceMessageSchema = StrictObject({
+    type: z.literal("relay.presence"),
+    machineId: IdentifierSchema,
+    role: RelayRoleSchema,
+    online: z.boolean(),
+    deviceId: IdentifierSchema.optional(),
+    serverTime: TimestampSchema,
+});
+export const RelayPayloadMessageSchema = StrictObject({
+    type: z.literal("relay.payload"),
+    machineId: IdentifierSchema,
+    messageId: IdentifierSchema,
+    sender: RelayRoleSchema,
+    targetDeviceId: IdentifierSchema.optional(),
+    body: WireMessageSchema,
+});
+export const RelayErrorMessageSchema = StrictObject({
+    type: z.literal("relay.error"),
+    code: IdentifierSchema,
+    message: z.string().min(1).max(4_000),
+    machineId: IdentifierSchema.optional(),
+    messageId: IdentifierSchema.optional(),
+});
+export const RelayMessageSchema = z.discriminatedUnion("type", [
+    RelayReadyMessageSchema,
+    RelayPresenceMessageSchema,
+    RelayPayloadMessageSchema,
+    RelayErrorMessageSchema,
+]);
+export const parseRelayMessage = (value) => RelayMessageSchema.parse(value);
+/** Parse helpers keep callers from accidentally accepting a different protocol version. */
+export const parseEvent = (value) => EventEnvelopeSchema.parse(value);
+export const parseCommand = (value) => CommandEnvelopeSchema.parse(value);
+export const parsePairingRequest = (value) => PairingRequestSchema.parse(value);
+export const parsePairingResponse = (value) => PairingResponseSchema.parse(value);
+export const parseWireMessage = (value) => WireMessageSchema.parse(value);
+/** Sequence values are positive and strictly increasing for a given stream. */
+export const validateSequence = (previousSequence, sequence) => {
+    const parsed = SequenceSchema.safeParse(sequence);
+    return parsed.success && (previousSequence === undefined || parsed.data > previousSequence);
+};
+export const assertSequence = (previousSequence, sequence) => {
+    if (!validateSequence(previousSequence, sequence)) {
+        throw new Error("sequence must be a positive integer greater than the previous sequence");
+    }
+    return sequence;
+};
+/**
+ * QR pairing payload, shared by the Mac connector (producer) and the native
+ * client (consumer) so the two cannot drift apart.
+ *
+ * The iPhone derives both its HTTPS pairing call and its WSS session socket
+ * from a single base address, so the encoded relay always uses the https://
+ * form even though the connector stores wss://.
+ */
+export const PAIRING_LINK_SCHEME = "dshanywhere";
+/** Rewrites a stored wss:// (or ws://) relay address into its HTTPS form. */
+export const relayHTTPSURL = (value) => {
+    const url = new URL(value);
+    if (url.protocol === "wss:")
+        url.protocol = "https:";
+    else if (url.protocol === "ws:")
+        url.protocol = "http:";
+    else if (url.protocol !== "https:" && url.protocol !== "http:") {
+        throw new Error("relay must be an absolute HTTPS URL");
+    }
+    return url.toString().replace(/\/+$/, "");
+};
+export const pairingLink = (payload) => {
+    const url = new URL(`${PAIRING_LINK_SCHEME}://pair`);
+    url.searchParams.set("relay", relayHTTPSURL(payload.relay));
+    url.searchParams.set("machineId", payload.machineId);
+    if ("pairingSecret" in payload)
+        url.searchParams.set("secret", payload.pairingSecret);
+    else
+        url.searchParams.set("code", payload.pairingCode);
+    return url.toString();
+};
+/** Returns undefined rather than throwing so a scanner can reject foreign codes. */
+export const parsePairingLink = (value) => {
+    let url;
+    try {
+        url = new URL(value.trim());
+    }
+    catch {
+        return undefined;
+    }
+    if (url.protocol !== `${PAIRING_LINK_SCHEME}:`)
+        return undefined;
+    const relay = url.searchParams.get("relay");
+    const machineId = url.searchParams.get("machineId");
+    const pairingSecret = url.searchParams.get("secret");
+    const pairingCode = url.searchParams.get("code");
+    if (relay === null || machineId === null || machineId.trim() === "")
+        return undefined;
+    const secret = pairingSecret?.trim() ?? "";
+    const code = pairingCode?.trim().toUpperCase() ?? "";
+    if (secret === "" && code === "")
+        return undefined;
+    try {
+        const resolvedRelay = relayHTTPSURL(relay);
+        const resolvedMachineId = machineId.trim();
+        // A link carrying both is ambiguous; the one-time code wins because it is
+        // the narrower credential and what a freshly minted link carries.
+        return code !== ""
+            ? { relay: resolvedRelay, machineId: resolvedMachineId, pairingCode: code }
+            : { relay: resolvedRelay, machineId: resolvedMachineId, pairingSecret: secret };
+    }
+    catch {
+        return undefined;
+    }
+};

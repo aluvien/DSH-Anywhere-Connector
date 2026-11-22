@@ -1,0 +1,15 @@
+- insert:
+    - id: dsh-anywhere-plugin
+      name: 'dsh-anywhere'
+      inject:
+        - webServer
+        - sessionController
+        - workspaceRegistry
+        - typertGateway
+        - directoryPicker
+        - connection
+      config:
+        managedConnector: true
+        routePrefix: /dsh-anywhere/v1
+        approvalTimeoutMs: 120000
+        eventBufferSize: 2000

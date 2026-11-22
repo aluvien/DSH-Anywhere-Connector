@@ -2498,6 +2498,11 @@ final class DSHAppModel: ObservableObject {
     /// avoid offering a self-revoke the Relay would refuse anyway.
     var currentDeviceId: String? { profiles.activeProfile?.deviceId }
 
+    func recheckConnectivity(networkAvailable: Bool) async {
+        guard eventTask != nil, isPaired, !suspendingTransactions else { return }
+        await transport.recheckConnectivity(networkAvailable: networkAvailable)
+    }
+
     func connect() {
         guard pendingTransactionStoreLoaded, isPaired, eventTask == nil,
               !removedMachineFenceUnavailable,
@@ -2505,11 +2510,6 @@ final class DSHAppModel: ObservableObject {
               !machineID.isEmpty, !removedMachineIDs.contains(machineID) else { return }
         if suspendingTransactions {
             reconnectAfterSuspension = true
-    func recheckConnectivity(networkAvailable: Bool) async {
-        guard eventTask != nil, isPaired, !suspendingTransactions else { return }
-        await transport.recheckConnectivity(networkAvailable: networkAvailable)
-    }
-
             return
         }
         if pendingSessionCreationRequestIDs.isEmpty {
@@ -5132,13 +5132,6 @@ final class DSHAppModel: ObservableObject {
         return true
     }
 
-    private func scheduleReadOnlyRecoveryAttempt() {
-        guard readOnlyRecoveryTask == nil else { return }
-        readOnlyRecoveryTask = Task { @MainActor [weak self] in
-            // Commands from one appearance pass join one replacement batch.
-            await Task.yield()
-            guard let self, !Task.isCancelled else { return }
-            self.readOnlyRecoveryTask = nil
     private func prepareReadOnlyRecovery(for generation: Int, readinessAtAttempt: Int) {
         guard pendingReadOnlyRecoveryGeneration != generation else { return }
         pendingReadOnlyRecoveryGeneration = generation
@@ -5150,6 +5143,13 @@ final class DSHAppModel: ObservableObject {
         pendingSessionOpenRecoveryIDs.removeAll(keepingCapacity: false)
     }
 
+    private func scheduleReadOnlyRecoveryAttempt() {
+        guard readOnlyRecoveryTask == nil else { return }
+        readOnlyRecoveryTask = Task { @MainActor [weak self] in
+            // Commands from one appearance pass join one replacement batch.
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.readOnlyRecoveryTask = nil
             self.performPendingReadOnlyRecoveryIfReady()
         }
     }
@@ -5544,13 +5544,6 @@ final class DSHAppModel: ObservableObject {
 
     private func trackHistoryBatch(_ event: DSHEvent) {
         if case .transportState(let connection) = event.kind, connection != .connected {
-            requestedHistorySessions.removeAll()
-            for task in historyTimeoutTasks.values { task.cancel() }
-            historyTimeoutTasks.removeAll()
-            historyLastProgressAt.removeAll()
-            replayingHistoryBatches.removeAll()
-            return
-        }
             if case .reconnecting = connection, let sessionID = visibleConversationSessionID,
                requestedHistorySessions.contains(sessionID) || isReplayingHistory(sessionID: sessionID) {
                 // The reducer retires partial history batches on disconnect.
@@ -5559,8 +5552,15 @@ final class DSHAppModel: ObservableObject {
                                         readinessAtAttempt: readOnlyRecoveryReadinessRevision)
                 pendingSessionOpenRecoveryIDs.insert(sessionID)
             }
-        if case .protocolError = event.kind, let session = historyOpenRequests.removeValue(forKey: event.envelope.messageId) {
+            requestedHistorySessions.removeAll()
             historyOpenRequests.removeAll()
+            for task in historyTimeoutTasks.values { task.cancel() }
+            historyTimeoutTasks.removeAll()
+            historyLastProgressAt.removeAll()
+            replayingHistoryBatches.removeAll()
+            return
+        }
+        if case .protocolError = event.kind, let session = historyOpenRequests.removeValue(forKey: event.envelope.messageId) {
             reducer.abandonHistory(session: session, into: &state)
             requestedHistorySessions.remove(session)
             if state.historyFailures == nil { state.historyFailures = [:] }
