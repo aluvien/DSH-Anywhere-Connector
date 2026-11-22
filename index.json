@@ -1,0 +1,44 @@
+{
+  "format": 1,
+  "title": "DSH Anywhere",
+  "plugins": [
+    {
+      "name": "dsh-anywhere",
+      "title": "DSH Anywhere",
+      "description": {
+        "en": "Connect your iPhone to Harness.",
+        "zh": "用 iPhone 远程连接 Harness。"
+      },
+      "repository": {
+        "url": "https://github.com/aluvien/DSH-Anywhere-Connector",
+        "directory": "packages/dsh-anywhere-plugin"
+      },
+      "metadata": {
+        "keywords": [
+          "remote",
+          "iphone",
+          "远程连接",
+          "手机"
+        ]
+      },
+      "dist-tags": {
+        "latest": "0.2.0-beta.1"
+      },
+      "versions": [
+        {
+          "version": "0.2.0-beta.1",
+          "publishTimestamp": 1795313101,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/aluvien/DSH-Anywhere-Connector",
+            "commit": "1b4f10511338174a64c5395991a40914ddb9abb3",
+            "path": "release/harness"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.3 <0.2.3-0"
+          }
+        }
+      ]
+    }
+  ]
+}
