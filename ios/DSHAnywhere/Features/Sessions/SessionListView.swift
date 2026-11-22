@@ -1523,7 +1523,6 @@ struct DSHRemoteHomeView: View {
         .padding(.bottom, 8)
     }
 
-    @ViewBuilder
     private func showConversation(_ sessionID: String, location: DSHSearchHit? = nil) {
         if let openConversation {
             openConversation(sessionID, location)
@@ -1537,6 +1536,7 @@ struct DSHRemoteHomeView: View {
         showConversation(hit.sessionId, location: hit)
     }
 
+    @ViewBuilder
     private func remoteProjectSection(_ group: DSHSessionGroup) -> some View {
         let expanded = !model.isGroupCollapsed(group.id)
 
