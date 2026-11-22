@@ -18,7 +18,15 @@ DSH Anywhere 由 iOS App、电脑端 Connector 和 Relay 组成。电脑通过�
 
 在 iPhone 上打开 [TestFlight 测试加入地址](https://testflight.apple.com/join/cnkGqHtp)，加入测试并安装 DSH Anywhere。
 
-### 2. 在电脑上安装 Connector
+### 2. 通过 Harness 安装插件（预览）
+
+打开「插件 → 发现 → 管理索引源」，添加 [DSH Anywhere 预览索引](https://raw.githubusercontent.com/aluvien/DSH-Anywhere-Connector/refs/heads/codex/harness-plugin-preview/index.json)，搜索 **DSH Anywhere** 后点「安装」。如果没有「发现」，先在实验性插件中启用「自定义插件索引」。
+
+打开插件详情，点击「开启远程连接」，再用 iPhone 扫描一次性配对码。随插件安装的 Connector 会在退出 Harness 时断开。已有独立 Connector 的电脑沿用原配对。
+
+预览版已在 macOS 的官方 Harness Web 运行时验证。也可以使用下方的现有安装方式。
+
+### 2a. 使用现有 Connector 安装方式
 
 选择运行 DeepSeek Harness 的电脑系统，在终端执行对应命令。安装器会配置电脑端运行环境、注册电脑，并启动 Bridge 与 Connector。
 
